@@ -30,7 +30,7 @@ Your AWS access key was exposed in a chat message. You must rotate it immediatel
 1. Go to **IAM → Users → matrx-admin → Security credentials**
 2. Click **Create access key** (new one)
 3. Save the new key ID and secret
-4. **Delete the old key** (`AKIA4WJPWQC7IFK32ZPK`)
+4. **Delete the old key** (the one that was exposed)
 5. Update your local `~/.aws/credentials` and `.env` with the new values
 6. Update the EC2 instance if it uses these credentials directly
 
