@@ -6,46 +6,34 @@ All initial infrastructure is deployed, tested, and operational.
 
 | # | Task | Notes |
 |---|------|-------|
-| 1 | AWS Account Setup | IAM user `matrx-admin`, access key generated |
-| 2 | S3 Bucket | `matrx-sandbox-storage-prod-2024` (us-east-1) |
-| 3 | EC2 Key Pair | `matrx-sandbox-key` at ~/Code/secrets/ |
-| 4 | AWS CLI | Configured and verified |
-| 5 | ECR Repository | `872515272894.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox` |
-| 6 | Terraform Deploy | EC2 `i-084f757c1e47d4efb` at `44.204.240.45` |
-| 7 | Sandbox Image | Built on EC2 (2.22GB), all code fixes applied |
-| 8 | E2E Test | Full lifecycle verified: create/exec/destroy + S3 sync |
-| 9 | Security Groups | Locked SSH + API to `68.5.62.36/32` |
-| 10 | GitHub Secrets | `AWS_ACCESS_KEY_ID`, `AWS_SECRET_ACCESS_KEY`, `AWS_ACCOUNT_ID`, `ECR_REPO_URI` |
-| 11 | Rebuild on EC2 | Image rebuilt with all CRITICAL/HIGH fixes |
-| 12 | CI/CD Verification | All 3 CI jobs passing (test, build-sandbox, build-orchestrator) |
+| 1–8 | Full AWS setup + E2E test | EC2, S3, ECR, Terraform, image build, lifecycle verified |
+| 9 | Security Groups | SSH locked to home IP |
+| 10 | GitHub Secrets | 4 secrets for CI/CD |
+| 11 | Rebuild on EC2 | All CRITICAL/HIGH code fixes applied |
+| 12 | CI/CD Verification | 3/3 jobs passing |
 
 ---
 
 ## Remaining
 
-| # | Task | Priority | Notes |
-|---|------|----------|-------|
-| A1 | Allocate Elastic IP | HIGH | Prevents IP change on instance stop/start |
-| A2 | Set up orchestrator as systemd service | HIGH | Currently runs via nohup, won't survive reboot |
-| A3 | Test deploy workflow | MEDIUM | Trigger `deploy.yml` manually from GitHub Actions |
-| A4 | Delete old claude branch from GitHub | LOW | `claude/design-sandbox-architecture-kLhO4` still on remote |
+| # | Task | Who | Priority |
+|---|------|-----|----------|
+| A1 | Allocate Elastic IP | Terminal agent | HIGH |
+| A2 | Systemd service for orchestrator | Terminal agent | HIGH |
+| A3 | Open port 8000 to 0.0.0.0/0 in Terraform | Terminal agent | HIGH |
+| A4 | Test deploy workflow | Arman (GitHub UI) | MEDIUM |
+| A5 | Delete old branch | Terminal agent | LOW |
 
 ### A1. Allocate Elastic IP
 
-The EC2 public IP changes when the instance stops/starts (or when Terraform updates user_data). Allocate an Elastic IP to make it permanent:
-
 ```bash
-# From your terminal:
 aws ec2 allocate-address --domain vpc --query 'AllocationId' --output text
-# Note the allocation ID, then:
 aws ec2 associate-address --instance-id i-084f757c1e47d4efb --allocation-id <ALLOCATION_ID>
 ```
 
-Then update `terraform.tfvars` if your own IP changed, and update `.env` with the new static IP.
+Then update `.env` with the new static IP.
 
-### A2. Set up orchestrator as systemd service on EC2
-
-The orchestrator is currently started manually. To survive reboots:
+### A2. Systemd service
 
 ```bash
 ssh -i ~/Code/secrets/matrx-sandbox-key.pem ec2-user@44.204.240.45
@@ -78,11 +66,25 @@ sudo systemctl start matrx-orchestrator
 sudo systemctl status matrx-orchestrator
 ```
 
-### A3. Test deploy workflow
+### A3. Open API port to all IPs
 
-Go to GitHub > Actions > "Deploy" workflow > "Run workflow" on main. This will build and push the sandbox + orchestrator images to ECR.
+Once the Claude Code agent adds API key auth (Task 9), update Terraform
+to allow port 8000 from anywhere (the API key protects it, not the IP):
 
-### A4. Delete old claude branch
+In `infra/terraform/terraform.tfvars`, change:
+```hcl
+api_cidr_blocks = ["0.0.0.0/0"]
+```
+
+Then: `cd infra/terraform && terraform apply`
+
+Keep SSH locked to your home IP — only you need that.
+
+### A4. Test deploy workflow
+
+Go to GitHub → Actions → "Deploy" → "Run workflow" on main.
+
+### A5. Delete old branch
 
 ```bash
 git push origin --delete claude/design-sandbox-architecture-kLhO4
@@ -90,35 +92,41 @@ git push origin --delete claude/design-sandbox-architecture-kLhO4
 
 ---
 
-## Quick Test Commands
+## SSH Cheat Sheet
 
-SSH to EC2:
+Connect:
 ```bash
 ssh -i ~/Code/secrets/matrx-sandbox-key.pem ec2-user@44.204.240.45
 ```
 
-Health check:
+Once inside:
 ```bash
-curl http://44.204.240.45:8000/health
-```
+# ─── System status ───
+sudo systemctl status matrx-orchestrator   # Is the API running?
+docker ps                                   # Any sandboxes running?
+docker ps -a                                # All containers (including stopped)
+df -h                                       # Disk space
+free -h                                     # Memory
+docker images                               # What images are available?
 
-Create sandbox:
-```bash
-curl -X POST http://44.204.240.45:8000/sandboxes \
-  -H "Content-Type: application/json" \
-  -d '{"user_id": "my-test"}'
-```
+# ─── Orchestrator logs ───
+sudo journalctl -u matrx-orchestrator -f    # Live API logs (after systemd setup)
+sudo journalctl -u matrx-orchestrator -n 50 # Last 50 lines
 
-Execute command (replace SANDBOX_ID):
-```bash
-curl -X POST http://44.204.240.45:8000/sandboxes/<SANDBOX_ID>/exec \
-  -H "Content-Type: application/json" \
-  -d '{"command": "whoami && python3 --version && echo WORKING"}'
-```
+# ─── Test the API locally ───
+curl localhost:8000/health
+curl localhost:8000/sandboxes               # List all sandboxes
 
-Destroy sandbox:
-```bash
-curl -X DELETE "http://44.204.240.45:8000/sandboxes/<SANDBOX_ID>?graceful=true"
+# ─── Peek inside a running sandbox ───
+docker exec -it <container_id> bash         # Get a shell inside a sandbox
+docker logs <container_id>                  # See sandbox startup logs
+
+# ─── S3 storage check ───
+aws s3 ls s3://matrx-sandbox-storage-prod-2024/users/  # See all user data
+
+# ─── Maintenance ───
+docker system prune -f                      # Clean up old containers/images
+sudo dnf check-release-update               # Check for OS updates
 ```
 
 ---
@@ -133,5 +141,5 @@ curl -X DELETE "http://44.204.240.45:8000/sandboxes/<SANDBOX_ID>?graceful=true"
 | ECR Repo | `872515272894.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox` |
 | Key Pair | `matrx-sandbox-key` (~/Code/secrets/) |
 | IAM Role | `matrx-sandbox-host-dev` |
-| Security Group | `sg-05a1b5a6163cd8ee6` (SSH + API locked to your IP) |
+| Security Group | `sg-05a1b5a6163cd8ee6` |
 | CI/CD | `.github/workflows/ci.yml` (auto) + `deploy.yml` (manual) |
