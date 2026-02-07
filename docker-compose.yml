@@ -1,0 +1,43 @@
+# docker-compose.yml — Local development environment
+#
+# Usage:
+#   1. Build the sandbox image: docker build -t matrx-sandbox:latest sandbox-image/
+#   2. Start the orchestrator:  docker compose up orchestrator
+#   3. Create a sandbox via API: curl -X POST http://localhost:8000/sandboxes \
+#        -H "Content-Type: application/json" \
+#        -d '{"user_id": "test-user-1"}'
+
+version: "3.8"
+
+services:
+  orchestrator:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    ports:
+      - "8000:8000"
+    environment:
+      - MATRX_S3_BUCKET=${MATRX_S3_BUCKET:-matrx-sandbox-dev}
+      - MATRX_S3_REGION=${MATRX_S3_REGION:-us-east-1}
+      - MATRX_DEBUG=true
+      - MATRX_SANDBOX_IMAGE=matrx-sandbox:latest
+    volumes:
+      # Mount Docker socket so orchestrator can manage containers
+      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount source for live reload during development
+      - ./orchestrator:/app
+    restart: unless-stopped
+
+  # LocalStack for local S3 development (no AWS account needed)
+  localstack:
+    image: localstack/localstack:latest
+    ports:
+      - "4566:4566"    # LocalStack gateway
+    environment:
+      - SERVICES=s3
+      - DEFAULT_REGION=us-east-1
+    volumes:
+      - localstack-data:/var/lib/localstack
+
+volumes:
+  localstack-data:
