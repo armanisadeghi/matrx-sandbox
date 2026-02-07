@@ -119,9 +119,10 @@ The base sandbox image includes:
 
 ## Scaling Model
 
-- **Phase 1** (current): Single EC2 instance, one sandbox at a time.
-- **Phase 2**: Single EC2 instance, multiple concurrent sandboxes (Docker
-  Compose or direct Docker API).
+- **Phase 1** (current): Single EC2 instance, multiple concurrent sandboxes
+  via Docker API. No hard limit enforced in code.
+- **Phase 2**: Single EC2 instance with resource-aware scheduling (track CPU/memory
+  per sandbox, reject creation when host is at capacity).
 - **Phase 3**: Auto-scaling EC2 fleet with placement logic. Each EC2 host runs
   N sandboxes. New hosts spin up when existing ones are at capacity.
 - **Phase 4**: ECS Fargate or EKS for fully managed container orchestration.

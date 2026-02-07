@@ -26,7 +26,8 @@ Console.
 - **Sandbox image** was built directly on EC2 (not pushed to ECR yet). CI/CD should handle ECR push.
 - **EC2 IAM role** (`matrx-sandbox-host-dev`) has ECR pull-only permissions. CI/CD pipeline needs separate push credentials via GitHub Secrets.
 - **Bug fix applied**: `sandbox-image/scripts/cold-mount.sh` — added `mkdir -p /tmp/s3cache` before `mount-s3` call (cache dir wasn't being created).
-- **Docker daemon fix**: `bootstrap-host.sh` sets `default-ulimits` in daemon.json, which conflicts with Amazon Linux 2023's systemd Docker config. The ulimits entry was removed from daemon.json on EC2. The bootstrap script should be updated to not include ulimits.
+- **Docker daemon fix**: `bootstrap-host.sh` ulimits entry has been removed from the repo (conflicts with Amazon Linux 2023 systemd). Already fixed in code.
+- **LocalStack issue**: `docker-compose.yml` doesn't configure the orchestrator to connect to LocalStack. The orchestrator's boto3 client tries real AWS S3 instead of `http://localstack:4566`. Fix: add `AWS_ENDPOINT_URL_S3=http://localstack:4566` to the orchestrator environment in docker-compose.yml, and add `depends_on: [localstack]`.
 
 ---
 

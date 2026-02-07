@@ -89,9 +89,9 @@ curl -X DELETE "http://localhost:8000/sandboxes/<sandbox-id>?graceful=true"
 |--------|------|-------------|
 | `POST` | `/sandboxes` | Create a new sandbox |
 | `GET` | `/sandboxes` | List all sandboxes |
-| `GET` | `/sandboxes/{id}` | Get sandbox details |
+| `GET` | `/sandboxes/{sandbox_id}` | Get sandbox details |
 | `POST` | `/sandboxes/{id}/exec` | Execute a command |
-| `DELETE` | `/sandboxes/{id}` | Destroy a sandbox |
+| `DELETE` | `/sandboxes/{sandbox_id}` | Destroy a sandbox |
 | `POST` | `/sandboxes/{id}/heartbeat` | Agent heartbeat |
 | `POST` | `/sandboxes/{id}/complete` | Agent signals completion |
 | `POST` | `/sandboxes/{id}/error` | Agent signals error |

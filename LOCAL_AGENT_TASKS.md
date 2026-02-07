@@ -16,7 +16,7 @@ AWS Console login.
 | 4 | Code Review & Quality Audit | DONE | Full report at `docs/CODE_REVIEW.md` |
 | 5 | Verify Terraform Configuration | DONE | Included in code review report |
 | 6 | Review & Test docker-compose.yml | DONE | Included in code review report |
-| 7 | Documentation Improvements | TODO | — |
+| 7 | Documentation Improvements | DONE | README, ARCHITECTURE, .env.example, DIRECTORY_STRUCTURE fixed |
 
 ---
 

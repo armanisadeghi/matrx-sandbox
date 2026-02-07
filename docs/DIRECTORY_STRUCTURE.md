@@ -4,6 +4,7 @@
 matrx-sandbox/
 ├── docs/                          # Architecture and design docs
 │   ├── ARCHITECTURE.md            # Full system architecture
+│   ├── CODE_REVIEW.md             # Code review report (45 issues)
 │   └── DIRECTORY_STRUCTURE.md     # This file
 │
 ├── sandbox-image/                 # Docker image for the sandbox container
@@ -31,7 +32,6 @@ matrx-sandbox/
 │   │   ├── models.py              # Pydantic models (requests, responses)
 │   │   ├── sandbox_manager.py     # Docker container lifecycle (create/destroy)
 │   │   ├── storage.py             # S3 operations (bucket setup, prefix management)
-│   │   ├── health.py              # Health monitoring and heartbeat
 │   │   └── routes/
 │   │       ├── __init__.py
 │   │       ├── sandboxes.py       # /sandboxes endpoints
@@ -54,9 +54,11 @@ matrx-sandbox/
 │   └── scripts/
 │       └── bootstrap-host.sh      # EC2 user-data script (install Docker, etc.)
 │
-├── ARMAN_TASKS.md                 # Manual tasks for Arman (AWS setup, etc.)
+├── ARMAN_TASKS.md                 # Manual AWS setup tasks (all complete)
+├── LOCAL_AGENT_TASKS.md           # Cowork agent tasks (browser + file ops)
+├── CLAUDE_CODE_AGENT_TASKS.md     # Claude Code agent tasks (coding + CI/CD)
 ├── README.md                      # Project overview and quickstart
 ├── .gitignore
 ├── .env.example                   # Example environment variables
-└── docker-compose.yml             # Local dev compose (orchestrator + sandbox)
+└── docker-compose.yml             # Local dev compose (orchestrator + LocalStack)
 ```
