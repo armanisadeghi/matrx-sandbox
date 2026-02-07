@@ -40,16 +40,11 @@ cat > /etc/docker/daemon.json <<'DOCKEREOF'
     "max-size": "10m",
     "max-file": "3"
   },
-  "storage-driver": "overlay2",
-  "default-ulimits": {
-    "nofile": {
-      "Name": "nofile",
-      "Hard": 65536,
-      "Soft": 65536
-    }
-  }
+  "storage-driver": "overlay2"
 }
 DOCKEREOF
+# Note: default-ulimits removed — conflicts with Amazon Linux 2023's
+# systemd Docker config which manages ulimits via systemd service overrides.
 
 systemctl restart docker
 

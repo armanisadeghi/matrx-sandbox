@@ -23,6 +23,7 @@ case "$ACTION" in
     mount)
         log "Mounting cold storage: s3://${S3_BUCKET}/${S3_COLD_PREFIX} → $LOCAL_COLD_PATH"
         mkdir -p "$LOCAL_COLD_PATH"
+        mkdir -p /tmp/s3cache
 
         # Mount using AWS Mountpoint for S3
         # --prefix scopes to the user's cold directory

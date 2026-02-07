@@ -1,23 +1,26 @@
 # Arman's Tasks
 
-Manual setup steps that cannot be done from within this codebase. Complete these
-in order. Each section tells you exactly what to do, what options to select, and
-what values to bring back.
+Manual setup steps that only Arman can do (account creation, credentials,
+local tool installation). Other tasks have been delegated:
+- **Browser tasks** (S3, Key Pair, ECR): → `LOCAL_AGENT_TASKS.md` (Cowork agent)
+- **Coding tasks** (tests, CI/CD, refactoring): → `CLAUDE_CODE_AGENT_TASKS.md`
+
+Complete these in order. Each section tells you exactly what to do.
 
 ---
 
 ## Status
 
-| # | Task | Status |
-|---|------|--------|
-| 1 | AWS Account Setup | TODO |
-| 2 | Create S3 Bucket | TODO |
-| 3 | Create EC2 Key Pair | TODO |
-| 4 | Configure AWS CLI Locally | TODO |
-| 5 | Create ECR Repository | TODO |
-| 6 | Deploy First EC2 Instance | TODO |
-| 7 | Build & Push Sandbox Image | TODO |
-| 8 | End-to-End Test | TODO |
+| # | Task | Status | Notes |
+|---|------|--------|-------|
+| 1 | AWS Account Setup | DONE | IAM user `matrx-admin` created, access key generated |
+| 2 | Create S3 Bucket | DONE | `matrx-sandbox-storage-prod-2024` in us-east-1 |
+| 3 | Create EC2 Key Pair | DONE | `matrx-sandbox-key` — .pem at ~/Code/secrets/ |
+| 4 | Configure AWS CLI Locally | DONE | Verified via `aws sts get-caller-identity` |
+| 5 | Create ECR Repository | DONE | `872515272894.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox` |
+| 6 | Deploy Infrastructure (Terraform) | DONE | EC2 `i-084f757c1e47d4efb` at `44.204.37.36` |
+| 7 | Build & Push Sandbox Image | DONE | Built on EC2 directly (2.22GB). ECR push deferred to CI/CD. |
+| 8 | End-to-End Test | DONE | Sandbox create/exec/destroy all working. S3 storage verified. |
 
 ---
 
