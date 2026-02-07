@@ -80,7 +80,7 @@ RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2
     && rm -rf awscliv2.zip aws/
 
 # ─── Mountpoint for Amazon S3 (cold storage FUSE) ────────────────────────────
-RUN curl -LO https://s3.amazonaws.com/mountpoint-s3-release/1.12.0/x86_64/mount-s3.deb \
+RUN curl -LO https://s3.amazonaws.com/mountpoint-s3-release/latest/x86_64/mount-s3.deb \
     && dpkg -i mount-s3.deb \
     && rm mount-s3.deb
 
