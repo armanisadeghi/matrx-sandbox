@@ -2,11 +2,17 @@
 
 from __future__ import annotations
 
+import logging
+
 from fastapi import APIRouter, HTTPException
 
 from orchestrator import sandbox_manager, storage
 from orchestrator.models import (
+    CompletionRequest,
+    CompletionResponse,
     CreateSandboxRequest,
+    ErrorReport,
+    ErrorResponse,
     ExecRequest,
     ExecResponse,
     HeartbeatResponse,
@@ -14,13 +20,15 @@ from orchestrator.models import (
     SandboxResponse,
 )
 
+logger = logging.getLogger(__name__)
+
 router = APIRouter(prefix="/sandboxes", tags=["sandboxes"])
 
 
 @router.post("", response_model=SandboxResponse, status_code=201)
 async def create_sandbox(req: CreateSandboxRequest):
     """Create a new sandbox for a user."""
-    # Ensure S3 storage exists for this user
+    logger.info("Sandbox creation requested for user_id=%s", req.user_id)
     await storage.ensure_user_storage(req.user_id)
 
     sandbox = await sandbox_manager.create_sandbox(
@@ -61,6 +69,8 @@ async def exec_command(sandbox_id: str, req: ExecRequest):
             user=req.user,
         )
         return ExecResponse(exit_code=exit_code, stdout=stdout, stderr=stderr)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -86,30 +96,29 @@ async def sandbox_heartbeat(sandbox_id: str):
     return HeartbeatResponse(acknowledged=True, sandbox_id=sandbox_id)
 
 
-@router.post("/{sandbox_id}/complete")
-async def sandbox_complete(sandbox_id: str, result: dict | None = None):
+@router.post("/{sandbox_id}/complete", response_model=CompletionResponse)
+async def sandbox_complete(sandbox_id: str, req: CompletionRequest | None = None):
     """Agent signals that its task is complete. Triggers graceful shutdown."""
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
 
+    logger.info("Sandbox %s signaled completion", sandbox_id)
     await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True)
-    return {"status": "shutting_down", "sandbox_id": sandbox_id}
+    return CompletionResponse(status="shutting_down", sandbox_id=sandbox_id)
 
 
-@router.post("/{sandbox_id}/error")
-async def sandbox_error(sandbox_id: str, body: dict | None = None):
+@router.post("/{sandbox_id}/error", response_model=ErrorResponse)
+async def sandbox_error(sandbox_id: str, req: ErrorReport):
     """Agent signals an error. Logs the error and triggers graceful shutdown."""
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
 
-    # In production, log the error to a monitoring system
-    error = (body or {}).get("error", "unknown error")
-    import logging
-    logging.getLogger(__name__).error(
-        f"Sandbox {sandbox_id} reported error: {error}"
+    logger.error(
+        "Sandbox %s (user=%s) reported error: %s",
+        sandbox_id, sandbox.user_id, req.error,
     )
 
     await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True)
-    return {"status": "shutting_down", "sandbox_id": sandbox_id, "error_received": True}
+    return ErrorResponse(status="shutting_down", sandbox_id=sandbox_id, error_received=True)

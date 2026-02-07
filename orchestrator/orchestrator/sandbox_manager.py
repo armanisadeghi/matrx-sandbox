@@ -1,4 +1,8 @@
-"""Sandbox lifecycle manager — creates, monitors, and destroys Docker containers."""
+"""Sandbox lifecycle manager — creates, monitors, and destroys Docker containers.
+
+Manages the full lifecycle: create, wait-for-ready, exec, heartbeat, destroy.
+Uses a singleton Docker client to avoid connection leaks.
+"""
 
 from __future__ import annotations
 
@@ -18,9 +22,34 @@ logger = logging.getLogger(__name__)
 # In-memory sandbox registry (replace with DB in production)
 _sandboxes: dict[str, SandboxResponse] = {}
 
+# Singleton Docker client — avoids creating new connections on every call (C7)
+_docker_client: docker.DockerClient | None = None
+
 
 def _get_docker_client() -> docker.DockerClient:
-    return docker.from_env()
+    """Get or create the singleton Docker client.
+
+    Returns a cached Docker client instance. The client is reused across all
+    operations to avoid leaking TCP connections and file descriptors.
+
+    Raises:
+        RuntimeError: If unable to connect to the Docker daemon.
+    """
+    global _docker_client
+    if _docker_client is None:
+        try:
+            _docker_client = docker.from_env()
+        except docker.errors.DockerException as e:
+            raise RuntimeError(f"Failed to connect to Docker daemon: {e}") from e
+    return _docker_client
+
+
+def close_docker_client() -> None:
+    """Explicitly close the Docker client. Called during app shutdown."""
+    global _docker_client
+    if _docker_client is not None:
+        _docker_client.close()
+        _docker_client = None
 
 
 async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxResponse:
@@ -36,10 +65,11 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
     )
     _sandboxes[sandbox_id] = sandbox
 
+    logger.info("Creating sandbox %s for user %s", sandbox_id, user_id)
+
     try:
         client = _get_docker_client()
 
-        # Build environment variables for the container
         env = {
             "SANDBOX_ID": sandbox_id,
             "USER_ID": user_id,
@@ -50,7 +80,6 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
             "SHUTDOWN_TIMEOUT_SECONDS": str(settings.shutdown_timeout_seconds),
         }
 
-        # Container resource limits
         container = client.containers.run(
             image=settings.sandbox_image,
             name=sandbox_id,
@@ -69,13 +98,11 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
             network=settings.docker_network,
             # Extra hosts so container can reach the orchestrator
             extra_hosts={"host.docker.internal": "host-gateway"},
-            # Labels for management
             labels={
                 "matrx.sandbox_id": sandbox_id,
                 "matrx.user_id": user_id,
                 "matrx.created_at": sandbox.created_at.isoformat(),
             },
-            # Restart policy: never (ephemeral)
             restart_policy={"Name": "no"},
         )
 
@@ -83,18 +110,17 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
         sandbox.status = SandboxStatus.STARTING
         _sandboxes[sandbox_id] = sandbox
 
-        # Wait for the container to signal readiness (poll for /tmp/.sandbox_ready)
         sandbox = await _wait_for_ready(sandbox)
         _sandboxes[sandbox_id] = sandbox
 
-        logger.info(f"Sandbox {sandbox_id} created for user {user_id}")
+        logger.info("Sandbox %s is %s for user %s", sandbox_id, sandbox.status, user_id)
         return sandbox
 
     except Exception as e:
         sandbox.status = SandboxStatus.FAILED
         _sandboxes[sandbox_id] = sandbox
-        logger.error(f"Failed to create sandbox {sandbox_id}: {e}")
-        raise
+        logger.error("Failed to create sandbox %s: %s", sandbox_id, e)
+        raise RuntimeError(f"Failed to create sandbox {sandbox_id}: {e}") from e
 
 
 async def _wait_for_ready(sandbox: SandboxResponse, timeout: int = 120) -> SandboxResponse:
@@ -110,21 +136,20 @@ async def _wait_for_ready(sandbox: SandboxResponse, timeout: int = 120) -> Sandb
                 sandbox.status = SandboxStatus.FAILED
                 return sandbox
 
-            # Check if ready file exists
             exit_code, _ = container.exec_run("test -f /tmp/.sandbox_ready")
             if exit_code == 0:
                 sandbox.status = SandboxStatus.READY
                 return sandbox
 
         except (NotFound, APIError) as e:
-            logger.warning(f"Error polling sandbox {sandbox.sandbox_id}: {e}")
+            logger.warning("Error polling sandbox %s: %s", sandbox.sandbox_id, e)
             sandbox.status = SandboxStatus.FAILED
             return sandbox
 
         await asyncio.sleep(interval)
         elapsed += interval
 
-    logger.warning(f"Sandbox {sandbox.sandbox_id} did not become ready within {timeout}s")
+    logger.warning("Sandbox %s did not become ready within %ds", sandbox.sandbox_id, timeout)
     sandbox.status = SandboxStatus.FAILED
     return sandbox
 
@@ -142,19 +167,51 @@ async def list_sandboxes(user_id: str | None = None) -> list[SandboxResponse]:
     return sandboxes
 
 
-async def exec_in_sandbox(sandbox_id: str, command: str, timeout: int = 30, user: str = "agent") -> tuple[int, str, str]:
-    """Execute a command inside a running sandbox. Returns (exit_code, stdout, stderr)."""
+async def exec_in_sandbox(
+    sandbox_id: str,
+    command: str,
+    timeout: int = 30,
+    user: str = "agent",
+) -> tuple[int, str, str]:
+    """Execute a command inside a running sandbox.
+
+    Returns (exit_code, stdout, stderr).
+
+    Validates that the sandbox exists and its container is running before
+    executing. Commands are length-limited (C2) and the container status
+    is checked (C1/H5) to prevent race conditions.
+    """
     sandbox = _sandboxes.get(sandbox_id)
     if not sandbox or not sandbox.container_id:
         raise ValueError(f"Sandbox {sandbox_id} not found or has no container")
 
+    # C2: Validate command length
+    if len(command) > settings.max_command_length:
+        raise ValueError(
+            f"Command exceeds max length ({settings.max_command_length} chars)"
+        )
+
     client = _get_docker_client()
     try:
         container = client.containers.get(sandbox.sandbox_id)
+
+        # C1/H5: Validate container is actually running before exec
+        container.reload()
+        if container.status != "running":
+            raise RuntimeError(
+                f"Container for sandbox {sandbox_id} is not running "
+                f"(status: {container.status})"
+            )
+
+        logger.info(
+            "Executing command in sandbox %s (user=%s, timeout=%d, len=%d)",
+            sandbox_id, user, timeout, len(command),
+        )
+
         exit_code, output = container.exec_run(
             cmd=["bash", "-c", command],
             user=user,
-            demux=True,  # separate stdout/stderr
+            demux=True,
         )
 
         stdout = (output[0] or b"").decode("utf-8", errors="replace")
@@ -162,11 +219,15 @@ async def exec_in_sandbox(sandbox_id: str, command: str, timeout: int = 30, user
         return exit_code, stdout, stderr
 
     except (NotFound, APIError) as e:
-        raise RuntimeError(f"Failed to exec in sandbox {sandbox_id}: {e}")
+        raise RuntimeError(f"Failed to exec in sandbox {sandbox_id}: {e}") from e
 
 
 async def destroy_sandbox(sandbox_id: str, graceful: bool = True) -> bool:
-    """Destroy a sandbox, optionally with graceful shutdown."""
+    """Destroy a sandbox, optionally with graceful shutdown.
+
+    After destruction, the sandbox entry is removed from the in-memory
+    registry to prevent unbounded memory growth (H6).
+    """
     sandbox = _sandboxes.get(sandbox_id)
     if not sandbox:
         return False
@@ -174,32 +235,32 @@ async def destroy_sandbox(sandbox_id: str, graceful: bool = True) -> bool:
     sandbox.status = SandboxStatus.SHUTTING_DOWN
     _sandboxes[sandbox_id] = sandbox
 
+    logger.info("Destroying sandbox %s (graceful=%s)", sandbox_id, graceful)
+
     client = _get_docker_client()
     try:
         container = client.containers.get(sandbox.sandbox_id)
 
         if graceful:
-            # Send SIGTERM, which triggers the shutdown trap in entrypoint.sh
             container.stop(timeout=settings.shutdown_timeout_seconds + 10)
         else:
             container.kill()
 
         container.remove(force=True)
-        sandbox.status = SandboxStatus.STOPPED
-        _sandboxes[sandbox_id] = sandbox
-        logger.info(f"Sandbox {sandbox_id} destroyed (graceful={graceful})")
+        # H6: Remove from registry to prevent memory leak
+        _sandboxes.pop(sandbox_id, None)
+        logger.info("Sandbox %s destroyed", sandbox_id)
         return True
 
     except NotFound:
-        sandbox.status = SandboxStatus.STOPPED
-        _sandboxes[sandbox_id] = sandbox
-        logger.warning(f"Sandbox {sandbox_id} container not found during destroy")
+        _sandboxes.pop(sandbox_id, None)
+        logger.warning("Sandbox %s container not found during destroy", sandbox_id)
         return True
 
     except APIError as e:
         sandbox.status = SandboxStatus.FAILED
         _sandboxes[sandbox_id] = sandbox
-        logger.error(f"Failed to destroy sandbox {sandbox_id}: {e}")
+        logger.error("Failed to destroy sandbox %s: %s", sandbox_id, e)
         return False
 
 
@@ -208,5 +269,4 @@ async def heartbeat(sandbox_id: str) -> bool:
     sandbox = _sandboxes.get(sandbox_id)
     if not sandbox:
         return False
-    # In production, update last_heartbeat timestamp
     return True

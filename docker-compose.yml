@@ -21,11 +21,22 @@ services:
       - MATRX_S3_REGION=${MATRX_S3_REGION:-us-east-1}
       - MATRX_DEBUG=true
       - MATRX_SANDBOX_IMAGE=matrx-sandbox:latest
+      # Route S3 requests to LocalStack instead of real AWS
+      - AWS_ENDPOINT_URL_S3=http://localstack:4566
     volumes:
-      # Mount Docker socket so orchestrator can manage containers
-      - /var/run/docker.sock:/var/run/docker.sock
+      # Mount Docker socket so orchestrator can manage sandbox containers.
+      # SECURITY: The Docker socket grants full control over the Docker daemon,
+      # which is effectively root-level access on the host. The orchestrator
+      # needs it to create, inspect, exec into, and destroy sandbox containers.
+      # Mounted read-only to prevent the orchestrator from modifying the socket
+      # file itself, though API-level access is still privileged.
+      - /var/run/docker.sock:/var/run/docker.sock:ro
       # Mount source for live reload during development
       - ./orchestrator:/app
+    depends_on:
+      - localstack
+    security_opt:
+      - no-new-privileges:true
     restart: unless-stopped
 
   # LocalStack for local S3 development (no AWS account needed)

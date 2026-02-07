@@ -8,11 +8,17 @@ Provides helpers for:
 
 from __future__ import annotations
 
+import logging
 import os
 from pathlib import Path
 
 import httpx
 from pydantic import BaseModel
+
+logger = logging.getLogger(__name__)
+
+MAX_RETRIES = 3
+RETRY_BACKOFF = 0.5  # seconds
 
 
 class SandboxInfo(BaseModel):
@@ -41,50 +47,83 @@ class SandboxClient:
         self._orchestrator_url = orchestrator_url or os.getenv(
             "ORCHESTRATOR_URL", "http://host.docker.internal:8000"
         )
-
-    def info(self) -> SandboxInfo:
-        """Return metadata about the current sandbox."""
-        return SandboxInfo(
+        # M7: Cache sandbox info at init instead of reading env vars every call
+        self._info = SandboxInfo(
             sandbox_id=os.environ.get("SANDBOX_ID", "unknown"),
             user_id=os.environ.get("USER_ID", "unknown"),
             hot_path=Path(os.environ.get("HOT_PATH", "/home/agent")),
             cold_path=Path(os.environ.get("COLD_PATH", "/data/cold")),
         )
 
+    def info(self) -> SandboxInfo:
+        """Return metadata about the current sandbox."""
+        return self._info
+
     def hot_path(self) -> Path:
         """Return the hot storage path."""
-        return self.info().hot_path
+        return self._info.hot_path
 
     def cold_path(self) -> Path:
         """Return the cold storage path."""
-        return self.info().cold_path
+        return self._info.cold_path
+
+    async def _request_with_retry(
+        self, method: str, path: str, timeout: float = 5.0, **kwargs
+    ) -> httpx.Response:
+        """Make an HTTP request with retry logic (H1)."""
+        url = f"{self._orchestrator_url}{path}"
+        last_error: Exception | None = None
+
+        for attempt in range(1, MAX_RETRIES + 1):
+            try:
+                async with httpx.AsyncClient() as client:
+                    resp = await client.request(
+                        method, url, timeout=timeout, **kwargs
+                    )
+                    return resp
+            except (httpx.ConnectError, httpx.TimeoutException) as e:
+                last_error = e
+                if attempt < MAX_RETRIES:
+                    import asyncio
+                    wait = RETRY_BACKOFF * (2 ** (attempt - 1))
+                    logger.warning(
+                        "Request to %s failed (attempt %d/%d), retrying in %.1fs: %s",
+                        url, attempt, MAX_RETRIES, wait, e,
+                    )
+                    await asyncio.sleep(wait)
+            except httpx.HTTPError as e:
+                logger.error("HTTP error calling %s: %s", url, e)
+                raise
+
+        logger.error("Request to %s failed after %d attempts", url, MAX_RETRIES)
+        raise RuntimeError(f"Failed to reach orchestrator at {url}") from last_error
 
     async def heartbeat(self) -> bool:
         """Send a heartbeat to the orchestrator. Returns True if acknowledged."""
-        info = self.info()
-        async with httpx.AsyncClient() as client:
-            resp = await client.post(
-                f"{self._orchestrator_url}/sandboxes/{info.sandbox_id}/heartbeat",
+        try:
+            resp = await self._request_with_retry(
+                "POST",
+                f"/sandboxes/{self._info.sandbox_id}/heartbeat",
                 timeout=5.0,
             )
             return resp.status_code == 200
+        except Exception:
+            return False
 
     async def signal_complete(self, result: dict | None = None) -> None:
         """Signal the orchestrator that the agent task is complete."""
-        info = self.info()
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                f"{self._orchestrator_url}/sandboxes/{info.sandbox_id}/complete",
-                json=result or {},
-                timeout=10.0,
-            )
+        await self._request_with_retry(
+            "POST",
+            f"/sandboxes/{self._info.sandbox_id}/complete",
+            json={"result": result or {}},
+            timeout=10.0,
+        )
 
     async def signal_error(self, error: str) -> None:
         """Signal the orchestrator that the agent encountered an error."""
-        info = self.info()
-        async with httpx.AsyncClient() as client:
-            await client.post(
-                f"{self._orchestrator_url}/sandboxes/{info.sandbox_id}/error",
-                json={"error": error},
-                timeout=10.0,
-            )
+        await self._request_with_retry(
+            "POST",
+            f"/sandboxes/{self._info.sandbox_id}/error",
+            json={"error": error},
+            timeout=10.0,
+        )

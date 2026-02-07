@@ -34,21 +34,21 @@ resource "aws_security_group" "sandbox_host" {
   description = "Security group for Matrx sandbox host EC2 instances"
   vpc_id      = local.vpc_id
 
-  # SSH access (restrict to your IP in production)
+  # SSH access
   ingress {
     from_port   = 22
     to_port     = 22
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # TODO: restrict in production
+    cidr_blocks = var.ssh_cidr_blocks
     description = "SSH access"
   }
 
-  # Orchestrator API (internal only in production)
+  # Orchestrator API
   ingress {
     from_port   = 8000
     to_port     = 8000
     protocol    = "tcp"
-    cidr_blocks = ["0.0.0.0/0"] # TODO: restrict in production
+    cidr_blocks = var.api_cidr_blocks
     description = "Orchestrator API"
   }
 

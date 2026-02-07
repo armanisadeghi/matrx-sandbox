@@ -82,13 +82,21 @@ resource "aws_iam_role_policy" "sandbox_ecr_pull" {
     Version = "2012-10-17"
     Statement = [
       {
+        Sid    = "ECRAuth"
+        Effect = "Allow"
+        Action = [
+          "ecr:GetAuthorizationToken",
+        ]
+        Resource = "*"
+      },
+      {
+        Sid    = "ECRPull"
         Effect = "Allow"
         Action = [
           "ecr:GetDownloadUrlForLayer",
           "ecr:BatchGetImage",
-          "ecr:GetAuthorizationToken",
         ]
-        Resource = "*"
+        Resource = var.ecr_repo_arn != "" ? var.ecr_repo_arn : "*"
       }
     ]
   })

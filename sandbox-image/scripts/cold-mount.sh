@@ -6,6 +6,13 @@ set -euo pipefail
 # Usage: cold-mount.sh [mount|unmount]
 
 ACTION="${1:-}"
+
+# Validate required environment variables
+if [ -z "${S3_BUCKET:-}" ] || [ -z "${USER_ID:-}" ]; then
+    echo "ERROR: S3_BUCKET and USER_ID must be set" >&2
+    exit 1
+fi
+
 S3_COLD_PREFIX="users/${USER_ID}/cold"
 LOCAL_COLD_PATH="${COLD_PATH:-/data/cold}"
 LOG_FILE="/var/log/sandbox/cold-mount.log"
@@ -30,7 +37,7 @@ case "$ACTION" in
         # --allow-other lets the agent user access the mount
         # --cache /tmp/s3cache enables local caching for repeated reads
         # --metadata-ttl 60 caches directory listings for 60 seconds
-        mount-s3 "$S3_BUCKET" "$LOCAL_COLD_PATH" \
+        timeout 30 mount-s3 "$S3_BUCKET" "$LOCAL_COLD_PATH" \
             --prefix "$S3_COLD_PREFIX/" \
             --region "${S3_REGION:-us-east-1}" \
             --allow-other \

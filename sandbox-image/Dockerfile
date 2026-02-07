@@ -46,6 +46,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && rm -rf /var/lib/apt/lists/*
 
 # ─── ripgrep and fd-find ─────────────────────────────────────────────────────
+# TODO: Add SHA256 checksum verification for ripgrep and fd downloads
 RUN curl -LO https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep_14.1.0-1_amd64.deb \
     && dpkg -i ripgrep_14.1.0-1_amd64.deb \
     && rm ripgrep_14.1.0-1_amd64.deb
@@ -79,7 +80,7 @@ RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2
     && rm -rf awscliv2.zip aws/
 
 # ─── Mountpoint for Amazon S3 (cold storage FUSE) ────────────────────────────
-RUN curl -LO https://s3.amazonaws.com/mountpoint-s3-release/latest/x86_64/mount-s3.deb \
+RUN curl -LO https://s3.amazonaws.com/mountpoint-s3-release/1.12.0/x86_64/mount-s3.deb \
     && dpkg -i mount-s3.deb \
     && rm mount-s3.deb
 

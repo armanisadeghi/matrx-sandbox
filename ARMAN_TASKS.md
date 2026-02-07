@@ -2,303 +2,99 @@
 
 Manual setup steps that only Arman can do (account creation, credentials,
 local tool installation). Other tasks have been delegated:
-- **Browser tasks** (S3, Key Pair, ECR): → `LOCAL_AGENT_TASKS.md` (Cowork agent)
 - **Coding tasks** (tests, CI/CD, refactoring): → `CLAUDE_CODE_AGENT_TASKS.md`
-
-Complete these in order. Each section tells you exactly what to do.
 
 ---
 
 ## Status
 
+All initial setup tasks are **DONE**. The system is operational.
+
 | # | Task | Status | Notes |
 |---|------|--------|-------|
-| 1 | AWS Account Setup | DONE | IAM user `matrx-admin` created, access key generated |
+| 1 | AWS Account Setup | DONE | IAM user `matrx-admin` created |
 | 2 | Create S3 Bucket | DONE | `matrx-sandbox-storage-prod-2024` in us-east-1 |
 | 3 | Create EC2 Key Pair | DONE | `matrx-sandbox-key` — .pem at ~/Code/secrets/ |
-| 4 | Configure AWS CLI Locally | DONE | Verified via `aws sts get-caller-identity` |
+| 4 | Configure AWS CLI | DONE | Verified via `aws sts get-caller-identity` |
 | 5 | Create ECR Repository | DONE | `872515272894.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox` |
-| 6 | Deploy Infrastructure (Terraform) | DONE | EC2 `i-084f757c1e47d4efb` at `44.204.37.36` |
-| 7 | Build & Push Sandbox Image | DONE | Built on EC2 directly (2.22GB). ECR push deferred to CI/CD. |
-| 8 | End-to-End Test | DONE | Sandbox create/exec/destroy all working. S3 storage verified. |
+| 6 | Deploy Infrastructure | DONE | EC2 `i-084f757c1e47d4efb` at `44.204.37.36` |
+| 7 | Build Sandbox Image | DONE | Built on EC2 (2.22GB). ECR push via CI/CD. |
+| 8 | End-to-End Test | DONE | Sandbox create/exec/destroy all working |
 
 ---
 
-## 1. AWS Account Setup
+## URGENT: Rotate AWS Credentials
 
-If you already have an AWS account with admin access, skip to step 2.
+Your AWS access key was exposed in a chat message. You must rotate it immediately:
 
-1. Go to https://aws.amazon.com/ and click "Create an AWS Account"
-2. Use your work email, set the account name to "AI Matrx" (or similar)
-3. Choose **Personal** or **Business** account type
-4. Add a payment method (credit card required)
-5. Choose the **Basic Support (Free)** plan
-6. After account creation, go to **IAM** in the AWS Console
-7. Create an IAM user for programmatic access:
-   - Go to IAM → Users → Create User
-   - Name: `matrx-admin`
-   - Check **"Provide user access to the AWS Management Console"**
-   - Select **"I want to create an IAM user"**
-   - For permissions, choose **"Attach policies directly"**
-   - Attach: `AdministratorAccess` (for initial setup — we'll scope this down later)
-   - Complete creation
-8. Go to the user → Security credentials → Create access key
-   - Use case: "Command Line Interface (CLI)"
-   - Save the **Access Key ID** and **Secret Access Key** — you'll need them in step 4
-
-**Values to save:**
-```
-AWS_ACCOUNT_ID=____________
-AWS_ACCESS_KEY_ID=____________
-AWS_SECRET_ACCESS_KEY=____________
-```
+1. Go to **IAM → Users → matrx-admin → Security credentials**
+2. Click **Create access key** (new one)
+3. Save the new key ID and secret
+4. **Delete the old key** (`AKIA4WJPWQC7IFK32ZPK`)
+5. Update your local `~/.aws/credentials` and `.env` with the new values
+6. Update the EC2 instance if it uses these credentials directly
 
 ---
 
-## 2. Create S3 Bucket
+## Remaining Tasks for Arman
 
-1. Go to AWS Console → S3 → Create bucket
-2. Settings:
-   - **Bucket name**: `matrx-sandbox-storage-<your-unique-suffix>` (must be globally unique; use something like `matrx-sandbox-storage-prod-2024`)
-   - **Region**: `us-east-1` (or your preferred region — just be consistent everywhere)
-   - **Object Ownership**: ACLs disabled (recommended)
-   - **Block all public access**: ✅ ON (keep all four boxes checked)
-   - **Bucket Versioning**: Enable
-   - **Default encryption**: Server-side encryption with Amazon S3 managed keys (SSE-S3)
-   - **Bucket Key**: Enable
-3. Click Create bucket
+### A1. Restrict Terraform Security Groups
 
-**Values to bring back** (add to your `.env` file in the repo):
-```
-MATRX_S3_BUCKET=matrx-sandbox-storage-<your-suffix>
-MATRX_S3_REGION=us-east-1
+The Terraform config now requires explicit CIDR blocks for SSH and API access.
+Update your `infra/terraform/terraform.tfvars`:
+
+```hcl
+ssh_cidr_blocks = ["YOUR_IP/32"]    # e.g., ["203.0.113.50/32"]
+api_cidr_blocks = ["YOUR_IP/32"]    # Same as above for now
+ecr_repo_arn    = "arn:aws:ecr:us-east-1:872515272894:repository/matrx-sandbox"
 ```
 
----
-
-## 3. Create EC2 Key Pair
-
-This lets you SSH into the sandbox host EC2 instance.
-
-1. Go to AWS Console → EC2 → Key Pairs (left sidebar under "Network & Security")
-2. Click "Create key pair"
-3. Settings:
-   - **Name**: `matrx-sandbox-key`
-   - **Key pair type**: RSA
-   - **Private key file format**: `.pem` (for Mac/Linux) or `.ppk` (for PuTTY on Windows)
-4. Click Create — it will download the `.pem` file
-5. Move the file to a safe location and set permissions:
-   ```bash
-   mv ~/Downloads/matrx-sandbox-key.pem ~/.ssh/
-   chmod 400 ~/.ssh/matrx-sandbox-key.pem
-   ```
-
-**Values to save:**
-```
-EC2_KEY_PAIR_NAME=matrx-sandbox-key
+Then re-apply:
+```bash
+cd infra/terraform
+terraform plan
+terraform apply
 ```
 
----
+### A2. Set Up GitHub Secrets for CI/CD
 
-## 4. Configure AWS CLI Locally
+The CI/CD pipeline needs these secrets in the GitHub repository settings
+(Settings → Secrets and variables → Actions):
 
-1. Install the AWS CLI if you don't have it:
-   ```bash
-   # macOS
-   brew install awscli
+| Secret Name | Value |
+|-------------|-------|
+| `AWS_ACCESS_KEY_ID` | Your new access key (after rotation) |
+| `AWS_SECRET_ACCESS_KEY` | Your new secret key (after rotation) |
+| `ECR_REPO_URI` | `872515272894.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox` |
 
-   # Or download from https://aws.amazon.com/cli/
-   ```
+### A3. Rebuild Sandbox Image on EC2
 
-2. Configure it with the credentials from step 1:
-   ```bash
-   aws configure
-   ```
-   Enter:
-   - **AWS Access Key ID**: (from step 1)
-   - **AWS Secret Access Key**: (from step 1)
-   - **Default region name**: `us-east-1`
-   - **Default output format**: `json`
-
-3. Verify it works:
-   ```bash
-   aws sts get-caller-identity
-   ```
-   You should see your account ID and user ARN.
-
-4. Verify S3 access:
-   ```bash
-   aws s3 ls s3://matrx-sandbox-storage-<your-suffix>/
-   ```
-
----
-
-## 5. Create ECR Repository
-
-ECR (Elastic Container Registry) stores the sandbox Docker image so EC2
-instances can pull it.
-
-1. Go to AWS Console → ECR → Create repository
-2. Settings:
-   - **Visibility**: Private
-   - **Repository name**: `matrx-sandbox`
-   - **Tag immutability**: Disabled
-   - **Scan on push**: Enabled
-   - **Encryption**: AES-256
-3. Click Create repository
-
-4. Note the repository URI — it looks like:
-   `<account-id>.dkr.ecr.<region>.amazonaws.com/matrx-sandbox`
-
-**Values to save:**
-```
-ECR_REPO_URI=<account-id>.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox
-```
-
----
-
-## 6. Deploy Infrastructure with Terraform
-
-1. Install Terraform if you don't have it:
-   ```bash
-   # macOS
-   brew install terraform
-
-   # Or download from https://developer.hashicorp.com/terraform/downloads
-   ```
-
-2. Configure the Terraform variables:
-   ```bash
-   cd infra/terraform
-   cp terraform.tfvars.example terraform.tfvars
-   ```
-
-3. Edit `terraform.tfvars` with your values:
-   ```hcl
-   s3_bucket_name    = "matrx-sandbox-storage-<your-suffix>"
-   ec2_key_pair_name = "matrx-sandbox-key"
-   # ec2_instance_type = "t3.xlarge"   # optional, default is fine
-   ```
-
-4. Initialize and apply:
-   ```bash
-   terraform init
-   terraform plan        # review what will be created
-   terraform apply       # type "yes" to confirm
-   ```
-
-5. Save the outputs:
-   ```bash
-   terraform output
-   ```
-
-**Values to save:**
-```
-EC2_INSTANCE_ID=____________
-EC2_PUBLIC_IP=____________
-```
-
----
-
-## 7. Build & Push Sandbox Image
-
-Once you have ECR and EC2 running:
-
-1. Authenticate Docker to ECR:
-   ```bash
-   aws ecr get-login-password --region us-east-1 | \
-     docker login --username AWS --password-stdin \
-     <account-id>.dkr.ecr.us-east-1.amazonaws.com
-   ```
-
-2. Build the sandbox image:
-   ```bash
-   cd sandbox-image
-   docker build -t matrx-sandbox:latest .
-   ```
-
-3. Tag and push to ECR:
-   ```bash
-   docker tag matrx-sandbox:latest \
-     <account-id>.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox:latest
-
-   docker push \
-     <account-id>.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox:latest
-   ```
-
-4. SSH into the EC2 instance and pull the image:
-   ```bash
-   ssh -i ~/.ssh/matrx-sandbox-key.pem ec2-user@<EC2_PUBLIC_IP>
-
-   # On the EC2 instance:
-   aws ecr get-login-password --region us-east-1 | \
-     docker login --username AWS --password-stdin \
-     <account-id>.dkr.ecr.us-east-1.amazonaws.com
-
-   docker pull <account-id>.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox:latest
-   docker tag <account-id>.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox:latest \
-     matrx-sandbox:latest
-   ```
-
----
-
-## 8. End-to-End Test
-
-Run these on the EC2 instance to verify everything works:
-
-1. Start the orchestrator:
-   ```bash
-   # On EC2 instance
-   cd /home/ec2-user
-   pip3.11 install matrx-orchestrator  # or clone repo and install
-   python3.11 -m orchestrator.main
-   ```
-
-2. In another terminal, create a test sandbox:
-   ```bash
-   curl -X POST http://localhost:8000/sandboxes \
-     -H "Content-Type: application/json" \
-     -d '{"user_id": "test-user-1"}'
-   ```
-
-3. Execute a command:
-   ```bash
-   curl -X POST http://localhost:8000/sandboxes/<sandbox-id>/exec \
-     -H "Content-Type: application/json" \
-     -d '{"command": "whoami && pwd && ls -la"}'
-   ```
-
-4. Destroy the sandbox:
-   ```bash
-   curl -X DELETE "http://localhost:8000/sandboxes/<sandbox-id>?graceful=true"
-   ```
-
-5. Verify hot storage was synced:
-   ```bash
-   aws s3 ls s3://matrx-sandbox-storage-<suffix>/users/test-user-1/hot/
-   ```
-
----
-
-## Environment Variables Summary
-
-After completing all steps, your `.env` file should contain:
+After code review fixes are merged, rebuild the sandbox image on EC2:
 
 ```bash
-# AWS
-MATRX_S3_BUCKET=matrx-sandbox-storage-<your-suffix>
-MATRX_S3_REGION=us-east-1
+ssh -i ~/Code/secrets/matrx-sandbox-key.pem ec2-user@44.204.37.36
 
-# Orchestrator
-MATRX_HOST=0.0.0.0
-MATRX_PORT=8000
-MATRX_DEBUG=false
-MATRX_SANDBOX_IMAGE=matrx-sandbox:latest
+# Pull latest code
+cd ~/matrx-sandbox && git pull origin main
 
-# ECR (for CI/CD)
-ECR_REPO_URI=<account-id>.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox
+# Rebuild
+docker build -t matrx-sandbox:latest sandbox-image/
 
-# EC2
-EC2_KEY_PAIR_NAME=matrx-sandbox-key
-EC2_PUBLIC_IP=<from terraform output>
+# Restart orchestrator
+# (stop current one, then restart with updated code)
 ```
+
+---
+
+## Infrastructure Reference
+
+| Resource | Value |
+|----------|-------|
+| AWS Account ID | `872515272894` |
+| S3 Bucket | `matrx-sandbox-storage-prod-2024` |
+| S3 Region | `us-east-1` |
+| EC2 Instance | `i-084f757c1e47d4efb` |
+| EC2 Public IP | `44.204.37.36` |
+| EC2 Key Pair | `matrx-sandbox-key` |
+| ECR Repository | `872515272894.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox` |
+| IAM Role | `matrx-sandbox-host-dev` |

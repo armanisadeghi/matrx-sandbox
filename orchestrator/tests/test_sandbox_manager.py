@@ -2,11 +2,24 @@
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from unittest.mock import MagicMock, patch
 
 import pytest
 
-from orchestrator.models import SandboxStatus
+from orchestrator.models import SandboxResponse, SandboxStatus
+
+
+@pytest.fixture(autouse=True)
+def clean_sandbox_state():
+    """Reset sandbox manager state before and after each test."""
+    from orchestrator import sandbox_manager
+
+    sandbox_manager._sandboxes = {}
+    sandbox_manager._docker_client = None
+    yield
+    sandbox_manager._sandboxes = {}
+    sandbox_manager._docker_client = None
 
 
 @pytest.fixture
@@ -20,8 +33,6 @@ def mock_docker():
 @pytest.mark.asyncio
 async def test_create_sandbox_generates_unique_id(mock_docker):
     """Sandbox IDs should be unique and prefixed with 'sbx-'."""
-    from orchestrator.sandbox_manager import _sandboxes
-
     # Set up mock container
     container = MagicMock()
     container.id = "abc123"
@@ -44,9 +55,6 @@ async def test_create_sandbox_generates_unique_id(mock_docker):
 async def test_list_sandboxes_filters_by_user():
     """list_sandboxes should filter by user_id when provided."""
     from orchestrator import sandbox_manager
-    from orchestrator.models import SandboxResponse
-
-    from datetime import datetime, timezone
 
     # Seed some test data
     sandbox_manager._sandboxes = {
@@ -67,15 +75,119 @@ async def test_list_sandboxes_filters_by_user():
     all_sandboxes = await sandbox_manager.list_sandboxes()
     assert len(all_sandboxes) == 2
 
-    # Cleanup
-    sandbox_manager._sandboxes = {}
-
 
 @pytest.mark.asyncio
 async def test_heartbeat_returns_false_for_unknown_sandbox():
     """heartbeat should return False for non-existent sandboxes."""
     from orchestrator import sandbox_manager
-    sandbox_manager._sandboxes = {}
 
     result = await sandbox_manager.heartbeat("sbx-nonexistent")
     assert result is False
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_returns_true_for_known_sandbox():
+    """heartbeat should return True when the sandbox exists."""
+    from orchestrator import sandbox_manager
+
+    sandbox_manager._sandboxes["sbx-known"] = SandboxResponse(
+        sandbox_id="sbx-known", user_id="alice", status=SandboxStatus.READY,
+        created_at=datetime.now(timezone.utc),
+    )
+
+    result = await sandbox_manager.heartbeat("sbx-known")
+    assert result is True
+
+
+@pytest.mark.asyncio
+async def test_exec_in_sandbox_not_running(mock_docker):
+    """exec_in_sandbox should raise RuntimeError when the container is not running."""
+    from orchestrator import sandbox_manager
+
+    # Seed a sandbox with a container_id
+    sandbox_manager._sandboxes["sbx-stopped"] = SandboxResponse(
+        sandbox_id="sbx-stopped", user_id="alice", status=SandboxStatus.READY,
+        container_id="container-stopped",
+        created_at=datetime.now(timezone.utc),
+    )
+
+    container = MagicMock()
+    container.status = "exited"
+    mock_docker.containers.get.return_value = container
+
+    with pytest.raises(RuntimeError, match="is not running"):
+        await sandbox_manager.exec_in_sandbox("sbx-stopped", "echo hello")
+
+
+@pytest.mark.asyncio
+async def test_exec_in_sandbox_command_too_long(mock_docker):
+    """exec_in_sandbox should raise ValueError when command exceeds max length."""
+    from orchestrator import sandbox_manager
+    from orchestrator.config import settings
+
+    # Seed a sandbox with a container_id
+    sandbox_manager._sandboxes["sbx-long"] = SandboxResponse(
+        sandbox_id="sbx-long", user_id="alice", status=SandboxStatus.READY,
+        container_id="container-long",
+        created_at=datetime.now(timezone.utc),
+    )
+
+    long_command = "x" * (settings.max_command_length + 1)
+
+    with pytest.raises(ValueError, match="exceeds max length"):
+        await sandbox_manager.exec_in_sandbox("sbx-long", long_command)
+
+
+@pytest.mark.asyncio
+async def test_destroy_sandbox_removes_from_sandboxes(mock_docker):
+    """destroy_sandbox should remove the entry from _sandboxes dict."""
+    from orchestrator import sandbox_manager
+
+    sandbox_manager._sandboxes["sbx-destroy"] = SandboxResponse(
+        sandbox_id="sbx-destroy", user_id="alice", status=SandboxStatus.READY,
+        container_id="container-destroy",
+        created_at=datetime.now(timezone.utc),
+    )
+
+    container = MagicMock()
+    mock_docker.containers.get.return_value = container
+
+    result = await sandbox_manager.destroy_sandbox("sbx-destroy")
+
+    assert result is True
+    assert "sbx-destroy" not in sandbox_manager._sandboxes
+
+
+@pytest.mark.asyncio
+async def test_destroy_sandbox_returns_false_for_unknown():
+    """destroy_sandbox should return False for non-existent sandboxes."""
+    from orchestrator import sandbox_manager
+
+    result = await sandbox_manager.destroy_sandbox("sbx-ghost")
+    assert result is False
+
+
+@pytest.mark.asyncio
+async def test_get_sandbox_returns_none_for_unknown():
+    """get_sandbox should return None for non-existent sandboxes."""
+    from orchestrator import sandbox_manager
+
+    result = await sandbox_manager.get_sandbox("sbx-nope")
+    assert result is None
+
+
+@pytest.mark.asyncio
+async def test_get_sandbox_returns_sandbox():
+    """get_sandbox should return the sandbox when it exists."""
+    from orchestrator import sandbox_manager
+
+    expected = SandboxResponse(
+        sandbox_id="sbx-found", user_id="bob", status=SandboxStatus.READY,
+        created_at=datetime.now(timezone.utc),
+    )
+    sandbox_manager._sandboxes["sbx-found"] = expected
+
+    result = await sandbox_manager.get_sandbox("sbx-found")
+    assert result is not None
+    assert result.sandbox_id == "sbx-found"
+    assert result.user_id == "bob"

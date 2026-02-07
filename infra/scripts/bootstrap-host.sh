@@ -2,6 +2,7 @@
 # EC2 User Data — Bootstrap a sandbox host with Docker and dependencies
 # This runs once on first boot of the EC2 instance.
 set -euo pipefail
+trap 'echo "ERROR: Bootstrap failed at line $LINENO" >&2' ERR
 
 exec > /var/log/sandbox-bootstrap.log 2>&1
 echo "=== Matrx Sandbox Host Bootstrap ==="
@@ -22,6 +23,7 @@ echo "Installing Docker Compose..."
 COMPOSE_VERSION="v2.24.5"
 curl -SL "https://github.com/docker/compose/releases/download/${COMPOSE_VERSION}/docker-compose-linux-x86_64" \
     -o /usr/local/bin/docker-compose
+# TODO: pin checksum — echo "<checksum>  /usr/local/bin/docker-compose" | sha256sum -c -
 chmod +x /usr/local/bin/docker-compose
 
 # ─── Install Python 3.11 ─────────────────────────────────────────────────────

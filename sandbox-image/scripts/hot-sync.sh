@@ -7,6 +7,13 @@ set -euo pipefail
 #   up   = local → S3 (shutdown)
 
 DIRECTION="${1:-}"
+
+# Validate required environment variables
+if [ -z "${S3_BUCKET:-}" ] || [ -z "${USER_ID:-}" ]; then
+    echo "ERROR: S3_BUCKET and USER_ID must be set" >&2
+    exit 1
+fi
+
 S3_HOT_PREFIX="s3://${S3_BUCKET}/users/${USER_ID}/hot/"
 LOCAL_HOT_PATH="${HOT_PATH:-/home/agent}"
 LOG_FILE="/var/log/sandbox/hot-sync.log"

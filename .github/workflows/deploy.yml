@@ -1,0 +1,52 @@
+name: Deploy
+
+on:
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: "Target environment"
+        required: true
+        default: "dev"
+        type: choice
+        options:
+          - dev
+          - prod
+
+env:
+  AWS_REGION: us-east-1
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to ECR
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build and push sandbox image
+        run: |
+          ECR_REPO=${{ secrets.ECR_REPO_URI }}
+          docker build -t $ECR_REPO:latest -t $ECR_REPO:${{ github.sha }} sandbox-image/
+          docker push $ECR_REPO:latest
+          docker push $ECR_REPO:${{ github.sha }}
+
+      - name: Build and push orchestrator image
+        run: |
+          ECR_REPO=${{ secrets.ECR_REPO_URI }}-orchestrator
+          docker build -t $ECR_REPO:latest -t $ECR_REPO:${{ github.sha }} orchestrator/
+          docker push $ECR_REPO:latest
+          docker push $ECR_REPO:${{ github.sha }}
+
+      # TODO: Add SSH to EC2 and pull new images step
+      # This requires the EC2 key pair to be stored as a GitHub Secret
