@@ -1,13 +1,19 @@
 # docker-compose.yml — Local development environment
 #
-# Usage:
-#   1. Build the sandbox image: docker build -t matrx-sandbox:latest sandbox-image/
-#   2. Start the orchestrator:  docker compose up orchestrator
-#   3. Create a sandbox via API: curl -X POST http://localhost:8000/sandboxes \
-#        -H "Content-Type: application/json" \
-#        -d '{"user_id": "test-user-1"}'
-
-version: "3.8"
+# Profiles:
+#   default (no profile)  → orchestrator + LocalStack (fully local, no AWS needed)
+#   --profile production  → orchestrator with real Postgres + S3 (uses .env file)
+#
+# Usage (local with LocalStack):
+#   docker compose up
+#
+# Usage (local with real backends):
+#   docker compose --profile production up orchestrator-prod
+#
+# Quick test:
+#   curl -X POST http://localhost:8000/sandboxes \
+#     -H "Content-Type: application/json" \
+#     -d '{"user_id": "00000000-0000-0000-0000-000000000001"}'
 
 services:
   orchestrator:
@@ -24,17 +30,31 @@ services:
       # Route S3 requests to LocalStack instead of real AWS
       - AWS_ENDPOINT_URL_S3=http://localstack:4566
     volumes:
-      # Mount Docker socket so orchestrator can manage sandbox containers.
-      # SECURITY: The Docker socket grants full control over the Docker daemon,
-      # which is effectively root-level access on the host. The orchestrator
-      # needs it to create, inspect, exec into, and destroy sandbox containers.
-      # Mounted read-only to prevent the orchestrator from modifying the socket
-      # file itself, though API-level access is still privileged.
       - /var/run/docker.sock:/var/run/docker.sock:ro
-      # Mount source for live reload during development
       - ./orchestrator:/app
     depends_on:
       - localstack
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+  # Production-like local run: real Postgres + real S3, no LocalStack
+  orchestrator-prod:
+    build:
+      context: ./orchestrator
+      dockerfile: Dockerfile
+    profiles:
+      - production
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    environment:
+      - MATRX_DEBUG=true
+      - MATRX_SANDBOX_IMAGE=matrx-sandbox:latest
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+      - ./orchestrator:/app
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
@@ -43,7 +63,7 @@ services:
   localstack:
     image: localstack/localstack:latest
     ports:
-      - "4566:4566"    # LocalStack gateway
+      - "4566:4566"
     environment:
       - SERVICES=s3
       - DEFAULT_REGION=us-east-1

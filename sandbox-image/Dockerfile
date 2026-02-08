@@ -45,15 +45,12 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     tini \
     && rm -rf /var/lib/apt/lists/*
 
-# ─── ripgrep and fd-find ─────────────────────────────────────────────────────
-# TODO: Add SHA256 checksum verification for ripgrep and fd downloads
-RUN curl -LO https://github.com/BurntSushi/ripgrep/releases/download/14.1.0/ripgrep_14.1.0-1_amd64.deb \
-    && dpkg -i ripgrep_14.1.0-1_amd64.deb \
-    && rm ripgrep_14.1.0-1_amd64.deb
-
-RUN curl -LO https://github.com/sharkdp/fd/releases/download/v10.1.0/fd_10.1.0_amd64.deb \
-    && dpkg -i fd_10.1.0_amd64.deb \
-    && rm fd_10.1.0_amd64.deb
+# ─── ripgrep and fd-find (multi-arch via apt) ────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ripgrep \
+    fd-find \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/fdfind /usr/bin/fd
 
 # ─── Python 3.11 ─────────────────────────────────────────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
@@ -73,16 +70,23 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && rm -rf /var/lib/apt/lists/* \
     && npm install -g npm@latest
 
-# ─── AWS CLI v2 ──────────────────────────────────────────────────────────────
-RUN curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o "awscliv2.zip" \
+# ─── AWS CLI v2 (multi-arch) ─────────────────────────────────────────────────
+RUN UARCH=$(uname -m) \
+    && curl "https://awscli.amazonaws.com/awscli-exe-linux-${UARCH}.zip" -o "awscliv2.zip" \
     && unzip awscliv2.zip \
     && ./aws/install \
     && rm -rf awscliv2.zip aws/
 
 # ─── Mountpoint for Amazon S3 (cold storage FUSE) ────────────────────────────
-RUN curl -LO https://s3.amazonaws.com/mountpoint-s3-release/latest/x86_64/mount-s3.deb \
-    && dpkg -i mount-s3.deb \
-    && rm mount-s3.deb
+# Only available on x86_64 — ARM64 builds skip this (cold mount won't work locally)
+RUN UARCH=$(uname -m) \
+    && if [ "$UARCH" = "x86_64" ]; then \
+         curl -LO "https://s3.amazonaws.com/mountpoint-s3-release/latest/x86_64/mount-s3.deb" \
+         && dpkg -i mount-s3.deb \
+         && rm mount-s3.deb; \
+       else \
+         echo "Skipping mountpoint-s3 (not available for $UARCH)"; \
+       fi
 
 # ─── Chromium (headless browser for agent web access) ─────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
