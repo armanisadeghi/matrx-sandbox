@@ -74,38 +74,28 @@ jobs:
           EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
           ECR_REPO: ${{ secrets.ECR_REPO_URI }}
         run: |
-          # Build the deploy script as proper JSON to avoid shell escaping issues
-          DEPLOY_SCRIPT=$(cat <<'SCRIPT'
-          set -e
-          aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ECR_REPO_PLACEHOLDER
-          docker pull ECR_REPO_PLACEHOLDER:latest
-          docker pull ECR_REPO_PLACEHOLDER-orchestrator:latest
-          docker tag ECR_REPO_PLACEHOLDER:latest matrx-sandbox:latest
-          docker tag ECR_REPO_PLACEHOLDER-orchestrator:latest matrx-orchestrator:latest
-          sudo systemctl restart matrx-orchestrator
-          echo "Waiting for orchestrator to become healthy..."
-          for i in $(seq 1 30); do
-            if curl -sf -o /dev/null http://localhost:8000/health; then
-              echo "Orchestrator is healthy!"
-              exit 0
-            fi
-            echo "Attempt $i/30 - waiting..."
-            sleep 2
-          done
-          echo "ERROR: Orchestrator did not become healthy within 60 seconds"
-          sudo journalctl -u matrx-orchestrator --no-pager -n 50
-          exit 1
-          SCRIPT
-          )
+          # Build SSM parameters as proper JSON using jq (avoids all escaping issues)
+          PARAMS=$(jq -n --arg ecr "$ECR_REPO" '{
+            "commands": [
+              "set -e",
+              ("aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin " + $ecr),
+              ("docker pull " + $ecr + ":latest"),
+              ("docker pull " + $ecr + "-orchestrator:latest"),
+              ("docker tag " + $ecr + ":latest matrx-sandbox:latest"),
+              ("docker tag " + $ecr + "-orchestrator:latest matrx-orchestrator:latest"),
+              "sudo systemctl restart matrx-orchestrator",
+              "echo Waiting for orchestrator to become healthy...",
+              "HEALTHY=false; for i in $(seq 1 30); do if curl -sf -o /dev/null http://localhost:8000/health; then echo Orchestrator is healthy!; HEALTHY=true; break; fi; echo Attempt $i of 30; sleep 2; done",
+              "if [ \"$HEALTHY\" != \"true\" ]; then echo ERROR: Orchestrator did not become healthy; sudo journalctl -u matrx-orchestrator --no-pager -n 50; exit 1; fi"
+            ]
+          }')
 
-          # Replace placeholder with actual ECR repo
-          DEPLOY_SCRIPT="${DEPLOY_SCRIPT//ECR_REPO_PLACEHOLDER/$ECR_REPO}"
+          echo "SSM Parameters: $PARAMS"
 
-          # Send via SSM using JSON input to avoid all quoting issues
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
-            --parameters "{\"commands\":[\"bash -c '$(echo "$DEPLOY_SCRIPT" | base64 -w0 | xargs -I{} echo "echo {} | base64 -d | bash")'\"]}" \
+            --parameters "$PARAMS" \
             --timeout-seconds 300 \
             --query "Command.CommandId" \
             --output text)
