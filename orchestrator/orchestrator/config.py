@@ -19,6 +19,11 @@ class Settings(BaseSettings):
     port: int = 8000
     debug: bool = False
     log_level: str = "INFO"
+    log_format: str = "json"     # env var: MATRX_LOG_FORMAT (json or text)
+
+    # Authentication
+    api_key: str = ""            # env var: MATRX_API_KEY
+    api_key_header: str = "X-API-Key"  # env var: MATRX_API_KEY_HEADER
 
     # Docker
     sandbox_image: str = "matrx-sandbox:latest"
@@ -37,6 +42,10 @@ class Settings(BaseSettings):
     healthcheck_interval_seconds: int = 30
     max_command_length: int = 10000
     command_timeout_seconds: int = 300
+
+    # Sandbox store persistence
+    sandbox_store: str = "memory"   # env var: MATRX_SANDBOX_STORE (memory or postgres)
+    database_url: str = ""          # env var: MATRX_DATABASE_URL
 
     model_config = {"env_prefix": "MATRX_"}
 

@@ -2,8 +2,6 @@
 
 ## Completed
 
-All initial infrastructure is deployed, tested, and operational.
-
 | # | Task | Notes |
 |---|------|-------|
 | 1–8 | Full AWS setup + E2E test | EC2, S3, ECR, Terraform, image build, lifecycle verified |
@@ -11,84 +9,22 @@ All initial infrastructure is deployed, tested, and operational.
 | 10 | GitHub Secrets | 4 secrets for CI/CD |
 | 11 | Rebuild on EC2 | All CRITICAL/HIGH code fixes applied |
 | 12 | CI/CD Verification | 3/3 jobs passing |
+| A1 | Elastic IP | `54.144.86.132` assigned, `.env` + refs updated |
+| A2 | Systemd service | Auto-start on boot, auto-restart on crash |
+| A3 | Open port 8000 | Terraform updated, API publicly accessible |
+| A4 | Deploy workflow | GitHub Actions → Deploy passes (created `matrx-sandbox-orchestrator` ECR repo) |
+| A5 | Delete old branch | `claude/design-sandbox-architecture-kLhO4` removed |
+| A6 | API key auth deployed | Key generated, set in systemd + `.env`, latest code deployed to EC2 |
 
 ---
 
-## Remaining
+## Remaining (Claude Code Agent Tasks)
 
-| # | Task | Who | Priority |
-|---|------|-----|----------|
-| A1 | Allocate Elastic IP | Terminal agent | HIGH |
-| A2 | Systemd service for orchestrator | Terminal agent | HIGH |
-| A3 | Open port 8000 to 0.0.0.0/0 in Terraform | Terminal agent | HIGH |
-| A4 | Test deploy workflow | Arman (GitHub UI) | MEDIUM |
-| A5 | Delete old branch | Terminal agent | LOW |
-
-### A1. Allocate Elastic IP
-
-```bash
-aws ec2 allocate-address --domain vpc --query 'AllocationId' --output text
-aws ec2 associate-address --instance-id i-084f757c1e47d4efb --allocation-id <ALLOCATION_ID>
-```
-
-Then update `.env` with the new static IP.
-
-### A2. Systemd service
-
-```bash
-ssh -i ~/Code/secrets/matrx-sandbox-key.pem ec2-user@44.204.240.45
-
-sudo tee /etc/systemd/system/matrx-orchestrator.service <<'EOF'
-[Unit]
-Description=Matrx Sandbox Orchestrator
-After=docker.service
-Requires=docker.service
-
-[Service]
-User=ec2-user
-WorkingDirectory=/home/ec2-user/orchestrator
-Environment=MATRX_HOST=0.0.0.0
-Environment=MATRX_PORT=8000
-Environment=MATRX_SANDBOX_IMAGE=matrx-sandbox:latest
-Environment=MATRX_S3_BUCKET=matrx-sandbox-storage-prod-2024
-Environment=MATRX_S3_REGION=us-east-1
-ExecStart=/usr/bin/python3.11 -m uvicorn orchestrator.main:app --host 0.0.0.0 --port 8000
-Restart=always
-RestartSec=5
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable matrx-orchestrator
-sudo systemctl start matrx-orchestrator
-sudo systemctl status matrx-orchestrator
-```
-
-### A3. Open API port to all IPs
-
-Once the Claude Code agent adds API key auth (Task 9), update Terraform
-to allow port 8000 from anywhere (the API key protects it, not the IP):
-
-In `infra/terraform/terraform.tfvars`, change:
-```hcl
-api_cidr_blocks = ["0.0.0.0/0"]
-```
-
-Then: `cd infra/terraform && terraform apply`
-
-Keep SSH locked to your home IP — only you need that.
-
-### A4. Test deploy workflow
-
-Go to GitHub → Actions → "Deploy" → "Run workflow" on main.
-
-### A5. Delete old branch
-
-```bash
-git push origin --delete claude/design-sandbox-architecture-kLhO4
-```
+| # | Task | Priority | Notes |
+|---|------|----------|-------|
+| 6 | Structured Logging | MEDIUM | Already implemented in code, deployed to EC2 |
+| 7 | Postgres-Backed Sandbox Registry | MEDIUM | Store abstraction done, needs Supabase connection |
+| 8 | Integration Test Scaffolding | LOW | Full lifecycle tests against docker-compose |
 
 ---
 
@@ -96,7 +32,7 @@ git push origin --delete claude/design-sandbox-architecture-kLhO4
 
 Connect:
 ```bash
-ssh -i ~/Code/secrets/matrx-sandbox-key.pem ec2-user@44.204.240.45
+ssh -i ~/Code/secrets/matrx-sandbox-key.pem ec2-user@54.144.86.132
 ```
 
 Once inside:
@@ -113,9 +49,9 @@ docker images                               # What images are available?
 sudo journalctl -u matrx-orchestrator -f    # Live API logs (after systemd setup)
 sudo journalctl -u matrx-orchestrator -n 50 # Last 50 lines
 
-# ─── Test the API locally ───
+# ─── Test the API (requires API key for /sandboxes) ───
 curl localhost:8000/health
-curl localhost:8000/sandboxes               # List all sandboxes
+curl -H "X-API-Key: $MATRX_API_KEY" localhost:8000/sandboxes
 
 # ─── Peek inside a running sandbox ───
 docker exec -it <container_id> bash         # Get a shell inside a sandbox
@@ -129,6 +65,33 @@ docker system prune -f                      # Clean up old containers/images
 sudo dnf check-release-update               # Check for OS updates
 ```
 
+## API Quick Reference
+
+All endpoints except `/health` require the `X-API-Key` header.
+
+```bash
+# Health check (no auth needed)
+curl http://54.144.86.132:8000/health
+
+# Create a sandbox
+curl -X POST http://54.144.86.132:8000/sandboxes \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <key>" \
+  -d '{"user_id": "test-user"}'
+
+# Execute a command
+curl -X POST http://54.144.86.132:8000/sandboxes/<sandbox-id>/exec \
+  -H "Content-Type: application/json" \
+  -H "X-API-Key: <key>" \
+  -d '{"command": "whoami && python3 --version"}'
+
+# List sandboxes
+curl -H "X-API-Key: <key>" http://54.144.86.132:8000/sandboxes
+
+# Destroy a sandbox
+curl -X DELETE -H "X-API-Key: <key>" "http://54.144.86.132:8000/sandboxes/<sandbox-id>?graceful=true"
+```
+
 ---
 
 ## Infrastructure Reference
@@ -137,9 +100,10 @@ sudo dnf check-release-update               # Check for OS updates
 |----------|-------|
 | AWS Account | `872515272894` |
 | S3 Bucket | `matrx-sandbox-storage-prod-2024` |
-| EC2 Instance | `i-084f757c1e47d4efb` at `44.204.240.45` |
-| ECR Repo | `872515272894.dkr.ecr.us-east-1.amazonaws.com/matrx-sandbox` |
+| EC2 Instance | `i-084f757c1e47d4efb` at `54.144.86.132` (Elastic IP) |
+| ECR Repos | `matrx-sandbox` + `matrx-sandbox-orchestrator` |
 | Key Pair | `matrx-sandbox-key` (~/Code/secrets/) |
 | IAM Role | `matrx-sandbox-host-dev` |
-| Security Group | `sg-05a1b5a6163cd8ee6` |
+| Security Group | `sg-05a1b5a6163cd8ee6` (SSH: home IP only, API: 0.0.0.0/0) |
 | CI/CD | `.github/workflows/ci.yml` (auto) + `deploy.yml` (manual) |
+| API Key | Set in `.env` (local) and systemd service (EC2) |

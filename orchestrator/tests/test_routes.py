@@ -107,3 +107,92 @@ async def test_get_health_returns_healthy(mock_health_sandbox_manager):
     assert data["status"] == "healthy"
     assert "active_sandboxes" in data
     assert "uptime_seconds" in data
+
+
+# ─── API Key Authentication Tests ─────────────────────────────────────────────
+
+TEST_API_KEY = "test-secret-key-for-auth-tests"
+
+
+@pytest.fixture
+def mock_api_key():
+    """Temporarily set MATRX_API_KEY to enable auth enforcement."""
+    from orchestrator.config import settings
+
+    original = settings.api_key
+    settings.api_key = TEST_API_KEY
+    yield TEST_API_KEY
+    settings.api_key = original
+
+
+@pytest.mark.asyncio
+async def test_request_without_key_returns_401(
+    mock_sandbox_manager, mock_api_key
+):
+    """Request to authenticated endpoint without API key should return 401."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/sandboxes")
+
+    assert response.status_code == 401
+    assert "Missing API key" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_request_with_wrong_key_returns_403(
+    mock_sandbox_manager, mock_api_key
+):
+    """Request with an incorrect API key should return 403."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/sandboxes",
+            headers={"X-API-Key": "wrong-key"},
+        )
+
+    assert response.status_code == 403
+    assert "Invalid API key" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_request_with_correct_key_returns_200(
+    mock_sandbox_manager, mock_api_key
+):
+    """Request with the correct API key should succeed."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/sandboxes",
+            headers={"X-API-Key": TEST_API_KEY},
+        )
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_request_with_bearer_token_returns_200(
+    mock_sandbox_manager, mock_api_key
+):
+    """Request with correct key via Authorization: Bearer should succeed."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/sandboxes",
+            headers={"Authorization": f"Bearer {TEST_API_KEY}"},
+        )
+
+    assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_health_without_key_returns_200(
+    mock_health_sandbox_manager, mock_api_key
+):
+    """/health should be exempt from API key auth even when key is configured."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/health")
+
+    assert response.status_code == 200
+    assert response.json()["status"] == "healthy"
+

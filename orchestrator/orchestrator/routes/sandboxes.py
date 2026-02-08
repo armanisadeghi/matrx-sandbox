@@ -82,7 +82,9 @@ async def destroy_sandbox(sandbox_id: str, graceful: bool = True):
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
 
-    success = await sandbox_manager.destroy_sandbox(sandbox_id, graceful=graceful)
+    success = await sandbox_manager.destroy_sandbox(
+        sandbox_id, graceful=graceful, reason="user_requested"
+    )
     if not success:
         raise HTTPException(status_code=500, detail="Failed to destroy sandbox")
 
@@ -104,7 +106,7 @@ async def sandbox_complete(sandbox_id: str, req: CompletionRequest | None = None
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
 
     logger.info("Sandbox %s signaled completion", sandbox_id)
-    await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True)
+    await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="graceful_shutdown")
     return CompletionResponse(status="shutting_down", sandbox_id=sandbox_id)
 
 
@@ -120,5 +122,5 @@ async def sandbox_error(sandbox_id: str, req: ErrorReport):
         sandbox_id, sandbox.user_id, req.error,
     )
 
-    await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True)
+    await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="error")
     return ErrorResponse(status="shutting_down", sandbox_id=sandbox_id, error_received=True)

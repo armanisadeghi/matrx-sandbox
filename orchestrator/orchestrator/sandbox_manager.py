@@ -2,6 +2,7 @@
 
 Manages the full lifecycle: create, wait-for-ready, exec, heartbeat, destroy.
 Uses a singleton Docker client to avoid connection leaks.
+Uses a pluggable SandboxStore for persistence (in-memory or Postgres).
 """
 
 from __future__ import annotations
@@ -12,18 +13,27 @@ import uuid
 from datetime import datetime, timezone
 
 import docker
-from docker.errors import NotFound, APIError
+from docker.errors import DockerException, NotFound, APIError
 
 from orchestrator.config import settings
 from orchestrator.models import SandboxResponse, SandboxStatus
+from orchestrator.store import SandboxStore, create_store
 
 logger = logging.getLogger(__name__)
 
-# In-memory sandbox registry (replace with DB in production)
-_sandboxes: dict[str, SandboxResponse] = {}
+# Pluggable sandbox store (replaces old in-memory _sandboxes dict)
+_store: SandboxStore | None = None
 
 # Singleton Docker client — avoids creating new connections on every call (C7)
 _docker_client: docker.DockerClient | None = None
+
+
+def _get_store() -> SandboxStore:
+    """Get or create the sandbox store."""
+    global _store
+    if _store is None:
+        _store = create_store()
+    return _store
 
 
 def _get_docker_client() -> docker.DockerClient:
@@ -39,7 +49,7 @@ def _get_docker_client() -> docker.DockerClient:
     if _docker_client is None:
         try:
             _docker_client = docker.from_env()
-        except docker.errors.DockerException as e:
+        except DockerException as e:
             raise RuntimeError(f"Failed to connect to Docker daemon: {e}") from e
     return _docker_client
 
@@ -52,8 +62,17 @@ def close_docker_client() -> None:
         _docker_client = None
 
 
+async def close_store() -> None:
+    """Close the sandbox store. Called during app shutdown."""
+    global _store
+    if _store is not None:
+        await _store.close()
+        _store = None
+
+
 async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxResponse:
     """Create and start a new sandbox container for a user."""
+    store = _get_store()
     sandbox_id = f"sbx-{uuid.uuid4().hex[:12]}"
     config = config or {}
 
@@ -63,7 +82,7 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
         status=SandboxStatus.CREATING,
         created_at=datetime.now(timezone.utc),
     )
-    _sandboxes[sandbox_id] = sandbox
+    await store.save(sandbox)
 
     logger.info("Creating sandbox %s for user %s", sandbox_id, user_id)
 
@@ -103,22 +122,22 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
                 "matrx.user_id": user_id,
                 "matrx.created_at": sandbox.created_at.isoformat(),
             },
-            restart_policy={"Name": "no"},
-        )
+            restart_policy={"Name": "no", "MaximumRetryCount": 0},
+        )  # type: ignore[call-overload]
 
         sandbox.container_id = container.id
         sandbox.status = SandboxStatus.STARTING
-        _sandboxes[sandbox_id] = sandbox
+        await store.save(sandbox)
 
         sandbox = await _wait_for_ready(sandbox)
-        _sandboxes[sandbox_id] = sandbox
+        await store.save(sandbox)
 
         logger.info("Sandbox %s is %s for user %s", sandbox_id, sandbox.status, user_id)
         return sandbox
 
     except Exception as e:
         sandbox.status = SandboxStatus.FAILED
-        _sandboxes[sandbox_id] = sandbox
+        await store.save(sandbox)
         logger.error("Failed to create sandbox %s: %s", sandbox_id, e)
         raise RuntimeError(f"Failed to create sandbox {sandbox_id}: {e}") from e
 
@@ -156,15 +175,14 @@ async def _wait_for_ready(sandbox: SandboxResponse, timeout: int = 120) -> Sandb
 
 async def get_sandbox(sandbox_id: str) -> SandboxResponse | None:
     """Get sandbox info by ID."""
-    return _sandboxes.get(sandbox_id)
+    store = _get_store()
+    return await store.get(sandbox_id)
 
 
 async def list_sandboxes(user_id: str | None = None) -> list[SandboxResponse]:
     """List all sandboxes, optionally filtered by user."""
-    sandboxes = list(_sandboxes.values())
-    if user_id:
-        sandboxes = [s for s in sandboxes if s.user_id == user_id]
-    return sandboxes
+    store = _get_store()
+    return await store.list(user_id=user_id)
 
 
 async def exec_in_sandbox(
@@ -181,7 +199,8 @@ async def exec_in_sandbox(
     executing. Commands are length-limited (C2) and the container status
     is checked (C1/H5) to prevent race conditions.
     """
-    sandbox = _sandboxes.get(sandbox_id)
+    store = _get_store()
+    sandbox = await store.get(sandbox_id)
     if not sandbox or not sandbox.container_id:
         raise ValueError(f"Sandbox {sandbox_id} not found or has no container")
 
@@ -222,20 +241,24 @@ async def exec_in_sandbox(
         raise RuntimeError(f"Failed to exec in sandbox {sandbox_id}: {e}") from e
 
 
-async def destroy_sandbox(sandbox_id: str, graceful: bool = True) -> bool:
+async def destroy_sandbox(
+    sandbox_id: str,
+    graceful: bool = True,
+    reason: str = "user_requested",
+) -> bool:
     """Destroy a sandbox, optionally with graceful shutdown.
 
-    After destruction, the sandbox entry is removed from the in-memory
-    registry to prevent unbounded memory growth (H6).
+    Records the stop reason (user_requested, expired, error, graceful_shutdown, admin)
+    and marks the sandbox as stopped rather than deleting, preserving audit history.
     """
-    sandbox = _sandboxes.get(sandbox_id)
+    store = _get_store()
+    sandbox = await store.get(sandbox_id)
     if not sandbox:
         return False
 
-    sandbox.status = SandboxStatus.SHUTTING_DOWN
-    _sandboxes[sandbox_id] = sandbox
+    await store.update_status(sandbox_id, SandboxStatus.SHUTTING_DOWN)
 
-    logger.info("Destroying sandbox %s (graceful=%s)", sandbox_id, graceful)
+    logger.info("Destroying sandbox %s (graceful=%s, reason=%s)", sandbox_id, graceful, reason)
 
     client = _get_docker_client()
     try:
@@ -247,26 +270,34 @@ async def destroy_sandbox(sandbox_id: str, graceful: bool = True) -> bool:
             container.kill()
 
         container.remove(force=True)
-        # H6: Remove from registry to prevent memory leak
-        _sandboxes.pop(sandbox_id, None)
+
+        if hasattr(store, 'mark_stopped'):
+            await store.mark_stopped(sandbox_id, reason)
+        else:
+            await store.delete(sandbox_id)
+
         logger.info("Sandbox %s destroyed", sandbox_id)
         return True
 
     except NotFound:
-        _sandboxes.pop(sandbox_id, None)
+        if hasattr(store, 'mark_stopped'):
+            await store.mark_stopped(sandbox_id, reason)
+        else:
+            await store.delete(sandbox_id)
         logger.warning("Sandbox %s container not found during destroy", sandbox_id)
         return True
 
     except APIError as e:
-        sandbox.status = SandboxStatus.FAILED
-        _sandboxes[sandbox_id] = sandbox
+        await store.update_status(sandbox_id, SandboxStatus.FAILED)
         logger.error("Failed to destroy sandbox %s: %s", sandbox_id, e)
         return False
 
 
 async def heartbeat(sandbox_id: str) -> bool:
     """Record a heartbeat from a sandbox. Returns True if sandbox exists."""
-    sandbox = _sandboxes.get(sandbox_id)
+    store = _get_store()
+    sandbox = await store.get(sandbox_id)
     if not sandbox:
         return False
+    await store.update_heartbeat(sandbox_id)
     return True

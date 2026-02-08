@@ -2,9 +2,9 @@
 
 from __future__ import annotations
 
-import re
 from datetime import datetime
 from enum import Enum
+from uuid import UUID
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -17,22 +17,20 @@ class SandboxStatus(str, Enum):
     SHUTTING_DOWN = "shutting_down"
     STOPPED = "stopped"
     FAILED = "failed"
-
-
-_USER_ID_PATTERN = re.compile(r"^[a-zA-Z0-9._-]{1,255}$")
+    EXPIRED = "expired"
 
 
 class CreateSandboxRequest(BaseModel):
-    user_id: str = Field(..., description="User ID this sandbox belongs to")
+    user_id: str = Field(..., description="Supabase auth user UUID")
     config: dict = Field(default_factory=dict, description="Optional sandbox config overrides")
 
     @field_validator("user_id")
     @classmethod
     def validate_user_id(cls, v: str) -> str:
-        if not v or not _USER_ID_PATTERN.match(v):
-            raise ValueError(
-                "user_id must be 1-255 characters: alphanumeric, dots, dashes, underscores only"
-            )
+        try:
+            UUID(v)
+        except (ValueError, AttributeError):
+            raise ValueError("user_id must be a valid UUID")
         return v
 
 
