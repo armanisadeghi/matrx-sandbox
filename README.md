@@ -7,19 +7,19 @@ complete with shell, filesystem, browser, and internet access.
 ## Architecture
 
 ```
-Orchestrator API  →  Docker Container (Sandbox)
-                     ├── /home/agent/   (hot storage — real files, S3-synced)
-                     ├── /data/cold/    (cold storage — FUSE-mounted S3)
-                     ├── Python 3.11, Node 20, Chromium, shell tools
-                     └── Matrx Agent SDK
+ai-matrx-admin (Next.js) → API routes → Orchestrator API (EC2)
+                                          ├── Docker Container (Sandbox)
+                                          │   ├── /home/agent/   (hot storage — S3-synced)
+                                          │   ├── /data/cold/    (cold storage — FUSE-mounted S3)
+                                          │   ├── Python 3.11, Node 20, Chromium, shell tools
+                                          │   └── Matrx Agent SDK
+                                          └── Supabase Postgres (sandbox registry)
 ```
 
-- **Hot storage**: Small files (config, memory, text) eagerly copied from S3 at
-  startup, synced back on shutdown. Zero-latency local files.
-- **Cold storage**: Large files (videos, datasets) lazily loaded via FUSE mount.
-  Appear local but download on first access.
-- **Lifecycle**: Create → hot sync down → FUSE mount → agent works → graceful
-  shutdown → hot sync up → destroy.
+- **Hot storage**: Small files eagerly synced from S3 at startup, synced back on shutdown.
+- **Cold storage**: Large files lazily loaded via FUSE mount (x86_64 only).
+- **Persistence**: Sandbox metadata stored in Supabase Postgres with RLS per user.
+- **Deploy**: Push to `main` triggers GitHub Actions → ECR build → SSM deploy to EC2.
 
 See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) for the full design.
 
@@ -40,7 +40,6 @@ See [docs/DIRECTORY_STRUCTURE.md](docs/DIRECTORY_STRUCTURE.md) for details.
 
 - Docker and Docker Compose
 - Python 3.11+
-- AWS CLI (configured) or LocalStack for local S3
 
 ### 1. Build the sandbox image
 
@@ -52,7 +51,7 @@ docker build -t matrx-sandbox:latest sandbox-image/
 
 ```bash
 cp .env.example .env
-# Edit .env with your S3 bucket name (or use LocalStack)
+# Edit .env with your settings (or use defaults for LocalStack)
 ```
 
 ### 3. Start the orchestrator (with LocalStack for S3)
@@ -61,7 +60,13 @@ cp .env.example .env
 docker compose up
 ```
 
-### 4. Create a sandbox
+### 4. Start with real AWS/Supabase backends
+
+```bash
+docker compose --profile production up orchestrator-prod
+```
+
+### 5. Create a sandbox
 
 ```bash
 curl -X POST http://localhost:8000/sandboxes \
@@ -69,7 +74,7 @@ curl -X POST http://localhost:8000/sandboxes \
   -d '{"user_id": "test-user"}'
 ```
 
-### 5. Run a command in the sandbox
+### 6. Run a command in the sandbox
 
 ```bash
 curl -X POST http://localhost:8000/sandboxes/<sandbox-id>/exec \
@@ -77,7 +82,7 @@ curl -X POST http://localhost:8000/sandboxes/<sandbox-id>/exec \
   -d '{"command": "whoami && python3 --version && node --version"}'
 ```
 
-### 6. Destroy the sandbox
+### 7. Destroy the sandbox
 
 ```bash
 curl -X DELETE "http://localhost:8000/sandboxes/<sandbox-id>?graceful=true"
@@ -97,9 +102,17 @@ curl -X DELETE "http://localhost:8000/sandboxes/<sandbox-id>?graceful=true"
 | `POST` | `/sandboxes/{id}/error` | Agent signals error |
 | `GET` | `/health` | Orchestrator health check |
 
-## Production Deployment
+All endpoints except `/health` require the `X-API-Key` header.
 
-See [ARMAN_TASKS.md](ARMAN_TASKS.md) for step-by-step AWS setup instructions.
+## Deployment
+
+Pushing to `main` triggers automatic deployment:
+1. GitHub Actions runs tests
+2. Builds and pushes Docker images to ECR
+3. Deploys to EC2 via AWS SSM (no SSH required)
+4. Health check confirms orchestrator is healthy
+
+See [ARMAN_TASKS.md](ARMAN_TASKS.md) for infrastructure reference and commands.
 
 ## Running Tests
 
@@ -107,4 +120,10 @@ See [ARMAN_TASKS.md](ARMAN_TASKS.md) for step-by-step AWS setup instructions.
 cd orchestrator
 pip install -e ".[dev]"
 pytest
+```
+
+Or via Make:
+```bash
+make test                # Unit tests
+make test-integration    # Integration tests (requires Docker)
 ```
