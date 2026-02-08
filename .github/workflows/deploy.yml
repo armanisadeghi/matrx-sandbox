@@ -1,6 +1,8 @@
 name: Deploy
 
 on:
+  push:
+    branches: [main]
   workflow_dispatch:
     inputs:
       environment:
@@ -16,8 +18,26 @@ env:
   AWS_REGION: us-east-1
 
 jobs:
-  deploy:
+  test:
     runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dependencies
+        run: |
+          cd orchestrator
+          pip install -e ".[dev]"
+      - name: Run tests
+        run: |
+          cd orchestrator
+          pytest -v --tb=short
+
+  deploy:
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
     permissions:
       id-token: write
       contents: read
@@ -32,6 +52,7 @@ jobs:
           aws-region: ${{ env.AWS_REGION }}
 
       - name: Login to ECR
+        id: ecr-login
         uses: aws-actions/amazon-ecr-login@v2
 
       - name: Build and push sandbox image
@@ -48,5 +69,40 @@ jobs:
           docker push $ECR_REPO:latest
           docker push $ECR_REPO:${{ github.sha }}
 
-      # TODO: Add SSH to EC2 and pull new images step
-      # This requires the EC2 key pair to be stored as a GitHub Secret
+      - name: Deploy to EC2
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_PUBLIC_IP }}
+          username: ec2-user
+          key: ${{ secrets.EC2_SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+
+            # Login to ECR
+            aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin ${{ secrets.ECR_REPO_URI }}
+
+            # Pull latest images
+            docker pull ${{ secrets.ECR_REPO_URI }}:latest
+            docker pull ${{ secrets.ECR_REPO_URI }}-orchestrator:latest
+
+            # Tag for local use
+            docker tag ${{ secrets.ECR_REPO_URI }}:latest matrx-sandbox:latest
+            docker tag ${{ secrets.ECR_REPO_URI }}-orchestrator:latest matrx-orchestrator:latest
+
+            # Restart the orchestrator service
+            sudo systemctl restart matrx-orchestrator
+
+            # Wait for health check
+            echo "Waiting for orchestrator to become healthy..."
+            for i in $(seq 1 30); do
+              if curl -sf http://localhost:8000/health > /dev/null 2>&1; then
+                echo "Orchestrator is healthy!"
+                exit 0
+              fi
+              echo "Attempt $i/30 — waiting..."
+              sleep 2
+            done
+
+            echo "ERROR: Orchestrator did not become healthy within 60 seconds"
+            sudo journalctl -u matrx-orchestrator --no-pager -n 50
+            exit 1
