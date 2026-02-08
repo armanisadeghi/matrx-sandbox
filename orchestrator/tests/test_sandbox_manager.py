@@ -146,8 +146,8 @@ async def test_exec_in_sandbox_command_too_long(mock_docker, clean_sandbox_state
 
 
 @pytest.mark.asyncio
-async def test_destroy_sandbox_removes_from_store(mock_docker, clean_sandbox_state):
-    """destroy_sandbox should remove the entry from the store."""
+async def test_destroy_sandbox_marks_stopped(mock_docker, clean_sandbox_state):
+    """destroy_sandbox should mark the sandbox as stopped (not delete it)."""
     from orchestrator import sandbox_manager
 
     store = clean_sandbox_state
@@ -163,7 +163,9 @@ async def test_destroy_sandbox_removes_from_store(mock_docker, clean_sandbox_sta
     result = await sandbox_manager.destroy_sandbox("sbx-destroy")
 
     assert result is True
-    assert await store.get("sbx-destroy") is None
+    stopped = await store.get("sbx-destroy")
+    assert stopped is not None
+    assert stopped.status == SandboxStatus.STOPPED
 
 
 @pytest.mark.asyncio

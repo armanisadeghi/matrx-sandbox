@@ -44,6 +44,10 @@ class SandboxStore(ABC):
         """Record a heartbeat timestamp. Returns True if found and updated."""
         return await self.update_status(sandbox_id, SandboxStatus.RUNNING)
 
+    async def mark_stopped(self, sandbox_id: str, reason: str) -> bool:
+        """Mark a sandbox as stopped with a reason. Returns True if found and updated."""
+        return await self.update_status(sandbox_id, SandboxStatus.STOPPED)
+
     async def close(self) -> None:
         """Clean up resources. Override in subclasses that need cleanup."""
         pass
@@ -78,6 +82,14 @@ class InMemorySandboxStore(SandboxStore):
         if not sandbox:
             return False
         sandbox.status = status
+        self._sandboxes[sandbox_id] = sandbox
+        return True
+
+    async def mark_stopped(self, sandbox_id: str, reason: str) -> bool:
+        sandbox = self._sandboxes.get(sandbox_id)
+        if not sandbox:
+            return False
+        sandbox.status = SandboxStatus.STOPPED
         self._sandboxes[sandbox_id] = sandbox
         return True
 
@@ -137,8 +149,8 @@ class PostgresSandboxStore(SandboxStore):
                 sandbox.created_at,
                 sandbox.hot_path,
                 sandbox.cold_path,
-                json.dumps(getattr(sandbox, 'config', {})) or '{}',
-                getattr(sandbox, 'ttl_seconds', 7200),
+                json.dumps(sandbox.config) if sandbox.config else '{}',
+                sandbox.ttl_seconds,
             )
 
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
@@ -271,6 +283,9 @@ class PostgresSandboxStore(SandboxStore):
 
 def _row_to_sandbox(row) -> SandboxResponse:
     """Convert an asyncpg Row to a SandboxResponse."""
+    config_val = row.get("config")
+    if isinstance(config_val, str):
+        config_val = json.loads(config_val)
     return SandboxResponse(
         sandbox_id=row["sandbox_id"],
         user_id=str(row["user_id"]),
@@ -279,6 +294,8 @@ def _row_to_sandbox(row) -> SandboxResponse:
         created_at=row["created_at"],
         hot_path=row.get("hot_path", "/home/agent"),
         cold_path=row.get("cold_path", "/data/cold"),
+        config=config_val or {},
+        ttl_seconds=row.get("ttl_seconds", 7200),
     )
 
 

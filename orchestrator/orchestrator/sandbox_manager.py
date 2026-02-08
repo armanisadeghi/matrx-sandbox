@@ -81,6 +81,7 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
         user_id=user_id,
         status=SandboxStatus.CREATING,
         created_at=datetime.now(timezone.utc),
+        config=config,
     )
     await store.save(sandbox)
 
@@ -271,19 +272,13 @@ async def destroy_sandbox(
 
         container.remove(force=True)
 
-        if hasattr(store, 'mark_stopped'):
-            await store.mark_stopped(sandbox_id, reason)
-        else:
-            await store.delete(sandbox_id)
+        await store.mark_stopped(sandbox_id, reason)
 
         logger.info("Sandbox %s destroyed", sandbox_id)
         return True
 
     except NotFound:
-        if hasattr(store, 'mark_stopped'):
-            await store.mark_stopped(sandbox_id, reason)
-        else:
-            await store.delete(sandbox_id)
+        await store.mark_stopped(sandbox_id, reason)
         logger.warning("Sandbox %s container not found during destroy", sandbox_id)
         return True
 

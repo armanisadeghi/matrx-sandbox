@@ -42,6 +42,8 @@ class SandboxResponse(BaseModel):
     created_at: datetime
     hot_path: str = "/home/agent"
     cold_path: str = "/data/cold"
+    config: dict = Field(default_factory=dict)
+    ttl_seconds: int = 7200
 
 
 class SandboxListResponse(BaseModel):
