@@ -1,0 +1,112 @@
+# ─── Docker Build Context Exclusions ─────────────────────────────────────────
+# This file excludes unnecessary files from being sent to the Docker daemon,
+# dramatically speeding up builds and reducing context size.
+#
+# Copy this to your project root as `.dockerignore`
+
+# ─── Version Control ─────────────────────────────────────────────────────────
+.git/
+.github/
+.gitlab-ci.yml
+.gitignore
+.gitattributes
+
+# ─── Dependencies (installed by Dockerfile, not copied) ──────────────────────
+node_modules/
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+.Python
+*.so
+.venv/
+venv/
+env/
+ENV/
+*.egg-info/
+dist/
+build/
+target/
+
+# ─── Build Artifacts ─────────────────────────────────────────────────────────
+.next/
+out/
+.nuxt/
+.cache/
+.parcel-cache/
+.turbo/
+coverage/
+*.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+
+# ─── IDE and Editor ──────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+*.swo
+*.swn
+*~
+.DS_Store
+Thumbs.db
+
+# ─── Environment Files (NEVER include secrets in images) ────────────────────
+.env
+.env.*
+!.env.example
+!.env.template
+*.key
+*.pem
+*.crt
+*.p12
+credentials.json
+
+# ─── Documentation (reduces context size) ────────────────────────────────────
+docs/
+*.md
+!README.md
+LICENSE
+CHANGELOG.md
+
+# ─── CI/CD ───────────────────────────────────────────────────────────────────
+.github/
+.gitlab-ci.yml
+.circleci/
+Jenkinsfile
+azure-pipelines.yml
+
+# ─── Development and Testing ─────────────────────────────────────────────────
+tests/
+test/
+*.test.js
+*.test.ts
+*.spec.js
+*.spec.ts
+jest.config.*
+vitest.config.*
+playwright.config.*
+cypress/
+.storybook/
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+logs/
+npm-debug.log*
+yarn-debug.log*
+yarn-error.log*
+pnpm-debug.log*
+
+# ─── Docker ──────────────────────────────────────────────────────────────────
+Dockerfile*
+docker-compose*.yml
+.dockerignore
+
+# ─── Miscellaneous ───────────────────────────────────────────────────────────
+*.bak
+*.tmp
+*.temp
+.cache/
+.sass-cache/
+.eslintcache
+*.seed

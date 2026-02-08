@@ -1,0 +1,42 @@
+# ─── Orchestrator Docker Build Context Exclusions ───────────────────────────
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+*.pyd
+
+# ─── Tests (installed via dev dependencies, not copied) ─────────────────────
+tests/
+*.test.py
+test_*.py
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ─── Documentation ───────────────────────────────────────────────────────────
+*.md
+!README.md
+
+# ─── Logs ────────────────────────────────────────────────────────────────────
+*.log
+
+# ─── Docker ──────────────────────────────────────────────────────────────────
+Dockerfile
+.dockerignore
+
+# ─── Migrations (copied separately if needed) ───────────────────────────────
+# migrations/ are intentionally kept for now

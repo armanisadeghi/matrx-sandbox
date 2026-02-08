@@ -1,0 +1,185 @@
+# Production-grade docker-compose.yml template
+#
+# Features:
+# - Multi-stage build targets (dev/prod)
+# - Resource limits
+# - Security hardening
+# - Health checks
+# - Named volumes with backups
+#
+# Usage:
+#   Development: docker compose up
+#   Production:  docker compose --profile production up
+
+services:
+  # ─── API Service ───────────────────────────────────────────────────────────
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: production  # Use multi-stage production target
+      cache_from:
+        - type=registry,ref=ghcr.io/org/api:buildcache
+      args:
+        - BUILDKIT_INLINE_CACHE=1
+    
+    image: org/api:latest
+    container_name: api
+    
+    restart: unless-stopped
+    
+    # Ports
+    ports:
+      - "8000:8000"
+    
+    # Environment
+    env_file: .env
+    environment:
+      - NODE_ENV=production
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/app
+      - REDIS_URL=redis://redis:6379
+    
+    # Volumes
+    volumes:
+      - api-logs:/var/log/api
+    
+    # Dependencies
+    depends_on:
+      db:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    
+    # Health check
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+    
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 2G
+        reservations:
+          cpus: '1'
+          memory: 1G
+    
+    # Security
+    security_opt:
+      - no-new-privileges:true
+    cap_drop:
+      - ALL
+    read_only: true
+    tmpfs:
+      - /tmp
+    
+    # Network
+    networks:
+      - app-network
+
+  # ─── Database (PostgreSQL) ─────────────────────────────────────────────────
+  db:
+    image: postgres:16.6-alpine
+    container_name: postgres
+    
+    restart: unless-stopped
+    
+    environment:
+      - POSTGRES_DB=app
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - PGDATA=/var/lib/postgresql/data/pgdata
+    
+    volumes:
+      - postgres-data:/var/lib/postgresql/data
+      - ./migrations:/docker-entrypoint-initdb.d:ro
+    
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 1G
+    
+    networks:
+      - app-network
+
+  # ─── Redis (Cache) ─────────────────────────────────────────────────────────
+  redis:
+    image: redis:7.4.2-alpine
+    container_name: redis
+    
+    restart: unless-stopped
+    
+    command: redis-server --appendonly yes --maxmemory 256mb --maxmemory-policy allkeys-lru
+    
+    volumes:
+      - redis-data:/data
+    
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 3s
+      retries: 5
+    
+    deploy:
+      resources:
+        limits:
+          cpus: '0.5'
+          memory: 512M
+    
+    networks:
+      - app-network
+
+  # ─── Development Overrides ─────────────────────────────────────────────────
+  api-dev:
+    extends: api
+    profiles:
+      - development
+    
+    build:
+      target: development  # Use dev target with hot reload
+    
+    volumes:
+      - ./src:/app/src  # Mount source for hot reload
+      - api-logs:/var/log/api
+    
+    environment:
+      - NODE_ENV=development
+      - DEBUG=true
+    
+    security_opt: []  # Remove security restrictions for debugging
+    cap_drop: []
+    read_only: false
+
+# ─── Networks ────────────────────────────────────────────────────────────────
+networks:
+  app-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
+
+# ─── Volumes ─────────────────────────────────────────────────────────────────
+volumes:
+  postgres-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ./data/postgres
+  
+  redis-data:
+    driver: local
+  
+  api-logs:
+    driver: local

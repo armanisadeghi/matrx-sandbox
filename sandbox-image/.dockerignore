@@ -1,0 +1,34 @@
+# ─── Sandbox Image Docker Build Context Exclusions ──────────────────────────
+
+# ─── Python ──────────────────────────────────────────────────────────────────
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+*.egg-info/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+*.pyd
+
+# ─── SDK dev files ───────────────────────────────────────────────────────────
+sdk/tests/
+sdk/.pytest_cache/
+sdk/dist/
+sdk/build/
+
+# ─── IDE ─────────────────────────────────────────────────────────────────────
+.vscode/
+.idea/
+*.swp
+.DS_Store
+
+# ─── Documentation ───────────────────────────────────────────────────────────
+*.md
+!README.md
+
+# ─── Docker ──────────────────────────────────────────────────────────────────
+Dockerfile
+.dockerignore
