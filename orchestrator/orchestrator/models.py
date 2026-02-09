@@ -43,6 +43,7 @@ class SandboxResponse(BaseModel):
     hot_path: str = "/home/agent"
     cold_path: str = "/data/cold"
     config: dict = Field(default_factory=dict)
+    ssh_port: int | None = Field(default=None, description="Host port mapped to container SSH (port 22)")
     ttl_seconds: int = 7200
 
 
@@ -101,3 +102,11 @@ class HealthResponse(BaseModel):
 class HeartbeatResponse(BaseModel):
     acknowledged: bool
     sandbox_id: str
+
+
+class AccessResponse(BaseModel):
+    private_key: str = Field(description="PEM-encoded Ed25519 private key (temporary, per-request)")
+    username: str = Field(default="agent", description="SSH username")
+    host: str = Field(description="SSH host to connect to")
+    port: int = Field(description="SSH port to connect to")
+    ssh_command: str = Field(description="Ready-to-use SSH command")

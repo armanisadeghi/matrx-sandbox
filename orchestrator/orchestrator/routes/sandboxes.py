@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException
 
 from orchestrator import sandbox_manager, storage
 from orchestrator.models import (
+    AccessResponse,
     CompletionRequest,
     CompletionResponse,
     CreateSandboxRequest,
@@ -73,6 +74,38 @@ async def exec_command(sandbox_id: str, req: ExecRequest):
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
         raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.post("/{sandbox_id}/access", response_model=AccessResponse)
+async def request_access(sandbox_id: str):
+    """Generate temporary SSH credentials for direct sandbox access.
+
+    Returns a one-time Ed25519 private key and connection details.
+    The public key is injected into the running container. The private key
+    is never stored — it exists only in this response.
+    """
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+
+    try:
+        access = await sandbox_manager.generate_user_access(sandbox_id)
+        ssh_cmd = (
+            f"ssh -i /tmp/{sandbox_id}.pem "
+            f"-o StrictHostKeyChecking=no "
+            f"-p {access['port']} {access['username']}@{access['host']}"
+        )
+        return AccessResponse(
+            private_key=access["private_key"],
+            username=access["username"],
+            host=access["host"],
+            port=access["port"],
+            ssh_command=ssh_cmd,
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to generate access: {e}")
 
 
 @router.delete("/{sandbox_id}", status_code=204)

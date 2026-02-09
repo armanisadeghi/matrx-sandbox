@@ -112,8 +112,10 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
             # FUSE requires SYS_ADMIN capability and /dev/fuse access
             cap_add=["SYS_ADMIN"],
             devices=["/dev/fuse"],
-            # Security: drop other dangerous capabilities
-            cap_drop=["NET_RAW"],
+            # No capability drops — the container IS the security boundary
+            cap_drop=[],
+            # Expose SSH (port 22) on a dynamic host port
+            ports={"22/tcp": None},
             # Networking
             network=settings.docker_network,
             # Extra hosts so container can reach the orchestrator
@@ -128,6 +130,13 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
 
         sandbox.container_id = container.id
         sandbox.status = SandboxStatus.STARTING
+
+        # Read back the dynamically assigned SSH host port
+        container.reload()
+        port_bindings = container.attrs["NetworkSettings"]["Ports"].get("22/tcp")
+        if port_bindings:
+            sandbox.ssh_port = int(port_bindings[0]["HostPort"])
+
         await store.save(sandbox)
 
         sandbox = await _wait_for_ready(sandbox)
@@ -296,3 +305,46 @@ async def heartbeat(sandbox_id: str) -> bool:
         return False
     await store.update_heartbeat(sandbox_id)
     return True
+
+
+async def generate_user_access(sandbox_id: str) -> dict[str, str | int]:
+    """Generate a temporary SSH keypair and inject the public key into the sandbox.
+
+    Returns a dict with private_key (PEM), username, host, and port.
+    The private key is generated per-request and never stored by the orchestrator.
+    """
+    from cryptography.hazmat.primitives.asymmetric.ed25519 import Ed25519PrivateKey
+    from cryptography.hazmat.primitives import serialization
+
+    store = _get_store()
+    sandbox = await store.get(sandbox_id)
+    if not sandbox:
+        raise ValueError(f"Sandbox {sandbox_id} not found")
+
+    private_key = Ed25519PrivateKey.generate()
+    private_pem = private_key.private_bytes(
+        serialization.Encoding.PEM,
+        serialization.PrivateFormat.OpenSSH,
+        serialization.NoEncryption(),
+    ).decode()
+    public_key = private_key.public_key().public_bytes(
+        serialization.Encoding.OpenSSH,
+        serialization.PublicFormat.OpenSSH,
+    ).decode()
+
+    inject_cmd = (
+        "mkdir -p /home/agent/.ssh && "
+        f"echo '{public_key} user-access' >> /home/agent/.ssh/authorized_keys && "
+        "chown agent:agent /home/agent/.ssh/authorized_keys && "
+        "chmod 600 /home/agent/.ssh/authorized_keys"
+    )
+    await exec_in_sandbox(sandbox_id, inject_cmd, user="root")
+
+    logger.info("Generated temporary SSH access for sandbox %s", sandbox_id)
+
+    return {
+        "private_key": private_pem,
+        "username": "agent",
+        "host": "localhost",
+        "port": sandbox.ssh_port or 22,
+    }

@@ -20,20 +20,27 @@ for var in SANDBOX_ID USER_ID S3_BUCKET; do
 done
 
 # ─── Step 1: Sync hot storage from S3 ────────────────────────────────────────
-echo "[1/4] Syncing hot storage from S3..."
+echo "[1/5] Syncing hot storage from S3..."
 /opt/sandbox/scripts/hot-sync.sh down
-echo "[1/4] Hot storage sync complete."
+echo "[1/5] Hot storage sync complete."
 
 # ─── Step 2: Mount cold storage via FUSE ──────────────────────────────────────
-echo "[2/4] Mounting cold storage FUSE filesystem..."
+echo "[2/5] Mounting cold storage FUSE filesystem..."
 /opt/sandbox/scripts/cold-mount.sh mount
-echo "[2/4] Cold storage mounted."
+echo "[2/5] Cold storage mounted."
 
 # ─── Step 3: Set up environment for agent ─────────────────────────────────────
-echo "[3/4] Preparing agent environment..."
+echo "[3/5] Preparing agent environment..."
 
 # Ensure agent owns their home directory after hot sync
 chown -R agent:agent "$HOT_PATH"
+
+# Restore SSH authorized_keys (hot sync may have overwritten /home/agent)
+mkdir -p /home/agent/.ssh
+cp /opt/sandbox/config/admin_authorized_keys /home/agent/.ssh/authorized_keys
+chown -R agent:agent /home/agent/.ssh
+chmod 700 /home/agent/.ssh
+chmod 600 /home/agent/.ssh/authorized_keys
 
 # Write a small env file the agent can source
 cat > /home/agent/.sandbox_env <<EOF
@@ -49,10 +56,15 @@ if ! grep -q '.sandbox_env' /home/agent/.bashrc 2>/dev/null; then
     echo '[ -f ~/.sandbox_env ] && source ~/.sandbox_env' >> /home/agent/.bashrc
 fi
 
-echo "[3/4] Agent environment ready."
+echo "[3/5] Agent environment ready."
 
-# ─── Step 4: Signal readiness ────────────────────────────────────────────────
-echo "[4/4] Sandbox is READY."
+# ─── Step 4: Start SSH server ────────────────────────────────────────────────
+echo "[4/5] Starting SSH server..."
+/usr/sbin/sshd
+echo "[4/5] SSH server running on port 22."
+
+# ─── Step 5: Signal readiness ────────────────────────────────────────────────
+echo "[5/5] Sandbox is READY."
 touch /tmp/.sandbox_ready
 
 # ─── Register shutdown handler ────────────────────────────────────────────────

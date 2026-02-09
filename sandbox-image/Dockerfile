@@ -90,6 +90,19 @@ RUN UARCH=$(uname -m) \
          echo "Skipping mountpoint-s3 (not available for $UARCH)"; \
        fi
 
+# ─── SSH server + sudo (full access inside the sandbox) ──────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server \
+    sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+# Configure sshd: key-only auth, allow agent + root
+RUN mkdir -p /run/sshd \
+    && sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+    && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+    && sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+    && echo "AllowUsers agent root" >> /etc/ssh/sshd_config
+
 # ─── Chromium (headless browser for agent web access) ─────────────────────────
 RUN apt-get update && apt-get install -y --no-install-recommends \
     chromium-browser \
@@ -126,6 +139,10 @@ RUN groupadd -g 1000 agent \
     && mkdir -p /home/agent /data/cold /var/log/sandbox \
     && chown -R agent:agent /home/agent /data/cold /var/log/sandbox
 
+# Give agent passwordless sudo — the container IS the security boundary
+RUN echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent \
+    && chmod 0440 /etc/sudoers.d/agent
+
 # Allow agent to use FUSE
 RUN echo "user_allow_other" >> /etc/fuse.conf
 
@@ -135,6 +152,19 @@ RUN chmod +x /opt/sandbox/scripts/*.sh
 
 # ─── Copy sandbox config ─────────────────────────────────────────────────────
 COPY config/ /opt/sandbox/config/
+
+# ─── Set up SSH keys for admin access ────────────────────────────────────────
+# Admin keys baked into image — team can SSH into any sandbox
+RUN mkdir -p /home/agent/.ssh \
+    && cp /opt/sandbox/config/admin_authorized_keys /home/agent/.ssh/authorized_keys \
+    && chown -R agent:agent /home/agent/.ssh \
+    && chmod 700 /home/agent/.ssh \
+    && chmod 600 /home/agent/.ssh/authorized_keys \
+    # Also set up root SSH for deep debugging
+    && mkdir -p /root/.ssh \
+    && cp /opt/sandbox/config/admin_authorized_keys /root/.ssh/authorized_keys \
+    && chmod 700 /root/.ssh \
+    && chmod 600 /root/.ssh/authorized_keys
 
 # ─── Install Matrx SDK (agent utilities + Claude Code-compatible tools) ───────
 COPY sdk/ /opt/sandbox/sdk/
@@ -148,6 +178,9 @@ ENV S3_REGION="us-east-1"
 ENV HOT_PATH="/home/agent"
 ENV COLD_PATH="/data/cold"
 ENV SHUTDOWN_TIMEOUT_SECONDS="30"
+
+# ─── Expose SSH port ────────────────────────────────────────────────────────
+EXPOSE 22
 
 # ─── Health check ────────────────────────────────────────────────────────────
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \

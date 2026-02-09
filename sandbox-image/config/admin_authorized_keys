@@ -1,0 +1,8 @@
+# Matrx admin SSH keys — one per line
+# These keys grant access to ALL sandbox containers as both 'agent' and 'root'.
+# The corresponding private keys should be kept secure and never committed.
+#
+# To add your key, append your public key below:
+#   cat ~/.ssh/id_ed25519.pub >> sandbox-image/config/admin_authorized_keys
+#
+# ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAA... admin@matrx
