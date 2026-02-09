@@ -499,6 +499,342 @@ TOOL_DEFINITIONS: list[dict] = [
             },
         },
     },
+    # ── Browser Tools ──────────────────────────────────────────────────────
+    {
+        "name": "BrowserNavigate",
+        "description": (
+            "Navigate the browser to a URL.\n\n"
+            "Usage:\n"
+            "- The browser is launched lazily on first use and persists across calls.\n"
+            "- Cookies, localStorage, and navigation state carry over between calls.\n"
+            "- The browser runs in headless Chromium mode."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["url"],
+            "additionalProperties": False,
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to navigate to",
+                },
+                "wait_until": {
+                    "type": "string",
+                    "enum": ["domcontentloaded", "load", "networkidle", "commit"],
+                    "description": (
+                        "When to consider navigation complete. "
+                        "Default: 'domcontentloaded'."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "BrowserSnapshot",
+        "description": (
+            "Capture an accessibility-tree snapshot of the current page or a specific element.\n\n"
+            "Returns a structured text representation of the page's DOM hierarchy including "
+            "roles, labels, text content, values, and states. This is the primary way to "
+            "understand page structure without screenshots."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": [],
+            "additionalProperties": False,
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": (
+                        "Optional CSS selector to scope the snapshot to a specific element. "
+                        "If provided, returns the outerHTML of the matched element. "
+                        "If omitted, returns the full page accessibility tree."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "BrowserScreenshot",
+        "description": (
+            "Capture a PNG screenshot of the current page or a specific element.\n\n"
+            "Returns the screenshot as base64-encoded image data along with page info. "
+            "Use BrowserSnapshot for structured data; use this when visual rendering matters."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": [],
+            "additionalProperties": False,
+            "properties": {
+                "full_page": {
+                    "type": "boolean",
+                    "description": (
+                        "If true, capture the entire scrollable page. "
+                        "If false (default), capture only the visible viewport."
+                    ),
+                },
+                "selector": {
+                    "type": "string",
+                    "description": (
+                        "Optional CSS selector to screenshot a specific element "
+                        "instead of the full page."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "BrowserClick",
+        "description": (
+            "Click on a page element identified by CSS selector, text content, or coordinates.\n\n"
+            "Usage:\n"
+            "- Provide exactly one of 'selector', 'text', or 'position'.\n"
+            "- 'text' uses fuzzy matching to find elements containing that text.\n"
+            "- 'position' clicks at exact pixel coordinates {x, y}."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": [],
+            "additionalProperties": False,
+            "properties": {
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector of the element to click",
+                },
+                "text": {
+                    "type": "string",
+                    "description": "Text content to find and click (uses fuzzy matching)",
+                },
+                "position": {
+                    "type": "object",
+                    "description": "Exact pixel coordinates to click at",
+                    "properties": {
+                        "x": {"type": "number", "description": "X coordinate"},
+                        "y": {"type": "number", "description": "Y coordinate"},
+                    },
+                },
+                "button": {
+                    "type": "string",
+                    "enum": ["left", "right", "middle"],
+                    "description": "Mouse button to use. Default: 'left'.",
+                },
+                "click_count": {
+                    "type": "integer",
+                    "description": "Number of clicks (e.g. 2 for double-click). Default: 1.",
+                },
+            },
+        },
+    },
+    {
+        "name": "BrowserType",
+        "description": (
+            "Type text into a focused element or a specific element identified by selector.\n\n"
+            "Usage:\n"
+            "- If 'selector' is provided, types into that element.\n"
+            "- If no selector, types into the currently focused element.\n"
+            "- Use 'clear_first' to clear existing content before typing.\n"
+            "- Use 'press_enter' to submit forms after typing."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["text"],
+            "additionalProperties": False,
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "The text to type",
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "Optional CSS selector of the element to type into",
+                },
+                "press_enter": {
+                    "type": "boolean",
+                    "description": "Press Enter after typing. Default: false.",
+                },
+                "clear_first": {
+                    "type": "boolean",
+                    "description": "Clear the field before typing. Default: false.",
+                },
+            },
+        },
+    },
+    {
+        "name": "BrowserPressKey",
+        "description": (
+            "Press a keyboard key or key combination.\n\n"
+            "Examples: 'Enter', 'Tab', 'Escape', 'ArrowDown', 'Control+a', 'Meta+c', "
+            "'Shift+Tab'. Uses Playwright key names."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["key"],
+            "additionalProperties": False,
+            "properties": {
+                "key": {
+                    "type": "string",
+                    "description": (
+                        "Key or key combination to press (e.g. 'Enter', 'Control+a', 'Escape')"
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "BrowserScroll",
+        "description": (
+            "Scroll the page or a specific element.\n\n"
+            "Usage:\n"
+            "- Direction can be 'up', 'down', 'left', or 'right'.\n"
+            "- Amount is in scroll units (each unit ≈ 100 pixels).\n"
+            "- If 'selector' is provided, scrolls that element into view first."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": [],
+            "additionalProperties": False,
+            "properties": {
+                "direction": {
+                    "type": "string",
+                    "enum": ["up", "down", "left", "right"],
+                    "description": "Scroll direction. Default: 'down'.",
+                },
+                "amount": {
+                    "type": "integer",
+                    "description": "Number of scroll units (each ≈ 100px). Default: 3.",
+                },
+                "selector": {
+                    "type": "string",
+                    "description": (
+                        "Optional CSS selector. If provided, the element is scrolled "
+                        "into view before scrolling the page."
+                    ),
+                },
+            },
+        },
+    },
+    {
+        "name": "BrowserEvaluate",
+        "description": (
+            "Execute arbitrary JavaScript in the browser page context.\n\n"
+            "Returns the result of the expression as a string. Useful for extracting data, "
+            "manipulating the DOM, or running complex interactions that other browser tools "
+            "don't cover."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": ["javascript"],
+            "additionalProperties": False,
+            "properties": {
+                "javascript": {
+                    "type": "string",
+                    "description": "JavaScript code to evaluate in the page context",
+                },
+            },
+        },
+    },
+    {
+        "name": "BrowserWaitFor",
+        "description": (
+            "Wait for text or a CSS selector to appear on the page.\n\n"
+            "Useful after navigation or interactions that trigger async content loading. "
+            "Provide either 'text' or 'selector' (not both)."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": [],
+            "additionalProperties": False,
+            "properties": {
+                "text": {
+                    "type": "string",
+                    "description": "Text to wait for on the page",
+                },
+                "selector": {
+                    "type": "string",
+                    "description": "CSS selector to wait for",
+                },
+                "timeout": {
+                    "type": "integer",
+                    "description": "Maximum wait time in milliseconds. Default: 30000.",
+                },
+            },
+        },
+    },
+    {
+        "name": "BrowserBack",
+        "description": (
+            "Navigate back to the previous page in browser history.\n"
+            "Equivalent to clicking the browser's back button."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": [],
+            "additionalProperties": False,
+            "properties": {},
+        },
+    },
+    {
+        "name": "BrowserTabs",
+        "description": (
+            "Manage browser tabs: list, create, switch, or close.\n\n"
+            "Actions:\n"
+            "- 'list': Show all open tabs with their URLs and active status.\n"
+            "- 'new': Create a new tab (optionally navigate to a URL).\n"
+            "- 'switch': Switch to a tab by page_id.\n"
+            "- 'close': Close a tab by page_id."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": [],
+            "additionalProperties": False,
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": ["list", "new", "switch", "close"],
+                    "description": "Tab action to perform. Default: 'list'.",
+                },
+                "page_id": {
+                    "type": "string",
+                    "description": "Tab identifier (required for 'switch' and 'close' actions).",
+                },
+                "url": {
+                    "type": "string",
+                    "description": "URL to navigate to in a new tab (only used with 'new' action).",
+                },
+            },
+        },
+    },
+    {
+        "name": "BrowserConsole",
+        "description": (
+            "Retrieve browser console messages (console.log, console.error, etc.).\n\n"
+            "Messages are consumed on read — each message is returned only once. "
+            "Optionally filter messages with a regex pattern."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": [],
+            "additionalProperties": False,
+            "properties": {
+                "pattern": {
+                    "type": "string",
+                    "description": "Optional regex pattern to filter console messages.",
+                },
+            },
+        },
+    },
+    {
+        "name": "BrowserClose",
+        "description": (
+            "Close the browser and release all resources.\n"
+            "The browser will be relaunched automatically on the next browser tool call."
+        ),
+        "input_schema": {
+            "type": "object",
+            "required": [],
+            "additionalProperties": False,
+            "properties": {},
+        },
+    },
 ]
 
 TOOL_NAMES: set[str] = {t["name"] for t in TOOL_DEFINITIONS}

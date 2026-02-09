@@ -99,9 +99,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install playwright for Python (uses system Chromium)
+# Install playwright for Python with Chromium browser binary
 RUN python3 -m pip install --no-cache-dir playwright \
-    && playwright install-deps
+    && playwright install-deps \
+    && playwright install chromium
 
 # ─── Common Python packages for agent use ─────────────────────────────────────
 RUN python3 -m pip install --no-cache-dir \

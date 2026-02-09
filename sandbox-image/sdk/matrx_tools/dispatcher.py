@@ -18,6 +18,21 @@ from matrx_tools.tools.file_ops import (
 )
 from matrx_tools.tools.meta import tool_todo_write
 from matrx_tools.tools.web import tool_web_fetch, tool_web_search
+from matrx_tools.tools.browser import (
+    tool_browser_back,
+    tool_browser_click,
+    tool_browser_close,
+    tool_browser_console,
+    tool_browser_evaluate,
+    tool_browser_navigate,
+    tool_browser_press_key,
+    tool_browser_screenshot,
+    tool_browser_scroll,
+    tool_browser_snapshot,
+    tool_browser_tabs,
+    tool_browser_type,
+    tool_browser_wait_for,
+)
 from matrx_tools.types import ToolResult, ToolResultType
 
 logger = logging.getLogger(__name__)
@@ -38,6 +53,20 @@ TOOL_HANDLERS: dict[str, ToolHandler] = {
     "WebFetch": tool_web_fetch,
     "WebSearch": tool_web_search,
     "TodoWrite": tool_todo_write,
+    # Browser tools
+    "BrowserNavigate": tool_browser_navigate,
+    "BrowserSnapshot": tool_browser_snapshot,
+    "BrowserScreenshot": tool_browser_screenshot,
+    "BrowserClick": tool_browser_click,
+    "BrowserType": tool_browser_type,
+    "BrowserPressKey": tool_browser_press_key,
+    "BrowserScroll": tool_browser_scroll,
+    "BrowserEvaluate": tool_browser_evaluate,
+    "BrowserWaitFor": tool_browser_wait_for,
+    "BrowserBack": tool_browser_back,
+    "BrowserTabs": tool_browser_tabs,
+    "BrowserConsole": tool_browser_console,
+    "BrowserClose": tool_browser_close,
 }
 
 
