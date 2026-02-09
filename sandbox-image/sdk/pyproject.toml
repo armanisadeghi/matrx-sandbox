@@ -3,9 +3,9 @@ requires = ["setuptools>=68.0", "wheel"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "matrx-agent"
-version = "0.1.0"
-description = "Matrx agent SDK — utilities for AI agents running in Matrx sandboxes"
+name = "matrx-sdk"
+version = "0.2.0"
+description = "Matrx SDK — agent utilities + Claude Code-compatible tools for Matrx sandboxes"
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.25",
@@ -16,4 +16,4 @@ dependencies = [
 dev = ["pytest", "pytest-asyncio"]
 
 [tool.setuptools.packages.find]
-include = ["matrx_agent*"]
+include = ["matrx_agent*", "matrx_tools*"]

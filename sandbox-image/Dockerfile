@@ -43,6 +43,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     openssh-client \
     # Process management
     tini \
+    # PDF text extraction (for Read tool PDF support)
+    poppler-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # ─── ripgrep and fd-find (multi-arch via apt) ────────────────────────────────
@@ -133,7 +135,7 @@ RUN chmod +x /opt/sandbox/scripts/*.sh
 # ─── Copy sandbox config ─────────────────────────────────────────────────────
 COPY config/ /opt/sandbox/config/
 
-# ─── Install Matrx agent SDK ─────────────────────────────────────────────────
+# ─── Install Matrx SDK (agent utilities + Claude Code-compatible tools) ───────
 COPY sdk/ /opt/sandbox/sdk/
 RUN cd /opt/sandbox/sdk && python3 -m pip install --no-cache-dir -e .
 
