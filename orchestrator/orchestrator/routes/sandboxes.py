@@ -63,13 +63,14 @@ async def exec_command(sandbox_id: str, req: ExecRequest):
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
 
     try:
-        exit_code, stdout, stderr = await sandbox_manager.exec_in_sandbox(
+        exit_code, stdout, stderr, cwd = await sandbox_manager.exec_in_sandbox(
             sandbox_id=sandbox_id,
             command=req.command,
             timeout=req.timeout,
             user=req.user,
+            cwd=req.cwd,
         )
-        return ExecResponse(exit_code=exit_code, stdout=stdout, stderr=stderr)
+        return ExecResponse(exit_code=exit_code, stdout=stdout, stderr=stderr, cwd=cwd)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:

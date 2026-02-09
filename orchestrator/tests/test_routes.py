@@ -19,7 +19,7 @@ def mock_sandbox_manager():
         mock.create_sandbox = AsyncMock()
         mock.list_sandboxes = AsyncMock(return_value=[])
         mock.get_sandbox = AsyncMock(return_value=None)
-        mock.exec_in_sandbox = AsyncMock()
+        mock.exec_in_sandbox = AsyncMock(return_value=(0, "", "", "/home/agent"))
         mock.destroy_sandbox = AsyncMock(return_value=True)
         mock.heartbeat = AsyncMock(return_value=False)
         yield mock

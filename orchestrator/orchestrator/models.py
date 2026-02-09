@@ -56,6 +56,12 @@ class ExecRequest(BaseModel):
     command: str = Field(..., description="Shell command to execute in the sandbox")
     timeout: int = Field(default=30, ge=1, le=600, description="Timeout in seconds (1-600)")
     user: str = Field(default="agent", description="User to run command as")
+    cwd: str | None = Field(
+        default=None,
+        description="Working directory to run the command in. "
+        "If omitted, the server uses the last known CWD for this sandbox "
+        "(defaults to /home/agent on first call).",
+    )
 
     @field_validator("command")
     @classmethod
@@ -71,6 +77,11 @@ class ExecResponse(BaseModel):
     exit_code: int
     stdout: str
     stderr: str
+    cwd: str = Field(
+        default="/home/agent",
+        description="Working directory after command execution. "
+        "The frontend should send this value back as 'cwd' in the next ExecRequest.",
+    )
 
 
 class CompletionRequest(BaseModel):

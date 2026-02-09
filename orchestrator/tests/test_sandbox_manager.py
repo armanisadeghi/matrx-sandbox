@@ -23,9 +23,11 @@ def clean_sandbox_state():
     store = InMemorySandboxStore()
     sandbox_manager._store = store
     sandbox_manager._docker_client = None
+    sandbox_manager._sandbox_cwd.clear()
     yield store
     sandbox_manager._store = None
     sandbox_manager._docker_client = None
+    sandbox_manager._sandbox_cwd.clear()
 
 
 @pytest.fixture
@@ -202,3 +204,40 @@ async def test_get_sandbox_returns_sandbox(clean_sandbox_state):
     assert result is not None
     assert result.sandbox_id == "sbx-found"
     assert result.user_id == "bob"
+
+
+@pytest.mark.asyncio
+async def test_exec_in_sandbox_tracks_cwd(mock_docker, clean_sandbox_state):
+    """exec_in_sandbox should track CWD across invocations via sentinel."""
+    from orchestrator import sandbox_manager
+
+    store = clean_sandbox_state
+    await store.save(SandboxResponse(
+        sandbox_id="sbx-cwd", user_id="alice", status=SandboxStatus.READY,
+        container_id="container-cwd",
+        created_at=datetime.now(timezone.utc),
+    ))
+
+    container = MagicMock()
+    container.status = "running"
+    mock_docker.containers.get.return_value = container
+
+    sentinel = sandbox_manager._CWD_SENTINEL
+
+    # Simulate output of 'cd /tmp && { ls ; }; echo SENTINEL; pwd'
+    container.exec_run.return_value = (
+        0,
+        (f"file1.txt\nfile2.txt\n{sentinel}\n/tmp\n".encode(), b""),
+    )
+
+    exit_code, stdout, stderr, cwd = await sandbox_manager.exec_in_sandbox(
+        "sbx-cwd", "ls"
+    )
+
+    assert exit_code == 0
+    assert "file1.txt" in stdout
+    assert cwd == "/tmp"
+    # Sentinel text must NOT leak into user-visible stdout
+    assert sentinel not in stdout
+    # Server should cache the new CWD
+    assert sandbox_manager._sandbox_cwd["sbx-cwd"] == "/tmp"

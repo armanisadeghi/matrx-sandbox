@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import shlex
 import uuid
 from datetime import datetime, timezone
 
@@ -20,6 +21,13 @@ from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.store import SandboxStore, create_store
 
 logger = logging.getLogger(__name__)
+
+# ── CWD tracking ──────────────────────────────────────────────────────────────
+# Each sandbox has a server-side CWD so stateless Docker exec calls can chain
+# directory changes across requests (e.g. "cd home" then "ls" shows /home).
+_CWD_SENTINEL = "___MATRX_CWD_SENTINEL_9f8a7b___"
+_DEFAULT_CWD = "/home/agent"
+_sandbox_cwd: dict[str, str] = {}  # sandbox_id -> current working directory
 
 # Pluggable sandbox store (replaces old in-memory _sandboxes dict)
 _store: SandboxStore | None = None
@@ -200,14 +208,16 @@ async def exec_in_sandbox(
     command: str,
     timeout: int = 30,
     user: str = "agent",
-) -> tuple[int, str, str]:
-    """Execute a command inside a running sandbox.
+    cwd: str | None = None,
+) -> tuple[int, str, str, str]:
+    """Execute a command inside a running sandbox with CWD tracking.
 
-    Returns (exit_code, stdout, stderr).
+    Returns (exit_code, stdout, stderr, cwd_after).
 
-    Validates that the sandbox exists and its container is running before
-    executing. Commands are length-limited (C2) and the container status
-    is checked (C1/H5) to prevent race conditions.
+    The command is wrapped so it runs in the tracked working directory.
+    After execution, the new CWD is captured via a sentinel/pwd trailer
+    and cached for the next call.  Clients may also pass an explicit
+    ``cwd`` to override the server-tracked value.
     """
     store = _get_store()
     sandbox = await store.get(sandbox_id)
@@ -219,6 +229,9 @@ async def exec_in_sandbox(
         raise ValueError(
             f"Command exceeds max length ({settings.max_command_length} chars)"
         )
+
+    # Resolve CWD: explicit param > server cache > default
+    effective_cwd = cwd or _sandbox_cwd.get(sandbox_id, _DEFAULT_CWD)
 
     client = _get_docker_client()
     try:
@@ -233,22 +246,60 @@ async def exec_in_sandbox(
             )
 
         logger.info(
-            "Executing command in sandbox %s (user=%s, timeout=%d, len=%d)",
-            sandbox_id, user, timeout, len(command),
+            "Executing command in sandbox %s (user=%s, timeout=%d, len=%d, cwd=%s)",
+            sandbox_id, user, timeout, len(command), effective_cwd,
+        )
+
+        # Wrap the command so it:
+        #   1. cd's into the tracked CWD
+        #   2. runs the user command
+        #   3. prints a sentinel + pwd so we can capture the new CWD
+        wrapped = (
+            f"cd {shlex.quote(effective_cwd)} && "
+            f"{{ {command} ; }}; "
+            f"__matrx_ec=$?; "
+            f"echo '{_CWD_SENTINEL}'; "
+            f"pwd; "
+            f"exit $__matrx_ec"
         )
 
         exit_code, output = container.exec_run(
-            cmd=["bash", "-c", command],
+            cmd=["bash", "-c", wrapped],
             user=user,
             demux=True,
         )
 
-        stdout = (output[0] or b"").decode("utf-8", errors="replace")
+        stdout_raw = (output[0] or b"").decode("utf-8", errors="replace")
         stderr = (output[1] or b"").decode("utf-8", errors="replace")
-        return exit_code, stdout, stderr
+
+        # Parse sentinel to extract real stdout and new CWD
+        stdout, new_cwd = _parse_cwd_sentinel(stdout_raw)
+        if new_cwd:
+            _sandbox_cwd[sandbox_id] = new_cwd
+        else:
+            new_cwd = effective_cwd
+
+        return exit_code, stdout, stderr, new_cwd
 
     except (NotFound, APIError) as e:
         raise RuntimeError(f"Failed to exec in sandbox {sandbox_id}: {e}") from e
+
+
+def _parse_cwd_sentinel(raw: str) -> tuple[str, str | None]:
+    """Split stdout at the CWD sentinel, returning (visible_output, new_cwd)."""
+    idx = raw.rfind(_CWD_SENTINEL)
+    if idx == -1:
+        return raw, None
+    output = raw[:idx].rstrip("\n")
+    after = raw[idx + len(_CWD_SENTINEL):].strip()
+    lines = after.split("\n")
+    new_cwd = lines[0].strip() if lines else None
+    return output, new_cwd
+
+
+def forget_sandbox_cwd(sandbox_id: str) -> None:
+    """Remove CWD state for a destroyed sandbox."""
+    _sandbox_cwd.pop(sandbox_id, None)
 
 
 async def destroy_sandbox(
@@ -265,6 +316,8 @@ async def destroy_sandbox(
     sandbox = await store.get(sandbox_id)
     if not sandbox:
         return False
+
+    forget_sandbox_cwd(sandbox_id)
 
     await store.update_status(sandbox_id, SandboxStatus.SHUTTING_DOWN)
 
