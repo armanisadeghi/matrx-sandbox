@@ -21,6 +21,7 @@
 | 15 | React hooks + types | `use-sandbox.ts` hook, `types/sandbox.ts` TypeScript types |
 | 16 | Multi-arch Dockerfile | ripgrep/fd via apt, AWS CLI multi-arch, mountpoint-s3 conditional (x86_64 only) |
 | 17 | Remove fake simulation code | All `sbx-dev-*` simulation removed from ai-matrx-admin API routes |
+| 18 | Admin panel API enrichment | Logs endpoint, stats endpoint, `expires_at`/`ssh_host` in response, `MATRX_PUBLIC_HOST` config, fix SSH host bug |
 
 ---
 
@@ -28,8 +29,8 @@
 
 | # | Task | Priority | Notes |
 |---|------|----------|-------|
-| 18 | Dashboard sandbox widget | LOW | Summary widget on main dashboard |
-| 19 | Regenerate Supabase types | LOW | Run `npx supabase gen types` to pick up `sandbox_instances` |
-| 20 | WebSocket/streaming exec | MEDIUM | Replace polling with streaming command output |
-| 21 | File browser component | MEDIUM | Browse hot storage files from the sandbox detail page |
-| 22 | Sandbox TTL extension UI | LOW | Let users extend sandbox lifetime from the UI |
+| 19 | Dashboard sandbox widget | LOW | Summary widget on main dashboard |
+| 20 | Regenerate Supabase types | LOW | Run `npx supabase gen types` to pick up `sandbox_instances` |
+| 21 | WebSocket/streaming exec | MEDIUM | Replace polling with streaming command output |
+| 22 | File browser component | MEDIUM | Browse hot storage files from the sandbox detail page |
+| 23 | Sandbox TTL extension UI | LOW | Let users extend sandbox lifetime from the UI |

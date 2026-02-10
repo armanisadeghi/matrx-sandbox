@@ -17,8 +17,10 @@ from orchestrator.models import (
     ExecRequest,
     ExecResponse,
     HeartbeatResponse,
+    LogsResponse,
     SandboxListResponse,
     SandboxResponse,
+    StatsResponse,
 )
 
 logger = logging.getLogger(__name__)
@@ -107,6 +109,44 @@ async def request_access(sandbox_id: str):
         raise HTTPException(status_code=400, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to generate access: {e}")
+
+
+@router.get("/{sandbox_id}/logs", response_model=LogsResponse)
+async def get_sandbox_logs(sandbox_id: str, tail: int = 200):
+    """Retrieve container logs for a sandbox."""
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+
+    try:
+        logs = await sandbox_manager.get_sandbox_logs(sandbox_id, tail=tail)
+        stdout = logs.get("stdout", "")
+        return LogsResponse(
+            sandbox_id=sandbox_id,
+            stdout=stdout,
+            stderr=logs.get("stderr", ""),
+            lines=stdout.count("\n") + (1 if stdout and not stdout.endswith("\n") else 0),
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+@router.get("/{sandbox_id}/stats", response_model=StatsResponse)
+async def get_sandbox_stats(sandbox_id: str):
+    """Retrieve live resource usage stats for a sandbox container."""
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+
+    try:
+        stats = await sandbox_manager.get_sandbox_stats(sandbox_id)
+        return StatsResponse(sandbox_id=sandbox_id, **stats)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    except RuntimeError as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 
 @router.delete("/{sandbox_id}", status_code=204)

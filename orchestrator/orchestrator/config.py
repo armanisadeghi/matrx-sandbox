@@ -32,6 +32,9 @@ class Settings(BaseSettings):
     container_memory_limit: str = "4g"
     container_disk_limit: str = "20g"
 
+    # Public host (for SSH connection strings sent to clients)
+    public_host: str = "localhost"   # env var: MATRX_PUBLIC_HOST
+
     # AWS / S3
     s3_bucket: str = ""
     s3_region: str = "us-east-1"

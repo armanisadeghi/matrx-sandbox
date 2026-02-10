@@ -40,10 +40,12 @@ class SandboxResponse(BaseModel):
     status: SandboxStatus
     container_id: str | None = None
     created_at: datetime
+    expires_at: datetime | None = None
     hot_path: str = "/home/agent"
     cold_path: str = "/data/cold"
     config: dict = Field(default_factory=dict)
     ssh_port: int | None = Field(default=None, description="Host port mapped to container SSH (port 22)")
+    ssh_host: str | None = Field(default=None, description="Public host for SSH connections")
     ttl_seconds: int = 7200
 
 
@@ -121,3 +123,19 @@ class AccessResponse(BaseModel):
     host: str = Field(description="SSH host to connect to")
     port: int = Field(description="SSH port to connect to")
     ssh_command: str = Field(description="Ready-to-use SSH command")
+
+
+class LogsResponse(BaseModel):
+    sandbox_id: str
+    stdout: str = ""
+    stderr: str = ""
+    lines: int = 0
+
+
+class StatsResponse(BaseModel):
+    sandbox_id: str
+    cpu_percent: float = 0.0
+    memory_usage_mb: float = 0.0
+    memory_limit_mb: float = 0.0
+    memory_percent: float = 0.0
+    pids: int = 0

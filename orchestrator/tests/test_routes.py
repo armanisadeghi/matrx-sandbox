@@ -22,6 +22,14 @@ def mock_sandbox_manager():
         mock.exec_in_sandbox = AsyncMock(return_value=(0, "", "", "/home/agent"))
         mock.destroy_sandbox = AsyncMock(return_value=True)
         mock.heartbeat = AsyncMock(return_value=False)
+        mock.get_sandbox_logs = AsyncMock(return_value={"stdout": "", "stderr": ""})
+        mock.get_sandbox_stats = AsyncMock(return_value={
+            "cpu_percent": 0.0,
+            "memory_usage_mb": 0.0,
+            "memory_limit_mb": 0.0,
+            "memory_percent": 0.0,
+            "pids": 0,
+        })
         yield mock
 
 
@@ -195,4 +203,78 @@ async def test_health_without_key_returns_200(
 
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
+
+
+# ─── Logs & Stats Endpoint Tests ─────────────────────────────────────────────
+
+
+SAMPLE_SANDBOX = SandboxResponse(
+    sandbox_id="sbx-test123",
+    user_id="11111111-1111-1111-1111-111111111111",
+    status=SandboxStatus.READY,
+    container_id="abc123",
+    created_at=datetime(2024, 1, 1, tzinfo=timezone.utc),
+    ssh_port=32768,
+    ssh_host="54.144.86.132",
+)
+
+
+@pytest.mark.asyncio
+async def test_get_logs_unknown_sandbox_returns_404(mock_sandbox_manager):
+    """GET /sandboxes/{id}/logs with unknown ID should return 404."""
+    mock_sandbox_manager.get_sandbox.return_value = None
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/sandboxes/sbx-nonexistent/logs")
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_logs_returns_log_data(mock_sandbox_manager):
+    """GET /sandboxes/{id}/logs should return container logs."""
+    mock_sandbox_manager.get_sandbox.return_value = SAMPLE_SANDBOX
+    mock_sandbox_manager.get_sandbox_logs.return_value = {
+        "stdout": "line1\nline2\nline3\n",
+        "stderr": "",
+    }
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/sandboxes/sbx-test123/logs")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["sandbox_id"] == "sbx-test123"
+    assert "line1" in data["stdout"]
+    assert data["lines"] == 3
+
+
+@pytest.mark.asyncio
+async def test_get_stats_unknown_sandbox_returns_404(mock_sandbox_manager):
+    """GET /sandboxes/{id}/stats with unknown ID should return 404."""
+    mock_sandbox_manager.get_sandbox.return_value = None
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/sandboxes/sbx-nonexistent/stats")
+    assert response.status_code == 404
+
+
+@pytest.mark.asyncio
+async def test_get_stats_returns_resource_data(mock_sandbox_manager):
+    """GET /sandboxes/{id}/stats should return resource usage data."""
+    mock_sandbox_manager.get_sandbox.return_value = SAMPLE_SANDBOX
+    mock_sandbox_manager.get_sandbox_stats.return_value = {
+        "cpu_percent": 15.5,
+        "memory_usage_mb": 256.0,
+        "memory_limit_mb": 4096.0,
+        "memory_percent": 6.25,
+        "pids": 12,
+    }
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/sandboxes/sbx-test123/stats")
+    assert response.status_code == 200
+    data = response.json()
+    assert data["sandbox_id"] == "sbx-test123"
+    assert data["cpu_percent"] == 15.5
+    assert data["memory_usage_mb"] == 256.0
+    assert data["pids"] == 12
 

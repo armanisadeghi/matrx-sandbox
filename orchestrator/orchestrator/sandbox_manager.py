@@ -11,7 +11,7 @@ import asyncio
 import logging
 import shlex
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 import docker
 from docker.errors import DockerException, NotFound, APIError
@@ -84,11 +84,14 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
     sandbox_id = f"sbx-{uuid.uuid4().hex[:12]}"
     config = config or {}
 
+    now = datetime.now(timezone.utc)
     sandbox = SandboxResponse(
         sandbox_id=sandbox_id,
         user_id=user_id,
         status=SandboxStatus.CREATING,
-        created_at=datetime.now(timezone.utc),
+        created_at=now,
+        expires_at=now + timedelta(seconds=settings.max_session_duration_seconds),
+        ssh_host=settings.public_host,
         config=config,
     )
     await store.save(sandbox)
@@ -360,6 +363,82 @@ async def heartbeat(sandbox_id: str) -> bool:
     return True
 
 
+async def get_sandbox_logs(sandbox_id: str, tail: int = 200) -> dict[str, str]:
+    """Retrieve container logs for a sandbox."""
+    store = _get_store()
+    sandbox = await store.get(sandbox_id)
+    if not sandbox or not sandbox.container_id:
+        raise ValueError(f"Sandbox {sandbox_id} not found or has no container")
+
+    client = _get_docker_client()
+    try:
+        container = client.containers.get(sandbox.sandbox_id)
+        logs = container.logs(stdout=True, stderr=True, tail=tail, timestamps=False)
+        raw = logs.decode("utf-8", errors="replace") if isinstance(logs, bytes) else logs
+        return {"stdout": raw, "stderr": ""}
+    except NotFound:
+        raise ValueError(f"Container for sandbox {sandbox_id} not found")
+    except APIError as e:
+        raise RuntimeError(f"Failed to get logs for sandbox {sandbox_id}: {e}") from e
+
+
+async def get_sandbox_stats(sandbox_id: str) -> dict[str, float | int]:
+    """Retrieve live resource usage stats for a sandbox container."""
+    store = _get_store()
+    sandbox = await store.get(sandbox_id)
+    if not sandbox or not sandbox.container_id:
+        raise ValueError(f"Sandbox {sandbox_id} not found or has no container")
+
+    client = _get_docker_client()
+    try:
+        container = client.containers.get(sandbox.sandbox_id)
+        container.reload()
+        if container.status != "running":
+            return {
+                "cpu_percent": 0.0,
+                "memory_usage_mb": 0.0,
+                "memory_limit_mb": 0.0,
+                "memory_percent": 0.0,
+                "pids": 0,
+            }
+
+        stats = container.stats(stream=False)
+
+        # CPU percentage calculation
+        cpu_delta = (
+            stats["cpu_stats"]["cpu_usage"]["total_usage"]
+            - stats["precpu_stats"]["cpu_usage"]["total_usage"]
+        )
+        system_delta = (
+            stats["cpu_stats"]["system_cpu_usage"]
+            - stats["precpu_stats"]["system_cpu_usage"]
+        )
+        num_cpus = stats["cpu_stats"]["online_cpus"]
+        cpu_percent = (cpu_delta / system_delta) * num_cpus * 100.0 if system_delta > 0 else 0.0
+
+        # Memory
+        mem_usage = stats["memory_stats"].get("usage", 0)
+        mem_limit = stats["memory_stats"].get("limit", 0)
+        mem_usage_mb = mem_usage / (1024 * 1024)
+        mem_limit_mb = mem_limit / (1024 * 1024)
+        mem_percent = (mem_usage / mem_limit) * 100.0 if mem_limit > 0 else 0.0
+
+        # PIDs
+        pids = stats.get("pids_stats", {}).get("current", 0)
+
+        return {
+            "cpu_percent": round(cpu_percent, 2),
+            "memory_usage_mb": round(mem_usage_mb, 2),
+            "memory_limit_mb": round(mem_limit_mb, 2),
+            "memory_percent": round(mem_percent, 2),
+            "pids": pids,
+        }
+    except NotFound:
+        raise ValueError(f"Container for sandbox {sandbox_id} not found")
+    except APIError as e:
+        raise RuntimeError(f"Failed to get stats for sandbox {sandbox_id}: {e}") from e
+
+
 async def generate_user_access(sandbox_id: str) -> dict[str, str | int]:
     """Generate a temporary SSH keypair and inject the public key into the sandbox.
 
@@ -398,6 +477,6 @@ async def generate_user_access(sandbox_id: str) -> dict[str, str | int]:
     return {
         "private_key": private_pem,
         "username": "agent",
-        "host": "localhost",
+        "host": settings.public_host,
         "port": sandbox.ssh_port or 22,
     }
