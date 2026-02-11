@@ -55,3 +55,6 @@ node_modules/
 
 # Matrx Ship config (contains API key)
 .matrx-ship.json
+
+# matrx-dev-tools backups
+.env-backups/

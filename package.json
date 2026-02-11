@@ -10,7 +10,14 @@
     "ship:init": "tsx scripts/matrx/ship.ts init",
     "ship:setup": "tsx scripts/matrx/ship.ts setup",
     "ship:history": "tsx scripts/matrx/ship.ts history",
-    "ship:update": "tsx scripts/matrx/ship.ts update"
+    "ship:update": "tsx scripts/matrx/ship.ts update",
+    "env:pull": "bash scripts/matrx/env-sync.sh pull",
+    "env:push": "bash scripts/matrx/env-sync.sh push",
+    "env:diff": "bash scripts/matrx/env-sync.sh diff",
+    "env:status": "bash scripts/matrx/env-sync.sh status",
+    "env:pull:force": "bash scripts/matrx/env-sync.sh pull --force",
+    "env:push:force": "bash scripts/matrx/env-sync.sh push --force",
+    "tools:update": "curl -sL https://raw.githubusercontent.com/armanisadeghi/matrx-dev-tools/main/install.sh | bash"
   },
   "devDependencies": {
     "tsx": "^4.21.0"
