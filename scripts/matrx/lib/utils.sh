@@ -49,42 +49,79 @@ load_config() {
     _validate_config "$conf_path"
 }
 
+_validate_single_value() {
+    local key_name="$1"
+    local key_value="$2"
+
+    if [[ -z "$key_value" ]]; then
+        return 1
+    fi
+    if [[ "$key_value" == "# "* ]] || [[ "$key_value" == *"source "* ]] || [[ "$key_value" == *"shellcheck"* ]] || [[ "$key_value" == *'$'* ]]; then
+        return 1
+    fi
+    return 0
+}
+
 _validate_config() {
     local conf_path="$1"
     local has_errors=0
 
-    # Check DOPPLER_PROJECT
-    if [[ -z "${DOPPLER_PROJECT:-}" ]]; then
-        echo -e "${RED}Error: DOPPLER_PROJECT is not set in ${MATRX_TOOLS_CONF}${NC}"
-        echo -e "${DIM}  Open ${conf_path} and set: DOPPLER_PROJECT=\"your-doppler-project-name\"${NC}"
-        has_errors=1
-    elif [[ "${DOPPLER_PROJECT}" == "# "* ]] || [[ "${DOPPLER_PROJECT}" == *"source "* ]] || [[ "${DOPPLER_PROJECT}" == *"shellcheck"* ]]; then
-        echo -e "${RED}Error: DOPPLER_PROJECT has an invalid value: '${DOPPLER_PROJECT}'${NC}"
-        echo -e "${DIM}  This usually happens when the installer's prompts failed (e.g., curl|bash with no tty).${NC}"
-        echo -e "${DIM}  Open ${conf_path} and set it to your actual Doppler project name.${NC}"
-        has_errors=1
-    fi
+    if [[ "${DOPPLER_MULTI:-false}" == "true" ]]; then
+        # ─── Multi-config validation ──────────────────────────────
+        local configs_list
+        configs_list=$(conf_get "DOPPLER_CONFIGS" "")
 
-    # Check DOPPLER_CONFIG
-    if [[ -z "${DOPPLER_CONFIG:-}" ]]; then
-        echo -e "${RED}Error: DOPPLER_CONFIG is not set in ${MATRX_TOOLS_CONF}${NC}"
-        echo -e "${DIM}  Open ${conf_path} and set: DOPPLER_CONFIG=\"dev\"${NC}"
-        has_errors=1
-    elif [[ "${DOPPLER_CONFIG}" == "# "* ]] || [[ "${DOPPLER_CONFIG}" == *"shellcheck"* ]]; then
-        echo -e "${RED}Error: DOPPLER_CONFIG has an invalid value: '${DOPPLER_CONFIG}'${NC}"
-        echo -e "${DIM}  Open ${conf_path} and set it to your Doppler config (e.g., 'dev', 'stg', 'prd').${NC}"
-        has_errors=1
-    fi
+        if [[ -z "$configs_list" ]]; then
+            echo -e "${RED}Error: DOPPLER_MULTI is true but DOPPLER_CONFIGS is empty in ${MATRX_TOOLS_CONF}${NC}"
+            echo -e "${DIM}  Set DOPPLER_CONFIGS to a comma-separated list (e.g., 'web,api')${NC}"
+            has_errors=1
+        else
+            IFS=',' read -ra cnames <<< "$configs_list"
+            for cname in "${cnames[@]}"; do
+                cname=$(echo "$cname" | tr -d ' ')
+                [[ -z "$cname" ]] && continue
 
-    # Check ENV_FILE
-    if [[ -z "${ENV_FILE:-}" ]]; then
-        echo -e "${RED}Error: ENV_FILE is not set in ${MATRX_TOOLS_CONF}${NC}"
-        echo -e "${DIM}  Open ${conf_path} and set: ENV_FILE=\".env.local\"${NC}"
-        has_errors=1
-    elif [[ "${ENV_FILE}" == *'$'* ]] || [[ "${ENV_FILE}" == *"source "* ]]; then
-        echo -e "${RED}Error: ENV_FILE has an invalid value: '${ENV_FILE}'${NC}"
-        echo -e "${DIM}  Open ${conf_path} and set it to your env file path (e.g., '.env.local' or '.env').${NC}"
-        has_errors=1
+                local dp dc ef
+                dp=$(conf_get "DOPPLER_PROJECT_${cname}" "")
+                dc=$(conf_get "DOPPLER_CONFIG_${cname}" "")
+                ef=$(conf_get "ENV_FILE_${cname}" "")
+
+                if ! _validate_single_value "DOPPLER_PROJECT_${cname}" "$dp"; then
+                    echo -e "${RED}Error: DOPPLER_PROJECT_${cname} is missing or invalid in ${MATRX_TOOLS_CONF}${NC}"
+                    echo -e "${DIM}  Open ${conf_path} and set: DOPPLER_PROJECT_${cname}=\"your-project\"${NC}"
+                    has_errors=1
+                fi
+                if ! _validate_single_value "DOPPLER_CONFIG_${cname}" "$dc"; then
+                    echo -e "${RED}Error: DOPPLER_CONFIG_${cname} is missing or invalid in ${MATRX_TOOLS_CONF}${NC}"
+                    echo -e "${DIM}  Open ${conf_path} and set: DOPPLER_CONFIG_${cname}=\"${cname}\"${NC}"
+                    has_errors=1
+                fi
+                if [[ -z "$ef" ]]; then
+                    echo -e "${RED}Error: ENV_FILE_${cname} is not set in ${MATRX_TOOLS_CONF}${NC}"
+                    echo -e "${DIM}  Open ${conf_path} and set: ENV_FILE_${cname}=\"path/to/.env\"${NC}"
+                    has_errors=1
+                fi
+            done
+        fi
+    else
+        # ─── Single-config validation ─────────────────────────────
+        if ! _validate_single_value "DOPPLER_PROJECT" "${DOPPLER_PROJECT:-}"; then
+            echo -e "${RED}Error: DOPPLER_PROJECT is missing or invalid in ${MATRX_TOOLS_CONF}${NC}"
+            echo -e "${DIM}  Open ${conf_path} and set: DOPPLER_PROJECT=\"your-doppler-project-name\"${NC}"
+            has_errors=1
+        fi
+
+        if ! _validate_single_value "DOPPLER_CONFIG" "${DOPPLER_CONFIG:-}"; then
+            echo -e "${RED}Error: DOPPLER_CONFIG is missing or invalid in ${MATRX_TOOLS_CONF}${NC}"
+            echo -e "${DIM}  Open ${conf_path} and set: DOPPLER_CONFIG=\"dev\"${NC}"
+            has_errors=1
+        fi
+
+        if [[ -z "${ENV_FILE:-}" ]]; then
+            echo -e "${RED}Error: ENV_FILE is not set in ${MATRX_TOOLS_CONF}${NC}"
+            echo -e "${DIM}  Open ${conf_path} and set: ENV_FILE=\".env.local\"${NC}"
+            has_errors=1
+        fi
     fi
 
     if [[ $has_errors -eq 1 ]]; then

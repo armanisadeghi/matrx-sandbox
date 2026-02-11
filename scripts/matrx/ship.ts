@@ -464,7 +464,12 @@ async function handleSetup(args: string[]): Promise<void> {
   console.log(`💾 Server credentials saved to ${GLOBAL_CONFIG_FILE}`);
   console.log("");
   console.log("   You can now provision instances in any project:");
-  console.log('     pnpm ship:init my-project "My Project Name"');
+  const hasPackageJson = existsSync(path.join(process.cwd(), "package.json"));
+  if (hasPackageJson) {
+    console.log('     pnpm ship:init my-project "My Project Name"');
+  } else {
+    console.log('     bash scripts/matrx/ship.sh init my-project "My Project Name"');
+  }
   console.log("");
 }
 
@@ -1137,8 +1142,10 @@ async function handleUpdate(): Promise<void> {
 
   // Determine where the current script lives
   const currentScript = path.resolve(process.argv[1]);
+  const scriptDir = path.dirname(currentScript);
   const cwd = process.cwd();
   const relPath = path.relative(cwd, currentScript);
+  const hasPackageJson = existsSync(path.join(cwd, "package.json"));
 
   console.log(`   Script:  ${relPath}`);
 
@@ -1173,16 +1180,48 @@ async function handleUpdate(): Promise<void> {
   }
 
   // Ensure directory exists and write the file
-  mkdirSync(path.dirname(currentScript), { recursive: true });
+  mkdirSync(scriptDir, { recursive: true });
   writeFileSync(currentScript, content, "utf-8");
   console.log("   ✅ CLI script updated");
 
-  // Ensure package.json has all ship:* scripts
-  const scriptsUpdated = ensurePackageJsonScripts(relPath);
-  if (scriptsUpdated) {
-    console.log("   ✅ package.json scripts updated");
-  } else {
-    console.log("   ✓  package.json scripts already up to date");
+  // For non-Node projects, also update the bash wrapper
+  if (!hasPackageJson) {
+    console.log("   Downloading latest bash wrapper...");
+    try {
+      const controller = new AbortController();
+      const timeout = setTimeout(() => controller.abort(), 15000);
+      const response = await fetch(`${REPO_RAW}/cli/ship.sh`, {
+        signal: controller.signal,
+      });
+      clearTimeout(timeout);
+
+      if (response.ok) {
+        const wrapperContent = await response.text();
+        const wrapperPath = path.join(scriptDir, "ship.sh");
+        writeFileSync(wrapperPath, wrapperContent, "utf-8");
+        try {
+          execSync(`chmod +x "${wrapperPath}"`, { stdio: "ignore" });
+        } catch {
+          // Windows doesn't have chmod
+        }
+        console.log("   ✅ Bash wrapper updated");
+      }
+    } catch {
+      console.log("   ⚠️  Could not update bash wrapper (ship.sh)");
+    }
+  }
+
+  if (hasPackageJson) {
+    // Ensure package.json has all ship:* scripts
+    const scriptsUpdated = ensurePackageJsonScripts(relPath);
+    if (scriptsUpdated) {
+      console.log("   ✅ package.json scripts updated");
+    } else {
+      console.log("   ✓  package.json scripts already up to date");
+    }
+
+    // Ensure tsx is installed
+    ensureTsxDependency();
   }
 
   // Ensure .gitignore has .matrx-ship.json
@@ -1191,12 +1230,14 @@ async function handleUpdate(): Promise<void> {
     console.log("   ✅ Added .matrx-ship.json to .gitignore");
   }
 
-  // Ensure tsx is installed
-  ensureTsxDependency();
-
   console.log("");
   console.log("   ✅ Matrx Ship CLI is up to date!");
-  console.log("   Run 'pnpm ship help' to see all commands.");
+  if (hasPackageJson) {
+    console.log("   Run 'pnpm ship help' to see all commands.");
+  } else {
+    const wrapperRel = path.relative(cwd, path.join(scriptDir, "ship.sh"));
+    console.log(`   Run 'bash ${wrapperRel} help' to see all commands.`);
+  }
   console.log("");
 }
 
@@ -1218,44 +1259,52 @@ async function main() {
     const config = loadConfig();
     await getStatus(config);
   } else if (command === "help" || command === "--help" || command === "-h") {
+    const hasPackageJson = existsSync(path.join(process.cwd(), "package.json"));
+
+    // Build command examples that match the invocation style
+    const cmd = (sub: string) =>
+      hasPackageJson ? `pnpm ship:${sub}` : `bash scripts/matrx/ship.sh ${sub}`;
+    const ship = hasPackageJson ? "pnpm ship" : "bash scripts/matrx/ship.sh";
+    const minor = hasPackageJson ? "pnpm ship:minor" : `${ship} --minor`;
+    const major = hasPackageJson ? "pnpm ship:major" : `${ship} --major`;
+
     console.log(`
 Matrx Ship CLI - Universal Deployment Tool
 
 Usage:
-  pnpm ship "commit message"             Patch version bump + deploy
-  pnpm ship:minor "commit message"       Minor version bump + deploy
-  pnpm ship:major "commit message"       Major version bump + deploy
+  ${ship} "commit message"                  Patch version bump + deploy
+  ${minor} "commit message"                 Minor version bump + deploy
+  ${major} "commit message"                 Major version bump + deploy
 
 Setup Commands:
-  pnpm ship:setup --token TOKEN          Save server credentials (one-time per machine)
-  pnpm ship:init PROJECT "Display Name"  Auto-provision an instance on the server
-  pnpm ship:init --url URL --key KEY     Manual config (provide your own URL + key)
+  ${cmd("setup")} --token TOKEN             Save server credentials (one-time per machine)
+  ${cmd("init")} PROJECT "Display Name"     Auto-provision an instance on the server
+  ${cmd("init")} --url URL --key KEY        Manual config (provide your own URL + key)
 
 History:
-  pnpm ship:history                      Import full git history into ship
-  pnpm ship:history --dry                Preview what would be imported
-  pnpm ship:history --clear              Clear existing versions and reimport
-  pnpm ship:history --since 2024-01-01   Only import commits after a date
-  pnpm ship:history --branch main        Import from a specific branch
-  pnpm ship:history --start-version 1.0.0  Start versioning at a custom version
+  ${cmd("history")}                         Import full git history into ship
+  ${cmd("history")} --dry                   Preview what would be imported
+  ${cmd("history")} --clear                 Clear existing versions and reimport
+  ${cmd("history")} --since 2024-01-01      Only import commits after a date
+  ${cmd("history")} --branch main           Import from a specific branch
 
 Maintenance:
-  pnpm ship:update                       Update CLI to the latest version
-  pnpm ship status                       Show current version from server
-  pnpm ship help                         Show this help
+  ${cmd("update")}                          Update CLI to the latest version
+  ${ship} status                            Show current version from server
+  ${ship} help                              Show this help
 
 Environment Variables:
-  MATRX_SHIP_SERVER_TOKEN   Server token for provisioning (or use ship:setup)
+  MATRX_SHIP_SERVER_TOKEN   Server token for provisioning (or use ${cmd("setup")})
   MATRX_SHIP_SERVER         MCP server URL (default: ${DEFAULT_MCP_SERVER})
   MATRX_SHIP_URL            Instance URL (overrides .matrx-ship.json)
   MATRX_SHIP_API_KEY        Instance API key (overrides .matrx-ship.json)
 
 Quick Start:
-  1. One-time: pnpm ship:setup --token YOUR_SERVER_TOKEN
-  2. Per project: pnpm ship:init my-project "My Project"
-  3. Import history: pnpm ship:history
-  4. Ship: pnpm ship "your commit message"
-  5. Update CLI: pnpm ship:update
+  1. One-time: ${cmd("setup")} --token YOUR_SERVER_TOKEN
+  2. Per project: ${cmd("init")} my-project "My Project"
+  3. Import history: ${cmd("history")}
+  4. Ship: ${ship} "your commit message"
+  5. Update CLI: ${cmd("update")}
 `);
   } else {
     await handleShip(args);
