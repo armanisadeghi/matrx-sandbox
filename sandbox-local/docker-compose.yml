@@ -1,0 +1,143 @@
+# ─────────────────────────────────────────────────────────────────────────────
+# Matrx Sandbox — Local Deployment
+# ─────────────────────────────────────────────────────────────────────────────
+# Spins up multiple isolated sandbox instances, each with:
+#   - Persistent home directory (Docker volume)
+#   - ttyd web terminal routed via Traefik
+#   - Independent environment
+#
+# Usage:
+#   docker compose up -d                   # Start all instances
+#   docker compose up -d sandbox-1         # Start one instance
+#   docker compose logs -f sandbox-1       # View logs
+#   docker compose down                    # Stop all
+#
+# Prerequisites:
+#   1. Build core:  docker build -t matrx-sandbox:core ../sandbox-image/
+#   2. Build local: docker build -t matrx-sandbox:local .
+#   3. External network 'proxy' exists (Traefik)
+# ─────────────────────────────────────────────────────────────────────────────
+
+x-sandbox-defaults: &sandbox-defaults
+  image: matrx-sandbox:local
+  restart: unless-stopped
+  cap_add:
+    - SYS_ADMIN
+  devices:
+    - /dev/fuse
+  networks:
+    - proxy
+    - sandbox-internal
+  deploy:
+    resources:
+      limits:
+        cpus: "2.0"
+        memory: 4G
+      reservations:
+        cpus: "0.25"
+        memory: 256M
+
+services:
+  # ── Sandbox 1 ──────────────────────────────────────────────────────────────
+  sandbox-1:
+    <<: *sandbox-defaults
+    container_name: sandbox-1
+    hostname: sandbox-1
+    environment:
+      SANDBOX_ID: sbx-001
+      SANDBOX_NAME: sandbox-1
+      SANDBOX_MODE: local
+    volumes:
+      - sandbox-1-home:/home/agent
+    labels:
+      - "traefik.enable=true"
+      # Web terminal (ttyd on port 7681)
+      - "traefik.http.routers.sandbox-1.rule=Host(`sandbox-1.dev.codematrx.com`)"
+      - "traefik.http.routers.sandbox-1.entrypoints=websecure"
+      - "traefik.http.routers.sandbox-1.tls.certresolver=letsencrypt"
+      - "traefik.http.services.sandbox-1.loadbalancer.server.port=7681"
+
+  # ── Sandbox 2 ──────────────────────────────────────────────────────────────
+  sandbox-2:
+    <<: *sandbox-defaults
+    container_name: sandbox-2
+    hostname: sandbox-2
+    environment:
+      SANDBOX_ID: sbx-002
+      SANDBOX_NAME: sandbox-2
+      SANDBOX_MODE: local
+    volumes:
+      - sandbox-2-home:/home/agent
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.sandbox-2.rule=Host(`sandbox-2.dev.codematrx.com`)"
+      - "traefik.http.routers.sandbox-2.entrypoints=websecure"
+      - "traefik.http.routers.sandbox-2.tls.certresolver=letsencrypt"
+      - "traefik.http.services.sandbox-2.loadbalancer.server.port=7681"
+
+  # ── Sandbox 3 ──────────────────────────────────────────────────────────────
+  sandbox-3:
+    <<: *sandbox-defaults
+    container_name: sandbox-3
+    hostname: sandbox-3
+    environment:
+      SANDBOX_ID: sbx-003
+      SANDBOX_NAME: sandbox-3
+      SANDBOX_MODE: local
+    volumes:
+      - sandbox-3-home:/home/agent
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.sandbox-3.rule=Host(`sandbox-3.dev.codematrx.com`)"
+      - "traefik.http.routers.sandbox-3.entrypoints=websecure"
+      - "traefik.http.routers.sandbox-3.tls.certresolver=letsencrypt"
+      - "traefik.http.services.sandbox-3.loadbalancer.server.port=7681"
+
+  # ── Sandbox 4 ──────────────────────────────────────────────────────────────
+  sandbox-4:
+    <<: *sandbox-defaults
+    container_name: sandbox-4
+    hostname: sandbox-4
+    environment:
+      SANDBOX_ID: sbx-004
+      SANDBOX_NAME: sandbox-4
+      SANDBOX_MODE: local
+    volumes:
+      - sandbox-4-home:/home/agent
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.sandbox-4.rule=Host(`sandbox-4.dev.codematrx.com`)"
+      - "traefik.http.routers.sandbox-4.entrypoints=websecure"
+      - "traefik.http.routers.sandbox-4.tls.certresolver=letsencrypt"
+      - "traefik.http.services.sandbox-4.loadbalancer.server.port=7681"
+
+  # ── Sandbox 5 ──────────────────────────────────────────────────────────────
+  sandbox-5:
+    <<: *sandbox-defaults
+    container_name: sandbox-5
+    hostname: sandbox-5
+    environment:
+      SANDBOX_ID: sbx-005
+      SANDBOX_NAME: sandbox-5
+      SANDBOX_MODE: local
+    volumes:
+      - sandbox-5-home:/home/agent
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.sandbox-5.rule=Host(`sandbox-5.dev.codematrx.com`)"
+      - "traefik.http.routers.sandbox-5.entrypoints=websecure"
+      - "traefik.http.routers.sandbox-5.tls.certresolver=letsencrypt"
+      - "traefik.http.services.sandbox-5.loadbalancer.server.port=7681"
+
+volumes:
+  sandbox-1-home:
+  sandbox-2-home:
+  sandbox-3-home:
+  sandbox-4-home:
+  sandbox-5-home:
+
+networks:
+  proxy:
+    external: true
+  sandbox-internal:
+    driver: bridge
