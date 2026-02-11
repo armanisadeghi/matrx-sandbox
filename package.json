@@ -1,0 +1,18 @@
+{
+  "name": "matrx-sandbox",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Ephemeral sandbox for AI agent execution",
+  "scripts": {
+    "ship": "tsx scripts/matrx/ship.ts",
+    "ship:minor": "tsx scripts/matrx/ship.ts --minor",
+    "ship:major": "tsx scripts/matrx/ship.ts --major",
+    "ship:init": "tsx scripts/matrx/ship.ts init",
+    "ship:setup": "tsx scripts/matrx/ship.ts setup",
+    "ship:history": "tsx scripts/matrx/ship.ts history",
+    "ship:update": "tsx scripts/matrx/ship.ts update"
+  },
+  "devDependencies": {
+    "tsx": "^4.21.0"
+  }
+}

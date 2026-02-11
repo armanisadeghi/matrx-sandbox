@@ -49,3 +49,9 @@ htmlcov/
 # Build artifacts
 *.tar.gz
 *.zip
+
+# Node (ship CLI)
+node_modules/
+
+# Matrx Ship config (contains API key)
+.matrx-ship.json
