@@ -58,3 +58,5 @@ node_modules/
 
 # matrx-dev-tools backups
 .env-backups/
+.matrx.json
+.matrx-tools.conf

@@ -1,28 +1,55 @@
 #!/usr/bin/env bash
 # =============================================================================
-# utils.sh — Shared utility functions for matrx-dev-tools
+# utils.sh — Shared utility functions for Matrx CLI tools
 # Sourced by all tool scripts. Do not execute directly.
 # Compatible with bash 3.2+ (macOS default).
 # =============================================================================
 
 # ─── Config Loading ──────────────────────────────────────────────────────────
 
+MATRX_JSON=".matrx.json"
 MATRX_TOOLS_CONF=".matrx-tools.conf"
+MATRX_CONFIG_FORMAT=""  # "json" or "conf" — set by load_config
 
 load_config() {
     local search_dir
     search_dir="$(git rev-parse --show-toplevel 2>/dev/null || pwd)"
 
+    # ── Try .matrx.json first (requires jq) ──
+    local json_path=""
+    if [[ -f "${search_dir}/${MATRX_JSON}" ]]; then
+        json_path="${search_dir}/${MATRX_JSON}"
+    elif [[ -f "./${MATRX_JSON}" ]]; then
+        json_path="./${MATRX_JSON}"
+        search_dir="$(pwd)"
+    fi
+
+    if [[ -n "$json_path" ]] && command -v jq &>/dev/null; then
+        if jq empty "$json_path" 2>/dev/null; then
+            _load_json_config "$json_path" "$search_dir"
+            MATRX_CONFIG_FORMAT="json"
+            return 0
+        else
+            echo -e "${RED}Error: ${MATRX_JSON} contains invalid JSON${NC}"
+            echo -e "${DIM}  File: ${json_path}${NC}"
+            echo -e "${DIM}  Fix the JSON syntax and re-run the command.${NC}"
+            exit 1
+        fi
+    fi
+
+    # ── Fall back to .matrx-tools.conf ──
     local conf_path=""
     if [[ -f "${search_dir}/${MATRX_TOOLS_CONF}" ]]; then
         conf_path="${search_dir}/${MATRX_TOOLS_CONF}"
     elif [[ -f "./${MATRX_TOOLS_CONF}" ]]; then
         conf_path="./${MATRX_TOOLS_CONF}"
         search_dir="$(pwd)"
-    else
-        echo -e "${RED}Error: ${MATRX_TOOLS_CONF} not found${NC}"
+    fi
+
+    if [[ -z "$conf_path" ]]; then
+        echo -e "${RED}Error: No config file found (${MATRX_JSON} or ${MATRX_TOOLS_CONF})${NC}"
         echo -e "${DIM}Run the installer or create one manually.${NC}"
-        echo -e "${DIM}See: https://github.com/armanisadeghi/matrx-dev-tools${NC}"
+        echo -e "${DIM}See: https://github.com/armanisadeghi/matrx-ship${NC}"
         exit 1
     fi
 
@@ -36,7 +63,7 @@ load_config() {
         echo ""
         echo -e "${CYAN}To fix: delete ${MATRX_TOOLS_CONF} and re-run the installer:${NC}"
         echo -e "  ${DIM}rm ${conf_path}${NC}"
-        echo -e "  ${DIM}curl -sL https://raw.githubusercontent.com/armanisadeghi/matrx-dev-tools/main/install.sh | bash${NC}"
+        echo -e "  ${DIM}curl -sL https://raw.githubusercontent.com/armanisadeghi/matrx-ship/main/cli/install.sh | bash${NC}"
         exit 1
     fi
 
@@ -44,9 +71,59 @@ load_config() {
     source "$conf_path"
     REPO_ROOT="$search_dir"
     export REPO_ROOT
+    MATRX_CONFIG_FORMAT="conf"
 
     # Validate required config values
     _validate_config "$conf_path"
+}
+
+# Load config from .matrx.json using jq
+_load_json_config() {
+    local json_path="$1"
+    local search_dir="$2"
+
+    REPO_ROOT="$search_dir"
+    export REPO_ROOT
+
+    # Check for multi-config
+    local has_multi
+    has_multi=$(jq -r '.env.multi // false' "$json_path" 2>/dev/null)
+
+    if [[ "$has_multi" == "true" ]]; then
+        DOPPLER_MULTI="true"
+        DOPPLER_CONFIGS=$(jq -r '.env.configs | keys | join(",")' "$json_path" 2>/dev/null)
+        export DOPPLER_MULTI DOPPLER_CONFIGS
+
+        local IFS=','
+        for config_name in $DOPPLER_CONFIGS; do
+            local dp dc ef
+            dp=$(jq -r ".env.configs[\"${config_name}\"].doppler.project // empty" "$json_path" 2>/dev/null)
+            dc=$(jq -r ".env.configs[\"${config_name}\"].doppler.config // empty" "$json_path" 2>/dev/null)
+            ef=$(jq -r ".env.configs[\"${config_name}\"].file // empty" "$json_path" 2>/dev/null)
+
+            eval "DOPPLER_PROJECT_${config_name}=\"${dp}\""
+            eval "DOPPLER_CONFIG_${config_name}=\"${dc}\""
+            eval "ENV_FILE_${config_name}=\"${ef}\""
+            eval "export DOPPLER_PROJECT_${config_name} DOPPLER_CONFIG_${config_name} ENV_FILE_${config_name}"
+        done
+    else
+        DOPPLER_MULTI="false"
+        DOPPLER_PROJECT=$(jq -r '.env.doppler.project // empty' "$json_path" 2>/dev/null)
+        DOPPLER_CONFIG=$(jq -r '.env.doppler.config // empty' "$json_path" 2>/dev/null)
+        ENV_FILE=$(jq -r '.env.file // ".env"' "$json_path" 2>/dev/null)
+        export DOPPLER_MULTI DOPPLER_PROJECT DOPPLER_CONFIG ENV_FILE
+    fi
+
+    # Read localKeys if present
+    local local_keys
+    local_keys=$(jq -r '.env.localKeys // [] | join(",")' "$json_path" 2>/dev/null)
+    if [[ -n "$local_keys" ]]; then
+        LOCAL_KEYS="$local_keys"
+        export LOCAL_KEYS
+    fi
+
+    # Validate
+    _validate_config "$json_path"
 }
 
 _validate_single_value() {
@@ -126,8 +203,8 @@ _validate_config() {
 
     if [[ $has_errors -eq 1 ]]; then
         echo ""
-        echo -e "${YELLOW}Fix the values in ${conf_path}, then re-run the command.${NC}"
-        echo -e "${DIM}Or delete ${MATRX_TOOLS_CONF} and run the installer again to regenerate it.${NC}"
+        echo -e "${YELLOW}Fix the values in ${1}, then re-run the command.${NC}"
+        echo -e "${DIM}Or delete the config and run the installer again to regenerate it.${NC}"
         exit 1
     fi
 }
@@ -182,6 +259,66 @@ get_doppler_secrets() {
 }
 
 # ─── Env File Helpers ────────────────────────────────────────────────────────
+
+# Check if a value contains shell variable references like ${VAR} or $VAR
+value_has_shell_refs() {
+    local val="$1"
+    # Match ${VAR} or $VAR (but not escaped \$ or standalone $)
+    echo "$val" | grep -qE '\$\{[A-Za-z_][A-Za-z0-9_]*\}|\$[A-Za-z_][A-Za-z0-9_]*' 2>/dev/null
+}
+
+# Resolve shell variable references in a value against a parsed env file.
+# E.g. "postgresql://ship:${POSTGRES_PASSWORD}@db:5432/ship"
+# with POSTGRES_PASSWORD=secret → "postgresql://ship:secret@db:5432/ship"
+resolve_shell_refs() {
+    local val="$1"
+    local env_parsed_file="$2"
+    local result="$val"
+
+    # Resolve ${VAR} references
+    while true; do
+        local ref
+        ref=$(echo "$result" | grep -oE '\$\{[A-Za-z_][A-Za-z0-9_]*\}' | head -1) || true
+        [[ -z "$ref" ]] && break
+
+        local var_name="${ref#\$\{}"
+        var_name="${var_name%\}}"
+
+        local var_val=""
+        if [[ -f "$env_parsed_file" ]]; then
+            var_val=$(lookup_value "$var_name" "$env_parsed_file") || true
+        fi
+
+        if [[ -n "$var_val" ]]; then
+            result="${result//$ref/$var_val}"
+        else
+            # Can't resolve — leave as-is to avoid breaking the value
+            break
+        fi
+    done
+
+    # Resolve $VAR references (without braces)
+    while true; do
+        local ref
+        ref=$(echo "$result" | grep -oE '\$[A-Za-z_][A-Za-z0-9_]*' | head -1) || true
+        [[ -z "$ref" ]] && break
+
+        local var_name="${ref#\$}"
+
+        local var_val=""
+        if [[ -f "$env_parsed_file" ]]; then
+            var_val=$(lookup_value "$var_name" "$env_parsed_file") || true
+        fi
+
+        if [[ -n "$var_val" ]]; then
+            result="${result//$ref/$var_val}"
+        else
+            break
+        fi
+    done
+
+    echo "$result"
+}
 
 parse_env_to_sorted_file() {
     local input="$1"
