@@ -19,7 +19,8 @@
     "env:push:force": "bash scripts/matrx/env-sync.sh push --force",
     "tools:update": "curl -sL https://raw.githubusercontent.com/armanisadeghi/matrx-ship/main/cli/install.sh | bash",
     "tools:migrate": "curl -sL https://raw.githubusercontent.com/armanisadeghi/matrx-ship/main/cli/migrate.sh | bash",
-    "ship:force-remove": "tsx scripts/matrx/ship.ts force-remove"
+    "ship:force-remove": "tsx scripts/matrx/ship.ts force-remove",
+    "env:sync": "bash scripts/matrx/env-sync.sh sync"
   },
   "devDependencies": {
     "tsx": "^4.21.0"
