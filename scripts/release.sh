@@ -13,6 +13,23 @@
 #   ./scripts/release.sh --dry-run    # preview without changes
 set -euo pipefail
 
+# ── Failure trap ─────────────────────────────────────────────────────────────
+_on_error() {
+    local exit_code=$?
+    local line_no=${1:-}
+    echo "" >&2
+    echo -e "\033[0;31m╔══════════════════════════════════════════════════════════════╗\033[0m" >&2
+    echo -e "\033[0;31m║                    RELEASE SCRIPT FAILED                    ║\033[0m" >&2
+    echo -e "\033[0;31m╠══════════════════════════════════════════════════════════════╣\033[0m" >&2
+    echo -e "\033[0;31m║  Exit code : ${exit_code}$(printf '%*s' $((61 - ${#exit_code})) '')║\033[0m" >&2
+    [[ -n "$line_no" ]] && \
+    echo -e "\033[0;31m║  Line      : ${line_no}$(printf '%*s' $((61 - ${#line_no})) '')║\033[0m" >&2
+    echo -e "\033[0;31m║  No version was committed, tagged, or pushed.               ║\033[0m" >&2
+    echo -e "\033[0;31m╚══════════════════════════════════════════════════════════════╝\033[0m" >&2
+    echo "" >&2
+}
+trap '_on_error $LINENO' ERR
+
 # ── Resolve repo root ────────────────────────────────────────────────────────
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
