@@ -63,6 +63,11 @@ echo "[4/5] Starting SSH server..."
 /usr/sbin/sshd
 echo "[4/5] SSH server running on port 22."
 
+# ─── Step 4.5: Start Agent API Daemon ────────────────────────────────────────
+echo "[4.5/5] Starting Sandbox API Daemon..."
+sudo -u agent bash -c "cd /home/agent && python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
+echo "[4.5/5] Sandbox API Daemon running on port 8000."
+
 # ─── Step 5: Signal readiness ────────────────────────────────────────────────
 echo "[5/5] Sandbox is READY."
 touch /tmp/.sandbox_ready

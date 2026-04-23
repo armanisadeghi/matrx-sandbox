@@ -203,6 +203,17 @@ async def list_sandboxes(user_id: str | None = None) -> list[SandboxResponse]:
     return await store.list(user_id=user_id)
 
 
+def get_sandbox_internal_ip(sandbox_id: str) -> str | None:
+    """Get the internal Docker IP address of a running sandbox."""
+    client = _get_docker_client()
+    try:
+        container = client.containers.get(sandbox_id)
+        return container.attrs.get("NetworkSettings", {}).get("Networks", {}).get(settings.docker_network, {}).get("IPAddress")
+    except (NotFound, APIError):
+        return None
+
+
+
 async def exec_in_sandbox(
     sandbox_id: str,
     command: str,

@@ -1,0 +1,272 @@
+import base64
+import os
+import shutil
+import stat
+from pathlib import Path
+from typing import Any, List, Literal, Optional
+
+from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Form
+from fastapi.responses import FileResponse
+from pydantic import BaseModel
+
+app = FastAPI(title="Matrx Sandbox Agent API")
+
+# --- Models ---
+
+class WriteRequest(BaseModel):
+    path: str
+    content: str
+    encoding: Literal["utf8", "base64"] = "utf8"
+    mode: Optional[int] = None
+    create_parents: bool = False
+
+class EditChunk(BaseModel):
+    start: int
+    end: int
+    replacement: str
+
+class PatchRequest(BaseModel):
+    path: str
+    edits: List[EditChunk]
+
+class MkdirRequest(BaseModel):
+    path: str
+    parents: bool = False
+
+class RenameRequest(BaseModel):
+    from_path: str
+    to_path: str
+    overwrite: bool = False
+
+class CopyRequest(BaseModel):
+    from_path: str
+    to_path: str
+    recursive: bool = False
+
+# --- Helpers ---
+
+def get_stat_dict(file_path: Path) -> dict:
+    st = file_path.stat()
+    return {
+        "name": file_path.name,
+        "path": str(file_path),
+        "kind": "file" if file_path.is_file() else "dir" if file_path.is_dir() else "symlink",
+        "size": st.st_size,
+        "mtime": st.st_mtime,
+        "mode": stat.S_IMODE(st.st_mode),
+        "target": str(file_path.resolve()) if file_path.is_symlink() else None
+    }
+
+# --- FS Routes ---
+
+@app.get("/fs/list")
+async def fs_list(path: str, recursive: bool = False, depth: int = 1):
+    p = Path(path)
+    if not p.exists() or not p.is_dir():
+        raise HTTPException(status_code=404, detail="Directory not found")
+    
+    entries = []
+    # simplistic listing for depth=1
+    for child in p.iterdir():
+        try:
+            entries.append(get_stat_dict(child))
+        except FileNotFoundError:
+            continue
+            
+    return {"entries": entries}
+
+@app.get("/fs/stat")
+async def fs_stat(path: str):
+    p = Path(path)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+    return get_stat_dict(p)
+
+@app.get("/fs/read")
+async def fs_read(path: str, encoding: Literal["utf8", "base64"] = "utf8"):
+    p = Path(path)
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+        
+    content = p.read_bytes()
+    if encoding == "base64":
+        return Response(content=base64.b64encode(content).decode("utf-8"), media_type="text/plain")
+    else:
+        try:
+            return Response(content=content.decode("utf-8"), media_type="text/plain")
+        except UnicodeDecodeError:
+            raise HTTPException(status_code=400, detail="File is binary, use encoding=base64")
+
+@app.put("/fs/write")
+async def fs_write(req: WriteRequest):
+    p = Path(req.path)
+    if req.create_parents:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        
+    data = base64.b64decode(req.content) if req.encoding == "base64" else req.content.encode("utf-8")
+    
+    # write to temp and rename for atomic write
+    temp_path = p.with_suffix(".tmp")
+    temp_path.write_bytes(data)
+    if req.mode is not None:
+        temp_path.chmod(req.mode)
+    temp_path.rename(p)
+    return get_stat_dict(p)
+
+@app.post("/fs/patch")
+async def fs_patch(req: PatchRequest):
+    p = Path(req.path)
+    if not p.is_file():
+        raise HTTPException(status_code=404, detail="File not found")
+        
+    content = p.read_text(encoding="utf-8")
+    
+    # apply edits in reverse order so indices don't shift
+    edits = sorted(req.edits, key=lambda x: x.start, reverse=True)
+    for edit in edits:
+        content = content[:edit.start] + edit.replacement + content[edit.end:]
+        
+    # write to temp and rename
+    temp_path = p.with_suffix(".tmp")
+    temp_path.write_text(content, encoding="utf-8")
+    temp_path.rename(p)
+    return get_stat_dict(p)
+
+@app.delete("/fs/delete")
+async def fs_delete(path: str, recursive: bool = False):
+    p = Path(path)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+        
+    if p.is_file() or p.is_symlink():
+        p.unlink()
+    elif p.is_dir():
+        if recursive:
+            shutil.rmtree(p)
+        else:
+            try:
+                p.rmdir()
+            except OSError:
+                raise HTTPException(status_code=400, detail="Directory not empty")
+    return {"deleted": True}
+
+@app.post("/fs/mkdir")
+async def fs_mkdir(req: MkdirRequest):
+    p = Path(req.path)
+    p.mkdir(parents=req.parents, exist_ok=True)
+    return get_stat_dict(p)
+
+@app.post("/fs/rename")
+async def fs_rename(req: RenameRequest):
+    from_p = Path(req.from_path)
+    to_p = Path(req.to_path)
+    
+    if not from_p.exists():
+        raise HTTPException(status_code=404, detail="Source not found")
+    if to_p.exists() and not req.overwrite:
+        raise HTTPException(status_code=400, detail="Destination exists")
+        
+    from_p.rename(to_p)
+    return get_stat_dict(to_p)
+
+@app.post("/fs/copy")
+async def fs_copy(req: CopyRequest):
+    from_p = Path(req.from_path)
+    to_p = Path(req.to_path)
+    
+    if not from_p.exists():
+        raise HTTPException(status_code=404, detail="Source not found")
+        
+    if from_p.is_file():
+        shutil.copy2(from_p, to_p)
+    elif from_p.is_dir():
+        if not req.recursive:
+            raise HTTPException(status_code=400, detail="Use recursive=true for directories")
+        shutil.copytree(from_p, to_p, dirs_exist_ok=True)
+    return get_stat_dict(to_p)
+
+@app.post("/fs/upload")
+async def fs_upload(path: str = Form(...), file: UploadFile = File(...)):
+    p = Path(path)
+    p.parent.mkdir(parents=True, exist_ok=True)
+    
+    with p.open("wb") as buffer:
+        shutil.copyfileobj(file.file, buffer)
+        
+    return get_stat_dict(p)
+
+@app.get("/fs/download")
+async def fs_download(path: str, format: Literal["raw", "zip"] = "raw"):
+    p = Path(path)
+    if not p.exists():
+        raise HTTPException(status_code=404, detail="Path not found")
+        
+    if format == "raw":
+        if not p.is_file():
+            raise HTTPException(status_code=400, detail="Cannot download a directory as raw format, use format=zip")
+        return FileResponse(p)
+    elif format == "zip":
+        import tempfile
+        import zipfile
+        
+        # Create a temp file
+        fd, temp_path = tempfile.mkstemp(suffix=".zip")
+        os.close(fd)
+        
+        with zipfile.ZipFile(temp_path, "w", zipfile.ZIP_DEFLATED) as zipf:
+            if p.is_file():
+                zipf.write(p, arcname=p.name)
+            else:
+                for root, dirs, files in os.walk(p):
+                    for file in files:
+                        file_path = Path(root) / file
+                        arcname = file_path.relative_to(p.parent)
+                        zipf.write(file_path, arcname=arcname)
+                        
+        return FileResponse(temp_path, media_type="application/zip", filename=f"{p.name}.zip")
+
+class BatchRequest(BaseModel):
+    # Extremely simplified batch operation list
+    operations: List[dict]
+
+@app.post("/fs/batch")
+async def fs_batch(req: BatchRequest):
+    results = []
+    for op in req.operations:
+        action = op.get("action")
+        try:
+            if action == "delete":
+                p = Path(op["path"])
+                if p.is_file(): p.unlink()
+                elif p.is_dir(): shutil.rmtree(p)
+                results.append({"status": "success", "action": action, "path": op["path"]})
+            elif action == "mkdir":
+                Path(op["path"]).mkdir(parents=True, exist_ok=True)
+                results.append({"status": "success", "action": action, "path": op["path"]})
+            else:
+                results.append({"status": "error", "error": "Unknown action"})
+        except Exception as e:
+            results.append({"status": "error", "error": str(e)})
+            
+    return {"results": results}
+
+# Import routers
+from matrx_agent.api.exec import router as exec_router
+from matrx_agent.api.pty import router as pty_router
+from matrx_agent.api.git import router as git_router
+from matrx_agent.api.credentials import router as credentials_router
+from matrx_agent.api.watch import router as watch_router
+from matrx_agent.api.search import router as search_router
+from matrx_agent.api.processes import router as processes_router
+
+app.include_router(exec_router)
+app.include_router(pty_router)
+app.include_router(git_router)
+app.include_router(credentials_router)
+app.include_router(watch_router)
+app.include_router(search_router)
+app.include_router(processes_router)
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8000)

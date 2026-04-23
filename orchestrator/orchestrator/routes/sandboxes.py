@@ -4,7 +4,8 @@ from __future__ import annotations
 
 import logging
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
+import httpx
 
 from orchestrator import sandbox_manager, storage
 from orchestrator.models import (
@@ -141,9 +142,6 @@ async def sandbox_complete(sandbox_id: str, req: CompletionRequest | None = None
 
     logger.info("Sandbox %s signaled completion", sandbox_id)
     await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="graceful_shutdown")
-    return CompletionResponse(status="shutting_down", sandbox_id=sandbox_id)
-
-
 @router.post("/{sandbox_id}/error", response_model=ErrorResponse)
 async def sandbox_error(sandbox_id: str, req: ErrorReport):
     """Agent signals an error. Logs the error and triggers graceful shutdown."""
@@ -158,3 +156,400 @@ async def sandbox_error(sandbox_id: str, req: ErrorReport):
 
     await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="error")
     return ErrorResponse(status="shutting_down", sandbox_id=sandbox_id, error_received=True)
+
+
+@router.post("/{sandbox_id}/extend")
+async def extend_sandbox(sandbox_id: str, ttl_seconds: int = 3600):
+    """Extend the TTL of a sandbox."""
+    # Dummy implementation for now, should update the DB
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    # In a real implementation we would update expires_at in the DB
+    return {"status": "extended", "sandbox_id": sandbox_id, "ttl_seconds": ttl_seconds}
+
+
+@router.websocket("/{sandbox_id}/fs/watch")
+async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
+    """Proxy WebSocket for file watching to the internal sandbox daemon."""
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        await websocket.close(code=1008, reason=f"Sandbox {sandbox_id} not found")
+        return
+        
+    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    if not container_ip:
+        await websocket.close(code=1011, reason="Could not determine sandbox IP")
+        return
+
+    import websockets
+    from websockets.exceptions import ConnectionClosed
+    import asyncio
+    
+    await websocket.accept()
+    
+    query_string = str(websocket.query_params)
+    ws_url = f"ws://{container_ip}:8000/fs/watch"
+    if query_string:
+        ws_url += f"?{query_string}"
+        
+    try:
+        async with websockets.connect(ws_url) as client_ws:
+            async def forward_to_client():
+                try:
+                    while True:
+                        msg = await client_ws.recv()
+                        if isinstance(msg, bytes):
+                            await websocket.send_bytes(msg)
+                        else:
+                            await websocket.send_text(msg)
+                except ConnectionClosed:
+                    pass
+                except Exception:
+                    pass
+
+            async def forward_to_sandbox():
+                try:
+                    while True:
+                        msg = await websocket.receive()
+                        if "text" in msg:
+                            await client_ws.send(msg["text"])
+                        elif "bytes" in msg:
+                            await client_ws.send(msg["bytes"])
+                except Exception:
+                    pass
+
+            task1 = asyncio.create_task(forward_to_client())
+            task2 = asyncio.create_task(forward_to_sandbox())
+
+            done, pending = await asyncio.wait(
+                [task1, task2],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+    except Exception as e:
+        logger.error(f"WebSocket proxy error: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
+
+
+@router.api_route("/{sandbox_id}/fs/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
+async def proxy_fs(sandbox_id: str, path: str, request: Request):
+    """Proxy file system requests to the internal sandbox daemon."""
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+        
+    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    if not container_ip:
+        raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
+
+    # Forward the request
+    url = f"http://{container_ip}:8000/fs/{path}"
+    
+    # We use httpx.AsyncClient to forward the request
+    async with httpx.AsyncClient() as client:
+        # Read the body if it exists
+        body = await request.body()
+        
+        # Forward the query parameters
+        params = request.query_params
+        
+        try:
+            resp = await client.request(
+                method=request.method,
+                url=url,
+                params=params,
+                content=body,
+                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                timeout=60.0
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Error proxying request: {exc}")
+
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers)
+        )
+
+
+@router.api_route("/{sandbox_id}/exec/stream", methods=["POST"])
+async def proxy_exec_stream(sandbox_id: str, request: Request):
+    """Proxy streaming exec requests to the internal sandbox daemon."""
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+        
+    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    if not container_ip:
+        raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
+
+    url = f"http://{container_ip}:8000/exec/stream"
+    
+    from fastapi.responses import StreamingResponse
+    
+    async def stream_generator():
+        async with httpx.AsyncClient() as client:
+            body = await request.body()
+            async with client.stream(
+                method=request.method,
+                url=url,
+                content=body,
+                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                timeout=None
+            ) as resp:
+                async for chunk in resp.aiter_bytes():
+                    yield chunk
+
+    return StreamingResponse(stream_generator(), media_type="text/event-stream")
+
+
+@router.api_route("/{sandbox_id}/git/{path:path}", methods=["GET", "POST"])
+async def proxy_git(sandbox_id: str, path: str, request: Request):
+    """Proxy git requests to the internal sandbox daemon."""
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+        
+    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    if not container_ip:
+        raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
+
+    url = f"http://{container_ip}:8000/git/{path}"
+    
+    async with httpx.AsyncClient() as client:
+        body = await request.body()
+        params = request.query_params
+        
+        try:
+            resp = await client.request(
+                method=request.method,
+                url=url,
+                params=params,
+                content=body,
+                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                timeout=120.0 # Git clones can take a while
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Error proxying request: {exc}")
+
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers)
+        )
+
+
+@router.api_route("/{sandbox_id}/credentials", methods=["POST"])
+@router.api_route("/{sandbox_id}/credentials/revoke", methods=["POST"])
+async def proxy_credentials(sandbox_id: str, request: Request):
+    """Proxy credentials requests to the internal sandbox daemon."""
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+        
+    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    if not container_ip:
+        raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
+
+    # The path will be either /credentials or /credentials/revoke
+    # Reconstruct the path part
+    path = request.url.path.split(sandbox_id)[1]
+    url = f"http://{container_ip}:8000{path}"
+    
+    async with httpx.AsyncClient() as client:
+        body = await request.body()
+        params = request.query_params
+        
+        try:
+            resp = await client.request(
+                method=request.method,
+                url=url,
+                params=params,
+                content=body,
+                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                timeout=60.0
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Error proxying request: {exc}")
+
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers)
+        )
+
+
+@router.websocket("/{sandbox_id}/pty")
+async def proxy_pty(sandbox_id: str, websocket: WebSocket):
+    """Proxy PTY WebSocket to the internal sandbox daemon."""
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        await websocket.close(code=1008, reason=f"Sandbox {sandbox_id} not found")
+        return
+        
+    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    if not container_ip:
+        await websocket.close(code=1011, reason="Could not determine sandbox IP")
+        return
+
+    # Forward the WebSocket connection using websockets library
+    import websockets
+    from websockets.exceptions import ConnectionClosed
+    import asyncio
+    
+    await websocket.accept()
+    
+    query_string = str(websocket.query_params)
+    ws_url = f"ws://{container_ip}:8000/pty"
+    if query_string:
+        ws_url += f"?{query_string}"
+        
+    try:
+        async with websockets.connect(ws_url) as client_ws:
+            async def forward_to_client():
+                try:
+                    while True:
+                        msg = await client_ws.recv()
+                        if isinstance(msg, bytes):
+                            await websocket.send_bytes(msg)
+                        else:
+                            await websocket.send_text(msg)
+                except ConnectionClosed:
+                    pass
+                except Exception:
+                    pass
+
+            async def forward_to_sandbox():
+                try:
+                    while True:
+                        msg = await websocket.receive()
+                        if "text" in msg:
+                            await client_ws.send(msg["text"])
+                        elif "bytes" in msg:
+                            await client_ws.send(msg["bytes"])
+                except Exception:
+                    pass
+
+            task1 = asyncio.create_task(forward_to_client())
+            task2 = asyncio.create_task(forward_to_sandbox())
+
+            done, pending = await asyncio.wait(
+                [task1, task2],
+                return_when=asyncio.FIRST_COMPLETED
+            )
+            for task in pending:
+                task.cancel()
+    except Exception as e:
+        logger.error(f"WebSocket proxy error: {e}")
+    finally:
+        try:
+            await websocket.close()
+        except:
+            pass
+
+@router.api_route("/{sandbox_id}/search/{path:path}", methods=["GET", "POST"])
+async def proxy_search(sandbox_id: str, path: str, request: Request):
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+        
+    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    if not container_ip:
+        raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
+
+    url = f"http://{container_ip}:8000/search/{path}"
+    
+    async with httpx.AsyncClient() as client:
+        body = await request.body()
+        params = request.query_params
+        
+        try:
+            resp = await client.request(
+                method=request.method,
+                url=url,
+                params=params,
+                content=body,
+                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                timeout=60.0
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Error proxying request: {exc}")
+
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers)
+        )
+
+@router.api_route("/{sandbox_id}/processes", methods=["GET"])
+@router.api_route("/{sandbox_id}/processes/{pid:int}/signal", methods=["POST"])
+async def proxy_processes(sandbox_id: str, request: Request, pid: int = None):
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+        
+    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    if not container_ip:
+        raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
+
+    # Reconstruct the path
+    path = request.url.path.split(sandbox_id)[1]
+    url = f"http://{container_ip}:8000{path}"
+    
+    async with httpx.AsyncClient() as client:
+        body = await request.body()
+        params = request.query_params
+        
+        try:
+            resp = await client.request(
+                method=request.method,
+                url=url,
+                params=params,
+                content=body,
+                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                timeout=10.0
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Error proxying request: {exc}")
+
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers)
+        )
+
+@router.api_route("/{sandbox_id}/ports", methods=["GET"])
+async def proxy_ports(sandbox_id: str, request: Request):
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+        
+    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    if not container_ip:
+        raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
+
+    url = f"http://{container_ip}:8000/ports"
+    
+    async with httpx.AsyncClient() as client:
+        try:
+            resp = await client.request(
+                method=request.method,
+                url=url,
+                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                timeout=10.0
+            )
+        except httpx.RequestError as exc:
+            raise HTTPException(status_code=502, detail=f"Error proxying request: {exc}")
+
+        return Response(
+            content=resp.content,
+            status_code=resp.status_code,
+            headers=dict(resp.headers)
+        )
+
