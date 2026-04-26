@@ -31,6 +31,11 @@ else
     echo "[0/4] WARNING: persistence shutdown call failed or timed out (continuing anyway)"
 fi
 
+# ─── Step 0.5: Push AI Dream cloud_files changes back ────────────────────────
+# Best-effort — runs only if AI Dream env vars are present.
+echo "[0.5/4] Pushing cloud_files changes (if configured)..."
+sudo -E -u agent /opt/sandbox/scripts/cloud-files-sync.sh up || true
+
 # ─── Step 1: Sync hot storage back to S3 ─────────────────────────────────────
 echo "[1/4] Syncing hot storage to S3..."
 if timeout "$TIMEOUT" /opt/sandbox/scripts/hot-sync.sh up; then

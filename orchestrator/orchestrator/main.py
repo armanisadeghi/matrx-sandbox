@@ -78,6 +78,20 @@ async def root():
         "tier": settings.host_tier or None,
         "docs": "/docs",
         "api_surface": "/api-surface",
+        "integrations": {
+            # Surface so an admin can see at a glance whether the AI Dream
+            # bridge + AWS S3 sync are wired up. Booleans only — never echo
+            # the actual secrets.
+            "aidream": {
+                "configured": bool(settings.aidream_url) and bool(settings.aidream_service_token),
+                "url": settings.aidream_url or None,
+            },
+            "s3": {
+                "bucket": settings.s3_bucket or None,
+                "configured": bool(settings.s3_bucket),
+                "creds_passthrough": bool(settings.aws_access_key_id) and bool(settings.aws_secret_access_key),
+            },
+        },
     }
 
 

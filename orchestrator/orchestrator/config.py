@@ -52,6 +52,28 @@ class Settings(BaseSettings):
     # tier in /api-surface and SandboxResponse rows.
     host_tier: str = ""             # env var: MATRX_HOST_TIER ("ec2" or "hosted")
 
+    # ── AI Dream integration ────────────────────────────────────────────────
+    # Sandboxes need a way to call the AI Dream backend (cld_files,
+    # conversation context, agent endpoints) on behalf of the user. Two parts:
+    #   - aidream_url: where AI Dream lives (e.g. https://api.aidream.ai)
+    #   - aidream_service_token: a service-level token the orchestrator hands
+    #     each spawned sandbox; the sandbox uses it to authenticate as the
+    #     specific user via a `X-Matrx-User-Id` header. AI Dream verifies the
+    #     service token, then trusts the user_id header (this orchestrator is
+    #     the only thing that knows the service token).
+    # When unset, sandboxes start with no AI Dream integration and cloud-files
+    # sync is skipped.
+    aidream_url: str = ""           # env var: MATRX_AIDREAM_URL
+    aidream_service_token: str = "" # env var: MATRX_AIDREAM_SERVICE_TOKEN
+
+    # ── AWS credentials passthrough (hosted tier S3 sync) ───────────────────
+    # On EC2-tier orchestrator: instance role provides creds, no need to set.
+    # On hosted-tier orchestrator: explicit creds required to sync sandboxes
+    # to S3. Both keys are passed as env vars to spawned containers; if either
+    # is empty, hot-sync.sh + cold-mount.sh degrade to local-only mode.
+    aws_access_key_id: str = ""     # env var: MATRX_AWS_ACCESS_KEY_ID
+    aws_secret_access_key: str = "" # env var: MATRX_AWS_SECRET_ACCESS_KEY
+
     model_config = {"env_prefix": "MATRX_"}
 
     @field_validator("s3_bucket")

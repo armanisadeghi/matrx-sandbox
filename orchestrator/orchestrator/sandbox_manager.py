@@ -162,6 +162,25 @@ async def create_sandbox(
         if template_version:
             env["SANDBOX_TEMPLATE_VERSION"] = template_version
 
+        # ── AI Dream integration env ──────────────────────────────────────────
+        # When the orchestrator has a service token, hand it to the sandbox
+        # along with the user_id. The in-container ``mtx`` CLI uses this to
+        # call AI Dream's cld_files endpoints on behalf of the user.
+        if settings.aidream_url:
+            env["MATRX_AIDREAM_URL"] = settings.aidream_url
+        if settings.aidream_service_token:
+            env["MATRX_AIDREAM_SERVICE_TOKEN"] = settings.aidream_service_token
+
+        # ── AWS creds for hosted-tier S3 sync ────────────────────────────────
+        # On EC2 tier the orchestrator has an instance role and skips this
+        # block — sandboxes inherit creds via the role. On hosted tier we
+        # have to pass explicit creds (orchestrator reads them from its own
+        # env via ``settings.aws_access_key_id`` / ``aws_secret_access_key``).
+        if location.tier == "hosted" and settings.aws_access_key_id and settings.aws_secret_access_key:
+            env["AWS_ACCESS_KEY_ID"] = settings.aws_access_key_id
+            env["AWS_SECRET_ACCESS_KEY"] = settings.aws_secret_access_key
+            env["AWS_DEFAULT_REGION"] = config.get("s3_region", settings.s3_region)
+
         # Resource overrides — fall back to settings defaults
         cpu_limit = resources.get("cpu") or settings.container_cpu_limit
         memory_limit = resources.get("memory_mb")

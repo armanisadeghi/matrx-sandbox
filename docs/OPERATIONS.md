@@ -202,6 +202,33 @@ For the deploy pipeline to work, the repo needs:
 
 ---
 
+## AI Dream ↔ Sandbox integration
+
+Sandboxes can act on behalf of users against AI Dream's cloud_files (`cld_files`) backend, surfacing each user's uploaded files at `/home/agent/cloud-files/` for native shell-tool access by agents.
+
+**Wiring it up** — set in `/srv/apps/sandbox-orchestrator/.env`:
+```
+MATRX_AIDREAM_URL=https://api.aidream.example.com
+MATRX_AIDREAM_SERVICE_TOKEN=<shared with AI Dream's AIDREAM_SANDBOX_SERVICE_TOKEN>
+```
+Then `cd /srv/apps/sandbox-orchestrator && docker compose restart`. New sandboxes will auto-sync at startup.
+
+**Verifying it from the orchestrator:**
+```bash
+curl https://orchestrator.dev.codematrx.com/ | jq .integrations.aidream
+# expect: { "configured": true, "url": "https://api.aidream.example.com" }
+```
+
+**Verifying it from inside any sandbox:**
+```bash
+mtx whoami            # aidream.configured: true
+mtx files ls          # lists user's cld_files
+```
+
+Spec for what AI Dream needs to expose: **[AIDREAM_INTEGRATION.md](AIDREAM_INTEGRATION.md)**.
+
+---
+
 ## Persistence — what's saved, where, and how to inspect
 
 User data persists across sandbox lifecycle. Two storage backends, depending on tier:

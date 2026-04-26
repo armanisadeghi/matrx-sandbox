@@ -17,6 +17,11 @@ rm -f /tmp/.sandbox_ready
 # ─── Step 0: Persistence module — auto-stash + final manifest ────────────────
 # Same hook as production EC2 shutdown.sh. Hits the in-container daemon
 # at 127.0.0.1:8000 to flush a final session.json + auto-stash dirty repos.
+# ─── Step 0.5: Push cloud_files changes back to AI Dream ─────────────────────
+# Runs even on local-only sandboxes when AI Dream is configured. No-op otherwise.
+echo "[0.0/3] Pushing cloud_files changes (if configured)..."
+sudo -E -u agent /opt/sandbox/scripts/cloud-files-sync.sh up 2>&1 | sed 's/^/  /' || true
+
 echo "[0/3] Running persistence module..."
 if timeout 30 curl -sS -X POST -m 28 \
         -H 'Content-Type: application/json' \

@@ -626,9 +626,10 @@ Predecessor to `cld_files`. Has a Postgres table but zero code references in fea
 - **Phase 1** ✅ shipped + verified
 - **Phase 2** ✅ shipped + verified
 - **Phase 3** ✅ shipped + verified
-- **Phase 4** (frontend UX) — pending; backend ready (`/users/{uid}/persistence`, `/internal/session-report`)
+- **Phase 4** (frontend UX) — ✅ shipped by the matrx-frontend team (auto-stash UI in source-control, `useUserPersistence`, session-report opener, `/api/sandbox/persistence` proxy)
 - **Phase 5** (quotas + monitoring) — pending; backend ready (`get_user_volume_size`)
-- **Phase 6** (cloud_sync integration + cross-tier S3 portability) — depends on AWS creds on the dev server
+- **Phase 6a** (AI Dream cloud_files bridge) — sandbox-side **shipped** (`mtx` CLI, `cloud-files-sync.sh`, env-var passthrough); waiting on AI Dream side. **Spec: [AIDREAM_INTEGRATION.md](AIDREAM_INTEGRATION.md).**
+- **Phase 6b** (cross-tier S3 portability for hosted tier) — depends on AWS creds in `/srv/apps/sandbox-orchestrator/.env`
 
 ---
 

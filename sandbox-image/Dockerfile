@@ -170,6 +170,13 @@ RUN mkdir -p /home/agent/.ssh \
 COPY sdk/ /opt/sandbox/sdk/
 RUN cd /opt/sandbox/sdk && python3 -m pip install --no-cache-dir -e .
 
+# ─── ``mtx`` CLI shim — users/agents type ``mtx <subcommand>`` in any shell ──
+# Wraps ``python3 -m matrx_agent.cli`` so the SDK's CLI feels like a first-class
+# tool. Subcommands: files (ls/cat/put/rm/sync), whoami. See
+# /opt/sandbox/sdk/matrx_agent/cli/__init__.py for the auth + AI Dream details.
+RUN printf '#!/bin/sh\nexec /usr/bin/python3.11 -m matrx_agent.cli "$@"\n' > /usr/local/bin/mtx \
+    && chmod +x /usr/local/bin/mtx
+
 # ─── Environment variables (defaults, overridden at runtime) ──────────────────
 ENV SANDBOX_ID=""
 ENV USER_ID=""

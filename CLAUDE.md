@@ -16,6 +16,7 @@ Already deeply documented. Read the right doc for the question:
 | Local-only sandbox dev (this server) | [sandbox-local/ROADMAP.md](sandbox-local/ROADMAP.md), [sandbox-local/TESTING.md](sandbox-local/TESTING.md) |
 | **Day-to-day operations** (deploy, recovery, monitoring, key rotation) | **[docs/OPERATIONS.md](docs/OPERATIONS.md)** |
 | **User data persistence** (what's saved, where, session-report, auto-stash) | **[docs/PERSISTENCE_PLAN.md](docs/PERSISTENCE_PLAN.md)** |
+| **AI Dream ↔ Sandbox integration** (cloud-files bridge, `mtx` CLI, service-token auth) | **[docs/AIDREAM_INTEGRATION.md](docs/AIDREAM_INTEGRATION.md)** |
 | **Live infra dashboard** (recommended first stop) | **`/administration/sandbox-infra`** in matrx-frontend |
 
 This file is **orientation** — what each piece is, where it runs, and what's specific to running it on this dev server.

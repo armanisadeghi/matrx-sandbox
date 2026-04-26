@@ -103,6 +103,14 @@ echo "[4c] Starting Sandbox API Daemon..."
 sudo -E -u agent bash -c "cd /home/agent && python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
 echo "[4c] Sandbox API Daemon running on port 8000."
 
+# ─── Step 4d: Pull AI Dream cloud_files into ~/cloud-files/ ──────────────────
+# Same hook as production. Bridges user's AI Dream files into the sandbox
+# FS so agents can use shell tools natively. No-op when AI Dream isn't
+# configured — see /opt/sandbox/scripts/cloud-files-sync.sh.
+echo "[4d] Syncing AI Dream cloud_files (if configured)..."
+sudo -E -u agent /opt/sandbox/scripts/cloud-files-sync.sh down || true
+echo "[4d] cloud_files sync complete."
+
 # ─── Step 5: Signal readiness ────────────────────────────────────────────────
 echo "[5/5] Sandbox is READY."
 touch /tmp/.sandbox_ready
