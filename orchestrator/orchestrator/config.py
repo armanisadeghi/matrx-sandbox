@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import re
 
-from pydantic import field_validator
+from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings
 
 
@@ -71,8 +71,18 @@ class Settings(BaseSettings):
     # On hosted-tier orchestrator: explicit creds required to sync sandboxes
     # to S3. Both keys are passed as env vars to spawned containers; if either
     # is empty, hot-sync.sh + cold-mount.sh degrade to local-only mode.
-    aws_access_key_id: str = ""     # env var: MATRX_AWS_ACCESS_KEY_ID
-    aws_secret_access_key: str = "" # env var: MATRX_AWS_SECRET_ACCESS_KEY
+    #
+    # Accept both MATRX_AWS_* (project-prefixed, intentional) and bare AWS_*
+    # (the standard AWS SDK names) so a single .env can serve both this
+    # orchestrator and any other AWS-CLI-style consumer on the same host.
+    aws_access_key_id: str = Field(
+        default="",
+        validation_alias=AliasChoices("matrx_aws_access_key_id", "aws_access_key_id"),
+    )
+    aws_secret_access_key: str = Field(
+        default="",
+        validation_alias=AliasChoices("matrx_aws_secret_access_key", "aws_secret_access_key"),
+    )
 
     model_config = {"env_prefix": "MATRX_"}
 
