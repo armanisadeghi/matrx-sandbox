@@ -202,12 +202,72 @@ For the deploy pipeline to work, the repo needs:
 
 ---
 
+## Recovering EC2 from a stale or stuck state
+
+Two things can go wrong on EC2 at the same time, both of which happened on 2026‑04‑26:
+
+### 1. Disk full (deploy step `Deploy to EC2 via SSM` fails)
+
+Symptom: GHA log shows `failed to register layer: ... no space left on device` partway through `docker pull`.
+
+Recovery via Session Manager (no SSH needed):
+1. EC2 console → find the instance by IP → **Connect** → **Session Manager** tab.
+2. `df -h /` (confirm > 90% Use%).
+3. `sudo docker system prune -af --volumes`.
+4. `df -h /` (confirm space freed).
+5. Re-trigger: `gh workflow run deploy.yml --repo armanisadeghi/matrx-sandbox` (run from anywhere with `gh` auth).
+
+The deploy pipeline (post‑v0.2.0) auto-prunes before each pull, so this should be self-healing going forward. If it still happens, the prune isn't working (maybe `docker` permissions issue) — investigate the SSM command output.
+
+### 2. Orchestrator code on EC2 is stale even though deploy "succeeded"
+
+Symptom: `curl http://54.144.86.132:8000/` shows an old version. `/api-surface` returns 401 (old middleware blocked it) or 404.
+
+Root cause (legacy): pre-v0.2.0 deploy.yml only built/pushed Docker images and called `systemctl restart`. But the systemd unit runs Python from `/home/ec2-user/orchestrator/` — not from any Docker container. So `restart` reloaded the same old on-disk code over and over.
+
+Manual recovery:
+```bash
+# In Session Manager:
+sudo bash -c '
+  set -e
+  cp -a /home/ec2-user/orchestrator /home/ec2-user/orchestrator.backup-$(date +%Y%m%d)
+  rm -rf /tmp/matrx-sandbox-recover
+  git clone --depth 1 https://github.com/armanisadeghi/matrx-sandbox.git /tmp/matrx-sandbox-recover
+  find /home/ec2-user/orchestrator -mindepth 1 -maxdepth 1 ! -name ".*" -exec rm -rf {} +
+  cp -a /tmp/matrx-sandbox-recover/orchestrator/. /home/ec2-user/orchestrator/
+  chown -R ec2-user:ec2-user /home/ec2-user/orchestrator
+  rm -rf /tmp/matrx-sandbox-recover
+  su - ec2-user -c "cd /home/ec2-user/orchestrator && /usr/bin/python3.11 -m pip install --user -e \".[dev]\""
+  systemctl restart matrx-orchestrator
+  sleep 4
+  curl -sS http://localhost:8000/
+  curl -sS http://localhost:8000/api-surface | python3 -c "import sys,json; d=json.load(sys.stdin); print(\"routes=\",len(d.get(\"routes\",[])),\"version=\",d.get(\"version\"))"
+'
+```
+
+Verify `/` shows the expected version and `/api-surface` returns ≥23 routes.
+
+The deploy pipeline (post‑v0.2.0) does this automatically on every push, so this is only needed for one-off recovery if the pipeline itself breaks.
+
+### Tier env var
+
+The orchestrator reports `tier: null` unless `MATRX_HOST_TIER=ec2` is set. Drop-in:
+```bash
+sudo mkdir -p /etc/systemd/system/matrx-orchestrator.service.d
+echo -e '[Service]\nEnvironment=MATRX_HOST_TIER=ec2' | sudo tee /etc/systemd/system/matrx-orchestrator.service.d/tier.conf
+sudo systemctl daemon-reload
+sudo systemctl restart matrx-orchestrator
+```
+
+---
+
 ## What to do when…
 
 | Symptom | Likely cause | Fix |
 |---|---|---|
 | `https://orchestrator.dev.codematrx.com/health` 502s | `matrx-orchestrator` container down | `docker logs matrx-orchestrator`; if crashed, `docker compose up -d` |
-| EC2 `/openapi.json` shows fewer routes than expected | Stale deploy | Trigger `deploy.yml`; confirm via `/api-surface` post-deploy |
+| EC2 `/openapi.json` shows fewer routes than expected | Catchall proxy routes don't appear in OpenAPI by design — use `/api-surface` instead. If `/api-surface` is also missing, the deploy is stale (see "Recovering EC2" above). |
+| EC2 `/` shows old version after deploy "succeeded" | Pre‑v0.2.0 deploy never updated on-disk code (it only restarted with the same files). Use the manual recovery in "Recovering EC2" above; it should self-heal on the next deploy. |
 | `POST /sandboxes` succeeds on EC2 but fs/git/pty proxies 502 | In-container daemon not running | EC2: SSM into the host, check `docker exec <sbx> ss -tlnp \| grep 8000`. If missing, the sandbox image is stale — rebuild and redeploy. |
 | Hosted `/exec` works but `/fs/list` 502s | Spawned sandbox is on the wrong network — orchestrator can't reach `<container_ip>:8000` | Confirm `MATRX_DOCKER_NETWORK=proxy` in the orchestrator .env, and that the sandbox image inherits this via the orchestrator's `network=` argument |
 | `/extend` returns 200 but `expires_at` doesn't change | Pre-v0.2.0 orchestrator (stub still in place) | Redeploy with the latest image |

@@ -73,20 +73,56 @@ jobs:
         env:
           EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
           ECR_REPO: ${{ secrets.ECR_REPO_URI }}
+          GITHUB_SHA: ${{ github.sha }}
         run: |
-          # Build SSM parameters as proper JSON using jq (avoids all escaping issues)
-          PARAMS=$(jq -n --arg ecr "$ECR_REPO" '{
+          # The orchestrator runs as a host Python process from /home/ec2-user/orchestrator/,
+          # NOT inside a Docker container. The Docker image is only used to spawn user
+          # sandbox containers (via MATRX_SANDBOX_IMAGE). So the deploy must:
+          #   1. Free disk so pulls don't fail with "no space left on device" (Defense 1).
+          #   2. Pull the latest sandbox + orchestrator images to ECR (sandbox image is consumed
+          #      live; orchestrator image is for reference / future docker-based deploy).
+          #   3. Replace the on-disk orchestrator code at /home/ec2-user/orchestrator/.
+          #   4. Reinstall the editable Python package so importlib.metadata sees the new
+          #      version and any new entry points / route registrations show up.
+          #   5. Restart the systemd unit and health-check.
+          PARAMS=$(jq -n --arg ecr "$ECR_REPO" --arg sha "$GITHUB_SHA" '{
             "commands": [
-              "set -e",
-              ("aws ecr get-login-password --region us-east-1 | docker login --username AWS --password-stdin " + $ecr),
-              ("docker pull " + $ecr + ":latest"),
-              ("docker pull " + $ecr + "-orchestrator:latest"),
-              ("docker tag " + $ecr + ":latest matrx-sandbox:latest"),
-              ("docker tag " + $ecr + "-orchestrator:latest matrx-orchestrator:latest"),
+              "set -euo pipefail",
+
+              "echo === [1/5] Pre-pull disk cleanup (Defense 1 against disk-full) ===",
+              "df -h /",
+              "sudo docker system prune -af --filter \"until=24h\" || true",
+              "df -h /",
+
+              "echo === [2/5] Pull latest images from ECR ===",
+              ("aws ecr get-login-password --region us-east-1 | sudo docker login --username AWS --password-stdin " + $ecr),
+              ("sudo docker pull " + $ecr + ":latest"),
+              ("sudo docker pull " + $ecr + "-orchestrator:latest"),
+              ("sudo docker tag " + $ecr + ":latest matrx-sandbox:latest"),
+              ("sudo docker tag " + $ecr + "-orchestrator:latest matrx-orchestrator:latest"),
+
+              "echo === [3/5] Update on-disk orchestrator code ===",
+              ("sudo rm -rf /tmp/matrx-sandbox-deploy-" + $sha),
+              ("sudo git clone --depth 1 --branch main https://github.com/armanisadeghi/matrx-sandbox.git /tmp/matrx-sandbox-deploy-" + $sha),
+              "sudo find /home/ec2-user/orchestrator -mindepth 1 -maxdepth 1 ! -name \".*\" -exec rm -rf {} +",
+              ("sudo cp -a /tmp/matrx-sandbox-deploy-" + $sha + "/orchestrator/. /home/ec2-user/orchestrator/"),
+              "sudo chown -R ec2-user:ec2-user /home/ec2-user/orchestrator",
+              ("sudo rm -rf /tmp/matrx-sandbox-deploy-" + $sha),
+              "sudo grep -E \"^(version|name)\" /home/ec2-user/orchestrator/pyproject.toml",
+
+              "echo === [4/5] Reinstall editable Python package ===",
+              "sudo -u ec2-user bash -c \"cd /home/ec2-user/orchestrator && /usr/bin/python3.11 -m pip install --user --quiet -e .\"",
+
+              "echo === [5/5] Restart and health-check ===",
               "sudo systemctl restart matrx-orchestrator",
               "echo Waiting for orchestrator to become healthy...",
-              "HEALTHY=false; for i in $(seq 1 30); do if curl -sf -o /dev/null http://localhost:8000/health; then echo Orchestrator is healthy!; HEALTHY=true; break; fi; echo Attempt $i of 30; sleep 2; done",
-              "if [ \"$HEALTHY\" != \"true\" ]; then echo ERROR: Orchestrator did not become healthy; sudo journalctl -u matrx-orchestrator --no-pager -n 50; exit 1; fi"
+              "HEALTHY=false; for i in $(seq 1 30); do if curl -sf -o /dev/null http://localhost:8000/health; then echo Orchestrator is healthy on attempt $i; HEALTHY=true; break; fi; sleep 2; done",
+              "if [ \"$HEALTHY\" != \"true\" ]; then echo ERROR: Orchestrator did not become healthy; sudo journalctl -u matrx-orchestrator --no-pager -n 50; exit 1; fi",
+              "echo === Deployed code version ===",
+              "curl -sS http://localhost:8000/",
+              "echo",
+              "echo === Route count ===",
+              "curl -sS http://localhost:8000/api-surface | python3 -c \"import sys,json; d=json.load(sys.stdin); print(\\\"routes=\\\",len(d.get(\\\"routes\\\",[])),\\\"tier=\\\",d.get(\\\"tier\\\"),\\\"version=\\\",d.get(\\\"version\\\"))\""
             ]
           }')
 
@@ -96,7 +132,7 @@ jobs:
             --instance-ids "$EC2_INSTANCE_ID" \
             --document-name "AWS-RunShellScript" \
             --parameters "$PARAMS" \
-            --timeout-seconds 300 \
+            --timeout-seconds 600 \
             --query "Command.CommandId" \
             --output text)
 
