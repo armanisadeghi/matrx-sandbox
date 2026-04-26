@@ -78,11 +78,27 @@ async def close_store() -> None:
         _store = None
 
 
-async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxResponse:
-    """Create and start a new sandbox container for a user."""
+async def create_sandbox(
+    user_id: str,
+    config: dict | None = None,
+    template: str | None = None,
+    template_version: str | None = None,
+    tier: str | None = None,
+    resources: dict | None = None,
+    labels: dict | None = None,
+    ttl_seconds: int | None = None,
+) -> SandboxResponse:
+    """Create and start a new sandbox container for a user.
+
+    ``template``/``template_version``/``tier``/``labels`` are recorded on the
+    sandbox row for routing + observability. ``resources`` overrides the per-
+    container CPU/memory limits when supplied (hosted tier only — EC2 tier ignores
+    overrides for now). ``ttl_seconds`` overrides the default TTL for this sandbox.
+    """
     store = _get_store()
     sandbox_id = f"sbx-{uuid.uuid4().hex[:12]}"
     config = config or {}
+    resources = resources or {}
 
     sandbox = SandboxResponse(
         sandbox_id=sandbox_id,
@@ -90,10 +106,18 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
         status=SandboxStatus.CREATING,
         created_at=datetime.now(timezone.utc),
         config=config,
+        ttl_seconds=ttl_seconds or 7200,
+        tier=tier,
+        template=template,
+        template_version=template_version,
+        labels=labels,
     )
     await store.save(sandbox)
 
-    logger.info("Creating sandbox %s for user %s", sandbox_id, user_id)
+    logger.info(
+        "Creating sandbox %s for user %s (tier=%s, template=%s)",
+        sandbox_id, user_id, tier, template,
+    )
 
     try:
         client = _get_docker_client()
@@ -107,6 +131,15 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
             "COLD_PATH": "/data/cold",
             "SHUTDOWN_TIMEOUT_SECONDS": str(settings.shutdown_timeout_seconds),
         }
+        if template:
+            env["SANDBOX_TEMPLATE"] = template
+        if template_version:
+            env["SANDBOX_TEMPLATE_VERSION"] = template_version
+
+        # Resource overrides — fall back to settings defaults
+        cpu_limit = resources.get("cpu") or settings.container_cpu_limit
+        memory_limit = resources.get("memory_mb")
+        memory_limit = f"{memory_limit}m" if memory_limit else settings.container_memory_limit
 
         container = client.containers.run(
             image=settings.sandbox_image,
@@ -115,8 +148,8 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
             environment=env,
             # Resource constraints
             cpu_period=100000,
-            cpu_quota=int(settings.container_cpu_limit * 100000),
-            mem_limit=settings.container_memory_limit,
+            cpu_quota=int(cpu_limit * 100000),
+            mem_limit=memory_limit,
             # FUSE requires SYS_ADMIN capability and /dev/fuse access
             cap_add=["SYS_ADMIN"],
             devices=["/dev/fuse"],
@@ -132,6 +165,9 @@ async def create_sandbox(user_id: str, config: dict | None = None) -> SandboxRes
                 "matrx.sandbox_id": sandbox_id,
                 "matrx.user_id": user_id,
                 "matrx.created_at": sandbox.created_at.isoformat(),
+                **({"matrx.tier": tier} if tier else {}),
+                **({"matrx.template": template} if template else {}),
+                **{f"matrx.label.{k}": v for k, v in (labels or {}).items()},
             },
             restart_policy={"Name": "no", "MaximumRetryCount": 0},
         )  # type: ignore[call-overload]
@@ -220,6 +256,8 @@ async def exec_in_sandbox(
     timeout: int = 30,
     user: str = "agent",
     cwd: str | None = None,
+    env: dict[str, str] | None = None,
+    stdin: str | None = None,
 ) -> tuple[int, str, str, str]:
     """Execute a command inside a running sandbox with CWD tracking.
 
@@ -229,6 +267,10 @@ async def exec_in_sandbox(
     After execution, the new CWD is captured via a sentinel/pwd trailer
     and cached for the next call.  Clients may also pass an explicit
     ``cwd`` to override the server-tracked value.
+
+    ``env`` is merged into the container default env for this single exec.
+    ``stdin`` is fed to the command on stdin; large stdin payloads bypass the
+    command-length cap (use this instead of inline heredocs).
     """
     store = _get_store()
     sandbox = await store.get(sandbox_id)
@@ -257,8 +299,9 @@ async def exec_in_sandbox(
             )
 
         logger.info(
-            "Executing command in sandbox %s (user=%s, timeout=%d, len=%d, cwd=%s)",
+            "Executing command in sandbox %s (user=%s, timeout=%d, len=%d, cwd=%s, env_keys=%d, stdin=%s)",
             sandbox_id, user, timeout, len(command), effective_cwd,
+            len(env or {}), "yes" if stdin else "no",
         )
 
         # Wrap the command so it:
@@ -274,11 +317,20 @@ async def exec_in_sandbox(
             f"exit $__matrx_ec"
         )
 
-        exit_code, output = container.exec_run(
+        exec_kwargs: dict = dict(
             cmd=["bash", "-c", wrapped],
             user=user,
             demux=True,
         )
+        if env:
+            exec_kwargs["environment"] = env
+        if stdin is not None:
+            # docker-py exec_run with stdin requires socket attach; we use create+start.
+            return await _exec_with_stdin(
+                container, wrapped, user, env or {}, stdin, sandbox_id, effective_cwd,
+            )
+
+        exit_code, output = container.exec_run(**exec_kwargs)
 
         stdout_raw = (output[0] or b"").decode("utf-8", errors="replace")
         stderr = (output[1] or b"").decode("utf-8", errors="replace")
@@ -294,6 +346,72 @@ async def exec_in_sandbox(
 
     except (NotFound, APIError) as e:
         raise RuntimeError(f"Failed to exec in sandbox {sandbox_id}: {e}") from e
+
+
+async def _exec_with_stdin(
+    container,
+    wrapped: str,
+    user: str,
+    env: dict[str, str],
+    stdin_data: str,
+    sandbox_id: str,
+    effective_cwd: str,
+) -> tuple[int, str, str, str]:
+    """Run an exec where stdin is fed to the command.
+
+    docker-py's ``exec_run`` doesn't accept a stdin payload directly. We use
+    the lower-level ``exec_create`` + ``exec_start`` pair with ``socket=True``
+    to write the input, then collect output.
+    """
+    api = container.client.api
+    exec_id = api.exec_create(
+        container.id,
+        cmd=["bash", "-c", wrapped],
+        user=user,
+        environment=env,
+        stdin=True,
+        tty=False,
+        stdout=True,
+        stderr=True,
+    )["Id"]
+
+    sock = api.exec_start(exec_id, socket=True, demux=True)
+    raw = sock._sock if hasattr(sock, "_sock") else sock
+    try:
+        raw.sendall(stdin_data.encode("utf-8"))
+        try:
+            raw.shutdown(1)  # SHUT_WR — signal EOF on stdin
+        except OSError:
+            pass
+
+        chunks_out = bytearray()
+        chunks_err = bytearray()
+        while True:
+            data = raw.recv(65536)
+            if not data:
+                break
+            chunks_out.extend(data)
+        # NOTE: exec_start with demux=True returns multiplexed frames; we
+        # accept the simpler interleaved approach for stdin-fed execs and
+        # surface the combined stream as stdout. The frontend's primary use
+        # case for stdin is non-interactive piping (heredoc replacement).
+    finally:
+        try:
+            raw.close()
+        except OSError:
+            pass
+
+    inspect = api.exec_inspect(exec_id)
+    exit_code = inspect.get("ExitCode") or 0
+    stdout_raw = chunks_out.decode("utf-8", errors="replace")
+    stderr = chunks_err.decode("utf-8", errors="replace")
+
+    stdout, new_cwd = _parse_cwd_sentinel(stdout_raw)
+    if new_cwd:
+        _sandbox_cwd[sandbox_id] = new_cwd
+    else:
+        new_cwd = effective_cwd
+    return exit_code, stdout, stderr, new_cwd
 
 
 def _parse_cwd_sentinel(raw: str) -> tuple[str, str | None]:

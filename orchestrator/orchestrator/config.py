@@ -47,6 +47,11 @@ class Settings(BaseSettings):
     sandbox_store: str = "memory"   # env var: MATRX_SANDBOX_STORE (memory or postgres)
     database_url: str = ""          # env var: MATRX_DATABASE_URL
 
+    # Tiering — which tier this orchestrator hosts.
+    # Used to reject creates that ask for the wrong tier and to surface the
+    # tier in /api-surface and SandboxResponse rows.
+    host_tier: str = ""             # env var: MATRX_HOST_TIER ("ec2" or "hosted")
+
     model_config = {"env_prefix": "MATRX_"}
 
     @field_validator("s3_bucket")

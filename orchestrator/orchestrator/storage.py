@@ -63,7 +63,14 @@ async def ensure_user_storage(user_id: str) -> None:
 
     S3 doesn't have real directories, but we create zero-byte marker objects
     so that tools like `aws s3 ls` show the paths exist.
+
+    No-op when ``MATRX_S3_BUCKET`` is unset (hosted tier uses Docker volumes,
+    not S3). Skipping here keeps create_sandbox usable without an AWS context.
     """
+    if not settings.s3_bucket:
+        logger.debug("Skipping ensure_user_storage: no S3 bucket configured")
+        return
+
     s3 = get_s3_client()
     bucket = settings.s3_bucket
 

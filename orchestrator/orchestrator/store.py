@@ -9,7 +9,7 @@ from __future__ import annotations
 import json
 import logging
 from abc import ABC, abstractmethod
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from uuid import UUID
 
 from orchestrator.models import SandboxResponse, SandboxStatus
@@ -47,6 +47,13 @@ class SandboxStore(ABC):
     async def mark_stopped(self, sandbox_id: str, reason: str) -> bool:
         """Mark a sandbox as stopped with a reason. Returns True if found and updated."""
         return await self.update_status(sandbox_id, SandboxStatus.STOPPED)
+
+    @abstractmethod
+    async def extend_ttl(self, sandbox_id: str, ttl_seconds: int) -> datetime | None:
+        """Set ``expires_at = now() + ttl_seconds`` and persist ``ttl_seconds``.
+
+        Returns the new ``expires_at`` value, or ``None`` if the sandbox was not found.
+        """
 
     async def close(self) -> None:
         """Clean up resources. Override in subclasses that need cleanup."""
@@ -93,6 +100,16 @@ class InMemorySandboxStore(SandboxStore):
         self._sandboxes[sandbox_id] = sandbox
         return True
 
+    async def extend_ttl(self, sandbox_id: str, ttl_seconds: int) -> datetime | None:
+        sandbox = self._sandboxes.get(sandbox_id)
+        if not sandbox:
+            return None
+        new_expires = datetime.now(timezone.utc) + timedelta(seconds=ttl_seconds)
+        sandbox.ttl_seconds = ttl_seconds
+        sandbox.expires_at = new_expires
+        self._sandboxes[sandbox_id] = sandbox
+        return new_expires
+
 
 class PostgresSandboxStore(SandboxStore):
     """Postgres-backed sandbox store using asyncpg.
@@ -134,12 +151,17 @@ class PostgresSandboxStore(SandboxStore):
             await conn.execute(
                 """
                 INSERT INTO sandbox_instances
-                    (user_id, sandbox_id, status, container_id, created_at, hot_path, cold_path, config, ttl_seconds)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9)
+                    (user_id, sandbox_id, status, container_id, created_at, hot_path, cold_path,
+                     config, ttl_seconds, tier, template, template_version, labels)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb)
                 ON CONFLICT (sandbox_id) DO UPDATE SET
                     status = EXCLUDED.status,
                     container_id = EXCLUDED.container_id,
                     config = EXCLUDED.config,
+                    tier = COALESCE(EXCLUDED.tier, sandbox_instances.tier),
+                    template = COALESCE(EXCLUDED.template, sandbox_instances.template),
+                    template_version = COALESCE(EXCLUDED.template_version, sandbox_instances.template_version),
+                    labels = COALESCE(EXCLUDED.labels, sandbox_instances.labels),
                     updated_at = NOW()
                 """,
                 UUID(sandbox.user_id),
@@ -151,6 +173,10 @@ class PostgresSandboxStore(SandboxStore):
                 sandbox.cold_path,
                 json.dumps(sandbox.config) if sandbox.config else '{}',
                 sandbox.ttl_seconds,
+                sandbox.tier,
+                sandbox.template,
+                sandbox.template_version,
+                json.dumps(sandbox.labels) if sandbox.labels else None,
             )
 
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
@@ -227,6 +253,22 @@ class PostgresSandboxStore(SandboxStore):
             )
             return result == "UPDATE 1"
 
+    async def extend_ttl(self, sandbox_id: str, ttl_seconds: int) -> datetime | None:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            row = await conn.fetchrow(
+                """UPDATE sandbox_instances
+                   SET ttl_seconds = $1,
+                       expires_at = NOW() + ($1 || ' seconds')::INTERVAL
+                   WHERE sandbox_id = $2
+                   RETURNING expires_at""",
+                ttl_seconds,
+                sandbox_id,
+            )
+            if not row:
+                return None
+            return row["expires_at"]
+
     async def close(self) -> None:
         if self._pool:
             await self._pool.close()
@@ -283,19 +325,36 @@ class PostgresSandboxStore(SandboxStore):
 
 def _row_to_sandbox(row) -> SandboxResponse:
     """Convert an asyncpg Row to a SandboxResponse."""
-    config_val = row.get("config")
+    def _maybe(key: str, default=None):
+        # asyncpg Row supports __contains__ but not .get on older versions
+        try:
+            return row[key]
+        except (KeyError, IndexError):
+            return default
+
+    config_val = _maybe("config")
     if isinstance(config_val, str):
         config_val = json.loads(config_val)
+
+    labels_val = _maybe("labels")
+    if isinstance(labels_val, str):
+        labels_val = json.loads(labels_val)
+
     return SandboxResponse(
         sandbox_id=row["sandbox_id"],
         user_id=str(row["user_id"]),
         status=SandboxStatus(row["status"]),
         container_id=row["container_id"],
         created_at=row["created_at"],
-        hot_path=row.get("hot_path", "/home/agent"),
-        cold_path=row.get("cold_path", "/data/cold"),
+        hot_path=_maybe("hot_path") or "/home/agent",
+        cold_path=_maybe("cold_path") or "/data/cold",
         config=config_val or {},
-        ttl_seconds=row.get("ttl_seconds", 7200),
+        ttl_seconds=_maybe("ttl_seconds") or 7200,
+        expires_at=_maybe("expires_at"),
+        tier=_maybe("tier"),
+        template=_maybe("template"),
+        template_version=_maybe("template_version"),
+        labels=labels_val,
     )
 
 

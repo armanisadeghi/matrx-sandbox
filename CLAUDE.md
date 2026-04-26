@@ -1,6 +1,6 @@
 # Matrx Sandbox
 
-On-demand, isolated Unix sandboxes for AI agent execution. Each sandbox is a Docker container that *appears as a dedicated machine* to the agent — full shell, filesystem, browser, internet. Production runs on EC2; the local variant runs on this dev server.
+On-demand, isolated Unix sandboxes for AI agent execution. Each sandbox is a Docker container that *appears as a dedicated machine* to the agent — full shell, filesystem, browser, internet. **Two tiers, same orchestrator code:** EC2-tier (ephemeral, S3-backed) and hosted-tier (this server, persistent, larger workloads). Frontend picks tier at create time.
 
 Already deeply documented. Read the right doc for the question:
 
@@ -19,14 +19,19 @@ This file is **orientation** — what each piece is, where it runs, and what's s
 
 ---
 
-## Two Deployments You Need to Distinguish
+## Three deployments you need to distinguish
 
 | Deployment | Where | What runs | Trigger |
 |---|---|---|---|
-| **Production** | EC2 | Orchestrator (FastAPI) + sandbox containers it spawns on demand | Push to `main` → GitHub Actions → ECR build → SSM deploy |
-| **Local on this dev server** | Here in `/srv` | Pre-spawned `sandbox-1` … `sandbox-5` containers via [sandbox-local/docker-compose.yml](sandbox-local/docker-compose.yml). Each one routed by Traefik to `sandbox-N.dev.codematrx.com` (web terminal via ttyd on port 7681). **No orchestrator running here** — these are static, long-lived sandboxes for testing. | `cd sandbox-local && docker compose up -d` |
+| **EC2 tier** (`tier: "ec2"`) | EC2 | Orchestrator (FastAPI) + sandbox containers it spawns on demand. S3 hot/cold + Supabase Postgres. | Push to `main` → GitHub Actions → ECR build → SSM deploy |
+| **Hosted tier** (`tier: "hosted"`) | This server `/srv` | Orchestrator at `https://orchestrator.dev.codematrx.com` (deployed via [/srv/apps/sandbox-orchestrator/](/srv/apps/sandbox-orchestrator/)) + dynamically-spawned sandbox containers. Docker volumes (no S3). In-memory store today; Postgres-backed is a follow-up. | `cd /srv/apps/sandbox-orchestrator && docker compose up -d` |
+| **Static "starter pool"** | This server `/srv` | Hard-coded `sandbox-1` … `sandbox-5` from [sandbox-local/docker-compose.yml](sandbox-local/docker-compose.yml). They run the matrx_agent daemon on port 8000 plus ttyd on 7681 for browser shells. **Will be retired** once the hosted orchestrator is fully adopted. | `cd sandbox-local && docker compose up -d` |
 
-Plus, separately, there's a **Ship instance** for this project at `matrx-sandbox.dev.codematrx.com` (container `matrx-sandbox`, image `matrx-ship:latest`) — that's just version tracking via Matrx Ship, **not** the sandbox runtime. Don't confuse them.
+Plus, separately, there's a **Ship instance** at `matrx-sandbox.dev.codematrx.com` (container `matrx-sandbox`, image `matrx-ship:latest`) — that's just version tracking via Matrx Ship, **not** the sandbox runtime. Three different things named "sandbox" on this server; don't confuse them:
+
+- `matrx-sandbox` (Ship instance) → version tracking only
+- `matrx-orchestrator` (hosted tier orchestrator) → spawns + manages sandbox containers
+- `sandbox-1`…`sandbox-5` (starter pool) → individual sandbox containers
 
 ---
 

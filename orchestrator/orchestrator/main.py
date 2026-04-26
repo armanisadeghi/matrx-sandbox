@@ -6,12 +6,14 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.routing import APIRoute, APIWebSocketRoute
 
 from orchestrator.config import settings
 from orchestrator.logging_config import setup_logging
 from orchestrator.middleware.auth import APIKeyMiddleware
 from orchestrator.middleware.request_logging import RequestLoggingMiddleware
-from orchestrator.routes import health, sandboxes
+from orchestrator.models import APISurfaceResponse, RouteInfo
+from orchestrator.routes import health, sandboxes, templates
 from orchestrator.sandbox_manager import close_docker_client, close_store
 from orchestrator.storage import validate_bucket
 
@@ -44,10 +46,16 @@ async def lifespan(app: FastAPI):
     close_docker_client()
 
 
+try:
+    from importlib.metadata import version as _pkg_version
+    SERVICE_VERSION = _pkg_version("matrx-orchestrator")
+except Exception:  # pragma: no cover — fallback if package isn't installed
+    SERVICE_VERSION = "0.0.0+local"
+
 app = FastAPI(
     title="Matrx Sandbox Orchestrator",
     description="Manages ephemeral AI agent sandboxes",
-    version="0.1.0",
+    version=SERVICE_VERSION,
     lifespan=lifespan,
 )
 
@@ -58,15 +66,52 @@ app.add_middleware(RequestLoggingMiddleware)
 
 app.include_router(sandboxes.router)
 app.include_router(health.router)
+app.include_router(templates.router)
 
 
 @app.get("/")
 async def root():
     return {
         "service": "matrx-sandbox-orchestrator",
-        "version": "0.1.0",
+        "version": SERVICE_VERSION,
+        "tier": settings.host_tier or None,
         "docs": "/docs",
+        "api_surface": "/api-surface",
     }
+
+
+@app.get("/api-surface", response_model=APISurfaceResponse, tags=["meta"])
+async def api_surface() -> APISurfaceResponse:
+    """Return every route this orchestrator serves.
+
+    The auto-generated ``/openapi.json`` omits routes registered via
+    ``@router.api_route(...)`` with broad path catchalls (the ``/fs/{path}``,
+    ``/git/{path}``, etc. proxies). Use this endpoint as the authoritative
+    capability list for client integrations.
+    """
+    routes: list[RouteInfo] = []
+    for r in app.routes:
+        if isinstance(r, APIRoute):
+            routes.append(RouteInfo(
+                path=r.path,
+                methods=sorted(r.methods or []),
+                name=r.name,
+                kind="http",
+            ))
+        elif isinstance(r, APIWebSocketRoute):
+            routes.append(RouteInfo(
+                path=r.path,
+                methods=["WS"],
+                name=r.name,
+                kind="websocket",
+            ))
+    routes.sort(key=lambda r: (r.path, r.methods))
+    return APISurfaceResponse(
+        service="matrx-sandbox-orchestrator",
+        version=SERVICE_VERSION,
+        tier=settings.host_tier or None,
+        routes=routes,
+    )
 
 
 def start():

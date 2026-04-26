@@ -23,7 +23,7 @@ from orchestrator.config import settings
 logger = logging.getLogger(__name__)
 
 # Paths that are exempt from API key authentication
-_EXEMPT_PATHS = frozenset({"/health", "/docs", "/openapi.json", "/redoc"})
+_EXEMPT_PATHS = frozenset({"/health", "/docs", "/openapi.json", "/redoc", "/api-surface"})
 
 
 class APIKeyMiddleware(BaseHTTPMiddleware):

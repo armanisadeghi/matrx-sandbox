@@ -8,6 +8,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 import httpx
 
 from orchestrator import sandbox_manager, storage
+from orchestrator.config import settings
 from orchestrator.models import (
     AccessResponse,
     CompletionRequest,
@@ -17,6 +18,8 @@ from orchestrator.models import (
     ErrorResponse,
     ExecRequest,
     ExecResponse,
+    ExtendRequest,
+    ExtendResponse,
     HeartbeatResponse,
     SandboxListResponse,
     SandboxResponse,
@@ -29,13 +32,40 @@ router = APIRouter(prefix="/sandboxes", tags=["sandboxes"])
 
 @router.post("", response_model=SandboxResponse, status_code=201)
 async def create_sandbox(req: CreateSandboxRequest):
-    """Create a new sandbox for a user."""
-    logger.info("Sandbox creation requested for user_id=%s", req.user_id)
+    """Create a new sandbox for a user.
+
+    The ``tier`` field is advisory: each orchestrator only spawns sandboxes for
+    its own tier (set via ``SANDBOX_HOST_TIER``). If a request specifies a tier
+    that doesn't match this orchestrator's tier, it is rejected with 400 so the
+    frontend can route to the correct orchestrator.
+    """
+    logger.info(
+        "Sandbox creation requested for user_id=%s (tier=%s, template=%s)",
+        req.user_id, req.tier, req.template,
+    )
+
+    if req.tier and settings.host_tier and req.tier != settings.host_tier:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Tier mismatch: this orchestrator hosts tier '{settings.host_tier}', "
+                f"but the request asked for '{req.tier}'. Route the request to the "
+                "appropriate orchestrator URL."
+            ),
+        )
+
     await storage.ensure_user_storage(req.user_id)
 
+    effective_tier = req.tier or settings.host_tier
     sandbox = await sandbox_manager.create_sandbox(
         user_id=req.user_id,
         config=req.config,
+        template=req.template,
+        template_version=req.template_version,
+        tier=effective_tier,
+        resources=req.resources.model_dump(exclude_none=True) if req.resources else None,
+        labels=req.labels,
+        ttl_seconds=req.ttl_seconds,
     )
     return sandbox
 
@@ -70,6 +100,8 @@ async def exec_command(sandbox_id: str, req: ExecRequest):
             timeout=req.timeout,
             user=req.user,
             cwd=req.cwd,
+            env=req.env,
+            stdin=req.stdin,
         )
         return ExecResponse(exit_code=exit_code, stdout=stdout, stderr=stderr, cwd=cwd)
     except ValueError as e:
@@ -158,15 +190,39 @@ async def sandbox_error(sandbox_id: str, req: ErrorReport):
     return ErrorResponse(status="shutting_down", sandbox_id=sandbox_id, error_received=True)
 
 
-@router.post("/{sandbox_id}/extend")
-async def extend_sandbox(sandbox_id: str, ttl_seconds: int = 3600):
-    """Extend the TTL of a sandbox."""
-    # Dummy implementation for now, should update the DB
+@router.post("/{sandbox_id}/extend", response_model=ExtendResponse)
+async def extend_sandbox(
+    sandbox_id: str,
+    req: ExtendRequest | None = None,
+    ttl_seconds: int | None = None,
+):
+    """Extend the TTL of a sandbox.
+
+    Accepts either a JSON body (``{"ttl_seconds": 3600}``) or a query param
+    (``?ttl_seconds=3600``) for backward compatibility. Persists the new
+    ``expires_at`` so the orchestrator's expiry sweep won't shut the sandbox
+    down prematurely.
+    """
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
-    # In a real implementation we would update expires_at in the DB
-    return {"status": "extended", "sandbox_id": sandbox_id, "ttl_seconds": ttl_seconds}
+
+    seconds = (req.ttl_seconds if req else None) or ttl_seconds or 3600
+    if seconds < 60 or seconds > 86400:
+        raise HTTPException(status_code=400, detail="ttl_seconds must be between 60 and 86400")
+
+    store = sandbox_manager._get_store()
+    new_expires_at = await store.extend_ttl(sandbox_id, seconds)
+    if not new_expires_at:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+
+    logger.info("Extended sandbox %s by %ds (new expires_at=%s)", sandbox_id, seconds, new_expires_at)
+    return ExtendResponse(
+        sandbox_id=sandbox_id,
+        ttl_seconds=seconds,
+        expires_at=new_expires_at,
+        new_expires_at=new_expires_at,
+    )
 
 
 @router.websocket("/{sandbox_id}/fs/watch")
