@@ -1,8 +1,10 @@
 # AI Dream ↔ Sandbox Integration
 
-**Status:** Sandbox-side plumbing shipped 2026-04-26 (orchestrator env-var passthrough, in-container `mtx` CLI, `cloud-files-sync.sh` bridge). AI Dream side: **needs implementation** — five REST endpoints + a service-token verification step.
+**Status:** Both sides shipped 2026-04-26.
+- **Sandbox side** — orchestrator env-var passthrough, in-container `mtx` CLI, `cloud-files-sync.sh` bridge. Live on EC2 + hosted tier.
+- **AI Dream side** — `/api/cloud-files/{list,get,put,delete,quota}` router with service-token + `X-Matrx-User-Id` auth. Pushed to `aidream-current` `main` as commit `48f70d2a`. Disabled until `AIDREAM_SANDBOX_SERVICE_TOKEN` is set in AI Dream's env; setting it flips the bridge on.
 
-This doc is the contract. AI Dream owns its end of the wire. Sandbox-side is built and waiting.
+This doc is the contract. Both ends now match. The only remaining step is provisioning the shared service token + AWS creds (see Configuration checklist below).
 
 ---
 
@@ -154,9 +156,17 @@ Report the user's storage usage and limit. Drives the editor's "1.3 / 10 GB" ind
 
 ---
 
-## Implementation hint for AI Dream — wire-up
+## Implementation — already shipped
 
-The cloud_sync module already does all the hard work. The bridge endpoints are mostly thin:
+Code lives at `aidream/api/routers/cloud_files_bridge.py` (commit `48f70d2a`). It's mounted with no auth dependency in `aidream/api/app.py` (the router verifies the service token itself). Behavior:
+
+- **`GET /list`** uses `SyncEngine.list_files_async(user_id=user_id)`. Optional `prefix` filters by path prefix; `limit` caps results (1–5000).
+- **`GET /get`** uses `SyncEngine.managed_read_async(path, user_id=user_id)`. 404 / 403 mapped from `FileNotFoundError` / `PermissionError`.
+- **`PUT /put`** uses `SyncEngine.managed_write_async(path, content, mime_type, user_id)`. Per-request cap 1 GiB; per-user soft quota 10 GiB enforced via a quick `list_files_async` sum (returns 413 with `{used_bytes, quota_bytes, incoming_bytes}` on overflow).
+- **`DELETE /delete`** uses `SyncEngine.managed_delete_async(path, user_id)` (soft delete).
+- **`GET /quota`** sums file_size from `list_files_async` against the 10 GiB cap. Per-user override is a follow-up — drop into `cld_account_tiers` style limits when we want it.
+
+Original sketch left below for reference.
 
 ```python
 # aidream/api/cloud_files_bridge.py  (sketch)
@@ -245,28 +255,49 @@ The whole pipeline already runs end-to-end. It just no-ops gracefully today beca
 
 ---
 
-## Configuration checklist (when AI Dream side ships)
+## Configuration checklist
 
-In `/srv/apps/sandbox-orchestrator/.env` on this server:
+The code is in place on both sides. To turn the bridge on, you just have to round-trip a single shared secret.
+
+### 1. Generate the shared service token (do this once)
+
+```bash
+openssl rand -hex 32
+# e.g. 7f3a4d8b9e1c2f6a... — keep this value
+```
+
+### 2. Set it on the AI Dream side
+
+Add to AI Dream's production `.env`:
 
 ```
-MATRX_AIDREAM_URL=https://api.aidream.example.com
-MATRX_AIDREAM_SERVICE_TOKEN=<paste from AI Dream's secrets>
-# AWS creds for hosted-tier S3 sync (Phase 6) — separate from AI Dream
-MATRX_AWS_ACCESS_KEY_ID=...
+AIDREAM_SANDBOX_SERVICE_TOKEN=<value from step 1>
+```
+
+Then redeploy AI Dream. The bridge endpoints `GET /api/cloud-files/list|get|quota`, `PUT /api/cloud-files/put`, `DELETE /api/cloud-files/delete` flip from 503 to active. Routes are public (no JWT required); the token + `X-Matrx-User-Id` header is the auth.
+
+### 3. Set it + the AI Dream URL on the orchestrator side
+
+In `/srv/apps/sandbox-orchestrator/.env` on this dev server, plus the EC2 orchestrator's env (via SSM or the GitHub Actions deploy):
+
+```
+MATRX_AIDREAM_URL=https://api.aidream.ai            # adjust to actual host
+MATRX_AIDREAM_SERVICE_TOKEN=<same value as step 1>
+```
+
+Then on this server: `cd /srv/apps/sandbox-orchestrator && docker compose restart`. EC2: trigger `deploy.yml` or `aws ssm send-command` with the same env update.
+
+### 4. (Phase 6b) AWS creds for hosted-tier S3 sync — separate concern
+
+If we also want hosted-tier sandboxes to push their hot-volume contents to S3 on shutdown (matching what EC2 already does), add to `/srv/apps/sandbox-orchestrator/.env`:
+
+```
+MATRX_AWS_ACCESS_KEY_ID=AKIA...
 MATRX_AWS_SECRET_ACCESS_KEY=...
+S3_BUCKET=matrx-sandbox-hosted-storage   # bucket the orchestrator writes into
 ```
 
-Then `cd /srv/apps/sandbox-orchestrator && docker compose restart`.
-
-On AI Dream's side:
-
-```
-AIDREAM_SANDBOX_SERVICE_TOKEN=<same token>
-# (cloud_sync's existing AWS / Supabase config stays as-is)
-```
-
-The token must match exactly on both sides — that's the only secret that has to round-trip.
+These are independent of the AI Dream cloud_files bridge — they're only used by the hot-sync layer inside each spawned sandbox. See `/srv/projects/matrx-sandbox/docs/PERSISTENCE_PLAN.md §6b` for the full provisioning steps.
 
 ---
 
