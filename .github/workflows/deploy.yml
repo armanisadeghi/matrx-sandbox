@@ -88,10 +88,11 @@ jobs:
           PARAMS=$(jq -n --arg ecr "$ECR_REPO" --arg sha "$GITHUB_SHA" '{
             "commands": [
               "set -euo pipefail",
+              "set -x",
 
-              "echo === [1/5] Pre-pull disk cleanup (Defense 1 against disk-full) ===",
+              "echo === [1/5] Pre-pull disk cleanup ===",
               "df -h /",
-              "sudo docker system prune -af --filter \"until=24h\" || true",
+              "sudo docker system prune -af --filter until=24h || true",
               "df -h /",
 
               "echo === [2/5] Pull latest images from ECR ===",
