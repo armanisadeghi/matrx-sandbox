@@ -147,6 +147,36 @@ class HealthResponse(BaseModel):
     uptime_seconds: float
 
 
+class SystemInfoResponse(BaseModel):
+    """Host pressure + container counts for the matrx-admin observability panel."""
+    tier: SandboxTier | None = None
+    uptime_seconds: float
+
+    # Disk (root filesystem — same FS as orchestrator code + sandbox volumes)
+    disk_total_bytes: int
+    disk_used_bytes: int
+    disk_free_bytes: int
+    disk_used_pct: float
+
+    # Memory (from /proc/meminfo, kB granularity)
+    memory_total_kb: int
+    memory_used_kb: int
+    memory_available_kb: int
+    memory_used_pct: float
+
+    # CPU
+    cpu_count: int
+    load_1m: float | None = None
+    load_5m: float | None = None
+    load_15m: float | None = None
+
+    # Sandbox counts — both DB and Docker views, so operators can spot drift
+    sandboxes_in_db: int
+    sandboxes_active: int
+    sandbox_containers_total: int  # via Docker label `matrx.sandbox_id`
+    sandbox_containers_running: int
+
+
 class HeartbeatResponse(BaseModel):
     acknowledged: bool
     sandbox_id: str
