@@ -293,12 +293,42 @@ Generates a one-time Ed25519 keypair, injects the public half into the container
 | Endpoint | Auth? | Purpose |
 |---|---|---|
 | `GET /` | No | Service banner: `{ service, version, tier, docs, api_surface }` |
-| `GET /health` | No | `{ status, active_sandboxes, uptime_seconds }` |
+| `GET /health` | No | `{ status, active_sandboxes, uptime_seconds }` — fast liveness probe |
+| `GET /system` | **Yes** | Full host pressure + container counts — see §11.1 |
 | `GET /api-surface` | No | Full route list (see §0) |
 | `GET /docs` | No | FastAPI auto-doc (incomplete — missing proxy routes) |
 | `GET /openapi.json` | No | Same caveat as `/docs` |
 
 All other endpoints require `X-API-Key: <key>` (or `Authorization: Bearer <key>`). The key is set via `MATRX_API_KEY` per orchestrator, separate per tier.
+
+### 11.1 `GET /system` — host pressure for the admin panel
+
+```jsonc
+{
+  "tier": "ec2" | "hosted" | null,
+  "uptime_seconds": 3621.4,
+  // Disk (root FS — same volume as orchestrator code + sandbox volumes)
+  "disk_total_bytes": 53687091200,
+  "disk_used_bytes": 13408000000,
+  "disk_free_bytes": 40279091200,
+  "disk_used_pct": 25.0,
+  // Memory (kB granularity, from /proc/meminfo)
+  "memory_total_kb": 16312828,
+  "memory_used_kb": 3104260,
+  "memory_available_kb": 13208568,
+  "memory_used_pct": 19.0,
+  // CPU
+  "cpu_count": 4,
+  "load_1m": 0.42, "load_5m": 0.31, "load_15m": 0.27,
+  // Sandbox counts — both views, so operators can spot drift
+  "sandboxes_in_db": 12,
+  "sandboxes_active": 4,
+  "sandbox_containers_total": 4,
+  "sandbox_containers_running": 4
+}
+```
+
+Powers the **Sandbox Infrastructure** admin panel in matrx-frontend (`/administration/sandbox-infra`). When `sandboxes_active != sandbox_containers_running`, the orchestrator's view of the world has drifted from Docker's — investigate (usually the orchestrator restarted but the store didn't reconcile).
 
 ---
 

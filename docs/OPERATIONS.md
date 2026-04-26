@@ -261,6 +261,39 @@ sudo systemctl restart matrx-orchestrator
 
 ---
 
+## Monitoring — first place to look
+
+For day-to-day "is the sandbox infra healthy" the **first stop is the matrx-frontend admin panel**:
+
+> **`/administration/sandbox-infra`**
+
+It auto-refreshes every 30s and shows for each tier:
+
+- Health status, version, route count (catches stale deploys live).
+- Disk pressure bar with red threshold at 90% (catches the Apr 2026 disk-full silently before deploys fail).
+- Memory pressure bar (catches sandbox capacity exhaustion).
+- CPU + load averages.
+- Sandboxes-in-DB vs Docker-containers-running drift detector.
+- Latest 5 GHA `deploy.yml` runs with status icons + commit SHA + actor.
+- One-click "Trigger deploy" button (enabled when `MATRX_SANDBOX_GH_TOKEN` is set on the frontend server).
+
+The panel is read-only by default — it just hits the orchestrators' new `GET /system` endpoint and the GitHub API. Triggering a deploy requires `MATRX_SANDBOX_GH_TOKEN` (a PAT with `actions:write` on `armanisadeghi/matrx-sandbox`) configured in the matrx-frontend Vercel env.
+
+CLI alternatives if the frontend is down:
+```bash
+# Per-tier disk + memory + container counts
+curl -H "X-API-Key: $KEY" https://orchestrator.dev.codematrx.com/system | jq
+curl -H "X-API-Key: $EC2_KEY" http://54.144.86.132:8000/system | jq
+
+# Latest deploys
+gh run list --workflow=deploy.yml --repo armanisadeghi/matrx-sandbox --limit 5
+
+# Trigger a fresh deploy
+gh workflow run deploy.yml --repo armanisadeghi/matrx-sandbox
+```
+
+---
+
 ## What to do when…
 
 | Symptom | Likely cause | Fix |
