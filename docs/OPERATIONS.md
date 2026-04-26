@@ -202,6 +202,48 @@ For the deploy pipeline to work, the repo needs:
 
 ---
 
+## Persistence — what's saved, where, and how to inspect
+
+User data persists across sandbox lifecycle. Two storage backends, depending on tier:
+
+| Tier | Backend | Path |
+|---|---|---|
+| EC2 | S3 prefix per user | `s3://matrx-sandbox-storage-prod-2024/users/{user_id}/{hot,cold}/` |
+| Hosted | Per-user Docker volume | `matrx-user-<uid>` mounted at `/home/agent` |
+
+Both tiers also run an in-container persistence module that:
+- Writes `~/.matrx/session.json` every 5 min and on shutdown
+- Auto-stashes dirty git repos to `matrx/auto-stash/<ts>` branches on shutdown (pushed when creds work)
+- Renders `~/.matrx/session-report.md` on startup with a "what was preserved / what was lost" report
+
+**Inspecting a user's persistence:**
+```bash
+# Hosted tier — Docker
+docker volume ls --filter label=matrx.user_id=<uuid>
+docker run --rm -v matrx-user-<uuid>:/home/agent alpine du -sh /home/agent
+
+# Either tier (via orchestrator API)
+curl -H "X-API-Key: $KEY" https://<orch>/users/<uuid>/persistence | jq
+```
+
+**Wiping a user's data (destructive):**
+```bash
+# Hosted tier only — refuses if any sandbox of theirs is running
+curl -X DELETE -H "X-API-Key: $KEY" https://<orch>/users/<uuid>/volume
+# EC2 tier — manual aws s3 rm against users/<uuid>/ prefix
+```
+
+**Inside a sandbox** (the user's own POV):
+```bash
+cat ~/.matrx/session-report.md     # what was restored / lost
+cat ~/.matrx/session.json | jq     # full manifest
+git stash list                     # see auto-stashed work
+```
+
+Full design + decisions: [PERSISTENCE_PLAN.md](PERSISTENCE_PLAN.md).
+
+---
+
 ## Recovering EC2 from a stale or stuck state
 
 Two things can go wrong on EC2 at the same time, both of which happened on 2026‑04‑26:

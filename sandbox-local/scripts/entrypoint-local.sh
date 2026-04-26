@@ -96,7 +96,11 @@ fi
 # that the orchestrator's proxy routes forward to. Without this, the local
 # sandbox is shell-only and the cloud editor can't talk to it.
 echo "[4c] Starting Sandbox API Daemon..."
-sudo -u agent bash -c "cd /home/agent && python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
+# ``-E`` preserves the env vars the orchestrator injected (SANDBOX_ID,
+# USER_ID, MATRX_TIER, MATRX_HOT_PREFIX, etc.) — without it sudo strips
+# them and the persistence module can't tell who/what it is, so the
+# manifest ends up with "user_id: unknown".
+sudo -E -u agent bash -c "cd /home/agent && python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
 echo "[4c] Sandbox API Daemon running on port 8000."
 
 # ─── Step 5: Signal readiness ────────────────────────────────────────────────
@@ -104,6 +108,9 @@ echo "[5/5] Sandbox is READY."
 touch /tmp/.sandbox_ready
 
 # ─── Shutdown handler ────────────────────────────────────────────────────────
+# Delegates to /opt/sandbox/scripts/shutdown-local.sh so the persistence module
+# (auto-stash + final manifest) gets the same shutdown path on both local and
+# production. Inline pkill kept as a safety net if shutdown-local.sh isn't there.
 cleanup() {
     echo ""
     echo "=========================================="
@@ -112,8 +119,12 @@ cleanup() {
     echo "  Time:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
     echo "=========================================="
     rm -f /tmp/.sandbox_ready
-    pkill ttyd 2>/dev/null || true
-    pkill -f 'uvicorn matrx_agent.api.main' 2>/dev/null || true
+    if [ -x /opt/sandbox/scripts/shutdown-local.sh ]; then
+        timeout 35 /opt/sandbox/scripts/shutdown-local.sh || true
+    else
+        pkill ttyd 2>/dev/null || true
+        pkill -f 'uvicorn matrx_agent.api.main' 2>/dev/null || true
+    fi
     echo "Shutdown complete."
     exit 0
 }

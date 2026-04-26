@@ -148,12 +148,16 @@ class PostgresSandboxStore(SandboxStore):
     async def save(self, sandbox: SandboxResponse) -> None:
         pool = await self._get_pool()
         async with pool.acquire() as conn:
+            # ``persistence_volume`` is added in migration 003 and is nullable
+            # in old environments — wrapped in COALESCE on update so the
+            # UPDATE branch tolerates missing values.
             await conn.execute(
                 """
                 INSERT INTO sandbox_instances
                     (user_id, sandbox_id, status, container_id, created_at, hot_path, cold_path,
-                     config, ttl_seconds, tier, template, template_version, labels)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb)
+                     config, ttl_seconds, tier, template, template_version, labels,
+                     persistence_volume)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14)
                 ON CONFLICT (sandbox_id) DO UPDATE SET
                     status = EXCLUDED.status,
                     container_id = EXCLUDED.container_id,
@@ -162,6 +166,7 @@ class PostgresSandboxStore(SandboxStore):
                     template = COALESCE(EXCLUDED.template, sandbox_instances.template),
                     template_version = COALESCE(EXCLUDED.template_version, sandbox_instances.template_version),
                     labels = COALESCE(EXCLUDED.labels, sandbox_instances.labels),
+                    persistence_volume = COALESCE(EXCLUDED.persistence_volume, sandbox_instances.persistence_volume),
                     updated_at = NOW()
                 """,
                 UUID(sandbox.user_id),
@@ -177,6 +182,7 @@ class PostgresSandboxStore(SandboxStore):
                 sandbox.template,
                 sandbox.template_version,
                 json.dumps(sandbox.labels) if sandbox.labels else None,
+                sandbox.persistence_volume,
             )
 
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
@@ -355,6 +361,7 @@ def _row_to_sandbox(row) -> SandboxResponse:
         template=_maybe("template"),
         template_version=_maybe("template_version"),
         labels=labels_val,
+        persistence_volume=_maybe("persistence_volume"),
     )
 
 

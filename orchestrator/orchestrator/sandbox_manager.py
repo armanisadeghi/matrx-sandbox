@@ -18,6 +18,11 @@ from docker.errors import DockerException, NotFound, APIError
 
 from orchestrator.config import settings
 from orchestrator.models import SandboxResponse, SandboxStatus
+from orchestrator.storage_layout import (
+    StorageLocation,
+    ensure_user_volume,
+    resolve_user_storage,
+)
 from orchestrator.store import SandboxStore, create_store
 
 logger = logging.getLogger(__name__)
@@ -122,14 +127,35 @@ async def create_sandbox(
     try:
         client = _get_docker_client()
 
+        # ── Resolve persistence location for this (user, tier) pair ───────────
+        location: StorageLocation = resolve_user_storage(user_id, tier)
+        volumes: dict[str, dict] = {}
+        if location.tier == "hosted":
+            # Hosted tier: per-user Docker volume mounted at /home/agent.
+            # Volume survives container destruction; subsequent sandboxes for
+            # the same user see the same home dir.
+            volume_name = ensure_user_volume(client, user_id)
+            volumes[volume_name] = {"bind": "/home/agent", "mode": "rw"}
+            sandbox.persistence_volume = volume_name
+            logger.info(
+                "Hosted-tier sandbox %s: mounting user volume %s -> /home/agent",
+                sandbox_id, volume_name,
+            )
+
         env = {
             "SANDBOX_ID": sandbox_id,
             "USER_ID": user_id,
-            "S3_BUCKET": config.get("s3_bucket", settings.s3_bucket),
+            "S3_BUCKET": location.s3_bucket or "",
             "S3_REGION": config.get("s3_region", settings.s3_region),
             "HOT_PATH": "/home/agent",
             "COLD_PATH": "/data/cold",
             "SHUTDOWN_TIMEOUT_SECONDS": str(settings.shutdown_timeout_seconds),
+            # Tier hint — the in-container persistence module reads this to
+            # decide whether to also push to S3 (Phase 1.5). When empty / "ec2"
+            # the existing hot-sync.sh + cold-mount.sh handle S3 directly.
+            "MATRX_TIER": location.tier,
+            "MATRX_HOT_PREFIX": location.s3_hot_prefix or "",
+            "MATRX_COLD_PREFIX": location.s3_cold_prefix or "",
         }
         if template:
             env["SANDBOX_TEMPLATE"] = template
@@ -146,6 +172,7 @@ async def create_sandbox(
             name=sandbox_id,
             detach=True,
             environment=env,
+            volumes=volumes or None,
             # Resource constraints
             cpu_period=100000,
             cpu_quota=int(cpu_limit * 100000),
@@ -461,11 +488,20 @@ async def destroy_sandbox(
         else:
             container.kill()
 
+        # ``container.remove`` deletes the container itself — anonymous
+        # volumes go with it, but the *named* per-user volume we mounted
+        # at /home/agent (hosted tier) is preserved. That's the whole
+        # point of the persistence model: user data survives sandbox
+        # lifecycle. Explicit volume wipe is a separate, admin-only path
+        # (see ``delete_user_volume``).
         container.remove(force=True)
 
         await store.mark_stopped(sandbox_id, reason)
 
-        logger.info("Sandbox %s destroyed", sandbox_id)
+        logger.info(
+            "Sandbox %s destroyed (volume %s preserved)",
+            sandbox_id, sandbox.persistence_volume or "n/a — EC2 tier",
+        )
         return True
 
     except NotFound:
@@ -477,6 +513,74 @@ async def destroy_sandbox(
         await store.update_status(sandbox_id, SandboxStatus.FAILED)
         logger.error("Failed to destroy sandbox %s: %s", sandbox_id, e)
         return False
+
+
+async def delete_user_volume(user_id: str) -> bool:
+    """Hard-delete a user's per-user Docker volume (hosted tier only).
+
+    Use case: a user explicitly clicks "Delete my persistent storage" in the
+    admin panel, OR an admin needs to forcibly wipe a user's home dir. This is
+    a destructive operation — there's no undo. Refuses to run if the volume
+    has active containers attached.
+    """
+    from orchestrator.storage_layout import user_volume_name
+
+    name = user_volume_name(user_id)
+    client = _get_docker_client()
+
+    # Refuse if any sandbox is still using the volume — would surprise the user.
+    in_use = client.containers.list(
+        all=True,
+        filters={"volume": name},
+    )
+    if in_use:
+        raise RuntimeError(
+            f"Volume {name} is still in use by {len(in_use)} container(s). "
+            "Stop those sandboxes first."
+        )
+
+    try:
+        volume = client.volumes.get(name)
+    except NotFound:
+        logger.info("delete_user_volume(%s): volume not found, no-op", user_id)
+        return True
+
+    try:
+        volume.remove(force=False)
+        logger.warning("Deleted user volume %s for user %s", name, user_id)
+        return True
+    except APIError as e:
+        logger.error("Failed to delete volume %s: %s", name, e)
+        return False
+
+
+def get_user_volume_size(user_id: str) -> int | None:
+    """Return the current size in bytes of a user's hosted-tier volume.
+
+    None if the volume doesn't exist (user has no hosted-tier data yet) or
+    Docker doesn't expose UsageData (older daemons / flag-disabled setups).
+    Cheap call — uses the docker daemon's own metadata, doesn't `du`.
+    """
+    from orchestrator.storage_layout import user_volume_name
+
+    name = user_volume_name(user_id)
+    client = _get_docker_client()
+    try:
+        # API endpoint /volumes returns a list with UsageData when invoked
+        # with the `?status=true` flag-equivalent in the SDK.
+        volumes_data = client.api.volumes()
+        for v in volumes_data.get("Volumes") or []:
+            if v.get("Name") == name:
+                usage = v.get("UsageData") or {}
+                size = usage.get("Size")
+                # Docker returns -1 when usage data isn't enabled (default).
+                # We need a separate `du -sb` path for accurate sizes; punt
+                # to Phase 5 (quotas) where that lives.
+                return size if isinstance(size, int) and size >= 0 else None
+    except APIError as e:
+        logger.warning("Failed to query volume size for %s: %s", name, e)
+        return None
+    return None
 
 
 async def heartbeat(sandbox_id: str) -> bool:

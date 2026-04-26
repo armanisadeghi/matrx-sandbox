@@ -1,15 +1,75 @@
+import asyncio
 import base64
+import logging
 import os
 import shutil
 import stat
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Form
-from fastapi.responses import FileResponse
+from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
-app = FastAPI(title="Matrx Sandbox Agent API")
+from matrx_agent.persistence import CheckpointDaemon, read_prior_manifest, render_report
+from matrx_agent.persistence.checkpoint import DEFAULT_INTERVAL_SECONDS
+from matrx_agent.persistence.git_autostash import auto_stash_all_repos
+from matrx_agent.persistence.manifest import (
+    HOME,
+    MANIFEST_PATH,
+    MATRX_DIR,
+    _find_git_repos,
+    collect_manifest,
+    write_manifest,
+)
+from matrx_agent.persistence.session_report import REPORT_PATH
+
+_logger = logging.getLogger("matrx_agent")
+_checkpoint = CheckpointDaemon(interval_seconds=int(os.environ.get(
+    "MATRX_CHECKPOINT_INTERVAL_SECONDS", str(DEFAULT_INTERVAL_SECONDS),
+)))
+
+
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    """Daemon lifespan — render the prior session's report on startup and
+    fire one final manifest write on shutdown.
+
+    The CheckpointDaemon owns the periodic 5-minute manifest writes between
+    those two events. The ``/internal/shutdown`` route can be hit before the
+    container exits to also run the auto-stash pass.
+    """
+    # Startup: render the welcome / session-report.md from any prior manifest.
+    try:
+        prior = read_prior_manifest()
+        render_report(prior)
+        _logger.info("matrx_agent: persistence module ready (prior=%s)", "yes" if prior else "no")
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("matrx_agent: failed to render session report: %s", e)
+
+    # Start the periodic checkpoint loop.
+    try:
+        await _checkpoint.start()
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("matrx_agent: failed to start checkpoint daemon: %s", e)
+
+    yield
+
+    # Shutdown: best-effort final manifest write. The container may still be
+    # killed mid-write — that's fine, the prior checkpoint is the floor.
+    try:
+        await _checkpoint.stop()
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("matrx_agent: checkpoint daemon stop error: %s", e)
+    try:
+        manifest = collect_manifest(graceful=True)
+        write_manifest(manifest)
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("matrx_agent: final manifest write failed: %s", e)
+
+
+app = FastAPI(title="Matrx Sandbox Agent API", lifespan=lifespan)
 
 # --- Models ---
 
@@ -266,6 +326,90 @@ app.include_router(credentials_router)
 app.include_router(watch_router)
 app.include_router(search_router)
 app.include_router(processes_router)
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# /internal/* — persistence integration points
+# ─────────────────────────────────────────────────────────────────────────────
+# Called by:
+#   - The orchestrator's ``shutdown.sh`` (before ``docker stop``) → /internal/shutdown
+#   - The orchestrator's ``entrypoint.sh`` after the daemon comes up → /internal/startup
+# Marked /internal/ so it's clear they're not for end users — they don't have
+# auth right now (the daemon listens only on the container's internal network),
+# but if we ever expose port 8000 externally, gate these behind a shared secret.
+
+@app.post("/internal/startup")
+def internal_startup() -> dict:
+    """Idempotent startup hook — re-renders session-report.md from the prior manifest."""
+    try:
+        prior = read_prior_manifest()
+        report = render_report(prior)
+        return {
+            "ok": True,
+            "had_prior_session": prior is not None,
+            "report_path": str(REPORT_PATH),
+            "report_chars": len(report),
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e)}
+
+
+@app.post("/internal/shutdown")
+def internal_shutdown(graceful: bool = True, auto_stash: bool = True,
+                      push_remote: bool = True) -> dict:
+    """Run the full shutdown persistence pass.
+
+    1. Walk for git repos and auto-stash dirty ones.
+    2. Collect a final manifest including the auto-stash results.
+    3. Write the manifest atomically.
+    """
+    autostashes: dict[str, dict] = {}
+    if auto_stash:
+        try:
+            repos = _find_git_repos(HOME)
+            autostashes = auto_stash_all_repos(repos, push_remote=push_remote)
+        except Exception as e:  # noqa: BLE001
+            autostashes = {"_error": {"error": str(e)}}
+
+    try:
+        manifest = collect_manifest(graceful=graceful)
+        # Splice auto-stash results back into the manifest under each repo
+        for repo in manifest.repos:
+            stash_result = autostashes.get(repo.path)
+            if stash_result is not None:
+                repo.auto_stash = stash_result
+        write_manifest(manifest)
+        return {
+            "ok": True,
+            "manifest_path": str(MANIFEST_PATH),
+            "repos_scanned": len(manifest.repos),
+            "auto_stashes": {k: v for k, v in autostashes.items() if not k.startswith("_")},
+        }
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "error": str(e), "auto_stashes": autostashes}
+
+
+@app.get("/internal/manifest")
+def internal_manifest_get() -> dict:
+    """Return the current (most recent) session manifest."""
+    if not MANIFEST_PATH.exists():
+        raise HTTPException(status_code=404, detail="No manifest yet (sandbox just started)")
+    import json as _json
+    try:
+        return _json.loads(MANIFEST_PATH.read_text())
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=500, detail=f"Manifest unreadable: {e}")
+
+
+@app.get("/internal/session-report", response_class=PlainTextResponse)
+def internal_session_report() -> str:
+    """Return the rendered session-report.md as plain text. The frontend
+    fetches this on connect and renders it as a welcome panel.
+    """
+    if REPORT_PATH.exists():
+        return REPORT_PATH.read_text()
+    return render_report(read_prior_manifest())
+
 
 if __name__ == "__main__":
     import uvicorn

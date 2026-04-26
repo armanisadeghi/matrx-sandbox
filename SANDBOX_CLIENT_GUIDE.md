@@ -332,7 +332,46 @@ Powers the **Sandbox Infrastructure** admin panel in matrx-frontend (`/administr
 
 ---
 
-## 12. Out of scope (deferred wishlist items)
+## 11.2 `GET /users/{user_id}/persistence` and `DELETE /users/{user_id}/volume`
+
+**Auth required.** Used by the matrx-frontend admin panel and end-user "Storage" page.
+
+```
+GET /users/{user_id}/persistence
+→ {
+    "user_id": "...", "tier": "hosted" | "ec2",
+    "volume_name": "matrx-user-...", "volume_bytes": 134217728, "volume_bytes_known": true,
+    "s3_bucket": null, "s3_hot_prefix": null, "s3_cold_prefix": null,
+    "sandboxes_total": 5, "sandboxes_active": 1
+  }
+
+DELETE /users/{user_id}/volume    → 204
+```
+
+DELETE is hosted-tier only (EC2 tier data lives in S3 and is managed via aidream's `cloud_sync`). Refuses with HTTP 409 if any sandbox is still using the volume.
+
+---
+
+## 12. In-container persistence module (`/internal/*`)
+
+Each sandbox runs a small persistence module inside the `matrx_agent` daemon. Frontends don't usually call these directly — the orchestrator's `entrypoint.sh` / `shutdown.sh` invoke them — but they're proxiable through the existing `/sandboxes/{id}/...` paths if needed.
+
+| Endpoint | Auth? | What it does |
+|---|---|---|
+| `POST /internal/startup` | Local only | Renders `~/.matrx/session-report.md` from the prior manifest. Idempotent. Auto-fired by daemon lifespan. |
+| `POST /internal/shutdown?graceful=true&auto_stash=true&push_remote=true` | Local only | Walks `/home/agent/` for git repos, auto-stashes dirty ones, optionally pushes `matrx/auto-stash/<ts>` branches, writes final `~/.matrx/session.json`. Hit by `shutdown.sh` before container stop. |
+| `GET /internal/manifest` | Local only | Returns the current `session.json` for inspection. |
+| `GET /internal/session-report` | Local only | Returns the current `session-report.md` as plain text. |
+
+The matrx-frontend editor reads `session-report.md` via the regular `/api/sandbox/[id]/fs/read?path=/home/agent/.matrx/session-report.md` route on connect to render its welcome panel.
+
+### Manifest schema (v1)
+
+`~/.matrx/session.json` written every 5 min and on shutdown. Captures shell cwd, git repo state per-repo, auto-stash results, listening ports, running processes (informational only), home-dir size summary, and an explicit `transient_things_we_could_not_save` list so users always see what was lost. Full schema in [docs/PERSISTENCE_PLAN.md §4.4](docs/PERSISTENCE_PLAN.md).
+
+---
+
+## 13. Out of scope (deferred wishlist items)
 
 These are recognized needs but are not implemented in v0.2.0:
 

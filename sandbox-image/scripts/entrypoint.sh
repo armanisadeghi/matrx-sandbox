@@ -65,7 +65,9 @@ echo "[4/5] SSH server running on port 22."
 
 # ─── Step 4.5: Start Agent API Daemon ────────────────────────────────────────
 echo "[4.5/5] Starting Sandbox API Daemon..."
-sudo -u agent bash -c "cd /home/agent && python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
+# ``-E`` so env vars (SANDBOX_ID, USER_ID, MATRX_TIER, etc.) reach the
+# persistence module — see comment in entrypoint-local.sh for why.
+sudo -E -u agent bash -c "cd /home/agent && python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
 echo "[4.5/5] Sandbox API Daemon running on port 8000."
 
 # ─── Step 5: Signal readiness ────────────────────────────────────────────────

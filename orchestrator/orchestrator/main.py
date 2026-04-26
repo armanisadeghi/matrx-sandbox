@@ -13,7 +13,7 @@ from orchestrator.logging_config import setup_logging
 from orchestrator.middleware.auth import APIKeyMiddleware
 from orchestrator.middleware.request_logging import RequestLoggingMiddleware
 from orchestrator.models import APISurfaceResponse, RouteInfo
-from orchestrator.routes import health, sandboxes, templates
+from orchestrator.routes import health, sandboxes, templates, users
 from orchestrator.sandbox_manager import close_docker_client, close_store
 from orchestrator.storage import validate_bucket
 
@@ -67,6 +67,7 @@ app.add_middleware(RequestLoggingMiddleware)
 app.include_router(sandboxes.router)
 app.include_router(health.router)
 app.include_router(templates.router)
+app.include_router(users.router)
 
 
 @app.get("/")

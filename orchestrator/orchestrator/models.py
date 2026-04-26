@@ -71,6 +71,14 @@ class SandboxResponse(BaseModel):
     template: str | None = None
     template_version: str | None = None
     labels: dict[str, str] | None = None
+    persistence_volume: str | None = Field(
+        default=None,
+        description=(
+            "Hosted-tier per-user Docker volume backing /home/agent. Set on "
+            "create; survives container destruction. EC2-tier sandboxes leave "
+            "this null and use the S3 prefix model instead."
+        ),
+    )
 
 
 class SandboxListResponse(BaseModel):
