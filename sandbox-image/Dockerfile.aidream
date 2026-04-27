@@ -45,8 +45,10 @@ RUN apt-get update \
 # breakage on Ubuntu 22.04. The :core image's system Python 3.11 stays
 # untouched (matrx_agent daemon + mtx CLI still use it).
 ENV UV_INSTALL_DIR=/usr/local/bin
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 RUN curl -LsSf https://astral.sh/uv/0.5.18/install.sh | sh \
     && uv --version \
+    && mkdir -p "${UV_PYTHON_INSTALL_DIR}" \
     && uv python install 3.13 \
     && uv python find 3.13
 
@@ -56,6 +58,13 @@ RUN curl -LsSf https://astral.sh/uv/0.5.18/install.sh | sh \
 # entrypoint-aidream.sh and `mtx aidream {update,reset}`.
 ENV AIDREAM_TEMPLATE_DIR=/opt/aidream-template
 RUN mkdir -p "$AIDREAM_TEMPLATE_DIR"
+
+# Put the user's working venv on PATH for ALL processes — interactive,
+# non-interactive, bash -c, the matrx_agent daemon's exec endpoint, ssh
+# sessions, everything. The directory doesn't exist until entrypoint-aidream.sh
+# seeds /home/agent/aidream from the template, but a non-existent PATH entry
+# is harmless. Once seeded, `python -c "import matrx_ai"` just works.
+ENV PATH="/home/agent/aidream/.venv/bin:${PATH}"
 
 # Copy aidream source. .dockerignore-equivalent omissions (dashboard, studio,
 # .git, knowledgebase, tmp, etc.) are listed in sandbox-image/.dockerignore.aidream
@@ -81,8 +90,13 @@ WORKDIR ${AIDREAM_TEMPLATE_DIR}
 # own install at $UV_PYTHON_INSTALL_DIR/.../bin/python3.13.
 ENV UV_PYTHON=3.13
 ENV UV_PROJECT_ENVIRONMENT=${AIDREAM_TEMPLATE_DIR}/.venv
+# Make uv's Python install discoverable by non-root users (agent). Without
+# this, `uv run` works as root in the build but fails as agent at runtime.
+ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 RUN uv sync --frozen --no-dev \
-    && du -sh .venv
+    && du -sh .venv \
+    && chown -R agent:agent "${AIDREAM_TEMPLATE_DIR}" \
+    && chmod -R a+rX "${UV_PYTHON_INSTALL_DIR}"
 
 # ─── Helper scripts: mtx aidream {update,reset,serve,version} ──────────────
 # Lives at /opt/sandbox/scripts/aidream-helpers.sh — sourced by the mtx
@@ -95,11 +109,37 @@ RUN chmod +x /opt/sandbox/scripts/aidream-helpers.sh
 COPY --chown=root:root ./scripts/entrypoint-aidream.sh /opt/sandbox/scripts/entrypoint-aidream.sh
 RUN chmod +x /opt/sandbox/scripts/entrypoint-aidream.sh
 
-# Activate-by-default: agent's interactive shells get the aidream venv on
-# PATH so `python -c "import matrx_ai"` just works without manual activation.
-RUN echo 'export PATH="/home/agent/aidream/.venv/bin:$PATH"' >> /home/agent/.bashrc \
-    && echo '# Activated when ~/aidream exists; harmless otherwise.' >> /home/agent/.bashrc \
-    && chown agent:agent /home/agent/.bashrc
+# Bake the hosted-tier entrypoint variant (skips S3 hot-sync) so an aidream
+# sandbox can run on the hosted tier without S3 creds. The :core image only
+# ships the production entrypoint.sh which hard-fails when S3_BUCKET is unset.
+# entrypoint-aidream.sh detects S3_BUCKET and dispatches accordingly.
+# build-aidream.sh stages these from ../sandbox-local/scripts/ into ./scripts-local/
+# at build time (Docker COPY can't reach outside the build context).
+COPY --chown=root:root ./scripts-local/entrypoint-local.sh /opt/sandbox/scripts/entrypoint-local.sh
+COPY --chown=root:root ./scripts-local/shutdown-local.sh   /opt/sandbox/scripts/shutdown-local.sh
+RUN chmod +x /opt/sandbox/scripts/entrypoint-local.sh /opt/sandbox/scripts/shutdown-local.sh
+
+# Activate-by-default for ALL shell types — interactive, non-interactive,
+# login, and `bash -c "..."`. Three layers because each shell variant reads
+# different files:
+#   - /etc/profile.d/aidream.sh    sourced by login shells (bash -l, ssh)
+#   - /etc/bash.bashrc append      sourced by non-login interactive shells
+#   - /home/agent/.bashrc          user-level interactive
+# For pure non-interactive (`bash -c "..."`) we also drop a symlink at
+# /usr/local/bin/aidream-python so callers don't have to know the venv path.
+RUN printf '%s\n' '#!/bin/sh' \
+    '# Activate the aidream venv if present. Harmless if the user never' \
+    '# spawned an aidream-variant sandbox (the dir simply does not exist).' \
+    'if [ -d /home/agent/aidream/.venv/bin ]; then' \
+    '    PATH="/home/agent/aidream/.venv/bin:$PATH"' \
+    '    export PATH' \
+    'fi' \
+    > /etc/profile.d/aidream.sh \
+    && chmod 0644 /etc/profile.d/aidream.sh \
+    && echo '. /etc/profile.d/aidream.sh' >> /etc/bash.bashrc \
+    && echo '. /etc/profile.d/aidream.sh' >> /home/agent/.bashrc \
+    && chown agent:agent /home/agent/.bashrc \
+    && ln -sf /home/agent/aidream/.venv/bin/python /usr/local/bin/aidream-python
 
 # ─── Replace entrypoint with the aidream-aware variant ─────────────────────
 # Wraps the existing entrypoint with a "first-spawn copy template → home" step.

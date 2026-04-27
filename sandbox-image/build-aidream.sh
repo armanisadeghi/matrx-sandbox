@@ -40,6 +40,16 @@ cd "$(dirname "$0")"  # cd into sandbox-image/
 
 GIT_SHA=$(git -C "$AIDREAM_SRC" rev-parse --short HEAD 2>/dev/null || echo "unknown")
 STAGE_DIR="./aidream-src"
+LOCAL_SCRIPTS_STAGE="./scripts-local"
+
+# Stage entrypoint-local.sh + shutdown-local.sh from sandbox-local/ into the
+# build context so the Dockerfile can COPY them. Docker COPY can't reach
+# outside the build context (this dir).
+echo "[build-aidream] staging hosted-tier entrypoint scripts into $LOCAL_SCRIPTS_STAGE"
+rm -rf "$LOCAL_SCRIPTS_STAGE"
+mkdir -p "$LOCAL_SCRIPTS_STAGE"
+cp ../sandbox-local/scripts/entrypoint-local.sh "$LOCAL_SCRIPTS_STAGE/"
+cp ../sandbox-local/scripts/shutdown-local.sh "$LOCAL_SCRIPTS_STAGE/"
 
 echo "[build-aidream] staging aidream source ($GIT_SHA) into $STAGE_DIR"
 rm -rf "$STAGE_DIR"
@@ -96,7 +106,7 @@ docker build \
     .
 
 echo "[build-aidream] cleaning up staged source"
-rm -rf "$STAGE_DIR"
+rm -rf "$STAGE_DIR" "$LOCAL_SCRIPTS_STAGE"
 
 echo "[build-aidream] done — image: $TAG"
 docker images "$TAG" --format "table {{.Repository}}:{{.Tag}}\t{{.Size}}\t{{.CreatedSince}}"
