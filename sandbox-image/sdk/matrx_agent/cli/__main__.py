@@ -49,6 +49,16 @@ def main(argv: list[str] | None = None) -> int:
     _files_subparser(sub)
     sub.add_parser("whoami", help="Print sandbox identity + AI Dream config")
 
+    # `mtx aidream <subcommand> [args...]` — dispatches to a shell helper.
+    # Only available on matrx-sandbox:aidream image variants. We use
+    # parser.parse_known_args so the subcommand args pass through untouched.
+    aidream_p = sub.add_parser(
+        "aidream",
+        help="Manage the in-sandbox aidream working copy (image variant only)",
+        add_help=False,  # Let aidream-helpers.sh print its own help.
+    )
+    aidream_p.add_argument("aidream_args", nargs=argparse.REMAINDER)
+
     args = parser.parse_args(argv)
 
     # Lazy import — keeps `mtx --help` fast even if the cloud_files module
@@ -60,6 +70,17 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "files":
         from matrx_agent.cli.files import run as files_run
         return files_run(args)
+
+    if args.cmd == "aidream":
+        helper = "/opt/sandbox/scripts/aidream-helpers.sh"
+        if not os.path.exists(helper):
+            print(
+                "[mtx aidream] this sandbox image doesn't include aidream — "
+                "spawn one with template='aidream' to use these commands.",
+                file=sys.stderr,
+            )
+            return 1
+        os.execv(helper, [helper, *args.aidream_args])
 
     parser.print_help(sys.stderr)
     return 2

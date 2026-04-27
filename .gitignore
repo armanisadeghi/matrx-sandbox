@@ -60,3 +60,4 @@ node_modules/
 .env-backups/
 .matrx.json
 .matrx-tools.conf
+sandbox-image/aidream-src/

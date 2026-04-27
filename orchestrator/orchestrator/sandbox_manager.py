@@ -186,8 +186,14 @@ async def create_sandbox(
         memory_limit = resources.get("memory_mb")
         memory_limit = f"{memory_limit}m" if memory_limit else settings.container_memory_limit
 
+        # Per-template image override. Most templates share the bare image
+        # (they differ via env vars / init scripts), but variants like
+        # 'aidream' need a heavier purpose-built image.
+        from orchestrator.routes.templates import resolve_template_image
+        image_for_template = resolve_template_image(template) or settings.sandbox_image
+
         container = client.containers.run(
-            image=settings.sandbox_image,
+            image=image_for_template,
             name=sandbox_id,
             detach=True,
             environment=env,
