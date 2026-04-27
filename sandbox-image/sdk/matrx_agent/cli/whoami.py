@@ -26,12 +26,15 @@ def _probe_bridge(url: str) -> dict:
         return {"reachable": False, "configured": False, "reason": f"unreachable: {exc.reason}"}
     except (ValueError, TimeoutError) as exc:
         return {"reachable": False, "configured": False, "reason": str(exc)}
+    limits = body.get("limits") or {}
     return {
         "reachable": True,
         "configured": bool(body.get("configured")),
         "version": body.get("version"),
-        "quota_bytes": body.get("quota_bytes"),
-        "max_upload_bytes": body.get("max_upload_bytes"),
+        # AI Dream's bridge nests these under `limits` — fall back to the
+        # top-level keys in case the response shape changes again.
+        "quota_bytes": limits.get("quota_bytes") or body.get("quota_bytes"),
+        "max_upload_bytes": limits.get("max_upload_bytes") or body.get("max_upload_bytes"),
     }
 
 
