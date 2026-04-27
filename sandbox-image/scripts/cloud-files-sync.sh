@@ -34,6 +34,22 @@ if [ -z "${USER_ID:-}" ]; then
     exit 0
 fi
 
+# Ask AI Dream whether the bridge is actually live. The probe endpoint is
+# public (no auth) and returns {"configured": false} when the AI-Dream-side
+# AIDREAM_SANDBOX_SERVICE_TOKEN is unset — meaning the env var on this side
+# is stale or doesn't match. Skipping here is cleaner than getting 401s
+# inside `mtx files sync`.
+PROBE_URL="${MATRX_AIDREAM_URL%/}/api/cloud-files/integrations.aidream"
+PROBE_BODY="$(curl -fsS --max-time 5 "$PROBE_URL" 2>/dev/null || true)"
+if [ -z "$PROBE_BODY" ]; then
+    echo "[cloud-files-sync] AI Dream probe unreachable at $PROBE_URL, skipping ${DIRECTION}"
+    exit 0
+fi
+if ! echo "$PROBE_BODY" | grep -q '"configured":[[:space:]]*true'; then
+    echo "[cloud-files-sync] AI Dream bridge reports configured=false, skipping ${DIRECTION}"
+    exit 0
+fi
+
 mkdir -p "$CLOUD_DIR"
 
 case "$DIRECTION" in
