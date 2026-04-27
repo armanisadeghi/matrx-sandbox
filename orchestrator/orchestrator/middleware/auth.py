@@ -26,9 +26,19 @@ logger = logging.getLogger(__name__)
 _EXEMPT_PATHS = frozenset({"/health", "/docs", "/openapi.json", "/redoc", "/api-surface"})
 
 
+def _is_proxy_path(path: str) -> bool:
+    """Match /sandboxes/{any-id}/proxy/... — these have their own (bearer
+    or master-key) auth applied inside the route handler so the global
+    middleware should let them pass through."""
+    parts = path.split("/")
+    # ['', 'sandboxes', '<id>', 'proxy', ...]
+    return len(parts) >= 5 and parts[1] == "sandboxes" and parts[3] == "proxy"
+
+
 class APIKeyMiddleware(BaseHTTPMiddleware):
     """Middleware that enforces API key authentication on all routes
-    except health checks and docs."""
+    except health checks, docs, and CORS preflight + the per-sandbox
+    /proxy/* routes (those handle their own auth in-route)."""
 
     async def dispatch(
         self, request: Request, call_next: RequestResponseEndpoint
@@ -43,6 +53,16 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
         # Also exempt the root info endpoint
         if request.url.path == "/":
+            return await call_next(request)
+
+        # CORS preflight must pass through; the response is shaped by the
+        # CORSMiddleware sitting outside this one.
+        if request.method == "OPTIONS":
+            return await call_next(request)
+
+        # Per-sandbox /proxy/* uses a per-route bearer/master combined check
+        # — see proxy_to_container in routes/sandboxes.py.
+        if _is_proxy_path(request.url.path):
             return await call_next(request)
 
         # Extract API key from header

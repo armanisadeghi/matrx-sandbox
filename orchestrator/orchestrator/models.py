@@ -79,6 +79,18 @@ class SandboxResponse(BaseModel):
             "this null and use the S3 prefix model instead."
         ),
     )
+    proxy_url: str | None = Field(
+        default=None,
+        description=(
+            "Public URL the browser can hit DIRECTLY to reach the in-container "
+            "matrx_agent daemon (mounted at /sandboxes/{sandbox_id}/proxy/...). "
+            "Authentication is via short-lived bearer token from "
+            "POST /sandboxes/{id}/access-tokens. Used by the React `code` "
+            "module to route sandbox-mode AI calls (per-conversation "
+            "serverOverrideUrl) without traversing Next.js. Null when the "
+            "orchestrator's MATRX_PUBLIC_URL is unset."
+        ),
+    )
 
 
 class SandboxListResponse(BaseModel):
@@ -196,6 +208,58 @@ class AccessResponse(BaseModel):
     host: str = Field(description="SSH host to connect to")
     port: int = Field(description="SSH port to connect to")
     ssh_command: str = Field(description="Ready-to-use SSH command")
+
+
+# ── Browser-direct access tokens (HMAC bearer tokens for /proxy/*) ─────────
+# Mints short-lived tokens that browsers present on direct-to-orchestrator
+# SSE / WebSocket / large-body HTTP. Next.js calls this admin-authenticated
+# endpoint after verifying ownership of the sandbox; never exposed publicly.
+
+class AccessTokenRequest(BaseModel):
+    scopes: list[str] = Field(
+        ...,
+        min_length=1,
+        description=(
+            "Subset of: ai, exec.run, exec.stream, pty, fs.read, fs.write, "
+            "fs.watch, git, ports.read. Each scope gates a category of "
+            "operation on /sandboxes/{id}/proxy/*. The 'ai' scope is the "
+            "broadest; reach for the narrowest scope set the caller needs."
+        ),
+    )
+    ttl_seconds: int | None = Field(
+        default=None,
+        ge=1,
+        le=900,
+        description=(
+            "Token lifetime in seconds. Default 300 (5 min); hard cap 900 "
+            "(15 min). Browsers should refresh lazily before expiry."
+        ),
+    )
+    actor: dict | None = Field(
+        default=None,
+        description=(
+            "Caller identity (e.g. {user_id, email}). Echoed in audit logs; "
+            "Next.js fills this from the verified Supabase session before "
+            "calling the orchestrator."
+        ),
+    )
+    single_use: bool = Field(
+        default=False,
+        description=(
+            "If true, the token's jti is invalidated on first successful use. "
+            "Recommended for WebSocket upgrades where replay would otherwise "
+            "be possible. False for SSE/HTTP where retry/reconnect is normal."
+        ),
+    )
+
+
+class AccessTokenResponse(BaseModel):
+    token: str = Field(description="HS256 JWT — present as Authorization: Bearer <token> on direct calls.")
+    expires_at: datetime
+    direct_url: str = Field(description="HTTPS base URL the browser uses for SSE / large HTTP.")
+    ws_base: str = Field(description="WSS base URL the browser uses for PTY / file watcher.")
+    tier: str = Field(description="ec2 | hosted — echoed for client-side sanity checking.")
+    sandbox_id: str
 
 
 class ExtendRequest(BaseModel):

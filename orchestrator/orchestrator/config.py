@@ -66,6 +66,27 @@ class Settings(BaseSettings):
     aidream_url: str = ""           # env var: MATRX_AIDREAM_URL
     aidream_service_token: str = "" # env var: MATRX_AIDREAM_SERVICE_TOKEN
 
+    # ── Browser-direct access (token-issuance, proxy, CORS) ─────────────────
+    # Implements the React team's "Direct Browser Access" spec — browsers
+    # bypass Next.js for SSE / WebSocket / large transfers and hit the
+    # orchestrator's /sandboxes/{id}/proxy/* directly with a short-lived
+    # bearer token. See orchestrator/auth/sandbox_token.py for the contract.
+    #
+    # Required when /access-tokens or /proxy/* routes are used; if empty,
+    # those routes return 503.
+    access_token_secret: str = ""   # env var: MATRX_ACCESS_TOKEN_SECRET
+
+    # External base URL the orchestrator serves on (no trailing slash). Used
+    # to build the SandboxResponse.proxy_url field and the /access-tokens
+    # response's `direct_url` and `ws_base`. Hosted tier defaults to its
+    # Traefik hostname; EC2 sets this via env to its public IP/DNS.
+    public_url: str = ""            # env var: MATRX_PUBLIC_URL
+
+    # CORS allow-list for browser-direct calls. Comma-separated. When set,
+    # only these origins receive ACAO; * is never allowed (incompatible
+    # with Authorization: Bearer round-trips).
+    cors_allowed_origins: str = ""  # env var: MATRX_CORS_ALLOWED_ORIGINS
+
     # ── AWS credentials passthrough (hosted tier S3 sync) ───────────────────
     # On EC2-tier orchestrator: instance role provides creds, no need to set.
     # On hosted-tier orchestrator: explicit creds required to sync sandboxes

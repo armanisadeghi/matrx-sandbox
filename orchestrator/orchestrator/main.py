@@ -6,6 +6,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute, APIWebSocketRoute
 
 from orchestrator.config import settings
@@ -63,6 +64,44 @@ app = FastAPI(
 app.add_middleware(APIKeyMiddleware)
 # Request/response logging middleware (runs after auth, so only logs authed requests)
 app.add_middleware(RequestLoggingMiddleware)
+
+
+# CORS — required for browser-direct calls to /sandboxes/{id}/proxy/* and the
+# token-issuance endpoints. Configured from MATRX_CORS_ALLOWED_ORIGINS
+# (comma-separated). When unset, defaults to a sensible matrx-admin allow-list.
+# We never use "*" because the bearer-token routes require credentialed-style
+# CORS handling (Authorization header) and "*" + credentials is forbidden.
+def _resolve_cors_origins() -> list[str]:
+    raw = (settings.cors_allowed_origins or "").strip()
+    if raw:
+        return [o.strip() for o in raw.split(",") if o.strip()]
+    return [
+        "https://www.aimatrx.com",
+        "https://aimatrx.com",
+        "http://localhost:3000",
+        "http://localhost:3001",
+        "http://127.0.0.1:3000",
+    ]
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=_resolve_cors_origins(),
+    allow_origin_regex=r"^https://[a-z0-9-]+\.aimatrx\.com$|^https://[a-z0-9-]+\.vercel\.app$",
+    allow_credentials=False,  # bearer-token, not cookie-based
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-API-Key",
+        "X-Conversation-Id",
+        "X-Instance-Id",
+        "X-PTY-Cols",
+        "X-PTY-Rows",
+    ],
+    expose_headers=["X-Sandbox-Id", "X-Tier"],
+    max_age=3600,
+)
 
 app.include_router(sandboxes.router)
 app.include_router(health.router)

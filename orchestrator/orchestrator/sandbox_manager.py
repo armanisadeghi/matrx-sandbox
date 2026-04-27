@@ -41,6 +41,20 @@ _store: SandboxStore | None = None
 _docker_client: docker.DockerClient | None = None
 
 
+def _proxy_url_for(sandbox_id: str) -> str | None:
+    """Build the public ``proxy_url`` field surfaced on SandboxResponse.
+
+    The browser hits ``{proxy_url}/<path>`` (e.g. ``/ai/agents/.../execute``)
+    and the orchestrator forwards 1:1 to the in-container daemon. Returns
+    None when MATRX_PUBLIC_URL is unset (the orchestrator doesn't know how
+    it is reachable from the outside, so it can't build a URL).
+    """
+    base = (settings.public_url or "").rstrip("/")
+    if not base:
+        return None
+    return f"{base}/sandboxes/{sandbox_id}/proxy"
+
+
 def _get_store() -> SandboxStore:
     """Get or create the sandbox store."""
     global _store
@@ -116,6 +130,7 @@ async def create_sandbox(
         template=template,
         template_version=template_version,
         labels=labels,
+        proxy_url=_proxy_url_for(sandbox_id),
     )
     await store.save(sandbox)
 
@@ -279,16 +294,31 @@ async def _wait_for_ready(sandbox: SandboxResponse, timeout: int = 120) -> Sandb
     return sandbox
 
 
+def _backfill_proxy_url(sb: SandboxResponse | None) -> SandboxResponse | None:
+    """Stamp proxy_url on a SandboxResponse loaded from storage.
+
+    The store may hold rows persisted before MATRX_PUBLIC_URL was configured,
+    or before the proxy_url field existed; recompute on read so clients
+    always see the current orchestrator's idea of the URL.
+    """
+    if sb is not None and not sb.proxy_url:
+        sb.proxy_url = _proxy_url_for(sb.sandbox_id)
+    return sb
+
+
 async def get_sandbox(sandbox_id: str) -> SandboxResponse | None:
     """Get sandbox info by ID."""
     store = _get_store()
-    return await store.get(sandbox_id)
+    return _backfill_proxy_url(await store.get(sandbox_id))
 
 
 async def list_sandboxes(user_id: str | None = None) -> list[SandboxResponse]:
     """List all sandboxes, optionally filtered by user."""
     store = _get_store()
-    return await store.list(user_id=user_id)
+    rows = await store.list(user_id=user_id)
+    for sb in rows:
+        _backfill_proxy_url(sb)
+    return rows
 
 
 def get_sandbox_internal_ip(sandbox_id: str) -> str | None:

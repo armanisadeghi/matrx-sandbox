@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import hmac
 import logging
+from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
+from fastapi.responses import StreamingResponse
 import httpx
 
 from orchestrator import sandbox_manager, storage
+from orchestrator.auth import sandbox_token
 from orchestrator.config import settings
 from orchestrator.models import (
     AccessResponse,
+    AccessTokenRequest,
+    AccessTokenResponse,
     CompletionRequest,
     CompletionResponse,
     CreateSandboxRequest,
@@ -591,7 +597,7 @@ async def proxy_ports(sandbox_id: str, request: Request):
         raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
     url = f"http://{container_ip}:8000/ports"
-    
+
     async with httpx.AsyncClient() as client:
         try:
             resp = await client.request(
@@ -608,4 +614,206 @@ async def proxy_ports(sandbox_id: str, request: Request):
             status_code=resp.status_code,
             headers=dict(resp.headers)
         )
+
+
+# ─── Browser-direct access tokens + reverse proxy ────────────────────────────
+# §2 + §7 of features/code/SANDBOX_DIRECT_ENDPOINTS.md (matrx-frontend).
+# Lets the browser hit the orchestrator directly for SSE / WebSocket / large
+# transfers / AI passthrough — bypassing Vercel's 300s function cap and WS
+# limitations. Auth is short-lived HMAC bearer tokens minted by Next.js
+# (admin-key-authed); the proxy validates each token against the sandbox id
+# in the path, scope, and expiry before forwarding to the in-container
+# matrx_agent daemon.
+#
+# Two routes:
+#   POST /sandboxes/{sandbox_id}/access-tokens  — admin-key-authed, mints token
+#   ANY  /sandboxes/{sandbox_id}/proxy/{path:path} — bearer- or admin-authed reverse proxy
+
+_HOP_BY_HOP_FORWARD = {
+    "host", "content-length", "connection", "transfer-encoding", "upgrade",
+    "x-api-key", "authorization",  # never forward our auth headers upstream
+}
+_HOP_BY_HOP_BACK = {"transfer-encoding", "content-encoding", "content-length", "connection"}
+
+
+def _bearer_from_headers(headers) -> str | None:
+    raw = headers.get("authorization") or headers.get("Authorization")
+    if not raw:
+        return None
+    if not raw.lower().startswith("bearer "):
+        return None
+    return raw.split(" ", 1)[1].strip()
+
+
+def _authenticate_proxy_request(request: Request, sandbox_id: str, *, required_scope: str = "ai") -> str:
+    """Accept either Bearer (HMAC token) or X-API-Key (master key).
+
+    Returns the auth kind used: ``"bearer"`` or ``"master"``. Raises
+    ``HTTPException`` with the right status code on failure. Single-use jti
+    consumption is the caller's responsibility (we don't consume on REST —
+    too easy to accidentally invalidate a token mid-retry; only WS upgrades
+    consume).
+    """
+    # Master key path — same shape as the global APIKeyMiddleware uses.
+    api_key = request.headers.get(settings.api_key_header) or _bearer_from_headers(request.headers)
+    if settings.api_key and api_key and hmac.compare_digest(api_key, settings.api_key):
+        return "master"
+
+    # Bearer token path
+    token = _bearer_from_headers(request.headers)
+    if not token:
+        raise HTTPException(status_code=401, detail="missing bearer token (Authorization: Bearer <token>)")
+
+    if not settings.access_token_secret:
+        # Token issuance isn't configured — be explicit so the operator
+        # knows what to set, instead of silently rejecting.
+        raise HTTPException(status_code=503, detail="access tokens not configured (set MATRX_ACCESS_TOKEN_SECRET)")
+
+    try:
+        sandbox_token.verify_token(
+            token=token,
+            secret=settings.access_token_secret,
+            expected_sandbox_id=sandbox_id,
+            required_scope=required_scope,
+        )
+    except sandbox_token.TokenError as exc:
+        raise HTTPException(status_code=401, detail=str(exc)) from exc
+    return "bearer"
+
+
+@router.post("/{sandbox_id}/access-tokens", response_model=AccessTokenResponse)
+async def issue_access_token(sandbox_id: str, body: AccessTokenRequest) -> AccessTokenResponse:
+    """Mint a short-lived HMAC bearer token bound to ``sandbox_id``.
+
+    Admin-authed (via the global APIKeyMiddleware — Next.js calls this after
+    verifying the user owns the sandbox). The token is presented as
+    ``Authorization: Bearer <token>`` on browser-direct calls to
+    ``/sandboxes/{sandbox_id}/proxy/*``.
+
+    Returns 503 when the orchestrator hasn't been configured with an HMAC
+    secret (set ``MATRX_ACCESS_TOKEN_SECRET``).
+    """
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+
+    if not settings.access_token_secret:
+        raise HTTPException(
+            status_code=503,
+            detail="access tokens not configured (set MATRX_ACCESS_TOKEN_SECRET on the orchestrator)",
+        )
+
+    ttl = body.ttl_seconds or sandbox_token.DEFAULT_TTL_SECONDS
+
+    try:
+        token, payload = sandbox_token.issue_token(
+            secret=settings.access_token_secret,
+            sandbox_id=sandbox_id,
+            scopes=body.scopes,
+            tier=settings.host_tier or (sandbox.tier.value if sandbox.tier else "ec2"),
+            ttl_seconds=ttl,
+            actor=body.actor,
+            single_use=body.single_use,
+        )
+    except sandbox_token.TokenError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    direct_url = (settings.public_url or "").rstrip("/")
+    if not direct_url:
+        raise HTTPException(
+            status_code=503,
+            detail="MATRX_PUBLIC_URL must be set for the orchestrator to advertise its direct URL",
+        )
+    ws_base = direct_url.replace("https://", "wss://", 1).replace("http://", "ws://", 1)
+
+    return AccessTokenResponse(
+        token=token,
+        expires_at=datetime.fromtimestamp(payload["exp"], tz=timezone.utc),
+        direct_url=direct_url,
+        ws_base=ws_base,
+        tier=payload["tier"],
+        sandbox_id=sandbox_id,
+    )
+
+
+@router.api_route(
+    "/{sandbox_id}/proxy/{path:path}",
+    methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
+)
+async def proxy_to_container(sandbox_id: str, path: str, request: Request):
+    """Reverse-proxy arbitrary HTTP requests into the in-container daemon.
+
+    Browser → ``{public_url}/sandboxes/{sandbox_id}/proxy/<path>`` →
+    orchestrator validates token → forwards to ``http://<container_ip>:8000/<path>``
+    1:1 (method, headers minus hop-by-hop, body, response shape, streaming).
+
+    Used by the React `code` workspace's per-conversation
+    ``serverOverrideUrl`` to route AI-passthrough calls (``/ai/agents/.../execute``,
+    NDJSON streams, etc.) without traversing Next.js. Auth: Bearer token from
+    ``POST /access-tokens`` OR ``X-API-Key`` master.
+    """
+    # OPTIONS preflight handled by the global CORSMiddleware before reaching
+    # us; the route still has to declare the method so FastAPI's router
+    # doesn't 405. We do a fast-pass here in case CORSMiddleware was
+    # misconfigured — return 204 with no upstream call.
+    if request.method == "OPTIONS":
+        return Response(status_code=204)
+
+    _authenticate_proxy_request(request, sandbox_id, required_scope="ai")
+
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+
+    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    if not container_ip:
+        raise HTTPException(status_code=502, detail="Sandbox container has no reachable IP")
+
+    target_url = f"http://{container_ip}:8000/{path}"
+    forward_headers = {
+        k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP_FORWARD
+    }
+    body = await request.body()
+
+    # Use a long-lived client kept open across the streaming response so
+    # the upstream connection isn't closed mid-iteration. The body iterator
+    # is responsible for closing both the response and the client.
+    client = httpx.AsyncClient(timeout=None)
+    try:
+        upstream_request = client.build_request(
+            method=request.method,
+            url=target_url,
+            content=body,
+            headers=forward_headers,
+            params=dict(request.query_params),
+        )
+        upstream = await client.send(upstream_request, stream=True)
+    except httpx.RequestError as exc:
+        await client.aclose()
+        raise HTTPException(status_code=502, detail=f"upstream error: {exc}") from exc
+
+    async def body_iterator():
+        try:
+            async for chunk in upstream.aiter_raw():
+                yield chunk
+        finally:
+            await upstream.aclose()
+            await client.aclose()
+
+    response_headers = {
+        k: v for k, v in upstream.headers.items() if k.lower() not in _HOP_BY_HOP_BACK
+    }
+    response_headers["X-Sandbox-Id"] = sandbox_id
+    if sandbox.tier:
+        # sandbox.tier is a SandboxTier enum coming straight from create_sandbox,
+        # but the in-memory store re-serializes it to a plain string on round-trip.
+        # Handle both shapes.
+        response_headers["X-Tier"] = getattr(sandbox.tier, "value", sandbox.tier)
+
+    return StreamingResponse(
+        body_iterator(),
+        status_code=upstream.status_code,
+        headers=response_headers,
+        media_type=upstream.headers.get("content-type", "application/octet-stream"),
+    )
 
