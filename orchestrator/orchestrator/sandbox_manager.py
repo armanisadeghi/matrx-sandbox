@@ -309,13 +309,35 @@ async def create_sandbox(
         # code resolves real on-disk locations. Anything else (API keys,
         # secrets, Supabase connection bits) flows through verbatim.
         if (template or "") == "aidream":
-            sandbox_aidream_root = "/home/agent/aidream"
+            sandbox_home = "/home/agent"
+            sandbox_aidream_root = f"{sandbox_home}/aidream"
             env["BASE_DIR"] = sandbox_aidream_root
             env["TEMP_DIR"] = f"{sandbox_aidream_root}/temp"
             env["LOG_DIR"] = f"{sandbox_aidream_root}/temp/logs"
             env["MEDIA_BASE_DIR"] = f"{sandbox_aidream_root}/temp/media"
-            # Some legacy code looks for SAMPLE_DATA_DIR
             env["SAMPLE_DATA_DIR"] = f"{sandbox_aidream_root}/common/sample_data"
+            # matrx-ai filesystem tools (fs_list, fs_read, fs_search, ...) gate
+            # every path against TOOL_WORKSPACE_BASE. Aidream's .env points it
+            # at the maintainer's local /Users/.../temp, which strands every
+            # tool call with "Directory not found" / "Path escapes workspace".
+            # Inside the sandbox the natural workspace IS the agent's home —
+            # the container itself is the user/project boundary.
+            env["TOOL_WORKSPACE_BASE"] = sandbox_home
+            # The sniff-marker (/opt/aidream-template) is baked into the image;
+            # set the explicit env signal too so tools never fall back to the
+            # multi-tenant /tmp/workspaces layout even if the marker is moved.
+            env["MATRX_TOOLS_SANDBOX_MODE"] = "1"
+            # Other Mac-shaped paths that aidream code reads at runtime.
+            env["ADMIN_PYTHON_ROOT"] = sandbox_aidream_root
+            env["ADMIN_TS_ROOT"] = sandbox_aidream_root
+            env["ADMIN_SAVE_DIRECT_ROOT"] = sandbox_aidream_root
+            env["MATRX_PYTHON_ROOT"] = sandbox_aidream_root
+            env["PYTHONPATH"] = sandbox_aidream_root
+            # GOOGLE_APPLICATION_CREDENTIALS points at a Mac filesystem path
+            # that doesn't exist here — having it set causes google-auth to
+            # try to open a non-existent file. Drop it so the Google SDKs
+            # gracefully fall back to other auth signals (or stay unconfigured).
+            env.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
 
         # Resource overrides — fall back to settings defaults
         cpu_limit = resources.get("cpu") or settings.container_cpu_limit
