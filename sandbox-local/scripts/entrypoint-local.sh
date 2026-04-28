@@ -61,6 +61,13 @@ fi
 
 echo "[3/5] Agent environment ready."
 
+# ─── Step 3.5: Ensure canonical /home/agent layout ───────────────────────────
+# Same script as the production entrypoint — keeps the layout identical
+# regardless of how the sandbox boots. See ensure-layout.sh for details.
+echo "[3.5/5] Ensuring canonical sandbox layout..."
+/opt/sandbox/scripts/ensure-layout.sh
+echo "[3.5/5] Layout ready."
+
 # ─── Step 4: Start SSH server ────────────────────────────────────────────────
 echo "[4/5] Starting SSH server..."
 mkdir -p /run/sshd
