@@ -91,12 +91,11 @@ cmd_serve() {
     fi
     sudo mkdir -p "$LOG_DIR" && sudo chown agent:agent "$LOG_DIR"
     cd "$WORK_DIR" || exit 1
-    # aidream's run.py exists; otherwise fall back to uvicorn directly.
-    if [ -f run.py ]; then
-        nohup uv run python run.py >"$LOG_FILE" 2>&1 &
-    else
-        nohup uv run uvicorn aidream.api.app:fastapi_app --host 0.0.0.0 --port "$port" >"$LOG_FILE" 2>&1 &
-    fi
+    # ALWAYS go through uvicorn directly so we pin the port. aidream's run.py
+    # has its own "find a free port" logic that picks something random when
+    # 8000 is busy (matrx_agent has 8000); we need 8001 to be stable so the
+    # orchestrator's /proxy/{path:path} can route /ai/* to it deterministically.
+    nohup uv run uvicorn aidream.api.app:fastapi_app --host 0.0.0.0 --port "$port" >"$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     sleep 2
     if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then

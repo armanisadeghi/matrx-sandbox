@@ -56,6 +56,23 @@ else
     fi
 fi
 
+# Auto-start aidream's FastAPI on port 8001 after the standard daemon is up.
+# Background it so we don't block; the orchestrator's /proxy/{path:path}
+# routes /ai/* and /api/* paths here while leaving everything else (fs, git,
+# exec) on matrx_agent at port 8000.
+#
+# Run as the `agent` user (this entrypoint runs as root pre-exec). Wait 8s
+# so matrx_agent has bound :8000 and the volume is fully seeded before we
+# start uvicorn against the venv. Failure here is non-fatal — the sandbox
+# still works for fs/git/exec; only AI passthrough breaks.
+log "auto-starting aidream FastAPI on :8001 in the background"
+(
+    sleep 8
+    sudo -u agent -E -H bash -lc '/usr/local/bin/mtx aidream serve --port 8001' \
+        > /var/log/sandbox/aidream-autostart.log 2>&1 || true
+) &
+disown || true
+
 # Hand off to the right downstream entrypoint based on tier. Production
 # entrypoint.sh requires S3_BUCKET (it runs hot-sync), which the hosted tier
 # doesn't set; entrypoint-local.sh skips S3 and is what :local uses.

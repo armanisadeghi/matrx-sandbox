@@ -836,7 +836,21 @@ async def proxy_to_container(sandbox_id: str, path: str, request: Request):
     if not container_ip:
         raise HTTPException(status_code=502, detail="Sandbox container has no reachable IP")
 
-    target_url = f"http://{container_ip}:8000/{path}"
+    # Path-based port routing inside the container.
+    #
+    # Two services run side-by-side in the aidream-image variant:
+    #   port 8000 — matrx_agent: low-level sandbox surface
+    #               /fs/*, /git/*, /exec/stream, /processes, /ports,
+    #               /credentials, /internal/*, etc.
+    #   port 8001 — aidream FastAPI (when the image is :aidream and aidream
+    #               serve has auto-started): the full /ai/* + /api/* surface
+    #               that the FE's chat / agent runs hit.
+    #
+    # The bare matrx-sandbox:core image has nothing on 8001; calls there
+    # 502 with "container has no reachable IP" — which is correct, since
+    # AI passthrough only makes sense on the aidream variant.
+    upstream_port = 8001 if path.startswith(("ai/", "api/")) else 8000
+    target_url = f"http://{container_ip}:{upstream_port}/{path}"
     # Strip Authorization only when the orchestrator itself consumed it
     # (kind="scoped-bearer"). For master / scoped-header / passthrough-bearer
     # we forward Authorization unchanged so the upstream daemon can use it.
