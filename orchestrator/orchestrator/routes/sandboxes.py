@@ -629,10 +629,21 @@ async def proxy_ports(sandbox_id: str, request: Request):
 #   POST /sandboxes/{sandbox_id}/access-tokens  — admin-key-authed, mints token
 #   ANY  /sandboxes/{sandbox_id}/proxy/{path:path} — bearer- or admin-authed reverse proxy
 
+# Headers we proxy-side own (proxy auth, hop-by-hop) and must NEVER forward
+# to the in-container daemon. Notably ``authorization`` is INTENTIONALLY
+# NOT in this set — it carries the upstream identity (the user's Supabase
+# JWT, an aidream API token, etc.) and the daemon needs it to identify the
+# request. Stripping it was the cause of the "Conversation not found" 404
+# we saw when the FE switched to the proxy_url path.
 _HOP_BY_HOP_FORWARD = {
     "host", "content-length", "connection", "transfer-encoding", "upgrade",
-    "x-api-key", "authorization",  # never forward our auth headers upstream
+    "x-api-key",                   # master proxy auth — proxy-only
+    "x-sandbox-access-token",      # scoped proxy auth — proxy-only
 }
+
+# Headers we strip from the upstream response on the way back. Standard
+# hop-by-hop set; ``connection`` + ``transfer-encoding`` would make
+# starlette unhappy if forwarded verbatim.
 _HOP_BY_HOP_BACK = {"transfer-encoding", "content-encoding", "content-length", "connection"}
 
 
@@ -645,40 +656,94 @@ def _bearer_from_headers(headers) -> str | None:
     return raw.split(" ", 1)[1].strip()
 
 
-def _authenticate_proxy_request(request: Request, sandbox_id: str, *, required_scope: str = "ai") -> str:
-    """Accept either Bearer (HMAC token) or X-API-Key (master key).
+def _authenticate_proxy_request(
+    request: Request,
+    sandbox_id: str,
+    *,
+    required_scope: str = "ai",
+) -> tuple[str, bool]:
+    """Authenticate a /proxy/{path:path} call. Returns ``(kind, strip_authorization)``.
 
-    Returns the auth kind used: ``"bearer"`` or ``"master"``. Raises
-    ``HTTPException`` with the right status code on failure. Single-use jti
-    consumption is the caller's responsibility (we don't consume on REST —
-    too easy to accidentally invalidate a token mid-retry; only WS upgrades
-    consume).
+    Auth slots, checked in order:
+
+    1. ``X-API-Key`` — master admin key (Next.js, ops). Stripped on forward.
+       ``Authorization`` is left untouched.
+    2. ``X-Sandbox-Access-Token`` — sandbox-scoped HMAC token issued by
+       ``POST /access-tokens``. Recommended for browsers because it doesn't
+       collide with the upstream identity carried in ``Authorization``.
+       Stripped on forward; ``Authorization`` left untouched.
+    3. ``Authorization: Bearer <token>`` where the token validates as our
+       HMAC. Legacy compat for callers that already set Authorization to
+       our token. Consumed by us → stripped on forward.
+    4. ``Authorization: Bearer <anything else>`` — treated as upstream
+       identity (Supabase JWT, aidream API token, etc.). The daemon is the
+       identity boundary; we forward unchanged. The orchestrator does NOT
+       try to validate JWTs here — that responsibility belongs to the
+       upstream service, which already does it correctly.
+
+    Returns ``(kind, strip_authorization)`` where ``strip_authorization``
+    tells the proxy whether to drop the inbound ``Authorization`` from the
+    forwarded headers. False for cases (1), (2), (4); True only for (3).
+
+    A request with NO recognised auth (no master, no scoped, no bearer)
+    is rejected with 401 to keep the proxy from being an open relay.
     """
-    # Master key path — same shape as the global APIKeyMiddleware uses.
-    api_key = request.headers.get(settings.api_key_header) or _bearer_from_headers(request.headers)
-    if settings.api_key and api_key and hmac.compare_digest(api_key, settings.api_key):
-        return "master"
+    # 1. Master key
+    if settings.api_key:
+        master_candidate = request.headers.get(settings.api_key_header)
+        if master_candidate and hmac.compare_digest(master_candidate, settings.api_key):
+            return "master", False
 
-    # Bearer token path
-    token = _bearer_from_headers(request.headers)
-    if not token:
-        raise HTTPException(status_code=401, detail="missing bearer token (Authorization: Bearer <token>)")
+    # 2. Sandbox-scoped token via dedicated header (preferred for browsers)
+    scoped_header_token = request.headers.get("x-sandbox-access-token") or request.headers.get(
+        "X-Sandbox-Access-Token"
+    )
+    if scoped_header_token:
+        if not settings.access_token_secret:
+            raise HTTPException(
+                status_code=503,
+                detail="access tokens not configured (set MATRX_ACCESS_TOKEN_SECRET)",
+            )
+        try:
+            sandbox_token.verify_token(
+                token=scoped_header_token,
+                secret=settings.access_token_secret,
+                expected_sandbox_id=sandbox_id,
+                required_scope=required_scope,
+            )
+        except sandbox_token.TokenError as exc:
+            raise HTTPException(status_code=401, detail=str(exc)) from exc
+        return "scoped-header", False
 
-    if not settings.access_token_secret:
-        # Token issuance isn't configured — be explicit so the operator
-        # knows what to set, instead of silently rejecting.
-        raise HTTPException(status_code=503, detail="access tokens not configured (set MATRX_ACCESS_TOKEN_SECRET)")
+    # 3+4. Authorization Bearer — could be our HMAC (legacy) or a foreign
+    # token destined for the upstream daemon (Supabase JWT, etc.).
+    auth_bearer = _bearer_from_headers(request.headers)
+    if auth_bearer:
+        # Try to verify it as our HMAC token. Success → we own it; strip.
+        if settings.access_token_secret:
+            try:
+                sandbox_token.verify_token(
+                    token=auth_bearer,
+                    secret=settings.access_token_secret,
+                    expected_sandbox_id=sandbox_id,
+                    required_scope=required_scope,
+                )
+                return "scoped-bearer", True
+            except sandbox_token.TokenError:
+                # Not our token — treat as opaque upstream identity. The
+                # daemon validates it; the orchestrator just forwards.
+                pass
+        return "passthrough-bearer", False
 
-    try:
-        sandbox_token.verify_token(
-            token=token,
-            secret=settings.access_token_secret,
-            expected_sandbox_id=sandbox_id,
-            required_scope=required_scope,
-        )
-    except sandbox_token.TokenError as exc:
-        raise HTTPException(status_code=401, detail=str(exc)) from exc
-    return "bearer"
+    raise HTTPException(
+        status_code=401,
+        detail=(
+            "no auth provided — supply one of: "
+            "X-API-Key (master); "
+            "X-Sandbox-Access-Token: <token from POST /access-tokens> (scoped); "
+            "Authorization: Bearer <jwt-or-upstream-token> (forwarded to the in-container daemon)"
+        ),
+    )
 
 
 @router.post("/{sandbox_id}/access-tokens", response_model=AccessTokenResponse)
@@ -759,7 +824,9 @@ async def proxy_to_container(sandbox_id: str, path: str, request: Request):
     if request.method == "OPTIONS":
         return Response(status_code=204)
 
-    _authenticate_proxy_request(request, sandbox_id, required_scope="ai")
+    _kind, strip_authorization = _authenticate_proxy_request(
+        request, sandbox_id, required_scope="ai"
+    )
 
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
@@ -770,8 +837,12 @@ async def proxy_to_container(sandbox_id: str, path: str, request: Request):
         raise HTTPException(status_code=502, detail="Sandbox container has no reachable IP")
 
     target_url = f"http://{container_ip}:8000/{path}"
+    # Strip Authorization only when the orchestrator itself consumed it
+    # (kind="scoped-bearer"). For master / scoped-header / passthrough-bearer
+    # we forward Authorization unchanged so the upstream daemon can use it.
+    forward_drop = _HOP_BY_HOP_FORWARD | ({"authorization"} if strip_authorization else set())
     forward_headers = {
-        k: v for k, v in request.headers.items() if k.lower() not in _HOP_BY_HOP_FORWARD
+        k: v for k, v in request.headers.items() if k.lower() not in forward_drop
     }
     body = await request.body()
 

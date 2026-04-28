@@ -94,6 +94,7 @@ app.add_middleware(
         "Authorization",
         "Content-Type",
         "X-API-Key",
+        "X-Sandbox-Access-Token",  # scoped proxy auth (browsers — doesn't collide with Authorization)
         "X-Conversation-Id",
         "X-Instance-Id",
         "X-PTY-Cols",
