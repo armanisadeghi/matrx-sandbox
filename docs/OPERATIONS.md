@@ -375,3 +375,21 @@ gh workflow run deploy.yml --repo armanisadeghi/matrx-sandbox
 | `/extend` returns 200 but `expires_at` doesn't change | Pre-v0.2.0 orchestrator (stub still in place) | Redeploy with the latest image |
 | In-memory store loses sandboxes on orchestrator restart | Expected (in-memory); switch to Postgres per "Switching the metadata store" above | |
 | Traefik 404 on `orchestrator.dev.codematrx.com` | DNS not resolving or Traefik labels missing | `dig orchestrator.dev.codematrx.com` (must point at `77.37.62.64`); `docker inspect matrx-orchestrator \| grep traefik` |
+
+## Passing the full aidream env into spawned sandboxes (added 2026-04-28)
+
+The hosted orchestrator's `docker-compose.yml` (at `/srv/apps/sandbox-orchestrator/docker-compose.yml`) now loads TWO env files:
+
+1. `.env` — the orchestrator's own settings (`MATRX_API_KEY`, `MATRX_PUBLIC_URL`, `MATRX_ACCESS_TOKEN_SECRET`, etc.)
+2. `/srv/projects/aidream/.env` — the full aidream prod env (~159 vars) — Supabase URL/keys/JWT secret, AI provider API keys, admin tokens, etc.
+
+The orchestrator never stores values from #2 as typed settings. It reads from `os.environ` at sandbox-create time and forwards every name listed in `MATRX_AIDREAM_PASSTHROUGH_ENV` (default covers Supabase + JWT secret + ~20 AI provider keys + admin identifiers) to the spawned container's environment. This is what makes aidream's FastAPI inside `:aidream` template sandboxes able to validate user JWTs and call AI providers.
+
+Verify with:
+```bash
+curl -s https://orchestrator.dev.codematrx.com/ \
+  | python3 -c "import json,sys; ap=json.load(sys.stdin)['integrations']['aidream_passthrough']; \
+print(f'set ({ap[\"configured_count\"]}): {ap[\"configured_keys\"]}')"
+```
+
+Should show 25+ keys with `SUPABASE_MATRIX_JWT_SECRET` among them. If it doesn't, `aidream/.env` isn't being read — check the `env_file` block in the compose file.
