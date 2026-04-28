@@ -301,6 +301,22 @@ async def create_sandbox(
             if val and key not in env:  # don't clobber already-set vars
                 env[key] = val
 
+        # ── Path-shape overrides ──────────────────────────────────────────────
+        # /srv/projects/aidream/.env was authored on the maintainer's Mac and
+        # ships paths like BASE_DIR=/Users/armanisadeghi/code/aidream. Those
+        # paths don't exist inside the sandbox (aidream is at /home/agent/aidream).
+        # Override the path-shaped vars so matrx-utils settings + file-handling
+        # code resolves real on-disk locations. Anything else (API keys,
+        # secrets, Supabase connection bits) flows through verbatim.
+        if (template or "") == "aidream":
+            sandbox_aidream_root = "/home/agent/aidream"
+            env["BASE_DIR"] = sandbox_aidream_root
+            env["TEMP_DIR"] = f"{sandbox_aidream_root}/temp"
+            env["LOG_DIR"] = f"{sandbox_aidream_root}/temp/logs"
+            env["MEDIA_BASE_DIR"] = f"{sandbox_aidream_root}/temp/media"
+            # Some legacy code looks for SAMPLE_DATA_DIR
+            env["SAMPLE_DATA_DIR"] = f"{sandbox_aidream_root}/common/sample_data"
+
         # Resource overrides — fall back to settings defaults
         cpu_limit = resources.get("cpu") or settings.container_cpu_limit
         memory_limit = resources.get("memory_mb")
