@@ -96,6 +96,44 @@ class Settings(BaseSettings):
     # with Authorization: Bearer round-trips).
     cors_allowed_origins: str = ""  # env var: MATRX_CORS_ALLOWED_ORIGINS
 
+    # ── aidream-in-sandbox env passthrough ──────────────────────────────────
+    # When the aidream FastAPI runs INSIDE a sandbox container (template=
+    # 'aidream'), it needs the same secrets the central aidream backend uses
+    # — Supabase URL/keys, AI provider API keys, JWT secret, etc. Rather
+    # than enumerating each one as a separate setting, we keep ONE list of
+    # env-var names to read from the orchestrator's process environment and
+    # pass through to every spawned hosted-tier sandbox.
+    #
+    # Operator workflow: set the SAME env vars on the orchestrator host
+    # that the central aidream deploy uses, then list them here. The
+    # orchestrator NEVER stores their values in its own settings — it just
+    # acts as a conduit. Vars not present in the orchestrator's environ
+    # are silently skipped (so you can list a superset and have only what's
+    # set get forwarded).
+    #
+    # Default covers the minimum aidream needs to start successfully:
+    # AWS region, Supabase URL/keys + JWT secret, the major AI provider
+    # keys, and aidream's admin/system identifiers. Override via
+    # MATRX_AIDREAM_PASSTHROUGH_ENV (comma-separated) when adding new
+    # secrets without redeploying the orchestrator.
+    aidream_passthrough_env: str = (
+        # AWS region (boto3-standard; aidream's aws_client.py reads it)
+        "AWS_REGION,"
+        # Supabase — auth, RLS-bypass, JWT validation
+        "SUPABASE_URL,SUPABASE_KEY,"
+        "SUPABASE_MATRIX_URL,SUPABASE_MATRIX_KEY,SUPABASE_MATRIX_JWT_SECRET,"
+        "SUPABASE_DJANGO_URL,SUPABASE_DJANGO_KEY,"
+        # AI providers
+        "OPENAI_API_KEY,ANTHROPIC_API_KEY,GOOGLE_API_KEY,GROQ_API_KEY,"
+        "CEREBRAS_API_KEY,XAI_API_KEY,TOGETHER_API_KEY,COHERE_API_KEY,"
+        "FIREWORKS_API_KEY,REPLICATE_API_TOKEN,ELEVENLABS_API_KEY,"
+        "HUGGING_FACE_TOKEN_ID,HUGGINGFACE_API_KEY,"
+        # aidream system identifiers
+        "ADMIN_API_TOKEN,SYSTEM_USER_ID,ADMIN_USER_ID,"
+        # Postgres (only matters if aidream runs migrations / direct DB)
+        "POSTGRES_HOST,POSTGRES_DB,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_PORT,"
+    )
+
     # ── AWS credentials passthrough (hosted tier S3 sync) ───────────────────
     # On EC2-tier orchestrator: instance role provides creds, no need to set.
     # On hosted-tier orchestrator: explicit creds required to sync sandboxes

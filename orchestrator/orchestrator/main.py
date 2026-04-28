@@ -131,7 +131,25 @@ async def root():
                 "configured": bool(settings.s3_bucket),
                 "creds_passthrough": bool(settings.aws_access_key_id) and bool(settings.aws_secret_access_key),
             },
+            # Visibility into the aidream-in-sandbox passthrough — which env
+            # vars from this orchestrator's environ will be forwarded to
+            # spawned aidream containers, and how many of those are actually
+            # set. Names only; values are NEVER echoed.
+            "aidream_passthrough": _aidream_passthrough_status(),
         },
+    }
+
+
+def _aidream_passthrough_status() -> dict:
+    import os
+    keys = [k.strip() for k in (settings.aidream_passthrough_env or "").split(",") if k.strip()]
+    set_keys = sorted(k for k in keys if os.environ.get(k))
+    missing_keys = sorted(k for k in keys if not os.environ.get(k))
+    return {
+        "configured_count": len(set_keys),
+        "configured_keys": set_keys,
+        "missing_count": len(missing_keys),
+        "missing_keys": missing_keys,
     }
 
 

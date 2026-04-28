@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import shlex
 import uuid
 from datetime import datetime, timezone
@@ -218,7 +219,28 @@ async def create_sandbox(
         if location.tier == "hosted" and settings.aws_access_key_id and settings.aws_secret_access_key:
             env["AWS_ACCESS_KEY_ID"] = settings.aws_access_key_id
             env["AWS_SECRET_ACCESS_KEY"] = settings.aws_secret_access_key
-            env["AWS_DEFAULT_REGION"] = config.get("s3_region", settings.s3_region)
+            # Pass BOTH region env-var conventions. boto3 honors either, but
+            # downstream code may explicitly check just one — aidream's
+            # common/aws/aws_client.py reads AWS_REGION specifically.
+            region = config.get("s3_region", settings.s3_region)
+            env["AWS_DEFAULT_REGION"] = region
+            env["AWS_REGION"] = region
+
+        # ── aidream-in-sandbox env passthrough ────────────────────────────────
+        # Forward every env var named in settings.aidream_passthrough_env from
+        # the orchestrator's process environment into the spawned container.
+        # This is how aidream's FastAPI gets its Supabase URL/keys, AI
+        # provider API keys, JWT secret, etc. without us having to model
+        # each one as a typed Settings field. Values not present in the
+        # orchestrator's environ are silently skipped — list a superset
+        # safely.
+        passthrough_keys = [
+            k.strip() for k in (settings.aidream_passthrough_env or "").split(",") if k.strip()
+        ]
+        for key in passthrough_keys:
+            val = os.environ.get(key)
+            if val and key not in env:  # don't clobber already-set vars
+                env[key] = val
 
         # Resource overrides — fall back to settings defaults
         cpu_limit = resources.get("cpu") or settings.container_cpu_limit
