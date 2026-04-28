@@ -1066,14 +1066,22 @@ async def sandbox_logs(sandbox_id: str, source: str = "all", tail: int = 200) ->
     valid_sources = {"docker", "aidream", "matrx_agent", "entrypoint", "autostart"}
 
     async def _read_inside(path: str) -> str:
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "exec", sandbox_id, "tail", "-n", str(tail), path,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
-        if proc.returncode != 0:
-            return f"(could not read {path}: {stderr.decode(errors='replace').strip()})"
-        return stdout.decode(errors="replace")
+        # Use the docker SDK (same one diagnostics uses) — the orchestrator
+        # container is python:3.11-slim with no docker CLI installed, so
+        # subprocess-based docker exec fails with FileNotFoundError.
+        try:
+            client = sandbox_manager._get_docker_client()
+            container = client.containers.get(sandbox_id)
+            exit_code, output = container.exec_run(
+                ["tail", "-n", str(tail), path],
+                stdout=True, stderr=True, demux=False,
+            )
+            text = output.decode(errors="replace") if output else ""
+            if exit_code != 0:
+                return f"(could not read {path}: exit={exit_code}) {text.strip()}"
+            return text
+        except Exception as exc:
+            return f"(error reading {path}: {exc})"
 
     sources_to_read = valid_sources if source == "all" else {source}
     if source != "all" and source not in valid_sources:
