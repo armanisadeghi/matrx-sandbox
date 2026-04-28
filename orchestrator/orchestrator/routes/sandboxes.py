@@ -1080,13 +1080,14 @@ async def sandbox_logs(sandbox_id: str, source: str = "all", tail: int = 200) ->
         raise HTTPException(status_code=400, detail=f"unknown source '{source}'. valid: {sorted(valid_sources | {'all'})}")
 
     if "docker" in sources_to_read:
-        proc = await asyncio.create_subprocess_exec(
-            "docker", "logs", "--tail", str(tail), sandbox_id,
-            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
-        )
-        stdout, stderr = await proc.communicate()
         out.append("=== docker logs (container stdout/stderr) ===")
-        out.append(stdout.decode(errors="replace") + stderr.decode(errors="replace"))
+        try:
+            client = sandbox_manager._get_docker_client()
+            container = client.containers.get(sandbox_id)
+            log_bytes = container.logs(tail=tail, stdout=True, stderr=True, timestamps=False)
+            out.append(log_bytes.decode(errors="replace") if log_bytes else "(no log output)")
+        except Exception as exc:
+            out.append(f"(error fetching docker logs: {exc})")
 
     if "entrypoint" in sources_to_read:
         out.append("\n=== entrypoint.log ===")
