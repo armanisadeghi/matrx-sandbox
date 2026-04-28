@@ -12,6 +12,7 @@ from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Form
 from fastapi.responses import FileResponse, PlainTextResponse
 from pydantic import BaseModel
 
+from matrx_agent.cloud_sync import CloudFilesWatcher
 from matrx_agent.persistence import CheckpointDaemon, read_prior_manifest, render_report
 from matrx_agent.persistence.checkpoint import DEFAULT_INTERVAL_SECONDS
 from matrx_agent.persistence.git_autostash import auto_stash_all_repos
@@ -29,6 +30,7 @@ _logger = logging.getLogger("matrx_agent")
 _checkpoint = CheckpointDaemon(interval_seconds=int(os.environ.get(
     "MATRX_CHECKPOINT_INTERVAL_SECONDS", str(DEFAULT_INTERVAL_SECONDS),
 )))
+_cloud_watcher = CloudFilesWatcher()
 
 
 @asynccontextmanager
@@ -54,6 +56,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         _logger.warning("matrx_agent: failed to start checkpoint daemon: %s", e)
 
+    # Start the cloud-files real-time watcher (no-ops if AI Dream env is unset).
+    # Runs as a background task so a slow down-marker wait doesn't block the
+    # daemon from accepting requests.
+    cloud_watcher_starter = asyncio.create_task(_cloud_watcher.start())
+
     yield
 
     # Shutdown: best-effort final manifest write. The container may still be
@@ -62,6 +69,17 @@ async def lifespan(app: FastAPI):
         await _checkpoint.stop()
     except Exception as e:  # noqa: BLE001
         _logger.warning("matrx_agent: checkpoint daemon stop error: %s", e)
+    try:
+        # Cancel the starter in case it's still waiting on the down-marker; then
+        # stop the watcher itself (idempotent if it never started).
+        cloud_watcher_starter.cancel()
+        try:
+            await cloud_watcher_starter
+        except (asyncio.CancelledError, Exception):  # noqa: BLE001
+            pass
+        await _cloud_watcher.stop()
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("matrx_agent: cloud-files watcher stop error: %s", e)
     try:
         manifest = collect_manifest(graceful=True)
         write_manifest(manifest)

@@ -20,11 +20,11 @@ clear "AI Dream cloud-files API not reachable" message rather than crashing.
 from __future__ import annotations
 
 import json
-import os
 import sys
-import time
 from pathlib import Path
 from typing import Any
+
+from matrx_agent.cloud_sync.client import BridgeConfig, report_missing
 
 # Lazy http import — falls back to urllib if requests/httpx not in the image
 try:
@@ -35,30 +35,15 @@ except ImportError:  # pragma: no cover
     _USING = "urllib"
 
 
-def _config() -> dict[str, str] | None:
-    url = os.environ.get("MATRX_AIDREAM_URL", "").rstrip("/")
-    token = os.environ.get("MATRX_AIDREAM_SERVICE_TOKEN", "")
-    user_id = os.environ.get("USER_ID", "")
-    if not (url and token and user_id):
-        print(
-            "AI Dream not configured for this sandbox.\n"
-            "Need: MATRX_AIDREAM_URL, MATRX_AIDREAM_SERVICE_TOKEN, USER_ID env vars.\n"
-            "Run `mtx whoami` to see what's set.",
-            file=sys.stderr,
-        )
-        return None
-    return {"url": url, "token": token, "user_id": user_id}
+def _config() -> BridgeConfig | None:
+    cfg = BridgeConfig.from_env()
+    if cfg is None:
+        report_missing()
+    return cfg
 
 
-def _headers(cfg: dict[str, str], extra: dict[str, str] | None = None) -> dict[str, str]:
-    h = {
-        "Authorization": f"Bearer {cfg['token']}",
-        "X-Matrx-User-Id": cfg["user_id"],
-        "Accept": "application/json",
-    }
-    if extra:
-        h.update(extra)
-    return h
+def _headers(cfg: BridgeConfig, extra: dict[str, str] | None = None) -> dict[str, str]:
+    return cfg.headers(extra)
 
 
 def _http_json(method: str, url: str, headers: dict[str, str], **kwargs) -> Any:
@@ -89,9 +74,9 @@ def _http_json(method: str, url: str, headers: dict[str, str], **kwargs) -> Any:
 # ─── Commands ────────────────────────────────────────────────────────────────
 
 
-def cmd_ls(cfg: dict[str, str]) -> int:
+def cmd_ls(cfg: BridgeConfig) -> int:
     try:
-        listing = _http_json("GET", f"{cfg['url']}/api/cloud-files/list", _headers(cfg))
+        listing = _http_json("GET", f"{cfg.url}/api/cloud-files/list", _headers(cfg))
     except Exception as e:  # noqa: BLE001
         print(f"ls failed: {e}", file=sys.stderr)
         return 1
@@ -110,11 +95,11 @@ def cmd_ls(cfg: dict[str, str]) -> int:
     return 0
 
 
-def cmd_cat(cfg: dict[str, str], path: str) -> int:
+def cmd_cat(cfg: BridgeConfig, path: str) -> int:
     if _USING == "httpx":
         with _http.Client(timeout=60.0) as client:
             r = client.get(
-                f"{cfg['url']}/api/cloud-files/get",
+                f"{cfg.url}/api/cloud-files/get",
                 headers=_headers(cfg),
                 params={"path": path},
             )
@@ -126,7 +111,7 @@ def cmd_cat(cfg: dict[str, str], path: str) -> int:
         return 0
     else:
         import urllib.parse, urllib.error
-        url = f"{cfg['url']}/api/cloud-files/get?{urllib.parse.urlencode({'path': path})}"
+        url = f"{cfg.url}/api/cloud-files/get?{urllib.parse.urlencode({'path': path})}"
         req = _http.Request(url, headers=_headers(cfg))
         try:
             with _http.urlopen(req, timeout=60) as resp:
@@ -137,7 +122,7 @@ def cmd_cat(cfg: dict[str, str], path: str) -> int:
         return 0
 
 
-def cmd_put(cfg: dict[str, str], local_path: str, remote_path: str | None) -> int:
+def cmd_put(cfg: BridgeConfig, local_path: str, remote_path: str | None) -> int:
     p = Path(local_path)
     if not p.is_file():
         print(f"not a file: {local_path}", file=sys.stderr)
@@ -156,7 +141,7 @@ def cmd_put(cfg: dict[str, str], local_path: str, remote_path: str | None) -> in
     with _http.Client(timeout=120.0) as client:
         with p.open("rb") as fh:
             r = client.put(
-                f"{cfg['url']}/api/cloud-files/put",
+                f"{cfg.url}/api/cloud-files/put",
                 headers={k: v for k, v in _headers(cfg).items() if k != "Accept"},
                 files={"file": (p.name, fh)},
                 data={"file_path": remote_path},
@@ -169,11 +154,11 @@ def cmd_put(cfg: dict[str, str], local_path: str, remote_path: str | None) -> in
     return 0
 
 
-def cmd_rm(cfg: dict[str, str], path: str) -> int:
+def cmd_rm(cfg: BridgeConfig, path: str) -> int:
     try:
         _http_json(
             "DELETE",
-            f"{cfg['url']}/api/cloud-files/delete?path={path}",
+            f"{cfg.url}/api/cloud-files/delete?path={path}",
             _headers(cfg),
         )
         print(f"deleted {path}")
@@ -183,10 +168,10 @@ def cmd_rm(cfg: dict[str, str], path: str) -> int:
         return 1
 
 
-def cmd_sync_down(cfg: dict[str, str], dest: str, max_bytes: int) -> int:
+def cmd_sync_down(cfg: BridgeConfig, dest: str, max_bytes: int) -> int:
     """Bulk pull. Uses the same /list endpoint, then GETs each file."""
     try:
-        listing = _http_json("GET", f"{cfg['url']}/api/cloud-files/list", _headers(cfg))
+        listing = _http_json("GET", f"{cfg.url}/api/cloud-files/list", _headers(cfg))
     except Exception as e:  # noqa: BLE001
         print(f"sync down: list failed: {e}", file=sys.stderr)
         return 1
@@ -218,7 +203,7 @@ def cmd_sync_down(cfg: dict[str, str], dest: str, max_bytes: int) -> int:
             if _USING == "httpx":
                 with _http.Client(timeout=120.0) as client:
                     rr = client.get(
-                        f"{cfg['url']}/api/cloud-files/get",
+                        f"{cfg.url}/api/cloud-files/get",
                         headers=_headers(cfg),
                         params={"path": path},
                     )
@@ -226,7 +211,7 @@ def cmd_sync_down(cfg: dict[str, str], dest: str, max_bytes: int) -> int:
                     local.write_bytes(rr.content)
             else:
                 import urllib.parse
-                url = f"{cfg['url']}/api/cloud-files/get?{urllib.parse.urlencode({'path': path})}"
+                url = f"{cfg.url}/api/cloud-files/get?{urllib.parse.urlencode({'path': path})}"
                 req = _http.Request(url, headers=_headers(cfg))
                 with _http.urlopen(req, timeout=120) as resp:
                     local.write_bytes(resp.read())
@@ -240,7 +225,7 @@ def cmd_sync_down(cfg: dict[str, str], dest: str, max_bytes: int) -> int:
     return 0
 
 
-def cmd_sync_up(cfg: dict[str, str], src: str) -> int:
+def cmd_sync_up(cfg: BridgeConfig, src: str) -> int:
     src_dir = Path(src)
     if not src_dir.exists():
         print(f"sync up: source {src} doesn't exist, nothing to do")
@@ -259,7 +244,7 @@ def cmd_sync_up(cfg: dict[str, str], src: str) -> int:
             try:
                 with p.open("rb") as fh:
                     r = client.put(
-                        f"{cfg['url']}/api/cloud-files/put",
+                        f"{cfg.url}/api/cloud-files/put",
                         headers={k: v for k, v in _headers(cfg).items() if k != "Accept"},
                         files={"file": (p.name, fh)},
                         data={"file_path": rel},

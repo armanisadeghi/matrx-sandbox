@@ -62,6 +62,12 @@ case "$DIRECTION" in
             echo "[cloud-files-sync] WARNING: down-sync failed or timed out"
             exit 0  # don't block startup
         }
+        # Signal the in-process watcher (CloudFilesWatcher in matrx_agent.cloud_sync)
+        # that the down-sync completed and it is safe to start observing without
+        # re-uploading the bytes we just pulled. The watcher seeds its hash cache
+        # from the current contents of $CLOUD_DIR before it begins.
+        mkdir -p "${HOME:-/home/agent}/.matrx/runtime"
+        touch "${HOME:-/home/agent}/.matrx/runtime/cloud-files-down-complete"
         ;;
     up)
         echo "[cloud-files-sync] Pushing ~/cloud-files/ → cld_files"
