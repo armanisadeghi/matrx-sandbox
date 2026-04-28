@@ -82,6 +82,15 @@ class Settings(BaseSettings):
     # Traefik hostname; EC2 sets this via env to its public IP/DNS.
     public_url: str = ""            # env var: MATRX_PUBLIC_URL
 
+    # Public hostname the SSH credentials returned by /sandboxes/{id}/access
+    # advertise to clients. Defaults to the hostname of MATRX_PUBLIC_URL when
+    # unset. Set explicitly when SSH and HTTP exit through different
+    # hostnames (e.g., HTTPS via Traefik but SSH direct to the host's public
+    # IP). Containers' SSH is reached on the dynamic host port mapped by
+    # Docker; the firewall MUST allow that port range (Docker default
+    # 32768-60999) for direct ssh / VS Code Remote-SSH to work.
+    ssh_host: str = ""              # env var: MATRX_SSH_HOST
+
     # CORS allow-list for browser-direct calls. Comma-separated. When set,
     # only these origins receive ACAO; * is never allowed (incompatible
     # with Authorization: Bearer round-trips).

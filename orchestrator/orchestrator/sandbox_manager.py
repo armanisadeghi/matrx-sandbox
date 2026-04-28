@@ -55,6 +55,30 @@ def _proxy_url_for(sandbox_id: str) -> str | None:
     return f"{base}/sandboxes/{sandbox_id}/proxy"
 
 
+def _resolve_ssh_host() -> str:
+    """Public SSH host returned to clients in /access responses.
+
+    Priority:
+      1. Explicit ``MATRX_SSH_HOST`` env var (overrides; supports the case
+         where SSH and HTTP exit through different hostnames).
+      2. Hostname parsed out of ``MATRX_PUBLIC_URL``.
+      3. Fallback to ``"localhost"`` — only useful for in-host testing;
+         logs a loud warning when this fallback is hit.
+    """
+    if settings.ssh_host:
+        return settings.ssh_host
+    if settings.public_url:
+        from urllib.parse import urlparse
+        parsed = urlparse(settings.public_url)
+        if parsed.hostname:
+            return parsed.hostname
+    logger.warning(
+        "SSH host falling back to 'localhost' — set MATRX_SSH_HOST or MATRX_PUBLIC_URL "
+        "so /sandboxes/{id}/access returns a hostname clients can actually reach."
+    )
+    return "localhost"
+
+
 def _get_store() -> SandboxStore:
     """Get or create the sandbox store."""
     global _store
@@ -686,6 +710,6 @@ async def generate_user_access(sandbox_id: str) -> dict[str, str | int]:
     return {
         "private_key": private_pem,
         "username": "agent",
-        "host": "localhost",
+        "host": _resolve_ssh_host(),
         "port": sandbox.ssh_port or 22,
     }
