@@ -142,10 +142,13 @@ async def root():
 
 def _aidream_passthrough_status() -> dict:
     import os
-    keys = [k.strip() for k in (settings.aidream_passthrough_env or "").split(",") if k.strip()]
+    from orchestrator.sandbox_manager import _resolve_passthrough_keys
+    keys = _resolve_passthrough_keys()
     set_keys = sorted(k for k in keys if os.environ.get(k))
     missing_keys = sorted(k for k in keys if not os.environ.get(k))
     return {
+        "source_file": settings.aidream_passthrough_env_file or None,
+        "total_keys": len(keys),
         "configured_count": len(set_keys),
         "configured_keys": set_keys,
         "missing_count": len(missing_keys),

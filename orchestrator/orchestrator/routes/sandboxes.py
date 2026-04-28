@@ -902,3 +902,203 @@ async def proxy_to_container(sandbox_id: str, path: str, request: Request):
         media_type=upstream.headers.get("content-type", "application/octet-stream"),
     )
 
+
+
+# ─── Per-sandbox diagnostics + log streaming ────────────────────────────────
+# These endpoints exist so the FE can show "is this sandbox actually ready
+# for AI passthrough" and surface live logs from inside, instead of the
+# black-box situation we hit during sandbox-mode bring-up. Both use the
+# orchestrator's master X-API-Key (called from Next.js, never exposed to
+# the browser).
+
+import asyncio  # noqa: E402  (late import — only needed for log streaming)
+
+
+async def _check_url(url: str, timeout: float = 2.0) -> dict[str, object]:
+    """Probe an HTTP endpoint, return {ok, status, error?, latency_ms}."""
+    import time
+    started = time.monotonic()
+    try:
+        async with httpx.AsyncClient(timeout=timeout) as client:
+            resp = await client.get(url)
+            return {
+                "ok": 200 <= resp.status_code < 500,  # 401/403 still mean "service alive"
+                "status": resp.status_code,
+                "latency_ms": int((time.monotonic() - started) * 1000),
+                "body_preview": resp.text[:300] if resp.headers.get("content-type", "").startswith(("text/", "application/json")) else None,
+            }
+    except httpx.TimeoutException:
+        return {"ok": False, "error": "timeout", "latency_ms": int((time.monotonic() - started) * 1000)}
+    except Exception as exc:
+        return {"ok": False, "error": str(exc), "latency_ms": int((time.monotonic() - started) * 1000)}
+
+
+@router.get("/{sandbox_id}/diagnostics", tags=["diagnostics"])
+async def sandbox_diagnostics(sandbox_id: str) -> dict:
+    """End-to-end readiness check for a sandbox. Returns a single JSON
+    structure the FE can render verbatim — every layer is reported even on
+    failure so the operator sees exactly which piece is broken.
+
+    Sections:
+
+      - sandbox: orchestrator's view (status, container_id, tier, template,
+        proxy_url, last_heartbeat, expires_at, persistence_volume)
+      - container: docker inspect summary (running/exited, started_at,
+        health, network IP, env-var sample)
+      - matrx_agent (port 8000): probe /health → http_status + latency
+      - aidream (port 8001, only when template=aidream): probe /api/health
+        AND /api/health/ready → http_status + latency + body preview
+      - passthrough_env: which env vars the orchestrator forwarded into
+        this container vs which it tried to and couldn't (so the operator
+        knows whether eg SUPABASE_MATRIX_JWT_SECRET arrived)
+      - overall: True only if every required layer is ok
+    """
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+
+    template = sandbox.template or ""
+    is_aidream = (template == "aidream")
+
+    # 1. Container inspect
+    container_info: dict[str, object] = {"present": False}
+    try:
+        client = sandbox_manager._get_docker_client()
+        container = client.containers.get(sandbox_id)
+        container.reload()
+        attrs = container.attrs
+        state = attrs.get("State", {})
+        net = attrs.get("NetworkSettings", {}).get("Networks", {})
+        net_first = next(iter(net.values()), {}) if net else {}
+        # Sample of which passthrough vars made it (names only, never values)
+        env_list = attrs.get("Config", {}).get("Env", []) or []
+        env_keys_in_container = sorted({e.split("=", 1)[0] for e in env_list if "=" in e})
+        passthrough_keys = sandbox_manager._resolve_passthrough_keys()
+        env_passthrough_landed = sorted(set(env_keys_in_container) & set(passthrough_keys))
+        env_passthrough_missing = sorted(set(passthrough_keys) - set(env_keys_in_container))
+        container_info = {
+            "present": True,
+            "running": state.get("Running", False),
+            "status": state.get("Status"),
+            "health": (state.get("Health") or {}).get("Status"),
+            "started_at": state.get("StartedAt"),
+            "exit_code": state.get("ExitCode"),
+            "container_ip": net_first.get("IPAddress"),
+            "image": attrs.get("Config", {}).get("Image"),
+            "passthrough_landed": env_passthrough_landed,
+            "passthrough_missing_count": len(env_passthrough_missing),
+            "passthrough_missing_sample": env_passthrough_missing[:10],
+        }
+    except Exception as exc:
+        container_info["error"] = str(exc)
+
+    container_ip = container_info.get("container_ip")
+    matrx_agent: dict[str, object] = {"checked": False, "reason": "no container ip"}
+    aidream_health: dict[str, object] = {"checked": False, "reason": "not aidream template"}
+    aidream_ready: dict[str, object] = {"checked": False, "reason": "not aidream template"}
+
+    if container_ip:
+        # 2. matrx_agent (always present — fs/git/exec daemon)
+        matrx_agent = await _check_url(f"http://{container_ip}:8000/health")
+        matrx_agent["checked"] = True
+
+        # 3. aidream (only on the aidream variant) — both /api/health and /api/health/ready
+        if is_aidream:
+            aidream_health = await _check_url(f"http://{container_ip}:8001/api/health")
+            aidream_health["checked"] = True
+            aidream_ready = await _check_url(f"http://{container_ip}:8001/api/health/ready")
+            aidream_ready["checked"] = True
+
+    # 4. Overall
+    overall_ok = bool(
+        container_info.get("running")
+        and matrx_agent.get("ok")
+        and (not is_aidream or (aidream_health.get("ok") and aidream_ready.get("ok")))
+    )
+
+    return {
+        "sandbox_id": sandbox_id,
+        "overall_ok": overall_ok,
+        "sandbox": {
+            "status": getattr(sandbox.status, "value", sandbox.status),
+            "tier": getattr(sandbox.tier, "value", sandbox.tier),
+            "template": sandbox.template,
+            "template_version": sandbox.template_version,
+            "user_id": sandbox.user_id,
+            "container_id": sandbox.container_id,
+            "proxy_url": sandbox.proxy_url,
+            "ssh_port": sandbox.ssh_port,
+            "expires_at": sandbox.expires_at.isoformat() if sandbox.expires_at else None,
+            "last_heartbeat_at": getattr(sandbox, "last_heartbeat_at", None),
+            "persistence_volume": sandbox.persistence_volume,
+            "hot_path": sandbox.hot_path,
+            "cold_path": sandbox.cold_path,
+        },
+        "container": container_info,
+        "checks": {
+            "matrx_agent_8000": matrx_agent,
+            "aidream_health_8001": aidream_health,
+            "aidream_ready_8001": aidream_ready,
+        },
+    }
+
+
+@router.get("/{sandbox_id}/logs", tags=["diagnostics"])
+async def sandbox_logs(sandbox_id: str, source: str = "all", tail: int = 200) -> Response:
+    """Snapshot of the sandbox's recent logs.
+
+    ``source`` selects which log to read:
+      - ``"docker"`` — container's stdout/stderr (tini + entrypoint)
+      - ``"aidream"`` — aidream FastAPI's own log file (/var/log/sandbox/aidream-server.log)
+      - ``"matrx_agent"`` — matrx_agent daemon's log (/var/log/sandbox/api.log)
+      - ``"entrypoint"`` — entrypoint trace (/var/log/sandbox/entrypoint.log)
+      - ``"autostart"`` — aidream auto-start log (/var/log/sandbox/aidream-autostart.log)
+      - ``"all"`` (default) — concatenated, each section labeled
+
+    Returns a plain-text Response. The FE can render this as a code block
+    or hand it to xterm. ``tail`` limits each source to its last N lines.
+    """
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+
+    out: list[str] = []
+    valid_sources = {"docker", "aidream", "matrx_agent", "entrypoint", "autostart"}
+
+    async def _read_inside(path: str) -> str:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "exec", sandbox_id, "tail", "-n", str(tail), path,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        if proc.returncode != 0:
+            return f"(could not read {path}: {stderr.decode(errors='replace').strip()})"
+        return stdout.decode(errors="replace")
+
+    sources_to_read = valid_sources if source == "all" else {source}
+    if source != "all" and source not in valid_sources:
+        raise HTTPException(status_code=400, detail=f"unknown source '{source}'. valid: {sorted(valid_sources | {'all'})}")
+
+    if "docker" in sources_to_read:
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "logs", "--tail", str(tail), sandbox_id,
+            stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+        )
+        stdout, stderr = await proc.communicate()
+        out.append("=== docker logs (container stdout/stderr) ===")
+        out.append(stdout.decode(errors="replace") + stderr.decode(errors="replace"))
+
+    if "entrypoint" in sources_to_read:
+        out.append("\n=== entrypoint.log ===")
+        out.append(await _read_inside("/var/log/sandbox/entrypoint.log"))
+    if "autostart" in sources_to_read:
+        out.append("\n=== aidream-autostart.log ===")
+        out.append(await _read_inside("/var/log/sandbox/aidream-autostart.log"))
+    if "matrx_agent" in sources_to_read:
+        out.append("\n=== matrx_agent (api.log) ===")
+        out.append(await _read_inside("/var/log/sandbox/api.log"))
+    if "aidream" in sources_to_read:
+        out.append("\n=== aidream-server.log ===")
+        out.append(await _read_inside("/var/log/sandbox/aidream-server.log"))
+
+    return Response(content="\n".join(out), media_type="text/plain; charset=utf-8")

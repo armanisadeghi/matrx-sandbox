@@ -99,39 +99,86 @@ class Settings(BaseSettings):
     # ── aidream-in-sandbox env passthrough ──────────────────────────────────
     # When the aidream FastAPI runs INSIDE a sandbox container (template=
     # 'aidream'), it needs the same secrets the central aidream backend uses
-    # — Supabase URL/keys, AI provider API keys, JWT secret, etc. Rather
-    # than enumerating each one as a separate setting, we keep ONE list of
-    # env-var names to read from the orchestrator's process environment and
-    # pass through to every spawned hosted-tier sandbox.
+    # — Supabase URL/keys, AI provider API keys, JWT secret, multiple DB
+    # connection-pool credentials, AWS, etc.
     #
-    # Operator workflow: set the SAME env vars on the orchestrator host
-    # that the central aidream deploy uses, then list them here. The
-    # orchestrator NEVER stores their values in its own settings — it just
-    # acts as a conduit. Vars not present in the orchestrator's environ
-    # are silently skipped (so you can list a superset and have only what's
-    # set get forwarded).
+    # TWO mechanisms (combined): the orchestrator forwards every env var
+    # whose NAME appears in EITHER source. Values come from os.environ
+    # (read at sandbox-create time); names not present in the orchestrator's
+    # environ are silently skipped.
     #
-    # Default covers the minimum aidream needs to start successfully:
-    # AWS region, Supabase URL/keys + JWT secret, the major AI provider
-    # keys, and aidream's admin/system identifiers. Override via
-    # MATRX_AIDREAM_PASSTHROUGH_ENV (comma-separated) when adding new
-    # secrets without redeploying the orchestrator.
+    #   1. ``aidream_passthrough_env_file`` — path to a .env-style file.
+    #      Every key=... line in the file becomes a passthrough name.
+    #      This makes aidream's own .env the single source of truth — when
+    #      aidream adds a new required env var, dropping it into
+    #      /srv/projects/aidream/.env automatically forwards it.
+    #
+    #   2. ``aidream_passthrough_env`` — comma-separated explicit list. Use
+    #      this for env vars NOT in the file (orchestrator-host-only,
+    #      operator overrides, etc.). The default below covers the names
+    #      we KNOW aidream needs across DB pools, providers, and admin
+    #      identities — comprehensive even if the env_file is unset.
+    aidream_passthrough_env_file: str = "/srv/projects/aidream/.env"
     aidream_passthrough_env: str = (
-        # AWS region (boto3-standard; aidream's aws_client.py reads it)
-        "AWS_REGION,"
-        # Supabase — auth, RLS-bypass, JWT validation
+        # AWS — region (boto3) + bucket
+        "AWS_REGION,AWS_BUCKET_MODELS,"
+        # Supabase — auth + JWT validation
         "SUPABASE_URL,SUPABASE_KEY,"
-        "SUPABASE_MATRIX_URL,SUPABASE_MATRIX_KEY,SUPABASE_MATRIX_JWT_SECRET,"
         "SUPABASE_DJANGO_URL,SUPABASE_DJANGO_KEY,"
-        # AI providers
-        "OPENAI_API_KEY,ANTHROPIC_API_KEY,GOOGLE_API_KEY,GROQ_API_KEY,"
-        "CEREBRAS_API_KEY,XAI_API_KEY,TOGETHER_API_KEY,COHERE_API_KEY,"
+        # Supabase Matrix — full DB pool + JWT secret + all connection bits
+        "SUPABASE_MATRIX_URL,SUPABASE_MATRIX_KEY,SUPABASE_MATRIX_JWT_SECRET,"
+        "SUPABASE_MATRIX_HOST,SUPABASE_MATRIX_PORT,"
+        "SUPABASE_MATRIX_USER,SUPABASE_MATRIX_PASSWORD,"
+        "SUPABASE_MATRIX_NAME,SUPABASE_MATRIX_DATABASE_NAME,"
+        "SUPABASE_MATRIX_PROTOCOL,"
+        # Other Supabase project pools aidream registers
+        "SUPABASE_AUTOMATION_MATRIX_DB_PASSWORD,SUPABASE_SAMPLE_DB_PASSWORD,"
+        # Postgres direct (matrx_dm + legacy)
+        "POSTGRES_HOST,POSTGRES_DB,POSTGRES_USER,POSTGRES_PASSWORD,"
+        "POSTGRES_PORT,POSTGRES_PROTOCOL,"
+        "MATRX_DM_HOST,MATRX_DM_PORT,MATRX_DM_NAME,MATRX_DM_USER,"
+        "MATRX_DM_PASSWORD,MATRX_DM_PROTOCOL,MATRX_DM_PROJECT_URL,"
+        "MATRX_DM_PUBLISHABLE_KEY,MATRX_DM_DIRECT_CONNECTION_STRING,"
+        "MATRX_DM_SECRET_KEY,"
+        # AI providers — exhaustive
+        "OPENAI_API_KEY,ANTHROPIC_API_KEY,ANTHROPIC_KEY,"
+        "GOOGLE_API_KEY,GEMINI_API_KEY,GOOGLE_AI_STUDIO,GOOGLE_APPLICATION_CREDENTIALS,"
+        "GROQ_API_KEY,CEREBRAS_API_KEY,CEREBRAS_API_KEY_PERSONAL,"
+        "XAI_API_KEY,TOGETHER_API_KEY,COHERE_API_KEY,"
         "FIREWORKS_API_KEY,REPLICATE_API_TOKEN,ELEVENLABS_API_KEY,"
         "HUGGING_FACE_TOKEN_ID,HUGGINGFACE_API_KEY,"
-        # aidream system identifiers
-        "ADMIN_API_TOKEN,SYSTEM_USER_ID,ADMIN_USER_ID,"
-        # Postgres (only matters if aidream runs migrations / direct DB)
-        "POSTGRES_HOST,POSTGRES_DB,POSTGRES_USER,POSTGRES_PASSWORD,POSTGRES_PORT,"
+        "MISTRAL_API_KEY,SAMBA_NOVA_API_KEY,STABILITY_API_KEY,"
+        "GETIMG_API_KEY,RUNPOD_API_KEY,"
+        "PLAYHT_USER_ID,PLAYHT_SECRET_KEY,"
+        "CARTESIA_API_KEY,SPEECHMATICS_API_KEY,SPEECHMATICS_AUTH_TOKEN,"
+        "CIVIT_API_KEY,MODEL_LABS_API_KEY,"
+        # Search / scrape
+        "BRAVE_SEARCH_API_KEY,BRAVE_SEARCH_API_KEY_AI,BRAVE_SEARCH_API_KEY_PRO_AI,"
+        "GOOGLE_SEARCH_API_KEY,GOOGLE_SEARCH_CSE_ID,AME_GOOGLE_SEARCH_API_KEY,"
+        "SERPAPI_API_KEY,RAPID_API_KEY,NEWS_API_KEY,AHREFS_MATRIX_API_KEY,"
+        "PAGESPEED_INSIGHTS_API_KEY,DATA_FOR_SEO_EMAIL,DATA_FOR_SEO_PASSWORD,"
+        # aidream system identifiers + admin
+        "ADMIN_API_TOKEN,ADMIN_AUTH_TOKEN,ADMIN_USER_ID,SYSTEM_USER_ID,"
+        "DEVELOPER_USER_ID,LOCAL_USER_ID,"
+        "MATRX_ENV,LOG_LEVEL,DEBUG,ALLOWED_HOSTS,PROJECT_ID,"
+        # Mongo (used in some parts of aidream)
+        "MONGO_URI,MONGO_USERNAME,MONGO_PASSWORD,MONGO_API_KEY,MONGO_API_KEY_NAME,"
+        # Comms / integrations
+        "MAILGUN_API_KEY,"
+        "TWILIO_ACCOUNT_SID,TWILIO_AUTH_TOKEN,TWILIO_PHONE_NUMBER,"
+        "TWILIO_MESSAGING_SERVICE_SID,TWILIO_VERIFY_SID,TWILIO_SKIP_VALIDATION,"
+        "SLACK_CLIENT_ID,SLACK_CLIENT_SECRET,SLACK_REDIRECT_URL,"
+        "GITHUB_CLIENT_ID,GITHUB_CLIENT_SECRET,GITHUB_PAT,"
+        "GITHUB_BOT_ACCOUNT_USERNAME,GITHUB_BOT_EMAIL,GITHUB_ORG_NAME,"
+        "SHOPIFY_API_SECRET_KEY,SHOPIFY_API_ACCESS_TOKEN,SHOPIFY_APP_NAME,"
+        "SHOPIFY_APP_CLIENT_ID,SHOPIFY_APP_CLIENT_SECRET,"
+        "AIMATRX_OAUTH_CLIENT_ID,AIMATRX_AIDREAM_REDIRECT_URI,"
+        "GOOGLE_OAUTH_CLIENT_SECRETS,FIREBASE_SERVICE_ACCOUNT,"
+        # AIDream sandbox bridge token (so the in-sandbox aidream can also act
+        # as an aidream-bridge consumer if its code reaches for it)
+        "AIDREAM_SANDBOX_SERVICE_TOKEN,"
+        # Tooling
+        "TOOL_WORKSPACE_BASE,"
     )
 
     # ── AWS credentials passthrough (hosted tier S3 sync) ───────────────────

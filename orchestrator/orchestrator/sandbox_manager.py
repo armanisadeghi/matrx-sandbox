@@ -42,6 +42,67 @@ _store: SandboxStore | None = None
 _docker_client: docker.DockerClient | None = None
 
 
+def _resolve_passthrough_keys() -> list[str]:
+    """Union of names from settings.aidream_passthrough_env_file (parsed once,
+    cached) and settings.aidream_passthrough_env (comma-separated). Values
+    are read from os.environ at call time — this only resolves NAMES.
+
+    Reading the file fresh each call would be wasted I/O; cache by mtime so
+    if the operator updates aidream's .env and restarts, we pick it up.
+    """
+    keys: set[str] = set()
+    explicit = (settings.aidream_passthrough_env or "").split(",")
+    keys.update(k.strip() for k in explicit if k.strip())
+
+    path = (settings.aidream_passthrough_env_file or "").strip()
+    if path and os.path.isfile(path):
+        keys.update(_parse_env_file_keys(path))
+    return sorted(keys)
+
+
+_env_file_cache: dict[str, tuple[float, frozenset[str]]] = {}
+
+
+def _parse_env_file_keys(path: str) -> frozenset[str]:
+    """Return the set of env-var NAMES defined in a .env-style file. Cached
+    by (path, mtime) so repeated calls don't re-read the file."""
+    try:
+        mtime = os.path.getmtime(path)
+    except OSError:
+        return frozenset()
+    cached = _env_file_cache.get(path)
+    if cached and cached[0] == mtime:
+        return cached[1]
+
+    keys: set[str] = set()
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                # Accept "FOO=bar", "export FOO=bar", "FOO =". Reject lines
+                # without "=" (they aren't env-vars).
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
+                key, sep, _ = line.partition("=")
+                if not sep:
+                    continue
+                key = key.strip()
+                # Defensive: skip lines that aren't valid env-var names so
+                # garbage in the file can't poison the passthrough set.
+                if key and all(c.isalnum() or c == "_" for c in key) and not key[0].isdigit():
+                    keys.add(key)
+    except OSError as exc:
+        logger.warning("could not read aidream_passthrough_env_file %s: %s", path, exc)
+        return frozenset()
+
+    frozen = frozenset(keys)
+    _env_file_cache[path] = (mtime, frozen)
+    logger.info("loaded %d passthrough keys from %s", len(frozen), path)
+    return frozen
+
+
 def _proxy_url_for(sandbox_id: str) -> str | None:
     """Build the public ``proxy_url`` field surfaced on SandboxResponse.
 
@@ -227,16 +288,14 @@ async def create_sandbox(
             env["AWS_REGION"] = region
 
         # ── aidream-in-sandbox env passthrough ────────────────────────────────
-        # Forward every env var named in settings.aidream_passthrough_env from
-        # the orchestrator's process environment into the spawned container.
-        # This is how aidream's FastAPI gets its Supabase URL/keys, AI
-        # provider API keys, JWT secret, etc. without us having to model
-        # each one as a typed Settings field. Values not present in the
-        # orchestrator's environ are silently skipped — list a superset
-        # safely.
-        passthrough_keys = [
-            k.strip() for k in (settings.aidream_passthrough_env or "").split(",") if k.strip()
-        ]
+        # Forward every env var named in EITHER (a) the file at
+        # settings.aidream_passthrough_env_file (e.g. /srv/projects/aidream/.env)
+        # or (b) the explicit settings.aidream_passthrough_env list, from the
+        # orchestrator's process environment into the spawned container.
+        # Values not present in the orchestrator's environ are silently
+        # skipped (list a superset safely). The file-based mechanism keeps
+        # this auto-synced as aidream adds new required env vars.
+        passthrough_keys = _resolve_passthrough_keys()
         for key in passthrough_keys:
             val = os.environ.get(key)
             if val and key not in env:  # don't clobber already-set vars
