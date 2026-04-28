@@ -162,6 +162,149 @@ async def destroy_sandbox(sandbox_id: str, graceful: bool = True):
         raise HTTPException(status_code=500, detail="Failed to destroy sandbox")
 
 
+@router.post("/{sandbox_id}/reset", response_model=SandboxResponse)
+async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
+    """Destroy + recreate a sandbox with the SAME configuration.
+
+    Used when an image / orchestrator config change means the running
+    container is out-of-date and the operator wants the latest version
+    without re-typing creation params. Preserves the per-user persistent
+    Docker volume (``/home/agent``) by default — pass ``wipe_volume=true``
+    to nuke it and start with a fresh home dir.
+
+    Returns the NEW sandbox row (different ``sandbox_id`` because the
+    in-memory store generates a new id). Callers must swap their cached
+    reference to the returned sandbox.
+    """
+    old = await sandbox_manager.get_sandbox(sandbox_id)
+    if not old:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+
+    # Snapshot creation params before destroy so we don't depend on the
+    # store keeping the row alive (some implementations purge on destroy).
+    user_id = old.user_id
+    tier = getattr(old.tier, "value", old.tier) if old.tier else None
+    template = old.template
+    template_version = old.template_version
+    labels = old.labels
+    ttl_seconds = old.ttl_seconds
+    config = dict(old.config or {})
+    resources = config.get("resources") if isinstance(config.get("resources"), dict) else None
+
+    logger.info(
+        "Resetting sandbox %s (user=%s, template=%s, wipe_volume=%s)",
+        sandbox_id, user_id, template, wipe_volume,
+    )
+
+    # 1. Destroy the existing container (preserves named volume).
+    await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="user_reset")
+
+    # 2. Optional volume wipe — clears the per-user Docker volume so the
+    # new sandbox boots with an empty /home/agent.
+    if wipe_volume:
+        try:
+            wiped = await sandbox_manager.delete_user_volume(user_id)
+            logger.info("Reset wiped per-user volume for %s: %s", user_id, wiped)
+        except Exception as exc:
+            logger.warning("Reset volume wipe for %s failed: %s", user_id, exc)
+
+    # 3. Re-create with the same shape.
+    try:
+        new_sandbox = await sandbox_manager.create_sandbox(
+            user_id=user_id,
+            config=config,
+            template=template,
+            template_version=template_version,
+            tier=tier,
+            resources=resources,
+            labels=labels,
+            ttl_seconds=ttl_seconds,
+        )
+    except Exception as exc:
+        logger.exception("Reset re-create failed for %s", sandbox_id)
+        raise HTTPException(status_code=500, detail=f"Reset re-create failed: {exc}")
+
+    return new_sandbox
+
+
+@router.get("/{sandbox_id}/agent-env", tags=["diagnostics"])
+async def sandbox_agent_env(sandbox_id: str) -> dict:
+    """Return the env vars VISIBLE INSIDE the running sandbox container.
+
+    Renders three views:
+      - ``container_config_env``: values baked in at ``docker run`` time
+        (from ``Config.Env`` on the container — the orchestrator's
+        passthrough output).
+      - ``runtime_env``: actual ``env`` output from a fresh shell inside
+        the container (catches anything the entrypoint or ttyd injects
+        that isn't on Config.Env).
+      - ``aidream_proc_env``: env of the running aidream process (PID 1
+        inside ``mtx aidream serve``), reflecting what the FastAPI
+        process actually sees. Only present if aidream is running.
+
+    Names are returned alphabetically; values are returned verbatim
+    because operator-only and isolated to the diagnostics surface.
+    Use this to debug 'why doesn't the agent see X?' without guessing.
+    """
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+
+    out: dict = {"sandbox_id": sandbox_id}
+
+    try:
+        client = sandbox_manager._get_docker_client()
+        container = client.containers.get(sandbox_id)
+        container.reload()
+
+        # 1. docker inspect Config.Env — the snapshot at run time
+        cfg_env = container.attrs.get("Config", {}).get("Env", []) or []
+        out["container_config_env"] = _kv_list_from_env_lines(cfg_env)
+
+        # 2. fresh shell `env` inside container
+        try:
+            exit_code, output = container.exec_run(["env"], stdout=True, stderr=True)
+            text = output.decode(errors="replace") if output else ""
+            if exit_code != 0:
+                out["runtime_env_error"] = text
+            else:
+                out["runtime_env"] = _kv_list_from_env_lines(text.splitlines())
+        except Exception as exc:
+            out["runtime_env_error"] = str(exc)
+
+        # 3. aidream process env via /proc/<pid>/environ if aidream is up
+        try:
+            # Find PID of the uvicorn-running aidream process.
+            pid_code, pid_out = container.exec_run(
+                ["sh", "-lc", "pgrep -f 'aidream|uvicorn' | head -1"],
+                stdout=True, stderr=True,
+            )
+            pid_text = (pid_out.decode(errors="replace") if pid_out else "").strip()
+            if pid_code == 0 and pid_text.isdigit():
+                env_code, env_out = container.exec_run(
+                    ["sh", "-lc", f"tr '\\0' '\\n' < /proc/{pid_text}/environ"],
+                    stdout=True, stderr=True,
+                )
+                if env_code == 0:
+                    out["aidream_pid"] = int(pid_text)
+                    out["aidream_proc_env"] = _kv_list_from_env_lines(
+                        env_out.decode(errors="replace").splitlines()
+                    )
+                else:
+                    out["aidream_proc_env_error"] = (
+                        env_out.decode(errors="replace") if env_out else ""
+                    )
+            else:
+                out["aidream_proc_env_error"] = "aidream/uvicorn process not found"
+        except Exception as exc:
+            out["aidream_proc_env_error"] = str(exc)
+
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Cannot inspect container: {exc}")
+
+    return out
+
+
 @router.post("/{sandbox_id}/heartbeat", response_model=HeartbeatResponse)
 async def sandbox_heartbeat(sandbox_id: str):
     """Record a heartbeat from a sandbox."""
@@ -912,6 +1055,26 @@ async def proxy_to_container(sandbox_id: str, path: str, request: Request):
 # the browser).
 
 import asyncio  # noqa: E402  (late import — only needed for log streaming)
+
+
+def _kv_list_from_env_lines(lines: list[str]) -> list[dict[str, str]]:
+    """Turn a list of ``KEY=value`` strings into ``[{key, value}]`` records,
+    sorted by key. Skips lines without ``=``. Used by the agent-env endpoint
+    so the FE renders a stable, alphabetised view across all three sources.
+    """
+    out: list[dict[str, str]] = []
+    seen: set[str] = set()
+    for raw in lines:
+        if not raw or "=" not in raw:
+            continue
+        key, value = raw.split("=", 1)
+        key = key.strip()
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        out.append({"key": key, "value": value})
+    out.sort(key=lambda r: r["key"])
+    return out
 
 
 async def _check_url(url: str, timeout: float = 2.0) -> dict[str, object]:
