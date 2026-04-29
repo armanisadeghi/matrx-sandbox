@@ -91,11 +91,18 @@ cmd_serve() {
     fi
     sudo mkdir -p "$LOG_DIR" && sudo chown agent:agent "$LOG_DIR"
     cd "$WORK_DIR" || exit 1
-    # ALWAYS go through uvicorn directly so we pin the port. aidream's run.py
-    # has its own "find a free port" logic that picks something random when
-    # 8000 is busy (matrx_agent has 8000); we need 8001 to be stable so the
-    # orchestrator's /proxy/{path:path} can route /ai/* to it deterministically.
-    nohup uv run uvicorn aidream.api.app:fastapi_app --host 0.0.0.0 --port "$port" >"$LOG_FILE" 2>&1 &
+    # MUST go through run.py — it calls aidream.package_integration which
+    # invokes matrx_ai.configure(...) to register the host's DB models with
+    # matrx-ai. Bypassing it (e.g. direct uvicorn aidream.api.app:fastapi_app)
+    # crashes at first DB-touching import with DBNotConfiguredError because
+    # ContentBlocks etc. were never registered.
+    #
+    # run.py reads PORT env (defaults to 8000) and falls back to a random
+    # free port when the preferred port is in use. We set PORT=$port AND
+    # ensure $port is free (8001 is free by convention; matrx_agent has 8000)
+    # so the bind is deterministic — required for the orchestrator's path
+    # routing in /proxy/{path:path} to know where to send /ai/* and /api/*.
+    PORT="$port" nohup uv run python run.py >"$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     sleep 2
     if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then

@@ -123,7 +123,7 @@ function loadConfig(): ShipConfig {
     console.error(`     ${shipCmd("init")} my-project "My Project Name"`);
     console.error("");
     console.error("   Or set environment variables:");
-    console.error("     export MATRX_SHIP_URL=https://ship-myproject.dev.codematrx.com");
+    console.error("     export MATRX_SHIP_URL=https://myproject.dev.codematrx.com");
     console.error("     export MATRX_SHIP_API_KEY=sk_ship_xxxxx");
     process.exit(1);
   }
@@ -694,7 +694,7 @@ async function handleInit(args: string[]): Promise<void> {
       console.error(`     ${serverConfig!.server}/admin/`);
       console.error("");
       console.error("   Then configure manually:");
-      console.error(`     ${shipCmd("init")} --url https://ship-${projectName}.dev.codematrx.com --key YOUR_API_KEY`);
+      console.error(`     ${shipCmd("init")} --url https://${projectName}.dev.codematrx.com --key YOUR_API_KEY`);
       process.exit(1);
     }
   } else if (result.error) {
