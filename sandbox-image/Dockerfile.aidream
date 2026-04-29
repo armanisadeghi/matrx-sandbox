@@ -22,6 +22,12 @@ FROM matrx-sandbox:core AS base
 ARG AIDREAM_GIT_SHA=unknown
 ENV AIDREAM_GIT_SHA=${AIDREAM_GIT_SHA}
 
+# Image-variant tag — overrides the "core" stamp from the base image so
+# entrypoint-local.sh's SANDBOX_MODE picks the right value when this image
+# layers on top of :local. Read by /home/agent/.sandbox_env on every boot.
+USER root
+RUN echo "aidream" > /etc/sandbox-image-tag
+
 # ─── System deps for aidream (mirroring aidream/Dockerfile) ────────────────
 # Skipping software-properties-common / deadsnakes PPA — it's brittle on
 # Ubuntu 22.04 (broken python3-apt + dbus dependency cascades). Instead we

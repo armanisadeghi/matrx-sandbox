@@ -193,6 +193,12 @@ EXPOSE 22
 HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
     CMD /opt/sandbox/scripts/healthcheck.sh
 
+# Image-variant marker — read by entrypoint-local.sh to set SANDBOX_MODE
+# accurately when a derived image (matrx-sandbox:aidream, :local) reuses
+# this entrypoint chain. Without it the env var said "local" even on
+# :aidream containers.
+RUN echo "core" > /etc/sandbox-image-tag
+
 # Use tini as init to handle signals properly
 ENTRYPOINT ["tini", "--"]
 CMD ["/opt/sandbox/scripts/entrypoint.sh"]

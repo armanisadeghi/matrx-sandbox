@@ -48,6 +48,7 @@ RUN chmod +x /opt/sandbox/scripts/entrypoint-local.sh \
 ENV S3_BUCKET=""
 ENV S3_REGION=""
 ENV SANDBOX_MODE="local"
+RUN echo "local" > /etc/sandbox-image-tag
 
 # ─── Expose ttyd web terminal port ──────────────────────────────────────────
 EXPOSE 7681

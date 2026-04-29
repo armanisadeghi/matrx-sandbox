@@ -25,7 +25,9 @@ HOT_PATH="${HOT_PATH:-/home/agent}"
 chown -R agent:agent "$HOT_PATH" 2>/dev/null || true
 
 # Ensure standard dirs exist
-mkdir -p /home/agent/.ssh /home/agent/workspace /data/cold
+# /home/agent/{cloud-files,repos,projects,scratch,.matrx/...} are created by
+# ensure-layout.sh in step 3.5 — don't duplicate here. Just .ssh + cold mount.
+mkdir -p /home/agent/.ssh /data/cold
 chown -R agent:agent /home/agent /data/cold
 
 # Restore SSH keys if present in config
@@ -35,11 +37,20 @@ if [ -f /opt/sandbox/config/admin_authorized_keys ]; then
     chmod 600 /home/agent/.ssh/authorized_keys
 fi
 
-# Write env file the agent can source
+# Write env file the agent can source. SANDBOX_MODE reflects the IMAGE
+# variant currently running, not the entrypoint-script that booted it
+# — the :aidream image execs through this same entrypoint-local.sh, so
+# hardcoding "local" misclassifies aidream containers. Read it from
+# /etc/sandbox-image-tag (baked at image-build time) and fall back to
+# "local" for legacy images that didn't set the tag.
+SANDBOX_MODE_VALUE="local"
+if [ -f /etc/sandbox-image-tag ]; then
+    SANDBOX_MODE_VALUE="$(cat /etc/sandbox-image-tag)"
+fi
 cat > /home/agent/.sandbox_env <<EOF
 export SANDBOX_ID="${SANDBOX_ID:-sandbox}"
 export HOT_PATH="${HOT_PATH}"
-export SANDBOX_MODE="local"
+export SANDBOX_MODE="${SANDBOX_MODE_VALUE}"
 export SANDBOX_NAME="${SANDBOX_NAME:-sandbox}"
 EOF
 chown agent:agent /home/agent/.sandbox_env
