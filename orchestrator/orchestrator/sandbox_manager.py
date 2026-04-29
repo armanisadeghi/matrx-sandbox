@@ -375,8 +375,13 @@ async def create_sandbox(
                 "matrx.sandbox_id": sandbox_id,
                 "matrx.user_id": user_id,
                 "matrx.created_at": sandbox.created_at.isoformat(),
+                # Labels carry the *minimum* state needed for boot-time
+                # reconcile to rebuild a SandboxResponse without help from
+                # the store. If you add a new field to SandboxResponse that
+                # the agent or FE depends on, add it here too.
                 **({"matrx.tier": tier} if tier else {}),
                 **({"matrx.template": template} if template else {}),
+                **({"matrx.template_version": template_version} if template_version else {}),
                 **{f"matrx.label.{k}": v for k, v in (labels or {}).items()},
             },
             restart_policy={"Name": "no", "MaximumRetryCount": 0},

@@ -41,6 +41,31 @@ async def lifespan(app: FastAPI):
         _logger.warning(
             "S3 bucket validation failed — S3 operations may not work"
         )
+
+    # Reconcile state from Docker — single source of truth bridge between
+    # whatever store we configured (in-memory or Postgres) and the actual
+    # set of running containers labeled by this orchestrator. Idempotent:
+    # safe to run on every boot; corrects drift in either direction.
+    # Without this, an orchestrator restart leaves the in-memory store
+    # empty (so live containers go orphan in the FE) and even the Postgres
+    # store goes stale if a container died while the orchestrator was
+    # down. See orchestrator/reconcile.py for the full mapping.
+    try:
+        from orchestrator.reconcile import reconcile_from_docker
+        from orchestrator.sandbox_manager import _get_store
+
+        store = _get_store()
+        summary = await reconcile_from_docker(store)
+        if summary["reconciled"]:
+            _logger.info(
+                "Boot reconcile: rehydrated %d sandbox(es) from Docker "
+                "(scanned=%d, skipped=%d, failed=%d)",
+                summary["reconciled"], summary["scanned"],
+                summary["skipped"], summary["failed"],
+            )
+    except Exception as exc:
+        _logger.warning("Boot reconcile failed (continuing without it): %s", exc)
+
     yield
     # Shutdown: close store and Docker client
     await close_store()
