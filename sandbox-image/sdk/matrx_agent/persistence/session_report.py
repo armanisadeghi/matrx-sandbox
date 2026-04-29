@@ -118,6 +118,32 @@ def render_report(prior_manifest: dict[str, Any] | None = None) -> str:
             f"- Shell history (last {len(manifest['shell_history_tail'])} commands)",
         ]
 
+    cs = manifest.get("cloud_sync") or {}
+    if cs:
+        puts = int(cs.get("puts") or 0)
+        deletes = int(cs.get("deletes") or 0)
+        bytes_up = _bytes_human(cs.get("bytes_uploaded"))
+        errors = int(cs.get("errors_total") or 0)
+        p50 = cs.get("latency_ms_p50")
+        p95 = cs.get("latency_ms_p95")
+        mode = cs.get("mode") or "unknown"
+        if puts or deletes or errors:
+            lines += [
+                "",
+                "### Cloud-files sync (last session)",
+                "",
+                f"- Mode: `{mode}`",
+                f"- {puts} upload{'s' if puts != 1 else ''} ({bytes_up}), "
+                f"{deletes} delete{'s' if deletes != 1 else ''}",
+            ]
+            if p50 is not None or p95 is not None:
+                p50_s = f"{p50}ms" if p50 is not None else "n/a"
+                p95_s = f"{p95}ms" if p95 is not None else "n/a"
+                lines.append(f"- Latency: p50 {p50_s} · p95 {p95_s}")
+            if errors:
+                last_err = cs.get("last_error_message") or "(none recorded)"
+                lines.append(f"- ⚠️ {errors} error{'s' if errors != 1 else ''} — last: {last_err}")
+
     lines += [
         "",
         "## ❌ What was NOT restored",

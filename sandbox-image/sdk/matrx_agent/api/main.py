@@ -82,6 +82,10 @@ async def lifespan(app: FastAPI):
         _logger.warning("matrx_agent: cloud-files watcher stop error: %s", e)
     try:
         manifest = collect_manifest(graceful=True)
+        try:
+            manifest.cloud_sync = _cloud_watcher.get_stats()
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("matrx_agent: cloud_sync stats splice failed: %s", e)
         write_manifest(manifest)
     except Exception as e:  # noqa: BLE001
         _logger.warning("matrx_agent: final manifest write failed: %s", e)
@@ -396,12 +400,18 @@ def internal_shutdown(graceful: bool = True, auto_stash: bool = True,
             stash_result = autostashes.get(repo.path)
             if stash_result is not None:
                 repo.auto_stash = stash_result
+        # Splice cloud-sync watcher stats so the session report can render them.
+        try:
+            manifest.cloud_sync = _cloud_watcher.get_stats()
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("matrx_agent: cloud_sync stats splice failed: %s", e)
         write_manifest(manifest)
         return {
             "ok": True,
             "manifest_path": str(MANIFEST_PATH),
             "repos_scanned": len(manifest.repos),
             "auto_stashes": {k: v for k, v in autostashes.items() if not k.startswith("_")},
+            "cloud_sync": manifest.cloud_sync,
         }
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "error": str(e), "auto_stashes": autostashes}
@@ -417,6 +427,16 @@ def internal_manifest_get() -> dict:
         return _json.loads(MANIFEST_PATH.read_text())
     except Exception as e:  # noqa: BLE001
         raise HTTPException(status_code=500, detail=f"Manifest unreadable: {e}")
+
+
+@app.get("/internal/cloud-sync-status")
+def internal_cloud_sync_status() -> dict:
+    """Return the cloud-files watcher's current state, queue, and metrics.
+
+    Frontend uses this to render a "syncing… N queued · last sync 3s ago"
+    indicator. Same shape regardless of mode (dormant/waiting/degraded/active).
+    """
+    return _cloud_watcher.get_status()
 
 
 @app.get("/internal/session-report", response_class=PlainTextResponse)

@@ -1,9 +1,20 @@
 """Real-time watcher for ~/cloud-files/ → AI Dream cld_files.
 
 Observes the cloud-files directory via watchdog, debounces events per-path
-for 5 seconds, then pushes through the cloud-files bridge. Stays dormant if
-AI Dream env vars are missing or if the down-sync marker hasn't been written
-yet (so we don't re-upload everything the down-sync just pulled).
+for 5 seconds, then pushes through the cloud-files bridge.
+
+Operating modes:
+    - dormant   AI Dream env vars unset; nothing to do.
+    - waiting   Daemon started but neither the down-marker nor the bridge
+                is reachable yet. Self-healing retry loop with backoff.
+    - degraded  Bridge probe succeeded but the bulk down-sync never wrote
+                its marker (so we don't have a clean seed for skip-unchanged).
+                Still observes + uploads; first edits may re-upload.
+    - active    Marker seen, hashes seeded, observer + drain loop running.
+
+Crash resilience: each scheduled event is appended to the cloud-sync
+PersistentQueue at ~/.matrx/runtime/cloud-sync-queue.jsonl. A SIGKILL or
+container restart replays unfinished events on next boot.
 
 Lifecycle is owned by the matrx_agent FastAPI daemon's lifespan.
 """
@@ -14,14 +25,20 @@ import asyncio
 import hashlib
 import logging
 import time
-from collections import OrderedDict
+from collections import OrderedDict, deque
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 
+import httpx
 from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from matrx_agent.cloud_sync.client import AsyncBridgeClient, BridgeConfig
+from matrx_agent.cloud_sync.queue import (
+    DEFAULT_PATH as DEFAULT_QUEUE_PATH,
+    PendingEvent,
+    PersistentQueue,
+)
 
 _logger = logging.getLogger("matrx_agent.cloud_sync")
 
@@ -32,8 +49,17 @@ MAX_INFLIGHT = 16
 RETRY_DELAYS = (1.0, 2.0, 4.0, 8.0)
 SEED_HASH_CHUNK = 1 << 20  # 1 MiB
 STABILITY_WAIT_SECONDS = 0.2
+
+# Self-healing startup
 DOWN_MARKER_WAIT_SECONDS = 60.0
 DOWN_MARKER_POLL_INTERVAL = 0.5
+STARTUP_BACKOFFS = (60.0, 120.0, 300.0)  # capped at last value, repeats forever
+PROBE_TIMEOUT = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
+
+# Metrics
+LATENCY_HISTORY_LEN = 256
+ERROR_HISTORY_LEN = 64
+COMPACT_CHECK_INTERVAL = 50  # check queue compaction every N completed events
 
 
 class _Handler(FileSystemEventHandler):
@@ -71,6 +97,48 @@ class _Handler(FileSystemEventHandler):
             self._enqueue("delete", event.src_path)
 
 
+class _Metrics:
+    """Lightweight rolling stats for /internal/cloud-sync-status + session-report."""
+
+    def __init__(self):
+        self.put_count = 0
+        self.delete_count = 0
+        self.bytes_uploaded = 0
+        self.errors_total = 0
+        self.last_success_ts: Optional[float] = None
+        self.last_error_ts: Optional[float] = None
+        self.last_error_message: Optional[str] = None
+        self.recent_latencies_ms: deque[float] = deque(maxlen=LATENCY_HISTORY_LEN)
+        self.recent_errors: deque[dict] = deque(maxlen=ERROR_HISTORY_LEN)
+
+    def record_put(self, bytes_n: int, latency_ms: float) -> None:
+        self.put_count += 1
+        self.bytes_uploaded += max(0, int(bytes_n))
+        self.recent_latencies_ms.append(latency_ms)
+        self.last_success_ts = time.time()
+
+    def record_delete(self, latency_ms: float) -> None:
+        self.delete_count += 1
+        self.recent_latencies_ms.append(latency_ms)
+        self.last_success_ts = time.time()
+
+    def record_error(self, kind: str, rel: str, error: str) -> None:
+        self.errors_total += 1
+        self.last_error_ts = time.time()
+        self.last_error_message = error[:200]
+        self.recent_errors.appendleft({
+            "kind": kind, "rel_path": rel, "error": error[:200], "ts": time.time(),
+        })
+
+    def percentile(self, p: float) -> Optional[int]:
+        n = len(self.recent_latencies_ms)
+        if n == 0:
+            return None
+        sorted_vals = sorted(self.recent_latencies_ms)
+        idx = max(0, min(n - 1, int(p * n)))
+        return int(sorted_vals[idx])
+
+
 class CloudFilesWatcher:
     """In-process watcher that pushes ~/cloud-files/ changes to AI Dream in real time."""
 
@@ -78,73 +146,95 @@ class CloudFilesWatcher:
         self,
         cloud_root: Path = Path("/home/agent/cloud-files"),
         marker_path: Path = Path("/home/agent/.matrx/runtime/cloud-files-down-complete"),
+        queue_path: Optional[Path] = None,
     ):
         self.cloud_root = cloud_root
         self.marker_path = marker_path
+        self._queue_path = queue_path
         self._cfg: Optional[BridgeConfig] = None
         self._client: Optional[AsyncBridgeClient] = None
         self._observer: Optional[Observer] = None
         self._loop: Optional[asyncio.AbstractEventLoop] = None
-        self._queue: Optional[asyncio.Queue] = None
+        self._fs_queue: Optional[asyncio.Queue] = None
         self._drain_task: Optional[asyncio.Task] = None
-        self._pending: "OrderedDict[str, asyncio.TimerHandle]" = OrderedDict()
+        self._startup_task: Optional[asyncio.Task] = None
+        # Maps rel_path → (TimerHandle, event_id) — at most one pending timer per path.
+        self._pending: "OrderedDict[str, tuple[asyncio.TimerHandle, str]]" = OrderedDict()
         self._inflight_sem: Optional[asyncio.Semaphore] = None
         self._last_hash: dict[str, str] = {}
         self._event_arrivals: dict[str, float] = {}
-        self._running = False
+        self._mode: str = "init"  # init|dormant|waiting|degraded|active|stopping|stopped
+        self._mode_since: float = time.time()
+        self._stop_requested = False
+        self._persistent_queue: Optional[PersistentQueue] = None
+        self._completed_since_compact = 0
+        self._metrics = _Metrics()
+        self._started_at: Optional[float] = None
+
+    @property
+    def mode(self) -> str:
+        return self._mode
+
+    def _set_mode(self, mode: str) -> None:
+        if mode != self._mode:
+            _logger.info("cloud-files: mode %s → %s", self._mode, mode)
+            self._mode = mode
+            self._mode_since = time.time()
 
     # ─── Lifecycle ───────────────────────────────────────────────────────────
 
     async def start(self) -> None:
+        """Top-level entry point. Always non-blocking from the lifespan's POV
+        because we either return immediately (dormant) or kick off a background
+        retry loop. The actual observer is started by ``_activate``.
+        """
         self._cfg = BridgeConfig.from_env()
         if self._cfg is None:
+            self._set_mode("dormant")
             _logger.info("cloud-files: AI Dream env not configured — watcher dormant")
             return
 
-        if not await self._await_down_marker():
-            _logger.warning(
-                "cloud-files: down-sync marker %s not seen in %.0fs — watcher dormant",
-                self.marker_path, DOWN_MARKER_WAIT_SECONDS,
-            )
-            return
-
         if not self.cloud_root.exists():
-            _logger.warning(
-                "cloud-files: %s does not exist — watcher dormant", self.cloud_root,
-            )
-            return
+            # ensure-layout.sh creates this on every boot, but be defensive.
+            try:
+                self.cloud_root.mkdir(parents=True, exist_ok=True)
+            except OSError as e:
+                _logger.warning("cloud-files: cannot create %s: %s", self.cloud_root, e)
+                self._set_mode("dormant")
+                return
 
         self._loop = asyncio.get_running_loop()
-        self._queue = asyncio.Queue()
-        self._inflight_sem = asyncio.Semaphore(MAX_INFLIGHT)
-        self._client = AsyncBridgeClient(self._cfg)
-
-        self._seed_hashes()
-
-        self._observer = Observer()
-        self._observer.schedule(
-            _Handler(self._queue, self._loop), str(self.cloud_root), recursive=True,
-        )
-        self._observer.start()
-
-        self._running = True
-        self._drain_task = asyncio.create_task(self._drain())
-        _logger.info(
-            "cloud-files: watcher started (root=%s, %d seeded hashes, debounce=%.1fs)",
-            self.cloud_root, len(self._last_hash), DEBOUNCE_SECONDS,
-        )
+        # Run the rest of startup as a background task so the lifespan returns
+        # even while we wait for the down-marker / probe the bridge.
+        self._startup_task = asyncio.create_task(self._self_heal_loop())
 
     async def stop(self) -> None:
-        if not self._running:
+        if self._mode in ("init", "dormant", "stopped"):
+            self._set_mode("stopped")
             return
-        self._running = False
-        for handle in list(self._pending.values()):
+        self._stop_requested = True
+        self._set_mode("stopping")
+
+        if self._startup_task is not None and not self._startup_task.done():
+            self._startup_task.cancel()
+            try:
+                await self._startup_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._startup_task = None
+
+        for handle, _eid in list(self._pending.values()):
             handle.cancel()
         self._pending.clear()
+
         if self._observer is not None:
-            self._observer.stop()
-            self._observer.join(timeout=2.0)
+            try:
+                self._observer.stop()
+                self._observer.join(timeout=2.0)
+            except Exception as e:  # noqa: BLE001
+                _logger.warning("cloud-files: observer stop error: %s", e)
             self._observer = None
+
         if self._drain_task is not None:
             self._drain_task.cancel()
             try:
@@ -152,25 +242,141 @@ class CloudFilesWatcher:
             except asyncio.CancelledError:
                 pass
             self._drain_task = None
+
         if self._client is not None:
             try:
                 await self._client.close()
             except Exception as e:  # noqa: BLE001
                 _logger.warning("cloud-files: error closing http client: %s", e)
             self._client = None
+
+        self._set_mode("stopped")
         _logger.info("cloud-files: watcher stopped")
 
-    # ─── Setup helpers ───────────────────────────────────────────────────────
+    # ─── Self-healing startup loop ───────────────────────────────────────────
+
+    async def _self_heal_loop(self) -> None:
+        """Keep trying until we either reach `active` or `degraded`, then return.
+
+        Loops on: down-marker (60s) → bridge probe → exponential backoff sleep.
+        Exits cleanly if `stop()` is called concurrently.
+        """
+        attempt = 0
+        try:
+            while not self._stop_requested:
+                self._set_mode("waiting")
+                if await self._await_down_marker():
+                    await self._activate(degraded=False)
+                    return
+                if await self._probe_bridge():
+                    _logger.warning(
+                        "cloud-files: down-marker missing but bridge reachable — "
+                        "starting in DEGRADED mode (no seed; first edits may re-upload)",
+                    )
+                    await self._activate(degraded=True)
+                    return
+                # Neither reachable — back off and try again.
+                delay = STARTUP_BACKOFFS[min(attempt, len(STARTUP_BACKOFFS) - 1)]
+                _logger.warning(
+                    "cloud-files: marker absent + bridge unreachable; "
+                    "retrying in %.0fs (attempt %d)",
+                    delay, attempt + 1,
+                )
+                attempt += 1
+                await asyncio.sleep(delay)
+        except asyncio.CancelledError:
+            return
+        except Exception as e:  # noqa: BLE001
+            _logger.exception("cloud-files: self-heal loop crashed: %s", e)
+            self._set_mode("dormant")
 
     async def _await_down_marker(self) -> bool:
-        """Block (with cap) until the bulk down-sync writes its completion marker."""
+        """Wait up to DOWN_MARKER_WAIT_SECONDS for the bulk down-sync to finish."""
         deadline = asyncio.get_running_loop().time() + DOWN_MARKER_WAIT_SECONDS
         while True:
+            if self._stop_requested:
+                return False
             if self.marker_path.exists():
                 return True
             if asyncio.get_running_loop().time() >= deadline:
                 return False
             await asyncio.sleep(DOWN_MARKER_POLL_INTERVAL)
+
+    async def _probe_bridge(self) -> bool:
+        """Hit the bridge's public health endpoint. Returns True on 2xx."""
+        if self._cfg is None:
+            return False
+        url = f"{self._cfg.url}/api/cloud-files/integrations.aidream"
+        try:
+            async with httpx.AsyncClient(timeout=PROBE_TIMEOUT) as c:
+                r = await c.get(url)
+                return r.status_code < 400
+        except Exception as e:  # noqa: BLE001
+            _logger.debug("cloud-files: bridge probe failed: %s", e)
+            return False
+
+    async def _activate(self, *, degraded: bool) -> None:
+        """Set up the observer, queue replay, and drain loop. Called once per process."""
+        assert self._loop is not None and self._cfg is not None
+
+        self._fs_queue = asyncio.Queue()
+        self._inflight_sem = asyncio.Semaphore(MAX_INFLIGHT)
+        self._client = AsyncBridgeClient(self._cfg)
+        self._persistent_queue = PersistentQueue(
+            path=self._queue_path or DEFAULT_QUEUE_PATH,
+        )
+        self._started_at = time.time()
+
+        if not degraded:
+            try:
+                self._seed_hashes()
+            except Exception as e:  # noqa: BLE001
+                _logger.warning("cloud-files: seed walk failed (continuing): %s", e)
+
+        self._observer = Observer()
+        self._observer.schedule(
+            _Handler(self._fs_queue, self._loop), str(self.cloud_root), recursive=True,
+        )
+        self._observer.start()
+
+        self._drain_task = asyncio.create_task(self._drain())
+
+        # Replay persisted events from a previous (possibly crashed) run.
+        try:
+            replayed = self._persistent_queue.replay_pending()
+            if replayed:
+                self._enqueue_replay(replayed)
+                _logger.info(
+                    "cloud-files: replayed %d pending events from %s",
+                    len(replayed), self._persistent_queue.path,
+                )
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("cloud-files: queue replay failed: %s", e)
+
+        self._set_mode("degraded" if degraded else "active")
+        _logger.info(
+            "cloud-files: watcher %s (root=%s, %d seeded hashes, debounce=%.1fs)",
+            self._mode, self.cloud_root, len(self._last_hash), DEBOUNCE_SECONDS,
+        )
+
+    def _enqueue_replay(self, events: list[PendingEvent]) -> None:
+        """Schedule replay events with zero debounce (already aged)."""
+        assert self._loop is not None
+        for evt in events:
+            handle = self._loop.call_later(
+                0.0,
+                (lambda r=evt.rel_path, eid=evt.event_id, k=evt.kind:
+                    asyncio.create_task(
+                        self._flush_upsert(r, eid) if k == "upsert"
+                        else self._flush_delete(r, eid)
+                    )),
+            )
+            # Replays don't go through _persistent_queue.enqueue again — they're
+            # already on disk. We just track them in _pending for stop() cleanup.
+            self._pending[evt.rel_path] = (handle, evt.event_id)
+            self._event_arrivals.setdefault(evt.rel_path, time.monotonic())
+
+    # ─── Setup helpers ───────────────────────────────────────────────────────
 
     def _seed_hashes(self) -> None:
         """Walk cloud_root once, populate last_hash so we don't re-upload existing files."""
@@ -215,10 +421,10 @@ class CloudFilesWatcher:
     # ─── Event loop ──────────────────────────────────────────────────────────
 
     async def _drain(self) -> None:
-        assert self._queue is not None and self._loop is not None
-        while self._running:
+        assert self._fs_queue is not None and self._loop is not None
+        while not self._stop_requested:
             try:
-                kind, abs_path, t_arrival = await self._queue.get()
+                kind, abs_path, t_arrival = await self._fs_queue.get()
             except asyncio.CancelledError:
                 return
 
@@ -231,37 +437,73 @@ class CloudFilesWatcher:
                 if self._is_dotpath(rel):
                     continue
 
+                # Cancel any pending timer + reuse its event_id is wrong (the
+                # old event might already be in flight). Always allocate a new
+                # event_id; the in-memory pending dict ensures we only fire one.
                 old = self._pending.pop(rel, None)
                 if old is not None:
-                    old.cancel()
+                    old[0].cancel()
+                    # Mark the superseded event done so the JSONL doesn't grow forever.
+                    self._safe_mark_done(old[1])
 
+                # Backpressure cap.
                 if len(self._pending) >= MAX_PENDING:
-                    drop_rel, drop_handle = self._pending.popitem(last=False)
+                    drop_rel, (drop_handle, drop_eid) = self._pending.popitem(last=False)
                     drop_handle.cancel()
+                    self._safe_mark_done(drop_eid)
                     _logger.warning(
                         "cloud-files: backpressure cap reached, dropping pending %s",
                         drop_rel,
                     )
 
                 self._event_arrivals.setdefault(rel, t_arrival)
+
+                # Persist + schedule.
+                evt = self._persistent_queue.enqueue(kind, rel) if self._persistent_queue else None
+                event_id = evt.event_id if evt else f"mem-{id(rel):x}"
+
                 if kind == "delete":
                     handle = self._loop.call_later(
                         DEBOUNCE_SECONDS,
-                        lambda r=rel: asyncio.create_task(self._flush_delete(r)),
+                        lambda r=rel, eid=event_id: asyncio.create_task(
+                            self._flush_delete(r, eid)
+                        ),
                     )
                 else:
                     handle = self._loop.call_later(
                         DEBOUNCE_SECONDS,
-                        lambda r=rel: asyncio.create_task(self._flush_upsert(r)),
+                        lambda r=rel, eid=event_id: asyncio.create_task(
+                            self._flush_upsert(r, eid)
+                        ),
                     )
-                self._pending[rel] = handle
+                self._pending[rel] = (handle, event_id)
             except Exception as e:  # noqa: BLE001
                 _logger.exception("cloud-files: drain error: %s", e)
 
+    def _safe_mark_done(self, event_id: str) -> None:
+        if not self._persistent_queue or event_id.startswith("mem-"):
+            return
+        try:
+            self._persistent_queue.mark_done(event_id)
+            self._completed_since_compact += 1
+            if self._completed_since_compact >= COMPACT_CHECK_INTERVAL:
+                self._completed_since_compact = 0
+                self._persistent_queue.maybe_compact()
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("cloud-files: mark_done failed: %s", e)
+
     # ─── Flush handlers ──────────────────────────────────────────────────────
 
-    async def _flush_upsert(self, rel: str) -> None:
-        self._pending.pop(rel, None)
+    async def _flush_upsert(self, rel: str, event_id: str) -> None:
+        # Remove from pending so a new event can schedule a replacement.
+        prev = self._pending.pop(rel, None)
+        # If a different event_id is now pending for this path, the newer one
+        # supersedes us — let it handle the upload.
+        if prev is not None and prev[1] != event_id:
+            self._pending[rel] = prev  # restore the newer one
+            self._safe_mark_done(event_id)
+            return
+
         assert self._inflight_sem is not None and self._client is not None
         async with self._inflight_sem:
             local = self.cloud_root / rel
@@ -271,10 +513,12 @@ class CloudFilesWatcher:
                         "cloud-files: skipping %s (symlink, v1 limitation)", rel,
                     )
                     self._event_arrivals.pop(rel, None)
+                    self._safe_mark_done(event_id)
                     return
                 if not local.exists():
                     # Created-then-deleted within the debounce window. Not an error.
                     self._event_arrivals.pop(rel, None)
+                    self._safe_mark_done(event_id)
                     return
                 size = local.stat().st_size
                 if size > MAX_FILE_SIZE:
@@ -282,6 +526,7 @@ class CloudFilesWatcher:
                         "cloud-files: skipping %s (>1 GiB cap, size=%d)", rel, size,
                     )
                     self._event_arrivals.pop(rel, None)
+                    self._safe_mark_done(event_id)
                     return
 
                 # Stability check: re-stat after a short wait. If size is still moving,
@@ -289,19 +534,31 @@ class CloudFilesWatcher:
                 await asyncio.sleep(STABILITY_WAIT_SECONDS)
                 if not local.exists():
                     self._event_arrivals.pop(rel, None)
+                    self._safe_mark_done(event_id)
                     return
                 if local.stat().st_size != size:
                     if self._loop is not None:
+                        new_evt = (
+                            self._persistent_queue.enqueue("upsert", rel)
+                            if self._persistent_queue else None
+                        )
+                        new_eid = new_evt.event_id if new_evt else f"mem-{id(rel):x}"
                         handle = self._loop.call_later(
                             DEBOUNCE_SECONDS,
-                            lambda r=rel: asyncio.create_task(self._flush_upsert(r)),
+                            lambda r=rel, eid=new_eid: asyncio.create_task(
+                                self._flush_upsert(r, eid)
+                            ),
                         )
-                        self._pending[rel] = handle
+                        self._pending[rel] = (handle, new_eid)
+                    self._safe_mark_done(event_id)
                     return
 
+                # Pre-send hash short-circuit (A5: don't even hit the bridge if
+                # local content matches what we last uploaded).
                 new_hash = self._sha256(local)
                 if self._last_hash.get(rel) == new_hash:
                     self._event_arrivals.pop(rel, None)
+                    self._safe_mark_done(event_id)
                     return
 
                 t0 = self._event_arrivals.get(rel, time.monotonic())
@@ -311,30 +568,41 @@ class CloudFilesWatcher:
                         await asyncio.sleep(delay)
                     try:
                         result = await self._client.put_one(local, rel)
-                        latency_ms = int((time.monotonic() - t0) * 1000)
+                        latency_ms = (time.monotonic() - t0) * 1000
                         is_new = (
                             isinstance(result, dict)
                             and result.get("version") == 1
                         )
                         _logger.info(
                             "cloud-files: PUT %s %d bytes new=%s latency_ms=%d",
-                            rel, size, is_new, latency_ms,
+                            rel, size, is_new, int(latency_ms),
                         )
                         self._last_hash[rel] = new_hash
+                        self._metrics.record_put(size, latency_ms)
                         self._event_arrivals.pop(rel, None)
+                        self._safe_mark_done(event_id)
                         return
                     except Exception as e:  # noqa: BLE001
                         last_err = e
                 _logger.warning(
                     "cloud-files: PUT %s failed after retries: %s", rel, last_err,
                 )
+                self._metrics.record_error("upsert", rel, str(last_err))
                 self._event_arrivals.pop(rel, None)
+                self._safe_mark_done(event_id)
             except Exception as e:  # noqa: BLE001
                 _logger.exception("cloud-files: flush_upsert error for %s: %s", rel, e)
+                self._metrics.record_error("upsert", rel, str(e))
                 self._event_arrivals.pop(rel, None)
+                self._safe_mark_done(event_id)
 
-    async def _flush_delete(self, rel: str) -> None:
-        self._pending.pop(rel, None)
+    async def _flush_delete(self, rel: str, event_id: str) -> None:
+        prev = self._pending.pop(rel, None)
+        if prev is not None and prev[1] != event_id:
+            self._pending[rel] = prev
+            self._safe_mark_done(event_id)
+            return
+
         assert self._inflight_sem is not None and self._client is not None
         async with self._inflight_sem:
             local = self.cloud_root / rel
@@ -343,11 +611,19 @@ class CloudFilesWatcher:
                 # it as an upsert instead of a delete.
                 if local.exists() and not local.is_symlink():
                     if self._loop is not None:
+                        new_evt = (
+                            self._persistent_queue.enqueue("upsert", rel)
+                            if self._persistent_queue else None
+                        )
+                        new_eid = new_evt.event_id if new_evt else f"mem-{id(rel):x}"
                         handle = self._loop.call_later(
                             0.0,
-                            lambda r=rel: asyncio.create_task(self._flush_upsert(r)),
+                            lambda r=rel, eid=new_eid: asyncio.create_task(
+                                self._flush_upsert(r, eid)
+                            ),
                         )
-                        self._pending[rel] = handle
+                        self._pending[rel] = (handle, new_eid)
+                    self._safe_mark_done(event_id)
                     return
 
                 t0 = self._event_arrivals.get(rel, time.monotonic())
@@ -357,19 +633,85 @@ class CloudFilesWatcher:
                         await asyncio.sleep(delay)
                     try:
                         await self._client.delete_one(rel)
-                        latency_ms = int((time.monotonic() - t0) * 1000)
+                        latency_ms = (time.monotonic() - t0) * 1000
                         _logger.info(
-                            "cloud-files: DELETE %s latency_ms=%d", rel, latency_ms,
+                            "cloud-files: DELETE %s latency_ms=%d", rel, int(latency_ms),
                         )
                         self._last_hash.pop(rel, None)
+                        self._metrics.record_delete(latency_ms)
                         self._event_arrivals.pop(rel, None)
+                        self._safe_mark_done(event_id)
                         return
                     except Exception as e:  # noqa: BLE001
                         last_err = e
                 _logger.warning(
                     "cloud-files: DELETE %s failed after retries: %s", rel, last_err,
                 )
+                self._metrics.record_error("delete", rel, str(last_err))
                 self._event_arrivals.pop(rel, None)
+                self._safe_mark_done(event_id)
             except Exception as e:  # noqa: BLE001
                 _logger.exception("cloud-files: flush_delete error for %s: %s", rel, e)
+                self._metrics.record_error("delete", rel, str(e))
                 self._event_arrivals.pop(rel, None)
+                self._safe_mark_done(event_id)
+
+    # ─── Status / Stats (A3 + A4) ────────────────────────────────────────────
+
+    def get_status(self) -> dict[str, Any]:
+        """Snapshot for /internal/cloud-sync-status. Designed to be cheap."""
+        m = self._metrics
+        queue_stats = (
+            self._persistent_queue.stats() if self._persistent_queue else
+            {"enqueued": 0, "done": 0, "pending": 0, "bytes": 0}
+        )
+        inflight = 0
+        if self._inflight_sem is not None:
+            # Best-effort — semaphores don't expose count directly; approximate
+            # via the pending dict (paths with timers + paths actively flushing).
+            inflight = len(self._pending)
+        return {
+            "mode": self._mode,
+            "mode_since_ts": self._mode_since,
+            "started_at_ts": self._started_at,
+            "is_running": self._mode in ("active", "degraded"),
+            "cloud_root": str(self.cloud_root),
+            "ai_dream_configured": self._cfg is not None,
+            "ai_dream_url": self._cfg.url if self._cfg else None,
+            "user_id": self._cfg.user_id if self._cfg else None,
+            "pending": len(self._pending),
+            "inflight_approx": inflight,
+            "seeded_hashes": len(self._last_hash),
+            "metrics": {
+                "puts": m.put_count,
+                "deletes": m.delete_count,
+                "bytes_uploaded": m.bytes_uploaded,
+                "errors_total": m.errors_total,
+                "last_success_ts": m.last_success_ts,
+                "last_error_ts": m.last_error_ts,
+                "last_error_message": m.last_error_message,
+                "latency_ms_p50": m.percentile(0.50),
+                "latency_ms_p95": m.percentile(0.95),
+                "latency_ms_p99": m.percentile(0.99),
+                "recent_errors": list(m.recent_errors)[:8],
+            },
+            "queue": queue_stats,
+        }
+
+    def get_stats(self) -> dict[str, Any]:
+        """Compact snapshot for embedding in the session manifest."""
+        m = self._metrics
+        return {
+            "mode": self._mode,
+            "puts": m.put_count,
+            "deletes": m.delete_count,
+            "bytes_uploaded": m.bytes_uploaded,
+            "errors_total": m.errors_total,
+            "last_success_ts": m.last_success_ts,
+            "last_error_message": m.last_error_message,
+            "latency_ms_p50": m.percentile(0.50),
+            "latency_ms_p95": m.percentile(0.95),
+            "queue_pending": (
+                self._persistent_queue.stats()["pending"] if self._persistent_queue else 0
+            ),
+        }

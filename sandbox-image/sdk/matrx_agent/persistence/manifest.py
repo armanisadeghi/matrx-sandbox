@@ -77,6 +77,9 @@ class SessionManifest:
     ports_at_shutdown: list[int] = field(default_factory=list)
     transient_things_we_could_not_save: list[str] = field(default_factory=list)
     size: dict[str, Any] = field(default_factory=dict)
+    # Spliced in by main.py on shutdown — watcher stats so the session report
+    # can render "files synced this session".
+    cloud_sync: dict[str, Any] | None = None
 
 
 def _now() -> str:
