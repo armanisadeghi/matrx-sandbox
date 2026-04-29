@@ -358,6 +358,20 @@ class CloudFilesWatcher:
                 self._seed_hashes()
             except Exception as e:  # noqa: BLE001
                 _logger.warning("cloud-files: seed walk failed (continuing): %s", e)
+            # Reconcile against cld_files: files in the persistent volume but
+            # NOT in the user's cld_files (or with a different checksum) need
+            # to be uploaded. Without this, files that pre-existed in the
+            # volume from a prior sandbox boot — but were never actually
+            # uploaded — stay invisible to the user forever.
+            try:
+                queued = await self._reconcile_against_remote()
+                if queued:
+                    _logger.info(
+                        "cloud-files: reconcile queued %d file(s) missing-or-changed in cld_files",
+                        queued,
+                    )
+            except Exception as e:  # noqa: BLE001
+                _logger.warning("cloud-files: reconcile against cld_files failed: %s", e)
 
         self._observer = Observer()
         self._observer.schedule(
@@ -428,6 +442,57 @@ class CloudFilesWatcher:
                 self._last_hash[rel] = self._sha256(p)
             except OSError:
                 continue
+
+    async def _reconcile_against_remote(self) -> int:
+        """One-shot startup reconciliation against cld_files.
+
+        The seed walk above tells us what's on disk. That's only HALF the
+        truth — the persistent volume can carry files from a previous
+        sandbox boot that were never actually uploaded to AI Dream. Without
+        this reconcile, those files look "already synced" forever (the
+        watcher's last-hash matches; no event ever fires; the user never
+        sees them in the AI Dream Files panel).
+
+        Strategy: ask the bridge for its current cld_files snapshot, build
+        a {file_path: checksum} map, and for each local file:
+          - If absent from cld_files → queue an upload.
+          - If present but checksum differs → queue an upload.
+          - If present with matching checksum → nothing to do.
+
+        Best-effort. Network failures, missing checksum fields, etc.
+        downgrade to "no reconcile this boot" — the next user edit will
+        eventually trigger a sync. Returns the count of files queued.
+        """
+        if self._client is None or self._loop is None:
+            return 0
+        try:
+            remote_files = await self._client.list_files()
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("cloud-files: list_files for reconcile failed: %s", e)
+            return 0
+
+        remote_index: dict[str, str] = {}
+        for row in remote_files or []:
+            rp = row.get("file_path") or row.get("path")
+            ck = row.get("checksum") or row.get("sha256")
+            if rp:
+                remote_index[str(rp)] = str(ck) if ck else ""
+
+        queued = 0
+        for rel, local_hash in list(self._last_hash.items()):
+            remote_hash = remote_index.get(rel)
+            if remote_hash and remote_hash == local_hash:
+                # In sync — leave alone.
+                continue
+            # Either missing from remote or checksum mismatch — schedule an upload.
+            # Use the existing debounce machinery so we don't thunder on boot;
+            # the 5s window batches naturally. Queue-event shape matches
+            # _Handler._enqueue: (kind, abs_path, t_arrival).
+            self._fs_queue.put_nowait(  # type: ignore[union-attr]
+                ("upsert", str(self.cloud_root / rel), time.monotonic())
+            )
+            queued += 1
+        return queued
 
     # ─── Path helpers ────────────────────────────────────────────────────────
 
