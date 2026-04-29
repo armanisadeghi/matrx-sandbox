@@ -45,7 +45,7 @@ no synthetic prefix, no UUID. This is your home; treat it like one.
 | Path | Purpose |
 |---|---|
 | `/home/agent/.matrx/` | **Your private workspace.** Hidden from `ls` by default; not user-facing. Use it for plans, learned skills, persistent self-notes, memory entries, and runtime artifacts. |
-| `/home/agent/cloud-files/` | The user's synced files. **Auto-syncs to AI Dream's `cld_files`** in both directions — anything you write here appears in their UI within seconds, and anything they upload appears here. Treat this as a shared surface with the user. |
+| `/home/agent/cloud-files/` | The user's synced files. **Up-direction is live**: anything you write here is auto-pushed to AI Dream's `cld_files` within ~5 seconds via the in-process watcher. **Down-direction is currently boundary-only**: edits the user makes in the AI Dream UI during your session won't appear here until the next sandbox boot (the down-sync runs at startup). Live down-direction is in flight; until then, if you need the absolute latest UI-side state mid-session, run `mtx files sync down`. Treat this as a shared surface with the user. |
 | `/home/agent/repos/` | Git checkouts. Convention: `repos/<owner>/<repo>` (e.g. `repos/aidream/aidream-current`). Default destination for `git clone`. |
 | `/home/agent/projects/` | User-created project folders. The line between `repos/` and `projects/` is "did this come from `git clone` or did the user/agent create it from scratch." |
 | `/home/agent/scratch/` | Throwaway / experimentation. Wipe freely — nothing here is precious. |
@@ -58,7 +58,7 @@ no synthetic prefix, no UUID. This is your home; treat it like one.
 | `.matrx/skills/` | Reusable snippets / learned patterns (`<skill-name>.md`). Drop one when you discover something worth remembering. |
 | `.matrx/instructions/` | Persistent self-notes ("when working on X, always Y"). This file lives here. |
 | `.matrx/memory/` | Long-term memory entries — facts about the project, the user, decisions made. |
-| `.matrx/runtime/tool-calls/` | Per-tool-call records. Every shell/python invocation writes a markdown file here with frontmatter (inputs, exit code, duration, conversation_id) plus full stdout/stderr. **Use these as your audit trail** — if you need to know "what did I run 10 steps back," fs_read the relevant file. Filename: `<unix_ts>-<tool>-<short_call_id>.md`. |
+| `.matrx/runtime/tool-calls/` | Per-tool-call records. Every shell/python invocation writes a markdown file here with frontmatter (inputs, exit code, duration, conversation_id) plus full stdout/stderr. Service actions (cloud-sync uploads, etc.) write to the `_runtime/` subdirectory under the same root. **Use these as your audit trail** — if you need to know "what did I run 10 steps back," `fs_read` the relevant file. Filename: `<unix_ts>-<tool>-<short_call_id>.md`. |
 | `.matrx/runtime/shell-logs/` | Legacy spill files from large shell outputs. New work writes to `tool-calls/` instead. |
 | `.matrx/runtime/session-reports/` | Startup session reports written by matrx_agent's persistence module. |
 
@@ -67,6 +67,18 @@ no synthetic prefix, no UUID. This is your home; treat it like one.
 - Don't put log files, temp output, or scratch data in cwd — that pollutes the workspace and makes `ls` unhelpful for the user. Use `scratch/` or `.matrx/runtime/`.
 - Don't try to escape `/home/agent` for file storage. Tool calls accept absolute paths anywhere on the rootfs (you're root-equivalent inside the container) but anything outside `/home/agent` doesn't survive `Reset`. The persistent volume is mounted at `/home/agent`.
 - Don't ask the user to paste file contents you can read yourself. `fs_read /home/agent/aidream/file.py` is a single tool call.
+
+## Useful CLI extras
+
+These are available in addition to the standard `mtx whoami` / `mtx files {ls,cat,put,rm,sync}`:
+
+- `mtx files versions <path>` — list version history for a cloud file. **`:aidream` image only**; falls back to a friendly "spawn an :aidream sandbox" hint on `:core`/`:local`.
+- `mtx files restore <path> <version>` — restore a previous version. **`:aidream` only**.
+- `mtx files diff <path> <v1> <v2>` — print a unified diff between two versions. **`:aidream` only**.
+
+The auto-sync watcher uses the same versioning under the hood; every
+auto-uploaded change creates a new version, so `mtx files versions` is
+the audit trail for what got pushed when.
 
 ## Why this matters
 

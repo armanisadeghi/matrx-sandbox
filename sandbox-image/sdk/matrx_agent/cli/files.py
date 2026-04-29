@@ -193,7 +193,20 @@ def cmd_sync_down(cfg: BridgeConfig, dest: str, max_bytes: int) -> int:
         path = r.get("file_path") or r.get("name")
         if not path:
             continue
-        local = dest_dir / path.lstrip("/")
+        # Path-traversal guard: a malicious or buggy server could return
+        # ``file_path = "../../etc/passwd"`` and we'd write outside dest_dir.
+        # Resolve and assert the target stays under dest_dir.
+        candidate = (dest_dir / path.lstrip("/")).resolve()
+        try:
+            dest_resolved = dest_dir.resolve()
+            candidate.relative_to(dest_resolved)
+        except ValueError:
+            print(
+                f"sync down: refusing to write outside {dest_dir}: {path}",
+                file=sys.stderr,
+            )
+            continue
+        local = candidate
         local.parent.mkdir(parents=True, exist_ok=True)
         # Skip if local already has same size + checksum (cheap idempotency).
         if local.exists() and local.stat().st_size == size:
@@ -260,6 +273,98 @@ def cmd_sync_up(cfg: BridgeConfig, src: str) -> int:
     return 0
 
 
+def cmd_versions(cfg: BridgeConfig, path: str) -> int:
+    """List version history for one cld_file. Requires the :aidream image."""
+    return _run_local_only(
+        "versions",
+        lambda client: client.list_versions(path),
+        on_success=lambda result: _print_versions(path, result),
+    )
+
+
+def cmd_restore(cfg: BridgeConfig, path: str, version: int) -> int:
+    """Restore a previous version. Requires the :aidream image."""
+    return _run_local_only(
+        "restore",
+        lambda client: client.restore_version(path, version),
+        on_success=lambda result: print(
+            f"restored {path} to v{version}: " + json.dumps(result, indent=2)
+        ),
+    )
+
+
+def cmd_diff(cfg: BridgeConfig, path: str, v1: int, v2: int) -> int:
+    """Print a unified diff between two versions of one file. :aidream only."""
+    return _run_local_only(
+        "diff",
+        lambda client: client.diff_versions(path, v1, v2),
+        on_success=lambda diff: sys.stdout.write(diff if diff else "(no changes)\n"),
+    )
+
+
+def _print_versions(path: str, versions: list[dict[str, Any]]) -> None:
+    if not versions:
+        print(f"{path}: no version history")
+        return
+    print(f"{path}: {len(versions)} version(s)")
+    for v in versions:
+        ver = v.get("version") or v.get("version_number") or "?"
+        size = v.get("size_bytes") or v.get("file_size") or "?"
+        ts = v.get("created_at") or v.get("uploaded_at") or "?"
+        author = v.get("author") or v.get("created_by") or "?"
+        print(f"  v{ver}  {size:>10} bytes  {ts}  {author}")
+
+
+def _run_local_only(
+    op_name: str,
+    work,
+    *,
+    on_success,
+) -> int:
+    """Helper for the three CLI commands that require the in-sandbox aidream
+    FastAPI on :8001 (versions/restore/diff). Probes for a LocalFilesClient,
+    runs the work function, prints. Falls back to a clear error message on
+    :core / :local images.
+    """
+    import asyncio
+
+    async def _go() -> int:
+        from matrx_agent.cloud_sync.client import (
+            BridgeConfig as _Cfg,
+            LocalFilesClient,
+            NotSupportedError,
+            select_bridge_client,
+        )
+        cfg = _Cfg.from_env()
+        if cfg is None:
+            report_missing()
+            return 1
+        client = await select_bridge_client(cfg)
+        try:
+            if not isinstance(client, LocalFilesClient):
+                print(
+                    f"mtx files {op_name}: requires the :aidream sandbox image "
+                    "(in-sandbox aidream FastAPI on :8001 is unreachable). "
+                    "Spawn a sandbox with template='aidream' to use this command.",
+                    file=sys.stderr,
+                )
+                return 1
+            try:
+                result = await work(client)
+            except NotSupportedError as exc:
+                print(f"mtx files {op_name}: {exc}", file=sys.stderr)
+                return 1
+            except FileNotFoundError as exc:
+                print(f"mtx files {op_name}: not found: {exc}", file=sys.stderr)
+                return 1
+            on_success(result)
+            return 0
+        finally:
+            await client.close()
+
+    return asyncio.run(_go())
+
+
 def run(args) -> int:
     cfg = _config()
     if cfg is None:
@@ -278,6 +383,12 @@ def run(args) -> int:
             return cmd_sync_down(cfg, args.dest, args.max_bytes)
         if args.sync_dir == "up":
             return cmd_sync_up(cfg, args.src)
+    if args.files_cmd == "versions":
+        return cmd_versions(cfg, args.path)
+    if args.files_cmd == "restore":
+        return cmd_restore(cfg, args.path, args.version)
+    if args.files_cmd == "diff":
+        return cmd_diff(cfg, args.path, args.v1, args.v2)
 
     print("unknown files command", file=sys.stderr)
     return 2

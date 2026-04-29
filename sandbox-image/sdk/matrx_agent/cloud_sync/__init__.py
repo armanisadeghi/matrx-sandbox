@@ -6,7 +6,24 @@ the `mtx files` CLI uses. The startup `cloud-files-sync.sh down` and shutdown
 `cloud-files-sync.sh up` shell hooks remain as bulk safety nets.
 """
 
-from matrx_agent.cloud_sync.client import AsyncBridgeClient, BridgeConfig
+from matrx_agent.cloud_sync.client import (
+    AsyncBridgeClient,
+    BridgeClient,
+    BridgeConfig,
+    LocalFilesClient,
+    NotSupportedError,
+    RemoteBridgeClient,
+    select_bridge_client,
+)
 from matrx_agent.cloud_sync.watcher import CloudFilesWatcher
 
-__all__ = ["AsyncBridgeClient", "BridgeConfig", "CloudFilesWatcher"]
+__all__ = [
+    "AsyncBridgeClient",
+    "BridgeClient",
+    "BridgeConfig",
+    "LocalFilesClient",
+    "NotSupportedError",
+    "RemoteBridgeClient",
+    "CloudFilesWatcher",
+    "select_bridge_client",
+]

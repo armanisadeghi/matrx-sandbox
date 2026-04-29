@@ -41,6 +41,30 @@ def _files_subparser(parent):
     up_p = sync_sub.add_parser("up", help="Push a local dir back to cld_files")
     up_p.add_argument("--src", default="/home/agent/cloud-files")
 
+    # Versioning commands — only on :aidream images (in-sandbox FastAPI on :8001).
+    # On :core / :local they print a friendly "spawn an :aidream sandbox" hint
+    # and return 1.
+    versions_p = files_sub.add_parser(
+        "versions",
+        help="List version history for a cloud file (:aidream image only)",
+    )
+    versions_p.add_argument("path", help="File path within cld_files")
+
+    restore_p = files_sub.add_parser(
+        "restore",
+        help="Restore a previous version of a cloud file (:aidream image only)",
+    )
+    restore_p.add_argument("path", help="File path within cld_files")
+    restore_p.add_argument("version", type=int, help="Version number to restore")
+
+    diff_p = files_sub.add_parser(
+        "diff",
+        help="Diff two versions of a cloud file (:aidream image only)",
+    )
+    diff_p.add_argument("path", help="File path within cld_files")
+    diff_p.add_argument("v1", type=int, help="Older version number")
+    diff_p.add_argument("v2", type=int, help="Newer version number")
+
 
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(prog="mtx", description="Matrx sandbox CLI")
