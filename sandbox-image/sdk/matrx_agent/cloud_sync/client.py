@@ -202,6 +202,23 @@ async def _remote_list_files(self: AsyncBridgeClient, prefix: str = "") -> list[
     return list(body.get("files") or [])
 
 
+async def _remote_list_changes(
+    self: AsyncBridgeClient, since_iso: str, limit: int = 1000,
+) -> dict[str, Any]:
+    """Polling fallback for the down-direction. Returns the bridge's
+    ``/api/cloud-files/changes`` envelope with ``files`` + ``next_cursor``
+    + ``deletions_supported`` keys. Used by ``downstream.PollingSubscriber``.
+    """
+    r = await self._client.get(
+        f"{self._cfg.url}/api/cloud-files/changes",
+        params={"since": since_iso, "limit": limit},
+        timeout=DELETE_TIMEOUT,
+    )
+    r.raise_for_status()
+    body = r.json()
+    return body if isinstance(body, dict) else {"files": [], "next_cursor": since_iso}
+
+
 async def _remote_unsupported(*_args: Any, **_kwargs: Any) -> Any:
     raise NotSupportedError(
         "This operation requires the :aidream sandbox image (full /files/* "
@@ -213,6 +230,7 @@ async def _remote_unsupported(*_args: Any, **_kwargs: Any) -> Any:
 # Patch the methods onto AsyncBridgeClient so it implements BridgeClient.
 AsyncBridgeClient.get_one = _remote_get_one  # type: ignore[attr-defined]
 AsyncBridgeClient.list_files = _remote_list_files  # type: ignore[attr-defined]
+AsyncBridgeClient.list_changes = _remote_list_changes  # type: ignore[attr-defined]
 AsyncBridgeClient.list_versions = _remote_unsupported  # type: ignore[attr-defined]
 AsyncBridgeClient.restore_version = _remote_unsupported  # type: ignore[attr-defined]
 AsyncBridgeClient.diff_versions = _remote_unsupported  # type: ignore[attr-defined]

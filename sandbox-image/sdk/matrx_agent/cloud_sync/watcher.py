@@ -34,6 +34,7 @@ from watchdog.events import FileSystemEventHandler
 from watchdog.observers import Observer
 
 from matrx_agent.cloud_sync.client import AsyncBridgeClient, BridgeConfig
+from matrx_agent.cloud_sync.downstream import RemoteChange, make_subscriber
 from matrx_agent.cloud_sync.queue import (
     DEFAULT_PATH as DEFAULT_QUEUE_PATH,
     PendingEvent,
@@ -60,6 +61,13 @@ PROBE_TIMEOUT = httpx.Timeout(connect=5.0, read=5.0, write=5.0, pool=5.0)
 LATENCY_HISTORY_LEN = 256
 ERROR_HISTORY_LEN = 64
 COMPACT_CHECK_INTERVAL = 50  # check queue compaction every N completed events
+
+# Echo-loop guard — when we apply a remote change to local fs, watchdog will
+# fire a "modified" event that we don't want to echo back. _last_hash dedup
+# would catch most of these in _flush_upsert, but the LRU is belt-and-braces
+# (and skips work earlier in the drain loop). Entries expire after this TTL.
+RECENTLY_APPLIED_TTL_SECONDS = 30.0
+RECENTLY_APPLIED_MAX = 1024
 
 
 class _Handler(FileSystemEventHandler):
@@ -170,6 +178,17 @@ class CloudFilesWatcher:
         self._completed_since_compact = 0
         self._metrics = _Metrics()
         self._started_at: Optional[float] = None
+        # Downstream (cloud → sandbox) subscriber, set up in _activate.
+        self._subscriber: Any = None
+        # Echo-loop guard: rel_path → (sha256, expires_at_monotonic).
+        # Populated when _apply_remote_change writes to disk; consulted in
+        # the drain loop to suppress the watchdog event that local FS write
+        # triggers. Entries are evicted lazily on lookup.
+        self._recently_applied: "OrderedDict[str, tuple[str, float]]" = OrderedDict()
+        # Counts for metrics — number of remote changes received vs applied.
+        self._remote_received = 0
+        self._remote_applied = 0
+        self._remote_echo_suppressed = 0
 
     @property
     def mode(self) -> str:
@@ -222,6 +241,13 @@ class CloudFilesWatcher:
             except (asyncio.CancelledError, Exception):  # noqa: BLE001
                 pass
             self._startup_task = None
+
+        if self._subscriber is not None:
+            try:
+                await self._subscriber.stop()
+            except Exception as e:  # noqa: BLE001
+                _logger.warning("cloud-files: subscriber stop error: %s", e)
+            self._subscriber = None
 
         for handle, _eid in list(self._pending.values()):
             handle.cancel()
@@ -353,6 +379,14 @@ class CloudFilesWatcher:
         except Exception as e:  # noqa: BLE001
             _logger.warning("cloud-files: queue replay failed: %s", e)
 
+        # B1 — start the down-direction subscriber (Realtime + polling fallback).
+        try:
+            self._subscriber = make_subscriber(self._client, self._cfg)
+            await self._subscriber.start(self._apply_remote_change)
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("cloud-files: downstream subscriber failed to start: %s", e)
+            self._subscriber = None
+
         self._set_mode("degraded" if degraded else "active")
         _logger.info(
             "cloud-files: watcher %s (root=%s, %d seeded hashes, debounce=%.1fs)",
@@ -435,6 +469,15 @@ class CloudFilesWatcher:
                     _logger.debug("cloud-files: ignoring %s (outside root)", abs_path)
                     continue
                 if self._is_dotpath(rel):
+                    continue
+
+                # Echo-loop guard. If we just applied a remote change to this
+                # path AND the local bytes still match what we wrote, watchdog
+                # is just echoing our own write back at us — drop it cheaply
+                # before it eats a debounce slot. The hash short-circuit in
+                # _flush_upsert is the second line of defence.
+                if self._is_recent_apply_echo(rel):
+                    self._remote_echo_suppressed += 1
                     continue
 
                 # Cancel any pending timer + reuse its event_id is wrong (the
@@ -656,6 +699,128 @@ class CloudFilesWatcher:
                 self._event_arrivals.pop(rel, None)
                 self._safe_mark_done(event_id)
 
+    # ─── Downstream / echo-loop helpers ──────────────────────────────────────
+
+    def _is_recent_apply_echo(self, rel: str) -> bool:
+        """Return True if rel was applied from a remote change recently and
+        the file's current hash still matches the bytes we wrote.
+        """
+        entry = self._recently_applied.get(rel)
+        if entry is None:
+            return False
+        cached_hash, expires_at = entry
+        if time.monotonic() > expires_at:
+            self._recently_applied.pop(rel, None)
+            return False
+        local = self.cloud_root / rel
+        if not local.exists() or local.is_symlink():
+            return False
+        try:
+            return self._sha256(local) == cached_hash
+        except OSError:
+            return False
+
+    def _remember_apply(self, rel: str, content_hash: str) -> None:
+        """Record that we just wrote rel with the given content hash so
+        watchdog's echo of that write can be suppressed.
+        """
+        if len(self._recently_applied) >= RECENTLY_APPLIED_MAX:
+            self._recently_applied.popitem(last=False)
+        self._recently_applied[rel] = (
+            content_hash,
+            time.monotonic() + RECENTLY_APPLIED_TTL_SECONDS,
+        )
+
+    async def _apply_remote_change(self, change: RemoteChange) -> None:
+        """Callback wired into the downstream subscriber.
+
+        For 'modified': fetch bytes via the bridge, write atomically, update
+        _last_hash so the resulting watchdog event de-dups in _flush_upsert,
+        and push the path into the recently-applied LRU.
+
+        For 'deleted': unlink locally, drop from _last_hash.
+
+        Failures here are logged but never raise — the next polling cycle
+        (or Realtime event) will retry naturally.
+        """
+        self._remote_received += 1
+        rel = change.rel_path or ""
+        if not rel or self._is_dotpath(rel):
+            return
+
+        # Path safety: refuse anything that resolves outside cloud_root.
+        # Build the candidate path the same way _rel_path does the inverse,
+        # but resolve manually for absolute parent dirs.
+        local = (self.cloud_root / rel)
+        try:
+            local_resolved = local.resolve()
+            root_resolved = self.cloud_root.resolve()
+            local_resolved.relative_to(root_resolved)
+        except (ValueError, OSError):
+            _logger.warning("cloud-files: refusing remote write outside root: %r", rel)
+            return
+
+        if change.kind == "deleted":
+            try:
+                if local.exists() and not local.is_symlink():
+                    local.unlink()
+                    self._last_hash.pop(rel, None)
+                    self._remote_applied += 1
+                    _logger.info("cloud-files: applied remote DELETE %s", rel)
+            except OSError as e:
+                _logger.warning("cloud-files: remote DELETE failed for %s: %s", rel, e)
+            return
+
+        # change.kind == "modified" → fetch + write
+        if self._client is None:
+            return
+
+        # If our local hash already matches the remote checksum, skip — bytes
+        # are identical (e.g. the change came from this same sandbox writing,
+        # round-tripping through cld_files, and back).
+        if change.checksum and self._last_hash.get(rel) == change.checksum:
+            return
+
+        try:
+            getter = getattr(self._client, "get_one", None)
+            if getter is None:
+                _logger.warning("cloud-files: client missing get_one; skipping remote pull for %s", rel)
+                return
+            data: bytes = await getter(rel)
+        except FileNotFoundError:
+            return
+        except Exception as e:  # noqa: BLE001
+            _logger.warning("cloud-files: remote GET failed for %s: %s", rel, e)
+            return
+
+        new_hash = hashlib.sha256(data).hexdigest()
+        # Skip if local already matches what we'd write.
+        try:
+            if local.exists() and not local.is_symlink() and self._sha256(local) == new_hash:
+                self._last_hash[rel] = new_hash
+                self._remember_apply(rel, new_hash)
+                return
+        except OSError:
+            pass
+
+        # Atomic write: tmp + rename.
+        try:
+            local.parent.mkdir(parents=True, exist_ok=True)
+            tmp = local.with_suffix(local.suffix + ".cloud-files.tmp")
+            tmp.write_bytes(data)
+            tmp.replace(local)
+        except OSError as e:
+            _logger.warning("cloud-files: failed to write %s: %s", rel, e)
+            return
+
+        self._last_hash[rel] = new_hash
+        self._remember_apply(rel, new_hash)
+        self._remote_applied += 1
+        _logger.info(
+            "cloud-files: applied remote MODIFY %s (%d bytes, version=%s)",
+            rel, len(data), change.current_version,
+        )
+
     # ─── Status / Stats (A3 + A4) ────────────────────────────────────────────
 
     def get_status(self) -> dict[str, Any]:
@@ -670,6 +835,9 @@ class CloudFilesWatcher:
             # Best-effort — semaphores don't expose count directly; approximate
             # via the pending dict (paths with timers + paths actively flushing).
             inflight = len(self._pending)
+        sub_kind = (
+            type(self._subscriber).__name__ if self._subscriber else None
+        )
         return {
             "mode": self._mode,
             "mode_since_ts": self._mode_since,
@@ -696,6 +864,13 @@ class CloudFilesWatcher:
                 "recent_errors": list(m.recent_errors)[:8],
             },
             "queue": queue_stats,
+            "downstream": {
+                "subscriber": sub_kind,
+                "received": self._remote_received,
+                "applied": self._remote_applied,
+                "echo_suppressed": self._remote_echo_suppressed,
+                "recently_applied_size": len(self._recently_applied),
+            },
         }
 
     def get_stats(self) -> dict[str, Any]:
@@ -713,5 +888,11 @@ class CloudFilesWatcher:
             "latency_ms_p95": m.percentile(0.95),
             "queue_pending": (
                 self._persistent_queue.stats()["pending"] if self._persistent_queue else 0
+            ),
+            "downstream_received": self._remote_received,
+            "downstream_applied": self._remote_applied,
+            "downstream_echo_suppressed": self._remote_echo_suppressed,
+            "downstream_subscriber": (
+                type(self._subscriber).__name__ if self._subscriber else None
             ),
         }
