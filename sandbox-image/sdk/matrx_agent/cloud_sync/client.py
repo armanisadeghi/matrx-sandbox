@@ -161,6 +161,10 @@ class BridgeClient(Protocol):
     async def put_one(self, local_path: Path, remote_path: str) -> dict[str, Any]: ...
     async def delete_one(self, remote_path: str) -> None: ...
     async def close(self) -> None: ...
+    # Polling fallback for the down-direction (Batch A B1). Both the bridge
+    # and the local /files router serve /api/cloud-files/changes — see
+    # downstream.PollingSubscriber for the consumer.
+    async def list_changes(self, since_iso: str, limit: int = 1000) -> dict[str, Any]: ...
 
     # Extended (LocalFilesClient only — RemoteBridgeClient raises NotSupportedError)
     async def get_one(self, remote_path: str) -> bytes: ...
@@ -314,6 +318,21 @@ class LocalFilesClient:
         if isinstance(body, list):
             return body
         return list(body.get("files") or [])
+
+    async def list_changes(self, since_iso: str, limit: int = 1000) -> dict[str, Any]:
+        """Polling-mode down-direction. Same endpoint shape the remote
+        bridge serves (Batch A B1) — when matrx-ai is on a :aidream image,
+        we go through the local FastAPI instead of the public bridge so
+        the polling loop doesn't transit aidream's network.
+        """
+        r = await self._client.get(
+            f"{self.BASE_URL}/api/cloud-files/changes",
+            params={"since": since_iso, "limit": limit},
+            timeout=DELETE_TIMEOUT,
+        )
+        r.raise_for_status()
+        body = r.json()
+        return body if isinstance(body, dict) else {"files": [], "next_cursor": since_iso}
 
     async def close(self) -> None:
         await self._client.aclose()
