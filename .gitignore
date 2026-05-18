@@ -61,3 +61,7 @@ node_modules/
 .matrx.json
 .matrx-tools.conf
 sandbox-image/aidream-src/
+
+# macOS Finder metadata
+.DS_Store
+**/.DS_Store
