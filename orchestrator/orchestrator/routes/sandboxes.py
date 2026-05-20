@@ -60,9 +60,24 @@ async def create_sandbox(req: CreateSandboxRequest):
             ),
         )
 
-    await storage.ensure_user_storage(req.user_id)
-
     effective_tier = req.tier or settings.host_tier
+
+    # The aidream template is a 5 GB image baked + venv-resolved only on the
+    # hosted tier (this server). EC2's ECR repo doesn't carry it, so an
+    # EC2 + aidream create silently fails with container_id=null. Reject it
+    # up front with a message the FE can show, instead of leaving a "failed"
+    # row the user has to puzzle over.
+    if (req.template == "aidream") and effective_tier == "ec2":
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                "The 'aidream' template is only available on the hosted tier. "
+                "EC2-tier sandboxes don't carry the aidream image. Either pick "
+                "the hosted tier, or choose a non-aidream template for EC2."
+            ),
+        )
+
+    await storage.ensure_user_storage(req.user_id)
     sandbox = await sandbox_manager.create_sandbox(
         user_id=req.user_id,
         config=req.config,

@@ -107,6 +107,7 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
         "scanned": 0,
         "reconciled": 0,
         "skipped": 0,
+        "reaped": 0,
         "failed": 0,
         "sandbox_ids": [],
     }
@@ -162,6 +163,27 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
                 )
                 continue
 
+            # ── Respect the user's intent — never resurrect a deleted row ──
+            # If the DB row was soft-deleted (user/admin destroyed it) but the
+            # container is somehow still running (e.g. the destroy call timed
+            # out against a wedged orchestrator), this container is an ORPHAN.
+            # Resurrecting its row to "running" is exactly the "system says
+            # destroyed but it's still running" bug. Reap the container
+            # instead, leaving the DB row deleted.
+            lifecycle = await store.get_lifecycle(sandbox_id)
+            if lifecycle and lifecycle["deleted"]:
+                summary["reaped"] += 1
+                logger.info(
+                    "Reconcile reaping orphan %s: DB row is soft-deleted but "
+                    "container is alive — destroying container, leaving row deleted.",
+                    sandbox_id,
+                )
+                try:
+                    container.remove(force=True)
+                except Exception as exc:
+                    logger.warning("Reconcile: failed to reap orphan %s: %s", sandbox_id, exc)
+                continue
+
             sandbox = SandboxResponse(
                 sandbox_id=sandbox_id,
                 user_id=user_id,
@@ -191,8 +213,9 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
             )
 
     logger.info(
-        "Reconcile complete: scanned=%d reconciled=%d skipped=%d failed=%d",
-        summary["scanned"], summary["reconciled"], summary["skipped"], summary["failed"],
+        "Reconcile complete: scanned=%d reconciled=%d skipped=%d reaped=%d failed=%d",
+        summary["scanned"], summary["reconciled"], summary["skipped"],
+        summary["reaped"], summary["failed"],
     )
     return summary
 

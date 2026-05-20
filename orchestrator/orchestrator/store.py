@@ -55,6 +55,18 @@ class SandboxStore(ABC):
         Returns the new ``expires_at`` value, or ``None`` if the sandbox was not found.
         """
 
+    async def get_lifecycle(self, sandbox_id: str) -> dict | None:
+        """Return ``{"status": str, "deleted": bool}`` for a sandbox, or None
+        if no row exists. Lets the reconciler tell "user deleted this" apart
+        from "this is just untracked" without expanding SandboxResponse with
+        a ``deleted_at`` field. Default implementation derives it from
+        ``get()``; the Postgres store overrides to read ``deleted_at``.
+        """
+        sb = await self.get(sandbox_id)
+        if sb is None:
+            return None
+        return {"status": getattr(sb.status, "value", sb.status), "deleted": False}
+
     async def close(self) -> None:
         """Clean up resources. Override in subclasses that need cleanup."""
         pass
@@ -326,6 +338,19 @@ class PostgresSandboxStore(SandboxStore):
             if not row:
                 return None
             return row["expires_at"]
+
+    async def get_lifecycle(self, sandbox_id: str) -> dict | None:
+        async def _do() -> dict | None:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT status, deleted_at FROM sandbox_instances WHERE sandbox_id = $1",
+                    sandbox_id,
+                )
+                if not row:
+                    return None
+                return {"status": row["status"], "deleted": row["deleted_at"] is not None}
+        return await self._execute_with_retry(_do)
 
     async def close(self) -> None:
         if self._pool:
