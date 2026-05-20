@@ -139,6 +139,21 @@ def get_stat_dict(file_path: Path) -> dict:
         "target": str(file_path.resolve()) if file_path.is_symlink() else None
     }
 
+# --- Health ---
+
+@app.get("/health")
+async def health() -> dict:
+    """Liveness probe consumed by the container HEALTHCHECK and operators.
+    Returns 200 as long as the matrx_agent daemon is responding. Doesn't
+    walk the filesystem or call other services — keep it cheap so the
+    healthcheck never adds load."""
+    return {
+        "status": "ok",
+        "service": "matrx_agent",
+        "sandbox_id": os.environ.get("SANDBOX_ID", ""),
+    }
+
+
 # --- FS Routes ---
 
 @app.get("/fs/list")

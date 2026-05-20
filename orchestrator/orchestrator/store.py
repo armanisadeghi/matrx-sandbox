@@ -125,7 +125,15 @@ class PostgresSandboxStore(SandboxStore):
         self._pool = None
 
     async def _get_pool(self):
-        """Lazy-initialize the connection pool."""
+        """Lazy-initialize the connection pool.
+
+        Supabase's transaction pooler closes idle connections aggressively
+        (~30s). Without ``max_inactive_connection_lifetime`` and a
+        ``setup`` health check, the pool hands out stale connections that
+        fail mid-query with ``ConnectionDoesNotExistError`` — which is
+        exactly what wedged the orchestrator for 3 weeks of consecutive
+        healthcheck failures before this fix.
+        """
         if self._pool is None:
             import asyncpg
             from urllib.parse import urlparse, unquote
@@ -141,9 +149,45 @@ class PostgresSandboxStore(SandboxStore):
                 max_size=10,
                 # Disable prepared statements for Supabase transaction pooler compatibility
                 statement_cache_size=0,
+                # Recycle connections aggressively — Supabase pooler closes
+                # them faster than we'd ever want to reuse one. 20s is
+                # comfortably under the typical pooler idle-kill window.
+                max_inactive_connection_lifetime=20.0,
+                # Quick noop on every acquire so the caller never gets a
+                # dead-on-arrival connection. asyncpg automatically
+                # discards + replaces a connection whose setup raises.
+                setup=lambda conn: conn.execute("SELECT 1"),
             )
-            logger.info("Postgres connection pool created")
+            logger.info("Postgres connection pool created (idle_lifetime=20s, setup-probed)")
         return self._pool
+
+    async def _execute_with_retry(self, fn, *args, **kwargs):
+        """Run a connection-using function with one automatic retry on the
+        Supabase pooler's "connection died mid-operation" exception family.
+
+        asyncpg occasionally hands out a connection that the pooler has
+        already closed; the first query raises ``ConnectionDoesNotExistError``
+        or ``InterfaceError``. We close the pool and rebuild it once, then
+        re-run the operation. If the second attempt also fails, we let the
+        exception propagate — the route layer surfaces it to the caller.
+        """
+        import asyncpg
+        try:
+            return await fn(*args, **kwargs)
+        except (
+            asyncpg.exceptions.ConnectionDoesNotExistError,
+            asyncpg.exceptions.InterfaceError,
+            ConnectionResetError,
+            BrokenPipeError,
+        ) as exc:
+            logger.warning("Postgres connection lost (%s); rebuilding pool and retrying once", exc)
+            try:
+                if self._pool is not None:
+                    await self._pool.close()
+            except Exception:
+                pass
+            self._pool = None
+            return await fn(*args, **kwargs)
 
     async def save(self, sandbox: SandboxResponse) -> None:
         pool = await self._get_pool()
@@ -186,29 +230,37 @@ class PostgresSandboxStore(SandboxStore):
             )
 
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                "SELECT * FROM sandbox_instances WHERE sandbox_id = $1",
-                sandbox_id,
-            )
-            if not row:
-                return None
-            return _row_to_sandbox(row)
+        async def _do() -> SandboxResponse | None:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    "SELECT * FROM sandbox_instances WHERE sandbox_id = $1",
+                    sandbox_id,
+                )
+                if not row:
+                    return None
+                return _row_to_sandbox(row)
+        return await self._execute_with_retry(_do)
 
     async def list(self, user_id: str | None = None) -> list[SandboxResponse]:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            if user_id:
-                rows = await conn.fetch(
-                    "SELECT * FROM sandbox_instances WHERE user_id = $1 ORDER BY created_at DESC",
-                    UUID(user_id),
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT * FROM sandbox_instances ORDER BY created_at DESC"
-                )
-            return [_row_to_sandbox(row) for row in rows]
+        async def _do() -> list[SandboxResponse]:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                if user_id:
+                    rows = await conn.fetch(
+                        "SELECT * FROM sandbox_instances WHERE user_id = $1 ORDER BY created_at DESC",
+                        UUID(user_id),
+                    )
+                else:
+                    rows = await conn.fetch(
+                        "SELECT * FROM sandbox_instances ORDER BY created_at DESC"
+                    )
+                return [_row_to_sandbox(row) for row in rows]
+        # ``list()`` is the hot path that wedged the orchestrator for 3 weeks
+        # in production. Wrap it explicitly so a dropped pool connection
+        # rebuilds the pool transparently. Other methods rely on the pool's
+        # max_inactive_connection_lifetime + setup-probe.
+        return await self._execute_with_retry(_do)
 
     async def delete(self, sandbox_id: str) -> bool:
         pool = await self._get_pool()
