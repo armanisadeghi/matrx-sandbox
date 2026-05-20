@@ -661,15 +661,43 @@ def forget_sandbox_cwd(sandbox_id: str) -> None:
     _sandbox_cwd.pop(sandbox_id, None)
 
 
+async def _finalize_terminal_status(
+    store: SandboxStore,
+    sandbox_id: str,
+    reason: str,
+    final_status: SandboxStatus | None,
+) -> None:
+    """Write the post-teardown terminal status.
+
+    Default (``final_status=None``) → ``mark_stopped`` (status='stopped',
+    stamps stop_reason). For the expiry path the caller passes
+    ``SandboxStatus.EXPIRED`` so the row lands in the resumable EXPIRED
+    state instead of being overwritten to 'stopped' — ``expire_stale``
+    already stamped stop_reason='expired'/stopped_at, so we only re-affirm
+    the status here (the transient SHUTTING_DOWN write during teardown
+    would otherwise leave it wrong if the process died mid-destroy).
+    """
+    if final_status is None:
+        await store.mark_stopped(sandbox_id, reason)
+    else:
+        await store.update_status(sandbox_id, final_status)
+
+
 async def destroy_sandbox(
     sandbox_id: str,
     graceful: bool = True,
     reason: str = "user_requested",
+    final_status: SandboxStatus | None = None,
 ) -> bool:
     """Destroy a sandbox, optionally with graceful shutdown.
 
     Records the stop reason (user_requested, expired, error, graceful_shutdown, admin)
     and marks the sandbox as stopped rather than deleting, preserving audit history.
+
+    ``final_status`` overrides the terminal status written after teardown.
+    The reaper passes ``SandboxStatus.EXPIRED`` so expired sandboxes stay
+    distinguishable from user-stopped ones (both keep their volume and are
+    resumable). Leave it ``None`` for the normal stop path.
     """
     store = _get_store()
     sandbox = await store.get(sandbox_id)
@@ -699,7 +727,7 @@ async def destroy_sandbox(
         # (see ``delete_user_volume``).
         container.remove(force=True)
 
-        await store.mark_stopped(sandbox_id, reason)
+        await _finalize_terminal_status(store, sandbox_id, reason, final_status)
 
         logger.info(
             "Sandbox %s destroyed (volume %s preserved)",
@@ -708,7 +736,7 @@ async def destroy_sandbox(
         return True
 
     except NotFound:
-        await store.mark_stopped(sandbox_id, reason)
+        await _finalize_terminal_status(store, sandbox_id, reason, final_status)
         logger.warning("Sandbox %s container not found during destroy", sandbox_id)
         return True
 

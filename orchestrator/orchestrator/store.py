@@ -67,6 +67,27 @@ class SandboxStore(ABC):
             return None
         return {"status": getattr(sb.status, "value", sb.status), "deleted": False}
 
+    async def expire_stale(self) -> list[str]:
+        """Mark every sandbox past ``expires_at`` (still in a live status) as
+        EXPIRED and return their ids.
+
+        This is the store half of the expiry lifecycle: the reaper calls it
+        on an interval, then physically tears down each returned container.
+        EXPIRED is a *resumable* terminal state — the per-user volume is kept
+        — distinct from a soft-deleted row (gone, volume wipe-eligible).
+
+        Default implementation scans ``list()``; the Postgres store overrides
+        with a single atomic UPDATE so concurrent reapers can't double-claim.
+        """
+        now = datetime.now(timezone.utc)
+        expired: list[str] = []
+        for sb in await self.list():
+            status = getattr(sb.status, "value", sb.status)
+            if status in ("ready", "running") and sb.expires_at and sb.expires_at < now:
+                await self.update_status(sb.sandbox_id, SandboxStatus.EXPIRED)
+                expired.append(sb.sandbox_id)
+        return expired
+
     async def close(self) -> None:
         """Clean up resources. Override in subclasses that need cleanup."""
         pass
@@ -389,21 +410,30 @@ class PostgresSandboxStore(SandboxStore):
         logger.info("Store reconciliation complete")
 
     async def expire_stale(self) -> list[str]:
-        """Find and mark expired sandboxes. Returns list of sandbox_ids that expired."""
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            rows = await conn.fetch(
-                """UPDATE sandbox_instances
-                   SET status = 'expired', stopped_at = NOW(), stop_reason = 'expired'
-                   WHERE status IN ('ready', 'running')
-                     AND expires_at IS NOT NULL
-                     AND expires_at < NOW()
-                   RETURNING sandbox_id"""
-            )
-            expired = [row["sandbox_id"] for row in rows]
-            if expired:
-                logger.info("Expired %d stale sandboxes: %s", len(expired), expired)
-            return expired
+        """Find and mark expired sandboxes. Returns list of sandbox_ids that expired.
+
+        Wrapped in ``_execute_with_retry`` because the reaper calls this from
+        an otherwise-idle loop every 60s — exactly the access pattern that
+        trips Supabase's idle-connection reaping. The retry rebuilds the pool
+        and runs once more rather than letting the whole sweep fail.
+        """
+        async def _do() -> list[str]:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """UPDATE sandbox_instances
+                       SET status = 'expired', stopped_at = NOW(), stop_reason = 'expired'
+                       WHERE status IN ('ready', 'running')
+                         AND expires_at IS NOT NULL
+                         AND expires_at < NOW()
+                         AND deleted_at IS NULL
+                       RETURNING sandbox_id"""
+                )
+                expired = [row["sandbox_id"] for row in rows]
+                if expired:
+                    logger.info("Expired %d stale sandboxes: %s", len(expired), expired)
+                return expired
+        return await self._execute_with_retry(_do)
 
 
 def _row_to_sandbox(row) -> SandboxResponse:

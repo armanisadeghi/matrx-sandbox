@@ -66,10 +66,33 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         _logger.warning("Boot reconcile failed (continuing without it): %s", exc)
 
-    yield
-    # Shutdown: close store and Docker client
-    await close_store()
-    close_docker_client()
+    # Start the expiry reaper — the missing half of the sandbox lifecycle.
+    # Without it, sandboxes hit ``expires_at`` and nothing happens: the
+    # container runs forever, the FE blocks the user as "expired", data is
+    # never flushed, and orphans pile up. The reaper sweeps on an interval,
+    # gracefully tears down expired containers (running the in-container
+    # final sync), preserves the per-user volume, and marks the row EXPIRED
+    # so it can be resumed later. See orchestrator/reaper.py.
+    import asyncio
+
+    from orchestrator.reaper import reaper_loop
+
+    reaper_stop = asyncio.Event()
+    reaper_task = asyncio.create_task(reaper_loop(reaper_stop))
+
+    try:
+        yield
+    finally:
+        # Shutdown: stop the reaper, then close store and Docker client.
+        reaper_stop.set()
+        try:
+            await asyncio.wait_for(reaper_task, timeout=10)
+        except (asyncio.TimeoutError, asyncio.CancelledError):
+            reaper_task.cancel()
+        except Exception as exc:  # pragma: no cover — defensive
+            _logger.warning("Reaper shutdown errored: %s", exc)
+        await close_store()
+        close_docker_client()
 
 
 try:

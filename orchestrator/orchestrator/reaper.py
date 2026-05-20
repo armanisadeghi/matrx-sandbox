@@ -1,0 +1,117 @@
+"""Background reaper — the missing half of the sandbox lifecycle.
+
+The bug this fixes: ``mark_expired`` existed in the store but NOTHING ever
+called it. A sandbox would hit ``expires_at``, and... nothing happened.
+The container kept running forever, the FE computed "expired" client-side
+and blocked the user, the data was never flushed, and orphan containers
+piled up (the user accumulated 17+ this way).
+
+The reaper closes that loop. On a fixed interval it:
+
+  1. Asks the store for sandboxes past ``expires_at`` that are still in a
+     live status (``ready``/``running``/``starting``) and not deleted.
+  2. For each, runs a GRACEFUL teardown: ``destroy_sandbox(reason="expired")``
+     sends SIGTERM, the in-container ``shutdown.sh`` trap runs the final
+     cloud-files up-sync, the container is removed, and the per-user
+     volume is PRESERVED.
+  3. Marks the row ``expired`` — a resumable terminal state, distinct from
+     ``deleted`` (which means "gone, volume wipe-eligible").
+
+The user's mental model, now actually implemented:
+  - Get a unit for 2h.
+  - At 2h: flush data → tear down container → keep volume → mark expired.
+  - Want it back: ``POST /sandboxes/{id}/resume`` spawns a fresh container
+    (latest image) on the same volume.
+  - Permanent = ``ttl_seconds`` huge / never reaped; same machinery.
+
+Idempotent and self-healing: a teardown failure for one sandbox is logged
+and the loop moves on; the next tick retries.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import logging
+
+from orchestrator.config import settings
+
+logger = logging.getLogger(__name__)
+
+# How often to sweep for expired sandboxes. 60s is responsive enough that
+# "at 2h it tears down" feels accurate without hammering Docker/Postgres.
+REAP_INTERVAL_SECONDS = 60
+
+
+async def _reap_once() -> dict:
+    """Single sweep. Returns a summary dict for logging. Never raises."""
+    summary = {"expired_found": 0, "torn_down": 0, "failed": 0, "sandbox_ids": []}
+    try:
+        from orchestrator.models import SandboxStatus
+        from orchestrator.sandbox_manager import _get_store, destroy_sandbox
+        store = _get_store()
+    except Exception as exc:
+        logger.warning("Reaper: store unavailable this tick: %s", exc)
+        return summary
+
+    # expire_stale flips status→expired + stamps stopped_at/stop_reason for
+    # every row past expires_at (and not soft-deleted), and returns the
+    # affected sandbox_ids. We then physically tear down each container.
+    # Marking first means that even if a teardown fails, the row already
+    # reflects "expired" so the FE stops showing it as usable.
+    try:
+        expired_ids = await store.expire_stale()
+    except Exception as exc:
+        logger.warning("Reaper: expire_stale failed this tick: %s", exc)
+        return summary
+
+    summary["expired_found"] = len(expired_ids)
+    for sandbox_id in expired_ids:
+        try:
+            # graceful=True → SIGTERM → in-container shutdown.sh trap runs
+            # the final cloud-files up-sync ("triple-check we didn't miss
+            # anything"). final_status=EXPIRED keeps the row resumable and
+            # distinct from a user-stopped sandbox; the per-user volume is
+            # preserved either way.
+            ok = await destroy_sandbox(
+                sandbox_id,
+                graceful=True,
+                reason="expired",
+                final_status=SandboxStatus.EXPIRED,
+            )
+            if ok:
+                summary["torn_down"] += 1
+                summary["sandbox_ids"].append(sandbox_id)
+            else:
+                summary["failed"] += 1
+        except Exception as exc:
+            summary["failed"] += 1
+            logger.warning("Reaper: teardown of expired %s failed: %s", sandbox_id, exc)
+
+    if summary["expired_found"]:
+        logger.info(
+            "Reaper sweep: expired_found=%d torn_down=%d failed=%d",
+            summary["expired_found"], summary["torn_down"], summary["failed"],
+        )
+    return summary
+
+
+async def reaper_loop(stop_event: asyncio.Event) -> None:
+    """Run ``_reap_once`` every REAP_INTERVAL_SECONDS until stop_event set.
+
+    Mounted from the FastAPI lifespan. The stop_event lets the lifespan
+    shut the loop down cleanly on app teardown.
+    """
+    logger.info("Reaper started (interval=%ds)", REAP_INTERVAL_SECONDS)
+    while not stop_event.is_set():
+        try:
+            await _reap_once()
+        except Exception as exc:  # belt-and-suspenders; _reap_once shouldn't raise
+            logger.warning("Reaper tick errored (continuing): %s", exc)
+        try:
+            await asyncio.wait_for(stop_event.wait(), timeout=REAP_INTERVAL_SECONDS)
+        except asyncio.TimeoutError:
+            pass
+    logger.info("Reaper stopped")
+
+
+__all__ = ["reaper_loop", "_reap_once", "REAP_INTERVAL_SECONDS"]

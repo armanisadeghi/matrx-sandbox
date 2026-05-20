@@ -242,6 +242,90 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     return new_sandbox
 
 
+@router.post("/{sandbox_id}/resume", response_model=SandboxResponse)
+async def resume_sandbox(sandbox_id: str):
+    """Bring a stopped / expired sandbox back online.
+
+    This is the other half of the lifecycle the reaper completes. When a
+    sandbox expires, the reaper gracefully tears down the container (running
+    the final data sync) and keeps the per-user volume. Resume spins a fresh
+    container — on the LATEST image — back onto that same volume, so the
+    user's data is "put back" exactly where it was. The user's mental model:
+    "I go and you put my data back and get it going again."
+
+    Resumable states: ``stopped``, ``expired``, ``failed``. Resume is
+    rejected for:
+      - a soft-deleted row (409) — that workspace was intentionally
+        discarded; create a new sandbox instead.
+      - an already-live sandbox (409) — nothing to resume; just use it.
+
+    Like ``/reset``, a NEW ``sandbox_id`` is minted (a fresh row + container).
+    The data is identical because the per-user Docker volume is keyed on
+    ``user_id``, not ``sandbox_id``. Callers must swap their cached reference
+    to the returned sandbox. The old row is left as audit history.
+    """
+    old = await sandbox_manager.get_sandbox(sandbox_id)
+    if not old:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+
+    # Don't resurrect an intentionally-discarded workspace.
+    store = sandbox_manager._get_store()
+    lifecycle = await store.get_lifecycle(sandbox_id)
+    if lifecycle and lifecycle["deleted"]:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Sandbox {sandbox_id} was deleted — its workspace is gone and "
+                "cannot be resumed. Create a new sandbox instead."
+            ),
+        )
+
+    status = getattr(old.status, "value", old.status)
+    _LIVE = {"creating", "starting", "ready", "running", "shutting_down"}
+    if status in _LIVE:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                f"Sandbox {sandbox_id} is '{status}', not stopped/expired — "
+                "it's already active, so there's nothing to resume. Use it directly."
+            ),
+        )
+
+    # Snapshot the original shape so the resumed sandbox is the same kind of
+    # box, just on the latest image. The per-user volume restores the data.
+    user_id = old.user_id
+    tier = getattr(old.tier, "value", old.tier) if old.tier else None
+    template = old.template
+    template_version = old.template_version
+    labels = old.labels
+    ttl_seconds = old.ttl_seconds
+    config = dict(old.config or {})
+    resources = config.get("resources") if isinstance(config.get("resources"), dict) else None
+
+    logger.info(
+        "Resuming sandbox %s (user=%s, template=%s, prior_status=%s)",
+        sandbox_id, user_id, template, status,
+    )
+
+    try:
+        await storage.ensure_user_storage(user_id)
+        new_sandbox = await sandbox_manager.create_sandbox(
+            user_id=user_id,
+            config=config,
+            template=template,
+            template_version=template_version,
+            tier=tier,
+            resources=resources,
+            labels=labels,
+            ttl_seconds=ttl_seconds,
+        )
+    except Exception as exc:
+        logger.exception("Resume re-create failed for %s", sandbox_id)
+        raise HTTPException(status_code=500, detail=f"Resume failed: {exc}")
+
+    return new_sandbox
+
+
 @router.get("/{sandbox_id}/agent-env", tags=["diagnostics"])
 async def sandbox_agent_env(sandbox_id: str) -> dict:
     """Return the env vars VISIBLE INSIDE the running sandbox container.
