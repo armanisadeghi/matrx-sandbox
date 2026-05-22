@@ -1,0 +1,161 @@
+FROM ubuntu:22.04
+
+LABEL maintainer="AI Matrx <team@aimatrx.com>"
+LABEL description="Lightweight ephemeral coding sandbox — clone, run tools, push a branch"
+
+# ─── Why this image exists ───────────────────────────────────────────────────
+# This is the "lightweight coding box" (see docs/EC2_LIGHTWEIGHT_BOX.md). Its
+# persistence model is GIT, not a volume and not S3: the agent clones a repo,
+# works, and pushes a branch — the remote IS the saved state. So unlike :core
+# this image deliberately OMITS:
+#   - AWS CLI v2        (~500 MB) — no S3 hot/cold sync
+#   - mountpoint-s3     (~100 MB) — no FUSE cold tier
+#   - Chromium+Playwright (~800 MB) — no browser tasks
+# Result: a ~2–4× smaller image that pulls fast and boots without the 5–30s
+# S3 hot-sync wait, which is what makes "launch from a chat window" viable.
+# It KEEPS the full matrx_agent capability surface (fs/exec/git/search/pty)
+# and BOTH Python 3.11 and Node 20 so it runs Python and JS/TS repos.
+
+ENV DEBIAN_FRONTEND=noninteractive
+ENV LANG=C.UTF-8
+ENV LC_ALL=C.UTF-8
+
+# ─── System packages (the coding toolkit) ───────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    bash \
+    curl \
+    wget \
+    git \
+    jq \
+    unzip \
+    zip \
+    tar \
+    gzip \
+    less \
+    vim-tiny \
+    htop \
+    tmux \
+    tree \
+    file \
+    ca-certificates \
+    gnupg \
+    lsb-release \
+    # Build essentials (for pip packages with native extensions)
+    build-essential \
+    libffi-dev \
+    libssl-dev \
+    # Network tools
+    dnsutils \
+    iputils-ping \
+    net-tools \
+    openssh-client \
+    # Process init
+    tini \
+    # PDF text extraction (secondary file-processing use case)
+    poppler-utils \
+    && rm -rf /var/lib/apt/lists/*
+
+# ─── ripgrep and fd-find (the agent's search tools, multi-arch via apt) ──────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    ripgrep \
+    fd-find \
+    && rm -rf /var/lib/apt/lists/* \
+    && ln -sf /usr/bin/fdfind /usr/bin/fd
+
+# ─── Python 3.11 ─────────────────────────────────────────────────────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    python3.11 \
+    python3.11-venv \
+    python3.11-dev \
+    python3-pip \
+    && update-alternatives --install /usr/bin/python3 python3 /usr/bin/python3.11 1 \
+    && update-alternatives --install /usr/bin/python python /usr/bin/python3.11 1 \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
+
+# ─── Node.js 20 LTS (so JS/TS repos run pnpm/npm test out of the box) ────────
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g npm@latest
+
+# ─── SSH server + sudo (optional human shell-in; key-only auth) ──────────────
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    openssh-server \
+    sudo \
+    && rm -rf /var/lib/apt/lists/*
+
+RUN mkdir -p /run/sshd \
+    && sed -i 's/#PermitRootLogin.*/PermitRootLogin prohibit-password/' /etc/ssh/sshd_config \
+    && sed -i 's/#PasswordAuthentication.*/PasswordAuthentication no/' /etc/ssh/sshd_config \
+    && sed -i 's/#PubkeyAuthentication.*/PubkeyAuthentication yes/' /etc/ssh/sshd_config \
+    && echo "AllowUsers agent root" >> /etc/ssh/sshd_config
+
+# ─── Common Python packages (no Playwright; + Pillow for the image use case) ─
+RUN python3 -m pip install --no-cache-dir \
+    httpx \
+    requests \
+    aiohttp \
+    pydantic \
+    rich \
+    click \
+    pyyaml \
+    toml \
+    python-dotenv \
+    beautifulsoup4 \
+    lxml \
+    Pillow
+
+# ─── Create agent user (non-root) ────────────────────────────────────────────
+RUN groupadd -g 1000 agent \
+    && useradd -m -u 1000 -g agent -s /bin/bash agent \
+    && mkdir -p /home/agent /var/log/sandbox \
+    && chown -R agent:agent /home/agent /var/log/sandbox
+
+# Passwordless sudo — the container IS the security boundary
+RUN echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent \
+    && chmod 0440 /etc/sudoers.d/agent
+
+# ─── Copy sandbox scripts + config ───────────────────────────────────────────
+COPY scripts/ /opt/sandbox/scripts/
+RUN chmod +x /opt/sandbox/scripts/*.sh
+COPY config/ /opt/sandbox/config/
+
+# ─── Admin SSH keys (team can shell into any box for debugging) ──────────────
+RUN mkdir -p /home/agent/.ssh \
+    && cp /opt/sandbox/config/admin_authorized_keys /home/agent/.ssh/authorized_keys \
+    && chown -R agent:agent /home/agent/.ssh \
+    && chmod 700 /home/agent/.ssh \
+    && chmod 600 /home/agent/.ssh/authorized_keys \
+    && mkdir -p /root/.ssh \
+    && cp /opt/sandbox/config/admin_authorized_keys /root/.ssh/authorized_keys \
+    && chmod 700 /root/.ssh \
+    && chmod 600 /root/.ssh/authorized_keys
+
+# ─── Install Matrx SDK (the matrx_agent capability surface) ──────────────────
+COPY sdk/ /opt/sandbox/sdk/
+RUN cd /opt/sandbox/sdk && python3 -m pip install --no-cache-dir -e .
+
+# ─── ``mtx`` CLI shim ────────────────────────────────────────────────────────
+RUN printf '#!/bin/sh\nexec /usr/bin/python3.11 -m matrx_agent.cli "$@"\n' > /usr/local/bin/mtx \
+    && chmod +x /usr/local/bin/mtx
+
+# ─── Environment variables (defaults, overridden at runtime) ──────────────────
+# Note: NO S3_BUCKET — this image never touches S3. HOT_PATH is just the
+# agent's working home; COLD_PATH is unused but kept for healthcheck parity.
+ENV SANDBOX_ID=""
+ENV USER_ID=""
+ENV HOT_PATH="/home/agent"
+ENV SHUTDOWN_TIMEOUT_SECONDS="30"
+
+EXPOSE 22
+
+HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
+    CMD /opt/sandbox/scripts/healthcheck.sh
+
+# Image-variant marker (read by SDK/scripts to set SANDBOX_MODE accurately)
+RUN echo "slim" > /etc/sandbox-image-tag
+
+ENTRYPOINT ["tini", "--"]
+CMD ["/opt/sandbox/scripts/entrypoint-slim.sh"]

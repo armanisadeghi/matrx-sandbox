@@ -28,6 +28,9 @@ router = APIRouter(prefix="/templates", tags=["templates"])
 # if we end up with > ~5 distinct images.
 _TEMPLATE_IMAGE_OVERRIDES: dict[str, str] = {
     "aidream": "matrx-sandbox:aidream",
+    # Lightweight coding box — clone, run tools, push a branch. Git-as-
+    # persistence, no S3/FUSE/Chromium. See docs/EC2_LIGHTWEIGHT_BOX.md.
+    "slim": "matrx-sandbox:slim",
 }
 
 
@@ -72,6 +75,20 @@ def _builtin_templates() -> list[TemplateInfo]:
             image=_img("python-3.13"),
             tier=tier,
             languages=["python"],
+        ),
+        TemplateInfo(
+            id="slim",
+            version="1",
+            description=(
+                "Lightweight coding box — Ubuntu + Python 3.11 + Node 20 + git "
+                "+ ripgrep/fd, NO Chromium/AWS/FUSE. Persistence is git: clone a "
+                "repo, run tools/tests, push a branch. Fast cold start; ephemeral "
+                "by design (set a short ttl_seconds and let the reaper tear it "
+                "down). Best for agent runs launched from chat + PDF/image jobs."
+            ),
+            image=_img("slim"),
+            tier=tier,
+            languages=["python", "node", "bash"],
         ),
         TemplateInfo(
             id="aidream",
