@@ -10,6 +10,7 @@ import logging
 from typing import Any
 
 from fastapi import APIRouter, HTTPException
+from pydantic import BaseModel
 
 from orchestrator import sandbox_manager
 from orchestrator.config import settings
@@ -18,6 +19,22 @@ from orchestrator.storage_layout import resolve_user_storage, user_volume_name
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/users", tags=["users"])
+
+
+class MemoryPutRequest(BaseModel):
+    content: str
+
+
+class MemoryEntry(BaseModel):
+    path: str
+    content: str
+    updated_at: Any | None = None
+
+
+class MemoryListResponse(BaseModel):
+    user_id: str
+    entries: list[MemoryEntry]
+    total: int
 
 
 @router.get("/{user_id}/persistence")
@@ -82,3 +99,52 @@ async def delete_user_volume(user_id: str) -> None:
 
     if not ok:
         raise HTTPException(status_code=500, detail="Failed to delete volume")
+
+
+# ── Central, cross-project per-user memory ───────────────────────────────────
+# The backing store for /home/agent/.matrx/memory/. The orchestrator hydrates
+# these into a sandbox on create and captures edits on graceful teardown (see
+# orchestrator/memory_sync.py), so memory follows the user across every project
+# and every box — including the ephemeral slim/EC2 ones that keep no volume.
+# These routes also let the matrx-frontend show + edit the memory directly.
+
+@router.get("/{user_id}/memory", response_model=MemoryListResponse)
+async def list_user_memory(user_id: str) -> MemoryListResponse:
+    """Return every memory entry for a user (small text files)."""
+    store = sandbox_manager._get_store()
+    try:
+        rows = await store.memory_list(user_id)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to list memory: {e}")
+    entries = [
+        MemoryEntry(path=r["path"], content=r["content"], updated_at=r.get("updated_at"))
+        for r in rows
+    ]
+    return MemoryListResponse(user_id=user_id, entries=entries, total=len(entries))
+
+
+@router.put("/{user_id}/memory/{path:path}", response_model=MemoryEntry)
+async def put_user_memory(user_id: str, path: str, body: MemoryPutRequest) -> MemoryEntry:
+    """Upsert one memory entry at ``path`` (relative under .matrx/memory/)."""
+    path = path.strip().lstrip("/")
+    if not path or ".." in path.split("/"):
+        raise HTTPException(status_code=400, detail="Invalid memory path")
+    store = sandbox_manager._get_store()
+    try:
+        await store.memory_put(user_id, path, body.content)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to save memory: {e}")
+    return MemoryEntry(path=path, content=body.content, updated_at=None)
+
+
+@router.delete("/{user_id}/memory/{path:path}", status_code=204)
+async def delete_user_memory(user_id: str, path: str) -> None:
+    """Delete one memory entry. 404 if it didn't exist."""
+    path = path.strip().lstrip("/")
+    store = sandbox_manager._get_store()
+    try:
+        ok = await store.memory_delete(user_id, path)
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to delete memory: {e}")
+    if not ok:
+        raise HTTPException(status_code=404, detail=f"No memory at '{path}'")

@@ -401,6 +401,16 @@ async def create_sandbox(
         sandbox = await _wait_for_ready(sandbox)
         await store.save(sandbox)
 
+        # Hydrate the user's central memory into .matrx/memory/ so a fresh box
+        # already knows the user/projects/preferences. Best-effort: a memory
+        # failure must never fail the create. Only when the box actually came up.
+        if sandbox.status == SandboxStatus.READY:
+            try:
+                from orchestrator.memory_sync import hydrate_memory_into_container
+                await hydrate_memory_into_container(container, user_id, store)
+            except Exception as exc:
+                logger.warning("Memory hydrate skipped for %s: %s", sandbox_id, exc)
+
         logger.info("Sandbox %s is %s for user %s", sandbox_id, sandbox.status, user_id)
         return sandbox
 
@@ -713,6 +723,16 @@ async def destroy_sandbox(
     client = _get_docker_client()
     try:
         container = client.containers.get(sandbox.sandbox_id)
+
+        # Capture the box's .matrx/memory/ back to central memory BEFORE we stop
+        # it (the dir must still be readable). Best-effort — never block teardown.
+        # graceful only: a kill means we're not trying to save anything.
+        if graceful:
+            try:
+                from orchestrator.memory_sync import capture_memory_from_container
+                await capture_memory_from_container(container, sandbox.user_id, store)
+            except Exception as exc:
+                logger.warning("Memory capture skipped for %s: %s", sandbox_id, exc)
 
         if graceful:
             container.stop(timeout=settings.shutdown_timeout_seconds + 10)

@@ -88,6 +88,25 @@ class SandboxStore(ABC):
                 expired.append(sb.sandbox_id)
         return expired
 
+    # ── User memory (central, cross-project) ─────────────────────────────────
+    # A tiny per-user text-file store that backs /home/agent/.matrx/memory/.
+    # Keyed on user_id + path ONLY, so it's the same memory across every
+    # project/tier/sandbox. The orchestrator hydrates it into a box on create
+    # and captures edits back on graceful teardown. See orchestrator/memory_sync.py.
+
+    async def memory_list(self, user_id: str) -> list[dict]:
+        """Return all memory entries for a user as
+        ``[{"path", "content", "updated_at"}]``. Override in subclasses."""
+        raise NotImplementedError
+
+    async def memory_put(self, user_id: str, path: str, content: str) -> None:
+        """Upsert one memory entry. Override in subclasses."""
+        raise NotImplementedError
+
+    async def memory_delete(self, user_id: str, path: str) -> bool:
+        """Delete one memory entry; return True if it existed. Override in subclasses."""
+        raise NotImplementedError
+
     async def close(self) -> None:
         """Clean up resources. Override in subclasses that need cleanup."""
         pass
@@ -101,6 +120,8 @@ class InMemorySandboxStore(SandboxStore):
 
     def __init__(self) -> None:
         self._sandboxes: dict[str, SandboxResponse] = {}
+        # user_id -> {path -> (content, updated_at)}
+        self._memory: dict[str, dict[str, tuple[str, datetime]]] = {}
 
     async def save(self, sandbox: SandboxResponse) -> None:
         self._sandboxes[sandbox.sandbox_id] = sandbox
@@ -142,6 +163,19 @@ class InMemorySandboxStore(SandboxStore):
         sandbox.expires_at = new_expires
         self._sandboxes[sandbox_id] = sandbox
         return new_expires
+
+    async def memory_list(self, user_id: str) -> list[dict]:
+        entries = self._memory.get(user_id, {})
+        return [
+            {"path": path, "content": content, "updated_at": updated_at}
+            for path, (content, updated_at) in sorted(entries.items())
+        ]
+
+    async def memory_put(self, user_id: str, path: str, content: str) -> None:
+        self._memory.setdefault(user_id, {})[path] = (content, datetime.now(timezone.utc))
+
+    async def memory_delete(self, user_id: str, path: str) -> bool:
+        return self._memory.get(user_id, {}).pop(path, None) is not None
 
 
 class PostgresSandboxStore(SandboxStore):
@@ -433,6 +467,45 @@ class PostgresSandboxStore(SandboxStore):
                 if expired:
                     logger.info("Expired %d stale sandboxes: %s", len(expired), expired)
                 return expired
+        return await self._execute_with_retry(_do)
+
+    async def memory_list(self, user_id: str) -> list[dict]:
+        async def _do() -> list[dict]:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    """SELECT path, content, updated_at FROM user_memory
+                       WHERE user_id = $1 ORDER BY path""",
+                    UUID(user_id),
+                )
+                return [
+                    {"path": r["path"], "content": r["content"], "updated_at": r["updated_at"]}
+                    for r in rows
+                ]
+        return await self._execute_with_retry(_do)
+
+    async def memory_put(self, user_id: str, path: str, content: str) -> None:
+        async def _do() -> None:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                await conn.execute(
+                    """INSERT INTO user_memory (user_id, path, content)
+                       VALUES ($1, $2, $3)
+                       ON CONFLICT (user_id, path) DO UPDATE
+                       SET content = EXCLUDED.content, updated_at = NOW()""",
+                    UUID(user_id), path, content,
+                )
+        await self._execute_with_retry(_do)
+
+    async def memory_delete(self, user_id: str, path: str) -> bool:
+        async def _do() -> bool:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                result = await conn.execute(
+                    "DELETE FROM user_memory WHERE user_id = $1 AND path = $2",
+                    UUID(user_id), path,
+                )
+                return result == "DELETE 1"
         return await self._execute_with_retry(_do)
 
 
