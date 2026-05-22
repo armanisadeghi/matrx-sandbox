@@ -232,10 +232,11 @@ Backend, in dependency order:
    [routes/templates.py](../orchestrator/orchestrator/routes/templates.py)
    `_TEMPLATE_IMAGE_OVERRIDES` → `matrx-sandbox:slim`, and to the `GET /templates`
    list.
-4. **EC2 image delivery** — extend
-   [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) to build +
-   push `:slim` to ECR alongside `:core`; pre-pull it on the instance(s) in the
-   SSM step (and/or bake into the AMI for the warm pool).
+4. **EC2 image delivery** — ✅ DONE.
+   [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) now builds +
+   pushes `$ECR_REPO:slim` alongside `:core`, and the SSM deploy step pulls it
+   and tags it `matrx-sandbox:slim` on the host so the template override
+   resolves there. (AMI bake is still optional for the warm pool — step 5.)
 5. **(If warm pool)** — a small controller that keeps N instances up with the
    slim image resident; the orchestrator places `tier:ec2, template:slim`
    creates onto a warm host.
