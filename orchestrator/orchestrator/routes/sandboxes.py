@@ -16,6 +16,7 @@ from orchestrator.config import settings
 from orchestrator.models import (
     AccessResponse,
     AccessTokenRequest,
+    AgentBindingRequest,
     AccessTokenResponse,
     CompletionRequest,
     CompletionResponse,
@@ -1076,6 +1077,58 @@ async def issue_access_token(sandbox_id: str, body: AccessTokenRequest) -> Acces
         tier=payload["tier"],
         sandbox_id=sandbox_id,
     )
+
+
+@router.post("/{sandbox_id}/agent-binding")
+async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None) -> dict:
+    """Return the exact ``active_sandbox`` binding the aidream agent expects.
+
+    This is the turnkey handoff primitive: one call mints a scoped token AND
+    assembles the binding, so the frontend drops the returned object straight
+    into a chat request's ``sandbox`` field and the agent's filesystem/shell/
+    git tools then execute INSIDE this box. No client-side URL assembly, no
+    guessing the scope set.
+
+    The returned shape matches matrx-ai's ``_sandbox_proxy.SandboxBinding``:
+        { sandbox_id, base_url, access_token, root_path, expires_at }
+
+    Admin-authed via the global middleware (Next.js calls this after verifying
+    the user owns the sandbox).
+    """
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    if not settings.access_token_secret:
+        raise HTTPException(status_code=503, detail="access tokens not configured (set MATRX_ACCESS_TOKEN_SECRET)")
+    base = (settings.public_url or "").rstrip("/")
+    if not base:
+        raise HTTPException(status_code=503, detail="MATRX_PUBLIC_URL must be set to build the binding base_url")
+
+    ttl = (body.ttl_seconds if body else None) or settings.max_session_duration_seconds
+    # The agent's hands need the full tool surface. The middleware accepts any
+    # valid token bound to this id on the structured tool routes; these scopes
+    # additionally satisfy the /proxy/* scope checks for the same box.
+    scopes = (body.scopes if body and body.scopes else None) or [
+        "ai", "exec.run", "exec.stream", "fs.read", "fs.write", "fs.watch", "git", "ports.read", "pty",
+    ]
+    try:
+        token, payload = sandbox_token.issue_token(
+            secret=settings.access_token_secret,
+            sandbox_id=sandbox_id,
+            scopes=scopes,
+            tier=settings.host_tier or (sandbox.tier.value if sandbox.tier else "ec2"),
+            ttl_seconds=ttl,
+        )
+    except sandbox_token.TokenError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+    return {
+        "sandbox_id": sandbox_id,
+        "base_url": f"{base}/sandboxes/{sandbox_id}",
+        "access_token": token,
+        "root_path": sandbox.hot_path or "/home/agent",
+        "expires_at": datetime.fromtimestamp(payload["exp"], tz=timezone.utc).isoformat(),
+    }
 
 
 @router.api_route(

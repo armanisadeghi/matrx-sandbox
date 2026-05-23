@@ -215,6 +215,13 @@ class AccessResponse(BaseModel):
 # SSE / WebSocket / large-body HTTP. Next.js calls this admin-authenticated
 # endpoint after verifying ownership of the sandbox; never exposed publicly.
 
+class AgentBindingRequest(BaseModel):
+    """Optional overrides for POST /sandboxes/{id}/agent-binding. Both optional;
+    sensible defaults (full tool scopes + the session TTL) apply when omitted."""
+    scopes: list[str] | None = None
+    ttl_seconds: int | None = None
+
+
 class AccessTokenRequest(BaseModel):
     scopes: list[str] = Field(
         ...,
