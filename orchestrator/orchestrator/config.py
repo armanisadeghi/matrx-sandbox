@@ -52,6 +52,17 @@ class Settings(BaseSettings):
     # tier in /api-surface and SandboxResponse rows.
     host_tier: str = ""             # env var: MATRX_HOST_TIER ("ec2" or "hosted")
 
+    # ── Warm pool ───────────────────────────────────────────────────────────
+    # Keep N pre-booted, unclaimed sandboxes ready so "launch from a chat
+    # window" is a fast CLAIM (adopt an already-running box) instead of a cold
+    # create. The user's spec: "2 warm instances ready; when one is launched,
+    # prepare another." Disabled by default (size 0) so EC2/other orchestrators
+    # are unaffected; the hosted orchestrator sets MATRX_WARM_POOL_SIZE=2.
+    warm_pool_size: int = 0             # env var: MATRX_WARM_POOL_SIZE
+    warm_pool_template: str = "slim"    # which template to pre-warm
+    # Sentinel user_id stamped on unclaimed warm boxes (no real owner yet).
+    warm_pool_sentinel_user: str = "00000000-0000-0000-0000-000000000000"
+
     # ── AI Dream integration ────────────────────────────────────────────────
     # Sandboxes need a way to call the AI Dream backend (cld_files,
     # conversation context, agent endpoints) on behalf of the user. Two parts:

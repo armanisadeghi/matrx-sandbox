@@ -91,6 +91,41 @@ async def create_sandbox(req: CreateSandboxRequest):
     return sandbox
 
 
+@router.post("/claim", response_model=SandboxResponse, status_code=201)
+async def claim_sandbox(req: CreateSandboxRequest):
+    """Launch fast by CLAIMing a pre-warmed box; fall back to a cold create.
+
+    Same request shape as ``POST /sandboxes``. If a warm box of the requested
+    template is available it's adopted (the user's memory is hydrated into it)
+    and returned in seconds; the pool replenishes in the background. If the
+    pool is empty / disabled, this transparently cold-creates so callers can
+    always use ``/claim`` and just get the fast path when it's available.
+    """
+    if req.tier and settings.host_tier and req.tier != settings.host_tier:
+        raise HTTPException(
+            status_code=400,
+            detail=(
+                f"Tier mismatch: this orchestrator hosts tier '{settings.host_tier}', "
+                f"but the request asked for '{req.tier}'."
+            ),
+        )
+
+    from orchestrator import pool
+    template = req.template or settings.warm_pool_template
+    claimed = await pool.claim_warm(
+        user_id=req.user_id,
+        template=template,
+        ttl_seconds=req.ttl_seconds,
+    )
+    if claimed is not None:
+        logger.info("Claimed warm sandbox %s for user %s", claimed.sandbox_id, req.user_id)
+        return claimed
+
+    # No warm box available — cold create with the same parameters.
+    logger.info("No warm box for template=%s; cold-creating for user %s", template, req.user_id)
+    return await create_sandbox(req)
+
+
 @router.get("", response_model=SandboxListResponse)
 async def list_sandboxes(user_id: str | None = None):
     """List all sandboxes, optionally filtered by user."""

@@ -80,17 +80,27 @@ async def lifespan(app: FastAPI):
     reaper_stop = asyncio.Event()
     reaper_task = asyncio.create_task(reaper_loop(reaper_stop))
 
+    # Warm pool — keep N pre-booted boxes ready so a launch is a fast CLAIM
+    # instead of a cold create. No-op unless MATRX_WARM_POOL_SIZE > 0. See
+    # orchestrator/pool.py.
+    from orchestrator.pool import pool_loop
+
+    pool_stop = asyncio.Event()
+    pool_task = asyncio.create_task(pool_loop(pool_stop))
+
     try:
         yield
     finally:
-        # Shutdown: stop the reaper, then close store and Docker client.
+        # Shutdown: stop background loops, then close store and Docker client.
         reaper_stop.set()
-        try:
-            await asyncio.wait_for(reaper_task, timeout=10)
-        except (asyncio.TimeoutError, asyncio.CancelledError):
-            reaper_task.cancel()
-        except Exception as exc:  # pragma: no cover — defensive
-            _logger.warning("Reaper shutdown errored: %s", exc)
+        pool_stop.set()
+        for task in (reaper_task, pool_task):
+            try:
+                await asyncio.wait_for(task, timeout=10)
+            except (asyncio.TimeoutError, asyncio.CancelledError):
+                task.cancel()
+            except Exception as exc:  # pragma: no cover — defensive
+                _logger.warning("Background task shutdown errored: %s", exc)
         await close_store()
         close_docker_client()
 

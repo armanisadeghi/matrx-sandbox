@@ -163,6 +163,20 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
                 )
                 continue
 
+            # ── Warm-pool boxes ──────────────────────────────────────────────
+            # An unclaimed warm box (matrx.warm_pool=1, no DB row) belongs to
+            # the pool controller, not a user — don't reconcile it into the
+            # store (its sentinel user_id would fail the auth.users FK anyway).
+            # Once claimed it HAS a row; from then on the DB row's user_id is
+            # authoritative over the (now-stale sentinel) label.
+            is_warm = labels.get("matrx.warm_pool") == "1"
+            existing_row = await store.get(sandbox_id)
+            if is_warm and existing_row is None:
+                summary["skipped"] += 1
+                continue
+            if existing_row is not None:
+                user_id = existing_row.user_id
+
             # ── Respect the user's intent — never resurrect a deleted row ──
             # If the DB row was soft-deleted (user/admin destroyed it) but the
             # container is somehow still running (e.g. the destroy call timed

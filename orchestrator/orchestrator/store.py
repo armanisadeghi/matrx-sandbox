@@ -382,9 +382,14 @@ class PostgresSandboxStore(SandboxStore):
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             row = await conn.fetchrow(
+                # Cast $1 to int in BOTH places so asyncpg deduces a single
+                # type. The naive forms each break: "($1 || ' seconds')" forces
+                # text-vs-int, and "make_interval(secs => $1)" forces
+                # double-vs-int. "$1::int * INTERVAL '1 second'" keeps $1 int
+                # everywhere.
                 """UPDATE sandbox_instances
-                   SET ttl_seconds = $1,
-                       expires_at = NOW() + ($1 || ' seconds')::INTERVAL
+                   SET ttl_seconds = $1::int,
+                       expires_at = NOW() + ($1::int * INTERVAL '1 second')
                    WHERE sandbox_id = $2
                    RETURNING expires_at""",
                 ttl_seconds,
