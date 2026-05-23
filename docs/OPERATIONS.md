@@ -393,3 +393,44 @@ print(f'set ({ap[\"configured_count\"]}): {ap[\"configured_keys\"]}')"
 ```
 
 Should show 25+ keys with `SUPABASE_MATRIX_JWT_SECRET` among them. If it doesn't, `aidream/.env` isn't being read — check the `env_file` block in the compose file.
+
+---
+
+## Out-of-repo live settings — replicate these (added 2026-05-23)
+
+Everything below is **live state that is NOT captured by the matrx-sandbox repo**. If this server were rebuilt from the repos alone, these would be missing. Recorded here so they're replicable.
+
+### 1. Warm-pool config (hosted orchestrator `.env`)
+
+Appended to `/srv/apps/sandbox-orchestrator/.env` (not in any git repo):
+
+```
+MATRX_WARM_POOL_SIZE=2
+MATRX_WARM_POOL_TEMPLATE=slim
+```
+
+This makes the orchestrator keep 2 pre-booted, unclaimed `slim` boxes ready so `POST /sandboxes/claim` adopts one in ~0.5s. Default is `0` (disabled) — so any orchestrator without this set behaves as before. To replicate on the EC2 orchestrator, set the same vars in its systemd env (see "Tier env var" pattern above). Code: `orchestrator/pool.py`, wired in `orchestrator/main.py` lifespan.
+
+### 2. `user_memory` migration applied to Supabase
+
+Migration [`migrations/004_user_memory.sql`](../orchestrator/migrations/004_user_memory.sql) (in the repo) was **applied to the live Matrx Main Supabase project** (`txzxabzwovsujtloxrus`) on 2026-05-23. The file replicates it; it has also already been run. New table `user_memory` — additive, nothing existing modified. Backs the per-user cross-project memory (see [MEMORY_API.md](MEMORY_API.md)).
+
+### 3. `matrx-sandbox:slim` image build
+
+The lightweight coding box is built from [`sandbox-image/Dockerfile.slim`](../sandbox-image/Dockerfile.slim) (in the repo). To (re)build locally on this host:
+
+```bash
+cd /srv/projects/matrx-sandbox/sandbox-image && docker build -f Dockerfile.slim -t matrx-sandbox:slim .
+```
+
+On EC2 the CI builds + pushes `:slim` to ECR and the SSM deploy pulls + tags it (see `.github/workflows/deploy.yml`). The hosted warm pool spawns from this local `matrx-sandbox:slim`.
+
+### 4. New orchestrator capabilities (all in-repo, no separate action)
+
+These are committed/pushed in matrx-sandbox `main`; listed for awareness — the running container picks them up on the next rebuild (already done on hosted):
+- Expiry reaper (`reaper.py`) + `POST /sandboxes/{id}/resume`.
+- Warm pool (`pool.py`) + `POST /sandboxes/claim`.
+- Per-user memory (`memory_sync.py`, store methods, `/users/{id}/memory`).
+- Scoped-token acceptance on the structured tool routes (`middleware/auth.py`) + `POST /sandboxes/{id}/agent-binding` (the conversation-handoff primitive).
+
+See [CONVERSATION_HANDOFF.md](CONVERSATION_HANDOFF.md) for the production low-latency plan (co-located AI Dream) that consumes these.
