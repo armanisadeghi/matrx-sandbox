@@ -35,6 +35,27 @@ def _is_proxy_path(path: str) -> bool:
     return len(parts) >= 5 and parts[1] == "sandboxes" and parts[3] == "proxy"
 
 
+# Per-sandbox subpaths that form the agent's "hands in the box" tool surface.
+# These accept EITHER the master key OR a sandbox-scoped token bound to the
+# {id} in the path — the same trust level as /proxy/*. This is what lets the
+# aidream agent's active_sandbox binding (which authenticates with a scoped
+# X-Sandbox-Access-Token) actually reach /fs and /exec. Lifecycle subpaths
+# (create/delete/resume/reset/extend/access/access-tokens/complete/error) are
+# deliberately NOT here — they stay master-key-only.
+_SCOPED_TOOL_SUBPATHS = frozenset({
+    "fs", "exec", "git", "search", "processes", "ports", "pty",
+})
+
+
+def _scoped_tool_sandbox_id(path: str) -> str | None:
+    """If ``path`` is /sandboxes/{id}/{tool-sub}/..., return {id}; else None."""
+    parts = path.split("/")
+    # ['', 'sandboxes', '<id>', '<sub>', ...]
+    if len(parts) >= 4 and parts[1] == "sandboxes" and parts[3] in _SCOPED_TOOL_SUBPATHS:
+        return parts[2]
+    return None
+
+
 class APIKeyMiddleware(BaseHTTPMiddleware):
     """Middleware that enforces API key authentication on all routes
     except health checks, docs, and CORS preflight + the per-sandbox
@@ -64,6 +85,29 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         # — see proxy_to_container in routes/sandboxes.py.
         if _is_proxy_path(request.url.path):
             return await call_next(request)
+
+        # Per-sandbox TOOL routes (fs/exec/git/search/processes/ports/pty)
+        # accept the master key OR a sandbox-scoped token bound to the {id} in
+        # the path. This is what makes the aidream agent's active_sandbox
+        # binding (scoped X-Sandbox-Access-Token → /fs, /exec) actually work.
+        tool_sandbox_id = _scoped_tool_sandbox_id(request.url.path)
+        if tool_sandbox_id is not None:
+            provided_key = _extract_api_key(request)
+            if provided_key and hmac.compare_digest(provided_key, settings.api_key):
+                return await call_next(request)
+            if _verify_scoped_token(request, tool_sandbox_id):
+                return await call_next(request)
+            logger.warning(
+                "Rejected tool call to %s: no valid master key or scoped token",
+                request.url.path,
+            )
+            return JSONResponse(
+                status_code=401,
+                content={"detail": (
+                    "This route accepts the master X-API-Key or a sandbox-scoped "
+                    "X-Sandbox-Access-Token issued by POST /sandboxes/{id}/access-tokens."
+                )},
+            )
 
         # Extract API key from header
         provided_key = _extract_api_key(request)
@@ -107,3 +151,36 @@ def _extract_api_key(request: Request) -> str | None:
         return auth_header[7:].strip()
 
     return None
+
+
+def _verify_scoped_token(request: Request, sandbox_id: str) -> bool:
+    """True if the request carries a valid sandbox-scoped token bound to
+    ``sandbox_id`` (via X-Sandbox-Access-Token or Authorization: Bearer).
+
+    Mirrors the per-route check in ``proxy_to_container``. ``required_scope``
+    is left None — a token validly issued for THIS sandbox (HMAC-signed by us,
+    bound to its id, unexpired) authorizes its tool surface, same as /proxy.
+    """
+    if not settings.access_token_secret:
+        return False
+    token = (
+        request.headers.get("x-sandbox-access-token")
+        or request.headers.get("X-Sandbox-Access-Token")
+    )
+    if not token:
+        auth_header = request.headers.get("Authorization", "")
+        if auth_header.startswith("Bearer "):
+            token = auth_header[7:].strip()
+    if not token:
+        return False
+
+    from orchestrator.auth import sandbox_token
+    try:
+        sandbox_token.verify_token(
+            token=token,
+            secret=settings.access_token_secret,
+            expected_sandbox_id=sandbox_id,
+        )
+        return True
+    except sandbox_token.TokenError:
+        return False
