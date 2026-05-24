@@ -117,6 +117,56 @@ def _proxy_url_for(sandbox_id: str) -> str | None:
     return f"{base}/sandboxes/{sandbox_id}/proxy"
 
 
+_internal_base_cache: str | None = None  # resolved once; "" means "fall back to public"
+
+
+def _imds_private_ipv4() -> str:
+    """Best-effort EC2 private IPv4 via the Instance Metadata Service.
+
+    Tries IMDSv2 (token) then IMDSv1. Returns "" on anything that isn't a
+    reachable EC2 IMDS (e.g. the Hostinger hosted tier) within a tight timeout,
+    so this never hangs a request on non-EC2 hosts.
+    """
+    import urllib.request
+    try:
+        token_req = urllib.request.Request(
+            "http://169.254.169.254/latest/api/token",
+            method="PUT",
+            headers={"X-aws-ec2-metadata-token-ttl-seconds": "60"},
+        )
+        token = urllib.request.urlopen(token_req, timeout=0.5).read().decode()
+        headers = {"X-aws-ec2-metadata-token": token}
+    except Exception:
+        headers = {}
+    try:
+        ip_req = urllib.request.Request(
+            "http://169.254.169.254/latest/meta-data/local-ipv4", headers=headers
+        )
+        return urllib.request.urlopen(ip_req, timeout=0.5).read().decode().strip()
+    except Exception:
+        return ""
+
+
+def resolve_internal_base() -> str:
+    """Base URL the co-located AI Dream uses to reach this orchestrator for
+    agent tool calls — kept on the private LAN so traffic is fast + free.
+
+    Precedence: explicit ``MATRX_INTERNAL_URL`` > auto-detected EC2 private IP
+    (``http://<private-ip>:<port>``) > ``MATRX_PUBLIC_URL``. Cached after the
+    first resolve. Returning the EC2 private IP automatically means the
+    operator does NOT have to set MATRX_INTERNAL_URL by hand.
+    """
+    global _internal_base_cache
+    if settings.internal_url:
+        return settings.internal_url.rstrip("/")
+    if _internal_base_cache is None:
+        ip = _imds_private_ipv4()
+        _internal_base_cache = f"http://{ip}:{settings.port}" if ip else ""
+        if _internal_base_cache:
+            logger.info("Resolved internal base via EC2 metadata: %s", _internal_base_cache)
+    return _internal_base_cache or (settings.public_url or "").rstrip("/")
+
+
 def _resolve_ssh_host() -> str:
     """Public SSH host returned to clients in /access responses.
 

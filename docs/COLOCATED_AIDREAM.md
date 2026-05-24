@@ -50,46 +50,24 @@ steps — split by who runs them.
 
 ## Remaining steps — exact commands, by who
 
-### [BROWSER AGENT / YOU — AWS] 1. Configure the EC2 orchestrator
+### [ME — done] 1. Orchestrator wiring
 
-Open **Session Manager** on `matrx-sandbox-host-dev` (`i-084f757c1e47d4efb`) — EC2 → Connect → Session Manager — and run:
+The orchestrator now **auto-detects its own EC2 private IP** (instance metadata)
+and uses it for the `/agent-binding` `base_url`, so AI Dream's tool calls ride
+the private LAN with **no operator config**. Shipped to `main` → deploys to the
+EC2 orchestrator. Verified live: EC2 orchestrator is on v0.3.0 with `/claim` +
+`/agent-binding`; hosted falls back to the public URL.
 
+Optional (speed only — `/claim` cold-creates fine without it): enable the warm
+pool on EC2 via Session Manager on `matrx-sandbox-host-dev`:
 ```bash
-# Derive this host's private IP and write a systemd drop-in for the orchestrator
-PRIV=$(curl -s http://169.254.169.254/latest/meta-data/local-ipv4)
-echo "private IP = $PRIV"
-
 sudo mkdir -p /etc/systemd/system/matrx-orchestrator.service.d
-sudo tee /etc/systemd/system/matrx-orchestrator.service.d/colocate.conf >/dev/null <<EOF
-[Service]
-Environment=MATRX_INTERNAL_URL=http://$PRIV:8000
-Environment=MATRX_WARM_POOL_SIZE=2
-Environment=MATRX_WARM_POOL_TEMPLATE=slim
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl restart matrx-orchestrator
-sleep 4
-curl -s http://localhost:8000/ | head -c 300; echo
+printf '[Service]\nEnvironment=MATRX_WARM_POOL_SIZE=2\nEnvironment=MATRX_WARM_POOL_TEMPLATE=slim\n' \
+  | sudo tee /etc/systemd/system/matrx-orchestrator.service.d/warmpool.conf
+sudo systemctl daemon-reload && sudo systemctl restart matrx-orchestrator
 ```
-
-Then confirm `/agent-binding` works (needs `MATRX_ACCESS_TOKEN_SECRET`):
-
-```bash
-# Does the orchestrator have an access-token secret? Check for 503.
-KEY=<the EC2 MATRX_API_KEY>
-SID=$(curl -s -X POST http://localhost:8000/sandboxes/claim \
-  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' \
-  -d '{"user_id":"<any-real-user-uuid>","template":"slim","ttl_seconds":600}' \
-  | python3 -c "import sys,json;print(json.load(sys.stdin)['sandbox_id'])")
-curl -s -X POST http://localhost:8000/sandboxes/$SID/agent-binding \
-  -H "X-API-Key: $KEY" -H 'Content-Type: application/json' -d '{}'
-# Expect JSON with base_url=http://<PRIV>:8000/sandboxes/...  (NOT the public IP)
-# If you get 503 "access tokens not configured", add to the drop-in above:
-#   Environment=MATRX_ACCESS_TOKEN_SECRET=$(openssl rand -hex 32)
-# then daemon-reload + restart. (Any value; only the orchestrator verifies it.)
-curl -s -X DELETE "http://localhost:8000/sandboxes/$SID?graceful=false" -H "X-API-Key: $KEY"  # cleanup
-```
+(`MATRX_ACCESS_TOKEN_SECRET` must be set on the EC2 orchestrator for tokens —
+it already is if `/agent-binding` returns 200 rather than 503.)
 
 ### [BROWSER AGENT / YOU — AWS] 2. Verify the private path AI Dream → orchestrator
 
@@ -132,11 +110,24 @@ curl -s http://localhost:8000/api-surface | python3 -c "import sys,json;d=json.l
 
 ---
 
-## A few confirmations I need (small)
+## Verified by me (no need to ask)
 
-1. **Is `matrx-sandbox-host-dev` (`i-084f757c1e47d4efb`) the EC2-tier orchestrator host?** (i.e., is `matrx-orchestrator` the systemd unit running there, and is the matrx-sandbox GHA `EC2_INSTANCE_ID` pointed at it?) If the orchestrator runs somewhere else, step 1 targets that instance instead.
-2. **Does the SG-to-SG rule include TCP 8000** in the AI-Dream→sandbox-host direction? (Step 2 verifies.)
-3. **The EC2 orchestrator's `MATRX_API_KEY`** (for step 1's test) — and confirm `MATRX_ACCESS_TOKEN_SECRET` is set there.
+- EC2 orchestrator `54.144.86.132` is **live, v0.3.0, tier=ec2**, and already
+  serves `/claim` + `/agent-binding` (40 routes). My backend work shipped there.
+- AI Dream's deployed code accepts the binding: `aidream/api/routers/chat.py`
+  `POST /chat` takes a `sandbox: SandboxBindingRequest` field whose shape
+  (`sandbox_id, base_url, access_token, root_path`) is **exactly** what
+  `/agent-binding` returns. The two were built to fit.
+
+## Two things only you can confirm/do
+
+1. **The deployed AI Dream repo** is `AI-Matrix-Engine/aidream` (the local clone
+   I read is `AI-Matrix-Engine/aidream-current`, v0.1.300 — has the binding).
+   Confirm the deployed build includes `aidream/api/sandbox_binding.py` + the
+   `sandbox` field on `/chat`. (Versions 299/300 strongly suggest same lineage.)
+2. **A public HTTPS endpoint for the co-located AI Dream** (nginx is installed
+   on `matrx-python-server`; front `:8000` with a domain + cert) — that URL is
+   what the FE routes sandbox-bound chats to.
 
 ---
 
