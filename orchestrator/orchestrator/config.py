@@ -93,6 +93,14 @@ class Settings(BaseSettings):
     # Traefik hostname; EC2 sets this via env to its public IP/DNS.
     public_url: str = ""            # env var: MATRX_PUBLIC_URL
 
+    # Internal/in-VPC base URL for SERVER-TO-SERVER callers (the co-located AI
+    # Dream making tool calls into sandboxes). When set, /agent-binding hands
+    # this private address to AI Dream so tool traffic stays on the LAN
+    # (same-AZ = free + sub-ms) instead of looping back out over the public
+    # internet. Browsers still get public_url via /access-tokens. Falls back to
+    # public_url when unset. e.g. http://172.31.83.75:8000
+    internal_url: str = ""          # env var: MATRX_INTERNAL_URL
+
     # Public hostname the SSH credentials returned by /sandboxes/{id}/access
     # advertise to clients. Defaults to the hostname of MATRX_PUBLIC_URL when
     # unset. Set explicitly when SSH and HTTP exit through different

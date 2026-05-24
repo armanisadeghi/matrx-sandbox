@@ -1100,9 +1100,12 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
     if not settings.access_token_secret:
         raise HTTPException(status_code=503, detail="access tokens not configured (set MATRX_ACCESS_TOKEN_SECRET)")
-    base = (settings.public_url or "").rstrip("/")
+    # Prefer the internal/in-VPC address so the co-located AI Dream's tool
+    # calls stay on the private LAN (same-AZ = free + sub-ms). Falls back to
+    # the public URL when MATRX_INTERNAL_URL isn't set.
+    base = (settings.internal_url or settings.public_url or "").rstrip("/")
     if not base:
-        raise HTTPException(status_code=503, detail="MATRX_PUBLIC_URL must be set to build the binding base_url")
+        raise HTTPException(status_code=503, detail="Set MATRX_INTERNAL_URL (preferred) or MATRX_PUBLIC_URL to build the binding base_url")
 
     ttl = (body.ttl_seconds if body else None) or settings.max_session_duration_seconds
     # The agent's hands need the full tool surface. The middleware accepts any
