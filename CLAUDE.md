@@ -28,7 +28,7 @@ This file is **orientation** — what each piece is, where it runs, and what's s
 | Deployment | Where | What runs | Trigger |
 |---|---|---|---|
 | **EC2 tier** (`tier: "ec2"`) | EC2 | Orchestrator (FastAPI) + sandbox containers it spawns on demand. S3 hot/cold + Supabase Postgres. | Push to `main` → GitHub Actions → ECR build → SSM deploy |
-| **Hosted tier** (`tier: "hosted"`) | This server `/srv` | Orchestrator at `https://orchestrator.dev.codematrx.com` (deployed via [/srv/apps/sandbox-orchestrator/](/srv/apps/sandbox-orchestrator/)) + dynamically-spawned sandbox containers. **Per-user Docker volumes** (`matrx-user-<uid>` mounted at `/home/agent`) survive container destroy. **Postgres-backed store** — same `sandbox_instances` table on the automation-matrix Supabase project that EC2 uses, so both tiers share one source of truth. Boot reconciles from `docker ps` on every restart so the in-process view never drifts from reality. | `cd /srv/apps/sandbox-orchestrator && docker compose up -d` |
+| **Hosted tier** (`tier: "hosted"`) | This server `/srv` | Orchestrator at `https://orchestrator.dev.codematrx.com` (deployed via [/srv/apps/sandbox-orchestrator/](/srv/apps/sandbox-orchestrator/)) + dynamically-spawned sandbox containers. **Per-user Docker volumes** (`matrx-user-<uid>` mounted at `/home/agent`) survive container destroy. **Postgres-backed store** — same `sandbox_instances` table on the automation-matrix Supabase project that EC2 uses, so both tiers share one source of truth. Reconciles from `docker ps` at boot AND on a 60s liveness sweep (tier-scoped): vanished-container rows get marked STOPPED, live rows get `updated_at` refreshed so long-lived boxes don't look "stale." See [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-reconciliation-boot--periodic-liveness). | `cd /srv/apps/sandbox-orchestrator && docker compose up -d` |
 | **Static "starter pool"** ⚠️ deprecated | This server `/srv` | Hard-coded `sandbox-1` … `sandbox-5` from [sandbox-local/docker-compose.yml](sandbox-local/docker-compose.yml). Per-slot volumes (not per-user) — unsuitable for real users; was a quick-test placeholder. **Retire once frontend create-flow is ready.** | n/a (use the dynamic flow above) |
 
 Plus, separately, there's a **Ship instance** at `matrx-sandbox.dev.codematrx.com` (container `matrx-sandbox`, image `matrx-ship:latest`) — that's just version tracking via Matrx Ship, **not** the sandbox runtime. Three different things named "sandbox" on this server; don't confuse them:
@@ -118,6 +118,8 @@ Public orchestrator endpoints (`X-API-Key` required except `/health`):
 | GET | `/health` | Orchestrator health |
 
 The richer fs / pty / git / processes / ports surface is documented in [SANDBOX_CLIENT_GUIDE.md](SANDBOX_CLIENT_GUIDE.md) — those route into the in-container `matrx_agent` daemon.
+
+Every `SandboxResponse` carries the full lifecycle state for operators/UIs: `status`, `created_at`, `updated_at` (refreshed every 60s by the liveness sweep for live boxes), `last_heartbeat_at`, `stopped_at`, `stop_reason`, `expires_at`, `tier`.
 
 ---
 

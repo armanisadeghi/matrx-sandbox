@@ -41,6 +41,11 @@ from orchestrator.store import SandboxStore
 
 logger = logging.getLogger(__name__)
 
+# A row in one of these statuses reflects a deliberate end-of-life. If a
+# container for such a row is still alive, that's an orphan ("system says
+# done but it's still running"), not something to resurrect to 'running'.
+_TERMINAL_STATUSES = {"stopped", "expired", "failed"}
+
 
 def _parse_created_at(value: str | None) -> datetime:
     """Parse the matrx.created_at label, fall back to "now" on bad data."""
@@ -177,20 +182,28 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
             if existing_row is not None:
                 user_id = existing_row.user_id
 
-            # ── Respect the user's intent — never resurrect a deleted row ──
-            # If the DB row was soft-deleted (user/admin destroyed it) but the
-            # container is somehow still running (e.g. the destroy call timed
-            # out against a wedged orchestrator), this container is an ORPHAN.
-            # Resurrecting its row to "running" is exactly the "system says
-            # destroyed but it's still running" bug. Reap the container
-            # instead, leaving the DB row deleted.
+            # ── Respect the recorded end-of-life — never resurrect it ──
+            # If the DB row was soft-deleted OR already moved to a terminal
+            # status (stopped/expired/failed — a user/admin/reaper destroy),
+            # but the container is somehow still running (e.g. the destroy
+            # call's container.stop/remove silently failed, or it timed out
+            # against a wedged orchestrator), this container is an ORPHAN.
+            # Upserting its row back to "running" is exactly the "system says
+            # done but it's still running" bug that left rows stuck in
+            # 'running' for days. Reap the container instead, leaving the row
+            # in its recorded terminal state. (A genuine resume sets the row
+            # back to a live status synchronously, so it is never terminal
+            # here.)
             lifecycle = await store.get_lifecycle(sandbox_id)
-            if lifecycle and lifecycle["deleted"]:
+            if lifecycle and (
+                lifecycle["deleted"] or lifecycle["status"] in _TERMINAL_STATUSES
+            ):
                 summary["reaped"] += 1
                 logger.info(
-                    "Reconcile reaping orphan %s: DB row is soft-deleted but "
-                    "container is alive — destroying container, leaving row deleted.",
+                    "Reconcile reaping orphan %s: DB row is %s but container is "
+                    "alive — destroying container, leaving row as-is.",
                     sandbox_id,
+                    "soft-deleted" if lifecycle["deleted"] else lifecycle["status"],
                 )
                 try:
                     container.remove(force=True)
@@ -234,4 +247,91 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
     return summary
 
 
-__all__ = ["reconcile_from_docker"]
+def _alive_container_ids(client, host_tier: str | None) -> set[str]:
+    """Set of container IDs for THIS tier that are alive enough to keep their
+    DB row in a live status.
+
+    "Alive" = running, created, or restarting. Exited/dead/removing map to a
+    terminal SandboxStatus, so those containers are treated as gone and their
+    rows get reconciled to stopped. A still-booting container (created/
+    restarting) is deliberately kept alive so we never stop a sandbox mid-boot.
+    """
+    alive: set[str] = set()
+    containers = client.containers.list(
+        all=True, filters={"label": "matrx.sandbox_id"}
+    )
+    for container in containers:
+        try:
+            container.reload()
+            attrs = container.attrs or {}
+            labels = (attrs.get("Config", {}) or {}).get("Labels") or {}
+            tier = labels.get("matrx.tier") or host_tier
+            # Only consider containers belonging to this orchestrator's tier.
+            if host_tier and tier and tier != host_tier:
+                continue
+            status = _docker_state_to_status(attrs.get("State", {}) or {})
+            if status in (
+                SandboxStatus.RUNNING,
+                SandboxStatus.CREATING,
+                SandboxStatus.STARTING,
+            ):
+                alive.add(container.id)
+        except Exception:
+            # We can SEE this container in the list but failed to read its
+            # state. Treat it as alive — never stop a row whose container
+            # demonstrably exists just because a metadata read hiccupped.
+            # (A cross-tier id added here is harmless: it won't match any of
+            # this tier's rows.)
+            try:
+                alive.add(container.id)
+            except Exception:
+                pass
+            continue
+    return alive
+
+
+async def reconcile_liveness(store: SandboxStore) -> dict:
+    """Tier-scoped liveness sweep: stop rows whose container vanished, refresh
+    rows whose container is alive.
+
+    The inverse of ``reconcile_from_docker``: that walks existing containers
+    and upserts their rows; this walks live-status rows and reconciles them
+    against the set of containers actually alive. Safe to call on boot and on
+    the reaper's interval. Never raises. Returns ``{"stopped", "refreshed"}``.
+    """
+    summary = {"stopped": [], "refreshed": 0}
+
+    host_tier = settings.host_tier or None
+    if not host_tier:
+        # Without a known tier we can't tell which rows in the shared
+        # sandbox_instances table are "ours" — skip rather than risk marking a
+        # sibling tier's healthy rows as stopped.
+        return summary
+
+    reconcile = getattr(store, "reconcile", None)
+    if reconcile is None:
+        return summary
+
+    try:
+        from orchestrator.sandbox_manager import _get_docker_client
+        client = _get_docker_client()
+    except Exception as exc:
+        logger.warning("Liveness reconcile skipped: docker client unavailable: %s", exc)
+        return summary
+
+    try:
+        alive_ids = _alive_container_ids(client, host_tier)
+    except Exception as exc:
+        # If we can't enumerate containers, do NOT proceed — an empty/partial
+        # alive set would wrongly stop healthy rows. Better to skip this tick.
+        logger.warning("Liveness reconcile skipped: container list failed: %s", exc)
+        return summary
+
+    try:
+        return await reconcile(alive_ids, tier=host_tier)
+    except Exception as exc:
+        logger.warning("Liveness reconcile failed: %s", exc)
+        return summary
+
+
+__all__ = ["reconcile_from_docker", "reconcile_liveness"]

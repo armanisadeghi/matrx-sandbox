@@ -458,6 +458,9 @@ async def sandbox_complete(sandbox_id: str, req: CompletionRequest | None = None
 
     logger.info("Sandbox %s signaled completion", sandbox_id)
     await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="graceful_shutdown")
+    return CompletionResponse(status="shutting_down", sandbox_id=sandbox_id)
+
+
 @router.post("/{sandbox_id}/error", response_model=ErrorResponse)
 async def sandbox_error(sandbox_id: str, req: ErrorReport):
     """Agent signals an error. Logs the error and triggers graceful shutdown."""

@@ -66,6 +66,26 @@ async def lifespan(app: FastAPI):
     except Exception as exc:
         _logger.warning("Boot reconcile failed (continuing without it): %s", exc)
 
+    # Liveness reconcile — the inverse sweep. ``reconcile_from_docker`` walks
+    # containers that EXIST; it can never notice a row still marked live whose
+    # container has vanished. That gap is what left rows stuck in 'running' for
+    # days (the persistence watchdog offenders). This pass marks those rows
+    # stopped and, for the containers that ARE alive, refreshes updated_at so a
+    # healthy long-lived sandbox doesn't trip the watchdog's max-age SLA.
+    # Tier-scoped: never touches a sibling orchestrator's rows.
+    try:
+        from orchestrator.reconcile import reconcile_liveness
+        from orchestrator.sandbox_manager import _get_store
+
+        live_summary = await reconcile_liveness(_get_store())
+        if live_summary["stopped"] or live_summary["refreshed"]:
+            _logger.info(
+                "Boot liveness reconcile: stopped=%d refreshed=%d",
+                len(live_summary["stopped"]), live_summary["refreshed"],
+            )
+    except Exception as exc:
+        _logger.warning("Boot liveness reconcile failed (continuing): %s", exc)
+
     # Start the expiry reaper — the missing half of the sandbox lifecycle.
     # Without it, sandboxes hit ``expires_at`` and nothing happens: the
     # container runs forever, the FE blocks the user as "expired", data is

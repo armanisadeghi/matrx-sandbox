@@ -44,7 +44,10 @@ REAP_INTERVAL_SECONDS = 60
 
 async def _reap_once() -> dict:
     """Single sweep. Returns a summary dict for logging. Never raises."""
-    summary = {"expired_found": 0, "torn_down": 0, "failed": 0, "sandbox_ids": []}
+    summary = {
+        "expired_found": 0, "torn_down": 0, "failed": 0, "sandbox_ids": [],
+        "liveness_stopped": 0, "liveness_refreshed": 0,
+    }
     try:
         from orchestrator.models import SandboxStatus
         from orchestrator.sandbox_manager import _get_store, destroy_sandbox
@@ -87,10 +90,28 @@ async def _reap_once() -> dict:
             summary["failed"] += 1
             logger.warning("Reaper: teardown of expired %s failed: %s", sandbox_id, exc)
 
-    if summary["expired_found"]:
+    # Liveness reconcile every tick — two jobs the TTL sweep above can't do:
+    #   1. Mark rows whose container has VANISHED as stopped within ~60s,
+    #      instead of waiting for the next orchestrator reboot. These are the
+    #      rows that otherwise sit stuck in 'running' (the watchdog offenders).
+    #   2. Refresh updated_at for rows whose container is still alive, so a
+    #      healthy long-lived sandbox keeps a fresh timestamp and never trips
+    #      the persistence watchdog's max-age SLA just for running a long time.
+    # Tier-scoped and never raises; failures are logged and the loop continues.
+    try:
+        from orchestrator.reconcile import reconcile_liveness
+        live = await reconcile_liveness(store)
+        summary["liveness_stopped"] = len(live["stopped"])
+        summary["liveness_refreshed"] = live["refreshed"]
+    except Exception as exc:
+        logger.warning("Reaper: liveness reconcile failed this tick: %s", exc)
+
+    if summary["expired_found"] or summary["liveness_stopped"]:
         logger.info(
-            "Reaper sweep: expired_found=%d torn_down=%d failed=%d",
+            "Reaper sweep: expired_found=%d torn_down=%d failed=%d "
+            "liveness_stopped=%d liveness_refreshed=%d",
             summary["expired_found"], summary["torn_down"], summary["failed"],
+            summary["liveness_stopped"], summary["liveness_refreshed"],
         )
     return summary
 

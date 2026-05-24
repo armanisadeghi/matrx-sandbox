@@ -98,11 +98,38 @@ rarely touched, so lazy loading is the right tradeoff.
    a. Hot sync: aws s3 sync /home/agent/ s3://bucket/users/{uid}/hot/
    b. Cold flush: ensure pending writes are flushed, unmount FUSE
    c. Container stops — sandbox marked STOPPED in database (not deleted)
-6. On crash/ungraceful shutdown:
-   a. Orchestrator detects missing heartbeat
-   b. Attempts hot sync from container if still accessible
-   c. Marks session as failed, logs state for recovery
+6. On crash/ungraceful shutdown (or any time a container disappears):
+   a. The **liveness reconcile** notices the row is still in a live status
+      (ready/running/starting) but its container is gone, and marks it STOPPED.
+   b. Runs at boot AND on the reaper's 60s sweep, so a dead row is corrected
+      within ~60s rather than lingering as a phantom "running" sandbox.
 ```
+
+### Status reconciliation (boot + periodic liveness)
+
+The orchestrator keeps the `sandbox_instances` rows honest with two passes, both
+in [orchestrator/reconcile.py](../orchestrator/orchestrator/reconcile.py):
+
+- **`reconcile_from_docker` (boot):** walks every container labeled
+  `matrx.sandbox_id` and upserts its row from the live Docker state. It will
+  **not** resurrect a row that's soft-deleted or in a terminal status
+  (stopped/expired/failed) — if such a row's container is somehow still alive,
+  that's an orphan and the container is reaped instead. (This closed a bug
+  where a destroyed-but-not-killed container got flipped back to `running`.)
+- **`reconcile_liveness` (boot + every 60s via the reaper):** the inverse
+  sweep. For rows still in a live status whose container has **vanished**, it
+  marks them STOPPED; for rows whose container is **alive**, it refreshes
+  `updated_at`. The refresh is what keeps a healthy long-lived (hosted-tier)
+  sandbox from looking "stale" to external persistence watchdogs.
+
+Both are **tier-scoped** (`MATRX_HOST_TIER`): since the `sandbox_instances`
+table is shared by the EC2 and hosted orchestrators, each orchestrator only
+ever touches its own tier's rows. A safety valve refuses the "mark stopped"
+pass if Docker reports **zero** live containers while live rows exist (treating
+it as a transient daemon read rather than a real mass-death).
+
+Row state surfaced on every `SandboxResponse`: `status`, `created_at`,
+`updated_at`, `last_heartbeat_at`, `stopped_at`, `stop_reason`, `expires_at`.
 
 ## Container Image Contents
 

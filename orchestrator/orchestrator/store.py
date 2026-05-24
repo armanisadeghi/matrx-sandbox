@@ -67,6 +67,20 @@ class SandboxStore(ABC):
             return None
         return {"status": getattr(sb.status, "value", sb.status), "deleted": False}
 
+    async def reconcile(
+        self, alive_container_ids: set[str], tier: str | None = None
+    ) -> dict:
+        """Liveness reconcile against the host's actually-alive containers.
+
+        Default: no-op. The in-memory store is rebuilt from ``docker ps`` on
+        every boot, so it never holds rows whose container has vanished. The
+        Postgres store overrides this to (a) mark active rows whose container
+        is gone as STOPPED and (b) refresh ``updated_at`` for rows whose
+        container is alive (so long-lived sandboxes don't look stale to the
+        persistence watchdog). Returns ``{"stopped": [...], "refreshed": int}``.
+        """
+        return {"stopped": [], "refreshed": 0}
+
     async def expire_stale(self) -> list[str]:
         """Mark every sandbox past ``expires_at`` (still in a live status) as
         EXPIRED and return their ids.
@@ -278,6 +292,18 @@ class PostgresSandboxStore(SandboxStore):
                     template_version = COALESCE(EXCLUDED.template_version, sandbox_instances.template_version),
                     labels = COALESCE(EXCLUDED.labels, sandbox_instances.labels),
                     persistence_volume = COALESCE(EXCLUDED.persistence_volume, sandbox_instances.persistence_volume),
+                    -- A row must never be both live AND carry a stop marker.
+                    -- Whenever an upsert moves a row back to a non-terminal
+                    -- status (e.g. resume, or a boot reconcile that finds the
+                    -- container alive), clear the stale stopped_at/stop_reason
+                    -- so we can't recreate the contradictory "running but
+                    -- stopped_at set" state that produced stuck watchdog rows.
+                    stopped_at = CASE
+                        WHEN EXCLUDED.status IN ('stopped', 'expired', 'failed', 'shutting_down')
+                        THEN sandbox_instances.stopped_at ELSE NULL END,
+                    stop_reason = CASE
+                        WHEN EXCLUDED.status IN ('stopped', 'expired', 'failed', 'shutting_down')
+                        THEN sandbox_instances.stop_reason ELSE NULL END,
                     updated_at = NOW()
                 """,
                 UUID(sandbox.user_id),
@@ -418,35 +444,106 @@ class PostgresSandboxStore(SandboxStore):
             self._pool = None
             logger.info("Postgres connection pool closed")
 
-    async def reconcile(self, running_container_ids: set[str]) -> None:
-        """Reconcile DB state with actual Docker containers.
+    async def reconcile(
+        self, alive_container_ids: set[str], tier: str | None = None
+    ) -> dict:
+        """Reconcile DB state against the containers actually alive on this host.
 
-        - Sandboxes marked READY/RUNNING but no matching container -> mark STOPPED
-        - Containers running but not in DB -> log warning (don't auto-destroy)
+        - A row in a live status (ready/running/starting) whose ``container_id``
+          is no longer among ``alive_container_ids`` -> mark STOPPED. This is the
+          path that catches "the container died but nothing transitioned the
+          row" — the stuck-'running' offenders the persistence watchdog alerts
+          on. (Boot reconcile only walks containers that EXIST, so it can never
+          notice a row whose container vanished; this is the inverse sweep.)
+        - A row whose container IS alive -> bump ``updated_at`` so a long-lived
+          sandbox sitting healthily in 'running' doesn't trip the watchdog's
+          max-age SLA just because nothing else wrote to its row.
+
+        ``tier`` MUST be passed by a tiered orchestrator. ``sandbox_instances``
+        is shared across the EC2 and hosted orchestrators, so we only ever
+        touch rows for THIS orchestrator's tier — otherwise we'd mark a sibling
+        tier's perfectly healthy rows as stopped. Returns
+        ``{"stopped": [...], "refreshed": int}``.
         """
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            active_rows = await conn.fetch(
-                "SELECT sandbox_id, container_id FROM sandbox_instances WHERE status IN ('ready', 'running', 'starting')"
-            )
-
-            for row in active_rows:
-                sandbox_id = row["sandbox_id"]
-                container_id = row["container_id"]
-
-                if container_id and container_id not in running_container_ids:
-                    await conn.execute(
-                        """UPDATE sandbox_instances
-                           SET status = 'stopped', stopped_at = NOW(), stop_reason = 'graceful_shutdown'
-                           WHERE sandbox_id = $1""",
-                        sandbox_id,
+        async def _do() -> dict:
+            pool = await self._get_pool()
+            stopped: list[str] = []
+            alive_sandbox_ids: list[str] = []
+            async with pool.acquire() as conn:
+                if tier:
+                    active_rows = await conn.fetch(
+                        """SELECT sandbox_id, container_id FROM sandbox_instances
+                           WHERE status IN ('ready', 'running', 'starting')
+                             AND deleted_at IS NULL
+                             AND tier = $1""",
+                        tier,
                     )
+                else:
+                    active_rows = await conn.fetch(
+                        """SELECT sandbox_id, container_id FROM sandbox_instances
+                           WHERE status IN ('ready', 'running', 'starting')
+                             AND deleted_at IS NULL"""
+                    )
+
+                # Safety valve: an EMPTY alive-set while live rows exist is far
+                # more likely a transient docker read (daemon just restarted,
+                # label index not warm) than every sandbox dying at once.
+                # Marking them all STOPPED on that basis would be a self-
+                # inflicted mass-outage in the FE. Refuse the stop pass this
+                # tick; the next tick / boot reconcile corrects real drift.
+                if not alive_container_ids and active_rows:
                     logger.warning(
-                        "Reconciled sandbox %s: marked STOPPED (container gone)",
-                        sandbox_id,
+                        "Liveness reconcile (tier=%s): %d active row(s) but ZERO "
+                        "alive containers reported — treating as a transient docker "
+                        "read and skipping the stop pass this tick.",
+                        tier or "all", len(active_rows),
                     )
+                    return {"stopped": [], "refreshed": 0}
 
-        logger.info("Store reconciliation complete")
+                for row in active_rows:
+                    sandbox_id = row["sandbox_id"]
+                    container_id = row["container_id"]
+                    if container_id and container_id not in alive_container_ids:
+                        # Re-assert the live-status guard in the WHERE so we never
+                        # stomp a row a concurrent request just moved to terminal.
+                        # 'graceful_shutdown' is the closest allowed stop_reason
+                        # for "container is simply no longer here".
+                        await conn.execute(
+                            """UPDATE sandbox_instances
+                               SET status = 'stopped', stopped_at = NOW(),
+                                   stop_reason = 'graceful_shutdown'
+                               WHERE sandbox_id = $1
+                                 AND status IN ('ready', 'running', 'starting')""",
+                            sandbox_id,
+                        )
+                        stopped.append(sandbox_id)
+                        logger.warning(
+                            "Reconciled sandbox %s: marked STOPPED (container gone)",
+                            sandbox_id,
+                        )
+                    elif container_id:
+                        alive_sandbox_ids.append(sandbox_id)
+
+                refreshed = 0
+                if alive_sandbox_ids:
+                    result = await conn.execute(
+                        """UPDATE sandbox_instances SET updated_at = NOW()
+                           WHERE sandbox_id = ANY($1::text[])
+                             AND status IN ('ready', 'running', 'starting')""",
+                        alive_sandbox_ids,
+                    )
+                    try:
+                        refreshed = int(result.split()[-1])
+                    except (ValueError, IndexError, AttributeError):
+                        refreshed = len(alive_sandbox_ids)
+
+            logger.info(
+                "Liveness reconcile complete (tier=%s): stopped=%d refreshed=%d",
+                tier or "all", len(stopped), refreshed,
+            )
+            return {"stopped": stopped, "refreshed": refreshed}
+
+        return await self._execute_with_retry(_do)
 
     async def expire_stale(self) -> list[str]:
         """Find and mark expired sandboxes. Returns list of sandbox_ids that expired.
@@ -537,6 +634,10 @@ def _row_to_sandbox(row) -> SandboxResponse:
         status=SandboxStatus(row["status"]),
         container_id=row["container_id"],
         created_at=row["created_at"],
+        updated_at=_maybe("updated_at"),
+        last_heartbeat_at=_maybe("last_heartbeat_at"),
+        stopped_at=_maybe("stopped_at"),
+        stop_reason=_maybe("stop_reason"),
         hot_path=_maybe("hot_path") or "/home/agent",
         cold_path=_maybe("cold_path") or "/data/cold",
         config=config_val or {},

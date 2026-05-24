@@ -61,6 +61,23 @@ class SandboxResponse(BaseModel):
     status: SandboxStatus
     container_id: str | None = None
     created_at: datetime
+    updated_at: datetime | None = Field(
+        default=None,
+        description=(
+            "Last time this row changed. The reaper's liveness sweep refreshes "
+            "it every ~60s for live sandboxes, so a live-status sandbox with a "
+            "stale updated_at signals the orchestrator has lost track of it. "
+            "Surfaced so operators can spot stuck rows without querying Postgres."
+        ),
+    )
+    last_heartbeat_at: datetime | None = Field(
+        default=None, description="Last heartbeat received from the in-container agent (null if it never sent one)."
+    )
+    stopped_at: datetime | None = Field(default=None, description="When the sandbox reached a terminal status.")
+    stop_reason: str | None = Field(
+        default=None,
+        description="Why it stopped: user_requested | expired | error | graceful_shutdown | admin.",
+    )
     hot_path: str = "/home/agent"
     cold_path: str = "/data/cold"
     config: dict = Field(default_factory=dict)
