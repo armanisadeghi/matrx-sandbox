@@ -140,6 +140,15 @@ unchanged.
 
 ## 7. Caveats / notes
 
+- **AI Dream auth is unchanged.** The co-located AI Dream at
+  `sandbox.matrxserver.com` runs the same app against the same Supabase as your
+  normal AI Dream backend, so the **same user auth (JWT) you already send works
+  here** — you're only changing the host for sandbox-bound turns, not the auth.
+- **CORS:** the browser calls `sandbox.matrxserver.com` cross-origin. AI Dream's
+  CORS allow-list must include your frontend origin (the same one it already
+  allows for the main AI Dream host). If you get a CORS error in the browser,
+  that allow-list on the co-located server is the fix (an AI Dream/ops config,
+  not FE code).
 - **Cloudflare bot protection:** `sandbox.matrxserver.com` is behind Cloudflare.
   Requests with a real **browser** User-Agent pass (HTTP 200). A non-browser UA
   (e.g. server-side Node `fetch` from Vercel SSR) may get a managed challenge
