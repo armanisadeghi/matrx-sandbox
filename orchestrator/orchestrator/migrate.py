@@ -107,7 +107,14 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     # Copy the old env EXCEPT MATRX_IMAGE_VERSION — the new image must report its
     # OWN baked version (otherwise the box would advertise the stale version and
     # the very drift we just fixed would look unfixed).
-    env = [e for e in (cfg.get("Env") or []) if not e.startswith("MATRX_IMAGE_VERSION=")]
+    env = [
+        e for e in (cfg.get("Env") or [])
+        if not e.startswith("MATRX_IMAGE_VERSION=") and not e.startswith("SANDBOX_MIGRATION=")
+    ]
+    # Tell the new container's entrypoint it's a MIGRATION boot, not a fresh
+    # spawn: the data is already on the volume we're re-mounting, so it skips the
+    # (up to 60s) cloud_files down-sync — the biggest chunk of migration time.
+    env.append("SANDBOX_MIGRATION=1")
     volumes = _binds_to_volumes(host)
     tmp_name = f"{sandbox_id}-mig"
 

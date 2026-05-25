@@ -82,9 +82,16 @@ echo "[4.5/5] Sandbox API Daemon running on port 8000."
 # Bridges the user's AI Dream uploads into the sandbox filesystem so agents
 # can use `cat`, `grep`, `find`, etc. natively. No-op if AI Dream env vars
 # aren't set.
-echo "[4.6/5] Syncing AI Dream cloud_files (if configured)..."
-sudo -E -u agent /opt/sandbox/scripts/cloud-files-sync.sh down || true
-echo "[4.6/5] cloud_files sync complete."
+if [ "${SANDBOX_MIGRATION:-}" = "1" ]; then
+    # Zero-drift migration boot: the per-user volume already holds the data
+    # (we're swapping the image under the SAME volume), so re-pulling cloud_files
+    # is wasteful and is the single biggest contributor to migration time. Skip.
+    echo "[4.6/5] Migration boot — skipping cloud_files down-sync (data already on the volume)."
+else
+    echo "[4.6/5] Syncing AI Dream cloud_files (if configured)..."
+    sudo -E -u agent /opt/sandbox/scripts/cloud-files-sync.sh down || true
+    echo "[4.6/5] cloud_files sync complete."
+fi
 
 # ─── Step 5: Signal readiness ────────────────────────────────────────────────
 echo "[5/5] Sandbox is READY."

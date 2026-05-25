@@ -17,6 +17,7 @@ Already deeply documented. Read the right doc for the question:
 | **Day-to-day operations** (deploy, recovery, monitoring, key rotation) | **[docs/OPERATIONS.md](docs/OPERATIONS.md)** |
 | **User data persistence** (what's saved, where, session-report, auto-stash) | **[docs/PERSISTENCE_PLAN.md](docs/PERSISTENCE_PLAN.md)** |
 | **AI Dream ↔ Sandbox integration** (cloud-files bridge, `mtx` CLI, service-token auth) | **[docs/AIDREAM_INTEGRATION.md](docs/AIDREAM_INTEGRATION.md)** |
+| **Zero-drift migration** (version stamping, drift detection, the safe image swap, auto-migrate) | **[docs/ZERO_DRIFT.md](docs/ZERO_DRIFT.md)** |
 | **Live infra dashboard** (recommended first stop) | **`/administration/sandbox-infra`** in matrx-frontend |
 
 This file is **orientation** — what each piece is, where it runs, and what's specific to running it on this dev server.
@@ -117,6 +118,9 @@ Public orchestrator endpoints (`X-API-Key` required except `/health`):
 | POST | `/sandboxes/{id}/heartbeat` | Agent liveness ping |
 | POST | `/sandboxes/{id}/complete` | Agent signals success |
 | POST | `/sandboxes/{id}/error` | Agent signals failure |
+| POST | `/sandboxes/{id}/migrate` | Migrate one box onto the current image (zero-drift) |
+| GET | `/drift` | Image-version drift report for this tier |
+| POST | `/migrate-all` | Roll every drifted box to the current image |
 | GET | `/health` | Orchestrator health |
 
 The richer fs / pty / git / processes / ports surface is documented in [SANDBOX_CLIENT_GUIDE.md](SANDBOX_CLIENT_GUIDE.md) — those route into the in-container `matrx_agent` daemon.

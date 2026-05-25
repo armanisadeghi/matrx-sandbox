@@ -70,9 +70,16 @@ sudo -E -u agent bash -c "cd /home/agent && python3 -m uvicorn matrx_agent.api.m
 echo "[3/4] Sandbox API Daemon running on port 8000."
 
 # ─── Step 3.5: Pull AI Dream cloud_files (best effort; PDF/image use case) ───
-echo "[3.5/4] Syncing AI Dream cloud_files (if configured)..."
-sudo -E -u agent /opt/sandbox/scripts/cloud-files-sync.sh down || true
-echo "[3.5/4] cloud_files sync complete."
+if [ "${SANDBOX_MIGRATION:-}" = "1" ]; then
+    # Zero-drift migration boot: data is already on the per-user volume we're
+    # re-mounting, so skip the (up to 60s) cloud_files down-sync — the biggest
+    # contributor to migration time.
+    echo "[3.5/4] Migration boot — skipping cloud_files down-sync (data already on the volume)."
+else
+    echo "[3.5/4] Syncing AI Dream cloud_files (if configured)..."
+    sudo -E -u agent /opt/sandbox/scripts/cloud-files-sync.sh down || true
+    echo "[3.5/4] cloud_files sync complete."
+fi
 
 # ─── Step 4: Signal readiness ─────────────────────────────────────────────────
 echo "[4/4] Lightweight sandbox is READY."

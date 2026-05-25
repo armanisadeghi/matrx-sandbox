@@ -58,7 +58,10 @@ jobs:
       - name: Build and push sandbox image
         run: |
           ECR_REPO=${{ secrets.ECR_REPO_URI }}
-          docker build -t $ECR_REPO:latest -t $ECR_REPO:${{ github.sha }} sandbox-image/
+          # Stamp the zero-drift version (the commit SHA) so drift detection +
+          # the migrate self-check work on ec2 images. See docs/ZERO_DRIFT.md.
+          docker build --build-arg MATRX_IMAGE_VERSION=${{ github.sha }} \
+            -t $ECR_REPO:latest -t $ECR_REPO:${{ github.sha }} sandbox-image/
           docker push $ECR_REPO:latest
           docker push $ECR_REPO:${{ github.sha }}
 
@@ -69,6 +72,7 @@ jobs:
           # matrx-sandbox:slim. See docs/EC2_LIGHTWEIGHT_BOX.md.
           ECR_REPO=${{ secrets.ECR_REPO_URI }}
           docker build -f sandbox-image/Dockerfile.slim \
+            --build-arg MATRX_IMAGE_VERSION=${{ github.sha }} \
             -t $ECR_REPO:slim -t $ECR_REPO:slim-${{ github.sha }} sandbox-image/
           docker push $ECR_REPO:slim
           docker push $ECR_REPO:slim-${{ github.sha }}
