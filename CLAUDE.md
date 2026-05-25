@@ -23,6 +23,8 @@ This file is **orientation** — what each piece is, where it runs, and what's s
 
 ---
 
+> **Terminology:** the canonical vocabulary for this whole platform (Server / Project / Deployment / Sandbox / Template / Image, and Manager vs Orchestrator vs Deploy) lives in **[/srv/projects/matrx-ship/NAMING.md](/srv/projects/matrx-ship/NAMING.md)**. The section below predates it; where they differ, NAMING.md wins. In its terms: "tier" = where a Sandbox runs (`ec2`/`hosted`); the `matrx-sandbox` container is a **Deployment** (version-tracking), not a Sandbox.
+
 ## Three deployments you need to distinguish
 
 | Deployment | Where | What runs | Trigger |
