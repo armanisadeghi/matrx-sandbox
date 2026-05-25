@@ -4,6 +4,8 @@ from typing import List, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from matrx_agent.workspace import WORKSPACE_ROOT
+
 router = APIRouter()
 
 class GitCloneRequest(BaseModel):
@@ -62,8 +64,8 @@ async def git_clone(req: GitCloneRequest):
     if req.depth:
         args.extend(["--depth", str(req.depth)])
     args.extend([req.url, req.dest])
-    
-    code, out, err = await run_git(args, cwd="/home/agent")
+
+    code, out, err = await run_git(args, cwd=str(WORKSPACE_ROOT))
     if code != 0:
         raise HTTPException(status_code=400, detail=err)
     return {"status": "success", "output": out}

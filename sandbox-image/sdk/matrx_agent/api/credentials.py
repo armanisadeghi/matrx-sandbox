@@ -5,6 +5,8 @@ from typing import Literal, Optional
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
 
+from matrx_agent.workspace import WORKSPACE_ROOT
+
 router = APIRouter()
 
 class CredentialRequest(BaseModel):
@@ -16,7 +18,7 @@ class CredentialRequest(BaseModel):
 
 @router.post("/credentials")
 async def add_credentials(req: CredentialRequest):
-    home_dir = Path("/home/agent")
+    home_dir = WORKSPACE_ROOT
     
     if req.kind == "github":
         if not req.token:
@@ -61,12 +63,12 @@ async def revoke_credentials():
     os.system('git config --global --unset credential.https://github.com.username')
     
     # Shred helper script
-    helper_script = Path("/home/agent/.matrx/credentials/github_helper.sh")
+    helper_script = WORKSPACE_ROOT / ".matrx" / "credentials" / "github_helper.sh"
     if helper_script.exists():
         helper_script.unlink()
-        
+
     # Shred SSH key
-    key_file = Path("/home/agent/.ssh/id_rsa")
+    key_file = WORKSPACE_ROOT / ".ssh" / "id_rsa"
     if key_file.exists():
         key_file.unlink()
         
