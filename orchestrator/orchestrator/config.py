@@ -59,7 +59,12 @@ class Settings(BaseSettings):
     # prepare another." Disabled by default (size 0) so EC2/other orchestrators
     # are unaffected; the hosted orchestrator sets MATRX_WARM_POOL_SIZE=2.
     warm_pool_size: int = 0             # env var: MATRX_WARM_POOL_SIZE
-    warm_pool_template: str = "slim"    # which template to pre-warm
+    warm_pool_template: str = "slim"    # which template to pre-warm (single-template fallback)
+    # Optional per-template warm pool, e.g. "slim:1,aidream:1" (MATRX_WARM_POOL_TEMPLATES).
+    # When set it takes precedence: the pool keeps EACH listed template warmed to
+    # its own count, so heavy templates users actually launch (aidream) are
+    # claim-fast too — not just slim. A bare name ("aidream") uses warm_pool_size.
+    warm_pool_templates: str = ""       # env var: MATRX_WARM_POOL_TEMPLATES
     # Sentinel user_id stamped on unclaimed warm boxes (no real owner yet).
     warm_pool_sentinel_user: str = "00000000-0000-0000-0000-000000000000"
 

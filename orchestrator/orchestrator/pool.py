@@ -48,6 +48,73 @@ def _warm_template() -> str:
     return settings.warm_pool_template or "slim"
 
 
+def _warm_targets() -> list[tuple[str, int]]:
+    """The (template, count) pairs to keep warmed.
+
+    Parsed from ``MATRX_WARM_POOL_TEMPLATES`` ("slim:1,aidream:1"); a bare name
+    uses ``warm_pool_size``. Falls back to the single-template config when the
+    multi-template spec is empty.
+    """
+    spec = (settings.warm_pool_templates or "").strip()
+    if spec:
+        targets: list[tuple[str, int]] = []
+        for part in spec.split(","):
+            part = part.strip()
+            if not part:
+                continue
+            name, sep, cnt = part.partition(":")
+            name = name.strip()
+            if not name:
+                continue
+            try:
+                n = int(cnt) if sep else settings.warm_pool_size
+            except ValueError:
+                n = settings.warm_pool_size
+            if n > 0:
+                targets.append((name, n))
+        if targets:
+            return targets
+    if settings.warm_pool_size > 0:
+        return [(_warm_template(), settings.warm_pool_size)]
+    return []
+
+
+def _pool_enabled() -> bool:
+    return bool(_warm_targets())
+
+
+def _current_image_id(template: str) -> str | None:
+    """Docker image ID currently backing ``template`` — used to detect warm
+    boxes booted from a now-superseded image (the version-refresh signal)."""
+    from orchestrator.sandbox_manager import _get_docker_client
+    from orchestrator.routes.templates import resolve_template_image
+    tag = resolve_template_image(template) or settings.sandbox_image
+    try:
+        return _get_docker_client().images.get(tag).id
+    except Exception as exc:
+        logger.warning("Pool: could not resolve current image for template=%s: %s", template, exc)
+        return None
+
+
+async def _retire_stale_warm(template: str, current_image_id: str | None) -> int:
+    """Remove UNCLAIMED warm boxes for ``template`` whose image no longer matches
+    ``current_image_id`` (i.e. the template image was rebuilt). Never touches a
+    claimed box. Returns how many were retired."""
+    if not current_image_id:
+        return 0
+    retired = 0
+    for c in await _unclaimed_warm(template):
+        try:
+            if c.image.id != current_image_id:
+                sid = (c.attrs.get("Config", {}) or {}).get("Labels", {}).get("matrx.sandbox_id", c.id[:12])
+                c.remove(force=True)
+                retired += 1
+                logger.info("Pool: retired stale warm %s (template=%s, image upgraded)", sid, template)
+        except Exception as exc:
+            logger.warning("Pool: failed to retire stale warm box (%s): %s", template, exc)
+    return retired
+
+
 def list_warm_containers(template: str | None = None) -> list:
     """Running, unclaimed warm containers (optionally filtered by template)."""
     from orchestrator.sandbox_manager import _get_docker_client
@@ -150,17 +217,19 @@ async def _unclaimed_warm(template: str) -> list:
 
 
 async def ensure_warm_pool() -> dict:
-    """Top the pool up to ``settings.warm_pool_size``. Returns a summary."""
-    summary = {"target": settings.warm_pool_size, "have": 0, "warmed": 0}
-    if settings.warm_pool_size <= 0:
-        return summary
-    template = _warm_template()
-    have = len(await _unclaimed_warm(template))
-    summary["have"] = have
-    deficit = settings.warm_pool_size - have
-    for _ in range(max(0, deficit)):
-        if _warm_run_container(template) is not None:
-            summary["warmed"] += 1
+    """For every (template, count) target: retire warm boxes whose image was
+    superseded (version-refresh), then top the template up to its count."""
+    summary = {"per_template": {}, "warmed": 0, "retired": 0}
+    for template, target in _warm_targets():
+        retired = await _retire_stale_warm(template, _current_image_id(template))
+        have = len(await _unclaimed_warm(template))  # post-retire count of fresh boxes
+        warmed = 0
+        for _ in range(max(0, target - have)):
+            if _warm_run_container(template) is not None:
+                warmed += 1
+        summary["per_template"][template] = {"target": target, "have": have, "warmed": warmed, "retired": retired}
+        summary["warmed"] += warmed
+        summary["retired"] += retired
     return summary
 
 
@@ -173,7 +242,7 @@ async def claim_warm(
     if no warm box of the right template is available (caller cold-creates).
     """
     template = template or _warm_template()
-    if settings.warm_pool_size <= 0:
+    if not _pool_enabled():
         return None
 
     candidates = await _unclaimed_warm(template)
@@ -248,12 +317,12 @@ async def _replenish_async() -> None:
 
 async def pool_loop(stop_event: asyncio.Event) -> None:
     """Maintain the warm pool on an interval until stop_event is set."""
-    if settings.warm_pool_size <= 0:
-        logger.info("Warm pool disabled (MATRX_WARM_POOL_SIZE=0)")
+    if not _pool_enabled():
+        logger.info("Warm pool disabled (set MATRX_WARM_POOL_SIZE or MATRX_WARM_POOL_TEMPLATES)")
         return
     logger.info(
-        "Warm pool started (size=%d, template=%s, interval=%ds)",
-        settings.warm_pool_size, _warm_template(), POOL_INTERVAL_SECONDS,
+        "Warm pool started (targets=%s, interval=%ds)",
+        _warm_targets(), POOL_INTERVAL_SECONDS,
     )
     while not stop_event.is_set():
         try:
