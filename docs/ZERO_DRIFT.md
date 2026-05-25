@@ -83,6 +83,10 @@ The in-flight accounting + migrating lock live in `orchestrator/activity.py` (th
 
 The event-loop-blocking limitation that previously gated this is **fixed** (see below), so the orchestrator stays responsive during a migration — auto-migrate is safe to run.
 
+### From the Server Manager UI
+
+The Manager's **orchestrator-sandboxes** admin page (`manager.dev.codematrx.com`) shows a **"Version drift" card** whenever any box is stale: it lists each drifted box (`running → current` version) and a **"Migrate all"** button. Backed by Manager proxy routes (`/api/orchestrator-sandboxes-drift`, `-migrate-all`, `/:id/migrate`) that call the orchestrator with the master key. So operators get drift visibility + one-click migration without the CLI or the API key.
+
 ---
 
 ## Known limitations
