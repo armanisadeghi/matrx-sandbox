@@ -72,19 +72,24 @@ The in-flight accounting + migrating lock live in `orchestrator/activity.py` (th
 
 ## Automation
 
-`migrate_all_drifted()` rolls drifted boxes one at a time (busy ones return `busy_deferred` and retry on the next pass — the "keep checking until it's idle, then migrate" loop). It's wired into the reaper, **gated behind `MATRX_AUTO_MIGRATE=1` (default OFF)**:
+`migrate_all_drifted()` rolls drifted boxes one at a time (busy ones return `busy_deferred` and retry on the next pass — the "keep checking until it's idle, then migrate" loop). It's wired into the reaper, gated behind `MATRX_AUTO_MIGRATE`:
 
-- `MATRX_AUTO_MIGRATE=1` — each reaper sweep migrates up to `MATRX_MIGRATE_MAX_PER_PASS` (default 2) drifted, idle boxes; busy ones defer to the next sweep.
+- `MATRX_AUTO_MIGRATE=1` — each reaper sweep (every 60s) migrates up to `MATRX_MIGRATE_MAX_PER_PASS` (default 2) drifted, **idle** boxes; busy ones defer to the next sweep.
 - With it OFF, nothing migrates automatically; `POST /migrate-all` and per-box `/migrate` still work for manual/triggered rollout.
 
-**Recommended rollout:** keep `AUTO_MIGRATE` off until the [known limitation](#known-limitations) below is addressed, then enable hosted-first, watch a day, then ec2.
+**Rollout status (2026-05-25):**
+- **Hosted tier: `MATRX_AUTO_MIGRATE=1` is ENABLED** (set in `/srv/apps/sandbox-orchestrator/.env`). Proven live: a drifted idle box auto-migrated to the current image within one reaper sweep (~48s) with data intact and drift cleared — no manual call.
+- **ec2 tier: still OFF** (deliberate soak-first). To enable: set `MATRX_AUTO_MIGRATE=1` in the ec2 orchestrator's systemd env (`/etc/systemd/system/matrx-orchestrator.service.d/*.conf` on `matrx-sandbox-host-dev`) and restart the service — reachable via SSM with the matrx-admin cred. Do this after hosted has soaked.
+
+The event-loop-blocking limitation that previously gated this is **fixed** (see below), so the orchestrator stays responsive during a migration — auto-migrate is safe to run.
 
 ---
 
 ## Known limitations
 
-1. **Blocking docker calls freeze the orchestrator event loop (pre-existing, being fixed separately).** The orchestrator makes synchronous `docker-py` calls (`exec_run`, `containers.run`, stop/rename) inside async handlers, so a long exec *or* a migration's container build briefly starves all other calls on that orchestrator. This is an orchestrator-wide issue, not specific to migration — the fix is to wrap blocking docker calls in `asyncio.to_thread`. **Migrations are data-safe regardless;** this is an availability/throughput concern and the reason `AUTO_MIGRATE` should stay off until it lands (a migration shouldn't degrade sibling boxes at scale).
-2. **Migration time** is dominated by new-container readiness; the `SANDBOX_MIGRATION=1` cloud-sync skip helps, but a heavy image still takes tens of seconds to come up. Only matters if a call arrives mid-migration (it retries); idle boxes migrate invisibly.
+1. ~~Blocking docker calls freeze the orchestrator event loop.~~ **FIXED (commit `e3e1770`, both tiers).** All blocking `docker-py` calls (`exec_run`, `containers.run`, stop/rename/remove, readiness poll, drift scan, reconcile, warm pool, memory sync) are now wrapped in `asyncio.to_thread`, so a long exec or a migration build no longer freezes the orchestrator. Proven under load: during a 41s migration the orchestrator stayed responsive and served 32 retryable 503s cleanly. **Any NEW blocking docker call added in an `async def` MUST be `to_thread`-wrapped** — that's the standing rule now.
+2. **Migration time** is dominated by new-container readiness; the `SANDBOX_MIGRATION=1` cloud-sync skip cut it to ~40s. Only matters if a call arrives mid-migration (it transparently retries via 503); idle boxes (the only ones auto-migrated) migrate invisibly.
+3. **Version labels** on hosted `:core`/`:aidream` images populate on their next `build.sh` rebuild; until then they read as unversioned (`dev`). Drift detection works by **image ID** regardless, so auto-migration is fully functional for those templates either way — the label is cosmetic. (ec2 images are versioned by CI; hosted `:slim` is versioned.)
 
 ---
 
