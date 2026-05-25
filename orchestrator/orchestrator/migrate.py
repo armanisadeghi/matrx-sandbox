@@ -118,6 +118,28 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     volumes = _binds_to_volumes(host)
     tmp_name = f"{sandbox_id}-mig"
 
+    # ── DATA-SAFETY GUARD ─────────────────────────────────────────────────────
+    # The proven-safe swap relies on the new container mounting the SAME
+    # persistent volume at /home/agent as the old one (hosted tier), so the data
+    # is physically shared and never copied. The ec2 tier has NO such volume —
+    # the home dir is S3-backed (hot-sync on boot, up-sync on shutdown). A naive
+    # build-then-cutover there would let the new box hot-sync STALE S3 before the
+    # old box flushes its final state at cutover → silent data loss. Until the
+    # S3-sync-ordered path is built + tested (quiesce → up-sync old → boot new
+    # from fresh S3 → cutover), REFUSE to migrate a box whose /home/agent isn't a
+    # shared volume. This makes auto-migrate structurally safe on every tier.
+    if "/home/agent" not in {v.get("bind") for v in volumes.values()}:
+        logger.info(
+            "migrate %s: home dir not on a shared volume (S3-backed/ec2) — refusing "
+            "(sync-ordered migration for this storage model not yet implemented)",
+            sandbox_id,
+        )
+        return {
+            "status": "unsupported_storage", "sandbox_id": sandbox_id,
+            "reason": ("home dir is not on a shared persistent volume (S3-backed / ec2 tier); "
+                       "sync-ordered migration for this storage model is not yet implemented"),
+        }
+
     # Lock for the WHOLE migration up front. While building the new container,
     # both it and the old one carry the same matrx.sandbox_id label, and the
     # store row / container lookup briefly flux — so rather than let calls race
@@ -245,7 +267,7 @@ async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
     from orchestrator.sandbox_manager import _get_docker_client
     from orchestrator.versioning import compute_drift
 
-    results: dict[str, list[str]] = {"migrated": [], "deferred": [], "failed": [], "skipped": []}
+    results: dict[str, list[str]] = {"migrated": [], "deferred": [], "failed": [], "skipped": [], "unsupported": []}
     try:
         client = _get_docker_client()
         drifted = await asyncio.to_thread(
@@ -272,13 +294,18 @@ async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
             done += 1
         elif st == "busy_deferred":
             results["deferred"].append(box.sandbox_id)
+        elif st == "unsupported_storage":
+            # S3-backed/ec2 box — safely refused (not a failure). Don't count
+            # toward the per-pass cap; it'll keep being skipped until the
+            # S3-sync-ordered path exists.
+            results["unsupported"].append(box.sandbox_id)
         else:
             results["failed"].append(box.sandbox_id)
             done += 1
     if results["migrated"] or results["failed"]:
         logger.info(
-            "migrate_all pass: migrated=%d deferred=%d failed=%d skipped=%d",
+            "migrate_all pass: migrated=%d deferred=%d failed=%d skipped=%d unsupported=%d",
             len(results["migrated"]), len(results["deferred"]),
-            len(results["failed"]), len(results["skipped"]),
+            len(results["failed"]), len(results["skipped"]), len(results["unsupported"]),
         )
     return results
