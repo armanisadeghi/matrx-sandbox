@@ -150,41 +150,63 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
             "reason": f"new box not ready / version mismatch (ready={ready}, version={new_ver}->{cur.version})",
         }
 
-    # ── Atomic cutover ───────────────────────────────────────────────────────
-    old_renamed = f"{sandbox_id}-old-{int(time.time())}"
-    try:
-        try:
-            old.stop(timeout=settings.shutdown_timeout_seconds)
-        except APIError:
-            pass
-        old.rename(old_renamed)
-        new.rename(sandbox_id)
-    except APIError as exc:
-        logger.error("MIGRATE CUTOVER FAILED %s: %s — rolling back to old box", sandbox_id, exc)
+    # ── Lock + drain right before cutover ────────────────────────────────────
+    # The new box is built and verified while the OLD box keeps serving (no lock
+    # yet). Only NOW do we refuse new calls and wait for in-flight ones to finish,
+    # so the agent-visible "migrating" window is just the drain+cutover (seconds),
+    # not the whole image build. If calls don't drain, defer — never cut over
+    # mid-operation.
+    from orchestrator import activity
+
+    drained = await activity.acquire_migration(sandbox_id, drain_timeout=20.0)
+    if not drained:
+        logger.info("migrate %s: box busy, deferring (will retry later)", sandbox_id)
         try:
             new.remove(force=True)
         except APIError:
             pass
-        try:  # best-effort restore of the old box
-            old.rename(sandbox_id)
-            old.start()
-        except APIError:
-            pass
-        return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"cutover failed: {exc}"}
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": "in-flight tool calls did not drain; retry later"}
 
+    # ── Atomic cutover (box is locked: new calls get 503-retry) ───────────────
     try:
-        old.remove(force=True)
-    except APIError as exc:
-        logger.warning("migrate %s: old container cleanup failed (non-fatal): %s", sandbox_id, exc)
+        old_renamed = f"{sandbox_id}-old-{int(time.time())}"
+        try:
+            try:
+                old.stop(timeout=settings.shutdown_timeout_seconds)
+            except APIError:
+                pass
+            old.rename(old_renamed)
+            new.rename(sandbox_id)
+        except APIError as exc:
+            logger.error("MIGRATE CUTOVER FAILED %s: %s — rolling back to old box", sandbox_id, exc)
+            try:
+                new.remove(force=True)
+            except APIError:
+                pass
+            try:  # best-effort restore of the old box
+                old.rename(sandbox_id)
+                old.start()
+            except APIError:
+                pass
+            return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"cutover failed: {exc}"}
 
-    try:
-        sbx = await store.get(sandbox_id)
-        if sbx:
-            sbx.template_version = cur.version or new_ver
-            sbx.container_id = new.id
-            await store.save(sbx)
-    except Exception as exc:
-        logger.warning("migrate %s: store update failed (non-fatal): %s", sandbox_id, exc)
+        try:
+            old.remove(force=True)
+        except APIError as exc:
+            logger.warning("migrate %s: old container cleanup failed (non-fatal): %s", sandbox_id, exc)
+
+        try:
+            sbx = await store.get(sandbox_id)
+            if sbx:
+                sbx.template_version = cur.version or new_ver
+                sbx.container_id = new.id
+                await store.save(sbx)
+        except Exception as exc:
+            logger.warning("migrate %s: store update failed (non-fatal): %s", sandbox_id, exc)
+    finally:
+        # Unlock — the new container now answers as sandbox_id; calls resume.
+        await activity.release_migration(sandbox_id)
 
     logger.info("MIGRATED %s -> %s (version=%s)", sandbox_id, target, cur.version or new_ver)
     return {

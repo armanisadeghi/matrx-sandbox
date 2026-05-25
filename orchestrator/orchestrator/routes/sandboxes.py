@@ -10,7 +10,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
 import httpx
 
-from orchestrator import sandbox_manager, storage
+from orchestrator import activity, sandbox_manager, storage
 from orchestrator.auth import sandbox_token
 from orchestrator.config import settings
 from orchestrator.models import (
@@ -143,6 +143,20 @@ async def get_sandbox(sandbox_id: str):
     return sandbox
 
 
+def _migrating_503(sandbox_id: str) -> HTTPException:
+    """Retryable response for a tool call that landed during a migration swap.
+    The agent's tool proxy retries onto the new container (same sandbox_id)."""
+    return HTTPException(
+        status_code=503,
+        detail={
+            "status": "migrating",
+            "sandbox_id": sandbox_id,
+            "message": "sandbox is migrating to a new image; retry shortly",
+        },
+        headers={"Retry-After": "3"},
+    )
+
+
 @router.post("/{sandbox_id}/exec", response_model=ExecResponse)
 async def exec_command(sandbox_id: str, req: ExecRequest):
     """Execute a command inside a running sandbox."""
@@ -151,16 +165,19 @@ async def exec_command(sandbox_id: str, req: ExecRequest):
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
 
     try:
-        exit_code, stdout, stderr, cwd = await sandbox_manager.exec_in_sandbox(
-            sandbox_id=sandbox_id,
-            command=req.command,
-            timeout=req.timeout,
-            user=req.user,
-            cwd=req.cwd,
-            env=req.env,
-            stdin=req.stdin,
-        )
-        return ExecResponse(exit_code=exit_code, stdout=stdout, stderr=stderr, cwd=cwd)
+        async with activity.track(sandbox_id):
+            exit_code, stdout, stderr, cwd = await sandbox_manager.exec_in_sandbox(
+                sandbox_id=sandbox_id,
+                command=req.command,
+                timeout=req.timeout,
+                user=req.user,
+                cwd=req.cwd,
+                env=req.env,
+                stdin=req.stdin,
+            )
+            return ExecResponse(exit_code=exit_code, stdout=stdout, stderr=stderr, cwd=cwd)
+    except activity.SandboxMigratingError:
+        raise _migrating_503(sandbox_id)
     except ValueError as e:
         raise HTTPException(status_code=400, detail=str(e))
     except RuntimeError as e:
@@ -610,39 +627,43 @@ async def proxy_fs(sandbox_id: str, path: str, request: Request):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
-        
-    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
-    if not container_ip:
-        raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
-    # Forward the request
-    url = f"http://{container_ip}:8000/fs/{path}"
-    
-    # We use httpx.AsyncClient to forward the request
-    async with httpx.AsyncClient() as client:
-        # Read the body if it exists
-        body = await request.body()
-        
-        # Forward the query parameters
-        params = request.query_params
-        
-        try:
-            resp = await client.request(
-                method=request.method,
-                url=url,
-                params=params,
-                content=body,
-                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
-                timeout=60.0
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail=f"Error proxying request: {exc}")
+    try:
+        async with activity.track(sandbox_id):
+            container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+            if not container_ip:
+                raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=dict(resp.headers)
-        )
+            # Forward the request
+            url = f"http://{container_ip}:8000/fs/{path}"
+
+            # We use httpx.AsyncClient to forward the request
+            async with httpx.AsyncClient() as client:
+                # Read the body if it exists
+                body = await request.body()
+
+                # Forward the query parameters
+                params = request.query_params
+
+                try:
+                    resp = await client.request(
+                        method=request.method,
+                        url=url,
+                        params=params,
+                        content=body,
+                        headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                        timeout=60.0
+                    )
+                except httpx.RequestError as exc:
+                    raise HTTPException(status_code=502, detail=f"Error proxying request: {exc}")
+
+                return Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    headers=dict(resp.headers)
+                )
+    except activity.SandboxMigratingError:
+        raise _migrating_503(sandbox_id)
 
 
 @router.api_route("/{sandbox_id}/exec/stream", methods=["POST"])
@@ -651,27 +672,35 @@ async def proxy_exec_stream(sandbox_id: str, request: Request):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
-        
+    if activity.is_migrating(sandbox_id):
+        raise _migrating_503(sandbox_id)
+
     container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
         raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
     url = f"http://{container_ip}:8000/exec/stream"
-    
+
     from fastapi.responses import StreamingResponse
-    
+
     async def stream_generator():
-        async with httpx.AsyncClient() as client:
-            body = await request.body()
-            async with client.stream(
-                method=request.method,
-                url=url,
-                content=body,
-                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
-                timeout=None
-            ) as resp:
-                async for chunk in resp.aiter_bytes():
-                    yield chunk
+        # Count the whole stream as in-flight so a migration drains/defers
+        # rather than cutting over mid-stream.
+        try:
+            async with activity.track(sandbox_id):
+                async with httpx.AsyncClient() as client:
+                    body = await request.body()
+                    async with client.stream(
+                        method=request.method,
+                        url=url,
+                        content=body,
+                        headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                        timeout=None
+                    ) as resp:
+                        async for chunk in resp.aiter_bytes():
+                            yield chunk
+        except activity.SandboxMigratingError:
+            return  # migration began in the race window; client retries the call
 
     return StreamingResponse(stream_generator(), media_type="text/event-stream")
 
@@ -682,34 +711,38 @@ async def proxy_git(sandbox_id: str, path: str, request: Request):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
-        
-    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
-    if not container_ip:
-        raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
-    url = f"http://{container_ip}:8000/git/{path}"
-    
-    async with httpx.AsyncClient() as client:
-        body = await request.body()
-        params = request.query_params
-        
-        try:
-            resp = await client.request(
-                method=request.method,
-                url=url,
-                params=params,
-                content=body,
-                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
-                timeout=120.0 # Git clones can take a while
-            )
-        except httpx.RequestError as exc:
-            raise HTTPException(status_code=502, detail=f"Error proxying request: {exc}")
+    try:
+        async with activity.track(sandbox_id):
+            container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+            if not container_ip:
+                raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
-        return Response(
-            content=resp.content,
-            status_code=resp.status_code,
-            headers=dict(resp.headers)
-        )
+            url = f"http://{container_ip}:8000/git/{path}"
+
+            async with httpx.AsyncClient() as client:
+                body = await request.body()
+                params = request.query_params
+
+                try:
+                    resp = await client.request(
+                        method=request.method,
+                        url=url,
+                        params=params,
+                        content=body,
+                        headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                        timeout=120.0 # Git clones can take a while
+                    )
+                except httpx.RequestError as exc:
+                    raise HTTPException(status_code=502, detail=f"Error proxying request: {exc}")
+
+                return Response(
+                    content=resp.content,
+                    status_code=resp.status_code,
+                    headers=dict(resp.headers)
+                )
+    except activity.SandboxMigratingError:
+        raise _migrating_503(sandbox_id)
 
 
 @router.api_route("/{sandbox_id}/credentials", methods=["POST"])
