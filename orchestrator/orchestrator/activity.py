@@ -39,6 +39,13 @@ def is_migrating(sandbox_id: str) -> bool:
     return sandbox_id in _migrating
 
 
+def inflight_count(sandbox_id: str) -> int:
+    """How many tool calls are executing against this box right now. The rolling
+    migrator uses this to migrate ONLY genuinely-idle boxes (0 in-flight), so a
+    call already mid-execution is never caught by a migration it can't 503-retry."""
+    return _inflight.get(sandbox_id, 0)
+
+
 @asynccontextmanager
 async def track(sandbox_id: str):
     """Count one in-flight tool call against a box. Refuses (raises
@@ -60,34 +67,34 @@ async def track(sandbox_id: str):
             _cond.notify_all()
 
 
-async def acquire_migration(sandbox_id: str, *, drain_timeout: float = 20.0) -> bool:
-    """Lock the box for migration and wait for in-flight calls to drain.
-
-    Returns True once locked AND idle (safe to swap). Returns False if calls did
-    not drain within ``drain_timeout`` — the lock is released and the caller must
-    NOT migrate now (defer + retry later). New calls are refused (503) for the
-    whole time the lock is held."""
+async def mark_migrating(sandbox_id: str) -> None:
+    """Lock the box for the WHOLE migration (call at migrate start). From here on
+    every new tool call is refused with a retryable 503 (see is_migrating + the
+    route guards), so calls don't hit the brief windows where the box's row/
+    container is in flux — they just retry and land on the migrated box. Must be
+    paired with release_migration() in a finally."""
     async with _cond:
         _migrating.add(sandbox_id)
-    try:
-        async with _cond:
-            try:
-                await asyncio.wait_for(
-                    _cond.wait_for(lambda: _inflight.get(sandbox_id, 0) == 0),
-                    timeout=drain_timeout,
-                )
-            except asyncio.TimeoutError:
-                logger.warning(
-                    "migration drain timed out for %s (in_flight=%d) — deferring",
-                    sandbox_id, _inflight.get(sandbox_id, 0),
-                )
-                _migrating.discard(sandbox_id)
-                return False
-        return True
-    except Exception:
-        async with _cond:
-            _migrating.discard(sandbox_id)
-        raise
+
+
+async def drain_inflight(sandbox_id: str, *, timeout: float = 20.0) -> bool:
+    """Wait for calls that were already in-flight when we marked migrating to
+    finish, so cutover never interrupts a tool mid-execution. Returns False if
+    they don't drain in time (caller defers the migration). New calls are already
+    refused via mark_migrating, so in-flight only shrinks."""
+    async with _cond:
+        try:
+            await asyncio.wait_for(
+                _cond.wait_for(lambda: _inflight.get(sandbox_id, 0) == 0),
+                timeout=timeout,
+            )
+            return True
+        except asyncio.TimeoutError:
+            logger.warning(
+                "migration drain timed out for %s (in_flight=%d) — deferring",
+                sandbox_id, _inflight.get(sandbox_id, 0),
+            )
+            return False
 
 
 async def release_migration(sandbox_id: str) -> None:

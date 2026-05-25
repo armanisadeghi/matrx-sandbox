@@ -160,6 +160,8 @@ def _migrating_503(sandbox_id: str) -> HTTPException:
 @router.post("/{sandbox_id}/exec", response_model=ExecResponse)
 async def exec_command(sandbox_id: str, req: ExecRequest):
     """Execute a command inside a running sandbox."""
+    if activity.is_migrating(sandbox_id):
+        raise _migrating_503(sandbox_id)
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -624,6 +626,8 @@ async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
 @router.api_route("/{sandbox_id}/fs/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_fs(sandbox_id: str, path: str, request: Request):
     """Proxy file system requests to the internal sandbox daemon."""
+    if activity.is_migrating(sandbox_id):
+        raise _migrating_503(sandbox_id)
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -708,6 +712,8 @@ async def proxy_exec_stream(sandbox_id: str, request: Request):
 @router.api_route("/{sandbox_id}/git/{path:path}", methods=["GET", "POST"])
 async def proxy_git(sandbox_id: str, path: str, request: Request):
     """Proxy git requests to the internal sandbox daemon."""
+    if activity.is_migrating(sandbox_id):
+        raise _migrating_503(sandbox_id)
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")

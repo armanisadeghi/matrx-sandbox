@@ -73,9 +73,14 @@ def _container_version(container) -> str | None:
 
 
 async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = None,
-                          verify_timeout: int = 90) -> dict:
+                          verify_timeout: int = 90, require_idle: bool = False) -> dict:
     """Migrate one box to the current image (or an explicit target_image).
-    Returns a status dict; never raises."""
+    Returns a status dict; never raises.
+
+    ``require_idle`` (used by the rolling auto-migrator): refuse to start if the
+    box has any in-flight tool call, so a call already mid-execution is never
+    caught by the swap. Defers to the next pass instead."""
+    from orchestrator import activity
     from orchestrator.sandbox_manager import _get_docker_client
 
     client = _get_docker_client()
@@ -93,6 +98,10 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     if not target_image and cur.image_id and old_image_id == cur.image_id:
         return {"status": "already_current", "sandbox_id": sandbox_id, "version": cur.version}
 
+    if require_idle and activity.inflight_count(sandbox_id) > 0:
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": "box has in-flight tool calls; defer migration to an idle gap"}
+
     cfg = old.attrs.get("Config") or {}
     host = old.attrs.get("HostConfig") or {}
     # Copy the old env EXCEPT MATRX_IMAGE_VERSION — the new image must report its
@@ -102,74 +111,78 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     volumes = _binds_to_volumes(host)
     tmp_name = f"{sandbox_id}-mig"
 
-    try:
-        client.containers.get(tmp_name).remove(force=True)  # clear any stale temp
-    except NotFound:
-        pass
-    except APIError as exc:
-        logger.warning("migrate %s: could not clear stale temp container: %s", sandbox_id, exc)
-
-    logger.info(
-        "migrate %s: %s -> %s (template=%s)",
-        sandbox_id, (old_image_id or "?")[:19], target, template,
-    )
-    run_kwargs: dict = dict(
-        image=target, name=tmp_name, detach=True, environment=env,
-        volumes=volumes or None, network=settings.docker_network,
-        cap_add=["SYS_ADMIN"], devices=["/dev/fuse"], cap_drop=[],
-        ports={"22/tcp": None}, extra_hosts={"host.docker.internal": "host-gateway"},
-        labels=labels, restart_policy={"Name": "no", "MaximumRetryCount": 0},
-    )
-    if host.get("NanoCpus"):
-        run_kwargs["nano_cpus"] = host["NanoCpus"]
-    if host.get("Memory"):
-        run_kwargs["mem_limit"] = host["Memory"]
-
-    try:
-        new = client.containers.run(**run_kwargs)
-    except APIError as exc:
-        logger.error("migrate %s: new container create failed: %s", sandbox_id, exc)
-        return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"create failed: {exc}"}
-
-    ready = await _wait_container_ready(new, verify_timeout)
-    new_ver = _container_version(new) if ready else None
-    # Skip the strict version equality when the current image is itself
-    # unversioned (built before the stamp) — fall back to readiness + image id.
-    version_ok = cur.version is None or new_ver == cur.version
-    if not ready or not version_ok:
-        logger.error(
-            "MIGRATE FAILED %s: ready=%s new_version=%s expected=%s — OLD box kept running, ALARM",
-            sandbox_id, ready, new_ver, cur.version,
-        )
-        try:
-            new.remove(force=True)
-        except APIError:
-            pass
-        return {
-            "status": "failed", "sandbox_id": sandbox_id,
-            "reason": f"new box not ready / version mismatch (ready={ready}, version={new_ver}->{cur.version})",
-        }
-
-    # ── Lock + drain right before cutover ────────────────────────────────────
-    # The new box is built and verified while the OLD box keeps serving (no lock
-    # yet). Only NOW do we refuse new calls and wait for in-flight ones to finish,
-    # so the agent-visible "migrating" window is just the drain+cutover (seconds),
-    # not the whole image build. If calls don't drain, defer — never cut over
-    # mid-operation.
+    # Lock for the WHOLE migration up front. While building the new container,
+    # both it and the old one carry the same matrx.sandbox_id label, and the
+    # store row / container lookup briefly flux — so rather than let calls race
+    # that (they 404'd / timed out in testing), we refuse every call with a
+    # retryable 503 from here until release. The agent's tool proxy waits it out
+    # and lands on the migrated box. We only auto-migrate idle boxes, so in
+    # practice few/no calls arrive during the window.
     from orchestrator import activity
 
-    drained = await activity.acquire_migration(sandbox_id, drain_timeout=20.0)
-    if not drained:
-        logger.info("migrate %s: box busy, deferring (will retry later)", sandbox_id)
-        try:
-            new.remove(force=True)
-        except APIError:
-            pass
-        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                "reason": "in-flight tool calls did not drain; retry later"}
-
-    # ── Atomic cutover (box is locked: new calls get 503-retry) ───────────────
+    await activity.mark_migrating(sandbox_id)
+    new = None
     try:
+        try:
+            client.containers.get(tmp_name).remove(force=True)  # clear any stale temp
+        except NotFound:
+            pass
+        except APIError as exc:
+            logger.warning("migrate %s: could not clear stale temp container: %s", sandbox_id, exc)
+
+        logger.info(
+            "migrate %s: %s -> %s (template=%s)",
+            sandbox_id, (old_image_id or "?")[:19], target, template,
+        )
+        run_kwargs: dict = dict(
+            image=target, name=tmp_name, detach=True, environment=env,
+            volumes=volumes or None, network=settings.docker_network,
+            cap_add=["SYS_ADMIN"], devices=["/dev/fuse"], cap_drop=[],
+            ports={"22/tcp": None}, extra_hosts={"host.docker.internal": "host-gateway"},
+            labels=labels, restart_policy={"Name": "no", "MaximumRetryCount": 0},
+        )
+        if host.get("NanoCpus"):
+            run_kwargs["nano_cpus"] = host["NanoCpus"]
+        if host.get("Memory"):
+            run_kwargs["mem_limit"] = host["Memory"]
+
+        try:
+            new = client.containers.run(**run_kwargs)
+        except APIError as exc:
+            logger.error("migrate %s: new container create failed: %s", sandbox_id, exc)
+            return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"create failed: {exc}"}
+
+        ready = await _wait_container_ready(new, verify_timeout)
+        new_ver = _container_version(new) if ready else None
+        # Skip strict version equality when the current image is itself
+        # unversioned (built before the stamp) — fall back to readiness + image id.
+        version_ok = cur.version is None or new_ver == cur.version
+        if not ready or not version_ok:
+            logger.error(
+                "MIGRATE FAILED %s: ready=%s new_version=%s expected=%s — OLD box kept running, ALARM",
+                sandbox_id, ready, new_ver, cur.version,
+            )
+            try:
+                new.remove(force=True)
+            except APIError:
+                pass
+            return {
+                "status": "failed", "sandbox_id": sandbox_id,
+                "reason": f"new box not ready / version mismatch (ready={ready}, version={new_ver}->{cur.version})",
+            }
+
+        # Drain calls that were already in-flight when we locked, so cutover
+        # never interrupts a tool mid-execution. New calls are already refused.
+        if not await activity.drain_inflight(sandbox_id, timeout=20.0):
+            logger.info("migrate %s: box busy, deferring (will retry later)", sandbox_id)
+            try:
+                new.remove(force=True)
+            except APIError:
+                pass
+            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                    "reason": "in-flight tool calls did not drain; retry later"}
+
+        # ── Atomic cutover ────────────────────────────────────────────────────
         old_renamed = f"{sandbox_id}-old-{int(time.time())}"
         try:
             try:
@@ -238,7 +251,7 @@ async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
             results["skipped"].append(box.sandbox_id)
             continue
         try:
-            res = await migrate_sandbox(box.sandbox_id, store=store)
+            res = await migrate_sandbox(box.sandbox_id, store=store, require_idle=True)
         except Exception as exc:  # defensive — migrate_sandbox already guards, but never let one box abort the pass
             logger.error("migrate_all: %s raised: %s", box.sandbox_id, exc)
             results["failed"].append(box.sandbox_id)
