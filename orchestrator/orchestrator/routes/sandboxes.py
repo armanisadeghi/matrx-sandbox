@@ -440,6 +440,30 @@ async def sandbox_agent_env(sandbox_id: str) -> dict:
     return out
 
 
+@router.post("/{sandbox_id}/migrate")
+async def migrate_sandbox_route(sandbox_id: str, target_image: str | None = None):
+    """Zero-drift migration: swap this box onto the current image for its
+    template, keeping the SAME sandbox_id and per-user volume (data intact).
+
+    Unlike /resume and /reset, the sandbox_id does NOT change — the agent's
+    existing binding (``/sandboxes/<id>``) stays valid across the swap, which is
+    what lets a chat suspend, migrate, and resume in place. The CALLER must
+    quiesce the chat first (aidream parks the turn); this primitive verifies
+    readiness + version before cutover and rolls back to the old box on failure.
+    Master-key only (global APIKeyMiddleware)."""
+    from orchestrator.migrate import migrate_sandbox
+
+    store = sandbox_manager._get_store()
+    result = await migrate_sandbox(sandbox_id, store=store, target_image=target_image)
+    if result["status"] in ("migrated", "already_current"):
+        return result
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    # failed — the OLD box is still running; surface loudly (502, not 500, so the
+    # caller knows the box is intact and it can keep using the old version).
+    raise HTTPException(status_code=502, detail=result)
+
+
 @router.post("/{sandbox_id}/heartbeat", response_model=HeartbeatResponse)
 async def sandbox_heartbeat(sandbox_id: str):
     """Record a heartbeat from a sandbox."""
