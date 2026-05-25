@@ -49,7 +49,7 @@ async def get_user_persistence(user_id: str) -> dict[str, Any]:
     # and surfaced via aidream's cloud_sync system, not by this orchestrator.
     volume_bytes: int | None = None
     if location.tier == "hosted" and location.volume_name:
-        volume_bytes = sandbox_manager.get_user_volume_size(user_id)
+        volume_bytes = await sandbox_manager.get_user_volume_size(user_id)
 
     # How many sandboxes does this user have on this tier?
     sandboxes = await sandbox_manager.list_sandboxes(user_id=user_id)

@@ -25,6 +25,7 @@ Guardrails (memory is meant to be SMALL):
 
 from __future__ import annotations
 
+import asyncio
 import io
 import logging
 import tarfile
@@ -76,10 +77,10 @@ async def hydrate_memory_into_container(container, user_id: str, store) -> int:
         buf.seek(0)
         if written == 0:
             return 0
-        container.put_archive(AGENT_HOME, buf.getvalue())
+        await asyncio.to_thread(container.put_archive, AGENT_HOME, buf.getvalue())
         # Make sure agent owns the tree (put_archive sets uid/gid numerically
         # but the .matrx parent dir may pre-exist root-owned from an early boot).
-        container.exec_run(["chown", "-R", "agent:agent", f"{AGENT_HOME}/.matrx"])
+        await asyncio.to_thread(container.exec_run, ["chown", "-R", "agent:agent", f"{AGENT_HOME}/.matrx"])
         logger.info("memory hydrate: wrote %d file(s) into %s for user %s",
                     written, MEMORY_ABS, user_id)
         return written
@@ -95,7 +96,7 @@ async def capture_memory_from_container(container, user_id: str, store) -> int:
     BEFORE the container is stopped (the dir must still be readable).
     """
     try:
-        bits, _ = container.get_archive(MEMORY_ABS)
+        bits, _ = await asyncio.to_thread(container.get_archive, MEMORY_ABS)
     except Exception as exc:
         # NotFound just means the box never created/used memory — not an error.
         logger.debug("memory capture: get_archive(%s) for %s: %s", MEMORY_ABS, user_id, exc)

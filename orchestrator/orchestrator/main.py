@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from contextlib import asynccontextmanager
 
@@ -230,7 +231,8 @@ async def version_drift():
     from orchestrator.sandbox_manager import _get_docker_client
     from orchestrator.versioning import drift_summary
 
-    return drift_summary(_get_docker_client())
+    client = _get_docker_client()
+    return await asyncio.to_thread(drift_summary, client)
 
 
 @app.post("/migrate-all", tags=["meta"])

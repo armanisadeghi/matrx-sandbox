@@ -107,7 +107,7 @@ async def _retire_stale_warm(template: str, current_image_id: str | None) -> int
         try:
             if c.image.id != current_image_id:
                 sid = (c.attrs.get("Config", {}) or {}).get("Labels", {}).get("matrx.sandbox_id", c.id[:12])
-                c.remove(force=True)
+                await asyncio.to_thread(c.remove, force=True)
                 retired += 1
                 logger.info("Pool: retired stale warm %s (template=%s, image upgraded)", sid, template)
         except Exception as exc:
@@ -203,7 +203,7 @@ async def _unclaimed_warm(template: str) -> list:
     from orchestrator.sandbox_manager import _get_store
     store = _get_store()
     out = []
-    for c in list_warm_containers(template):
+    for c in await asyncio.to_thread(list_warm_containers, template):
         labels = (c.attrs.get("Config", {}) or {}).get("Labels") or {}
         sid = labels.get("matrx.sandbox_id")
         if not sid:
@@ -221,11 +221,11 @@ async def ensure_warm_pool() -> dict:
     superseded (version-refresh), then top the template up to its count."""
     summary = {"per_template": {}, "warmed": 0, "retired": 0}
     for template, target in _warm_targets():
-        retired = await _retire_stale_warm(template, _current_image_id(template))
+        retired = await _retire_stale_warm(template, await asyncio.to_thread(_current_image_id, template))
         have = len(await _unclaimed_warm(template))  # post-retire count of fresh boxes
         warmed = 0
         for _ in range(max(0, target - have)):
-            if _warm_run_container(template) is not None:
+            if await asyncio.to_thread(_warm_run_container, template) is not None:
                 warmed += 1
         summary["per_template"][template] = {"target": target, "have": have, "warmed": warmed, "retired": retired}
         summary["warmed"] += warmed
@@ -253,7 +253,7 @@ async def claim_warm(
 
     store = _get_store()
     container = candidates[0]
-    container.reload()
+    await asyncio.to_thread(container.reload)
     labels = (container.attrs.get("Config", {}) or {}).get("Labels") or {}
     sandbox_id = labels.get("matrx.sandbox_id")
     if not sandbox_id:

@@ -285,7 +285,7 @@ async def create_sandbox(
             # Hosted tier: per-user Docker volume mounted at /home/agent.
             # Volume survives container destruction; subsequent sandboxes for
             # the same user see the same home dir.
-            volume_name = ensure_user_volume(client, user_id)
+            volume_name = await asyncio.to_thread(ensure_user_volume, client, user_id)
             volumes[volume_name] = {"bind": "/home/agent", "mode": "rw"}
             sandbox.persistence_volume = volume_name
             logger.info(
@@ -405,14 +405,14 @@ async def create_sandbox(
         # like. Falls back to the caller's value when the image is unstamped.
         try:
             from orchestrator.versioning import current_image
-            _born_version = current_image(client, template).version
+            _born_version = (await asyncio.to_thread(current_image, client, template)).version
             if _born_version:
                 template_version = _born_version
                 sandbox.template_version = _born_version
         except Exception as exc:
             logger.debug("could not read baked image version for %s: %s", image_for_template, exc)
 
-        container = client.containers.run(
+        container = await asyncio.to_thread(lambda: client.containers.run(
             image=image_for_template,
             name=sandbox_id,
             detach=True,
@@ -447,13 +447,13 @@ async def create_sandbox(
                 **{f"matrx.label.{k}": v for k, v in (labels or {}).items()},
             },
             restart_policy={"Name": "no", "MaximumRetryCount": 0},
-        )  # type: ignore[call-overload]
+        ))  # type: ignore[call-overload]
 
         sandbox.container_id = container.id
         sandbox.status = SandboxStatus.STARTING
 
         # Read back the dynamically assigned SSH host port
-        container.reload()
+        await asyncio.to_thread(container.reload)
         port_bindings = container.attrs["NetworkSettings"]["Ports"].get("22/tcp")
         if port_bindings:
             sandbox.ssh_port = int(port_bindings[0]["HostPort"])
@@ -491,12 +491,12 @@ async def _wait_for_ready(sandbox: SandboxResponse, timeout: int = 120) -> Sandb
 
     while elapsed < timeout:
         try:
-            container = client.containers.get(sandbox.sandbox_id)
+            container = await asyncio.to_thread(client.containers.get, sandbox.sandbox_id)
             if container.status == "exited":
                 sandbox.status = SandboxStatus.FAILED
                 return sandbox
 
-            exit_code, _ = container.exec_run("test -f /tmp/.sandbox_ready")
+            exit_code, _ = await asyncio.to_thread(container.exec_run, "test -f /tmp/.sandbox_ready")
             if exit_code == 0:
                 sandbox.status = SandboxStatus.READY
                 return sandbox
@@ -541,11 +541,15 @@ async def list_sandboxes(user_id: str | None = None) -> list[SandboxResponse]:
     return rows
 
 
-def get_sandbox_internal_ip(sandbox_id: str) -> str | None:
-    """Get the internal Docker IP address of a running sandbox."""
+async def get_sandbox_internal_ip(sandbox_id: str) -> str | None:
+    """Get the internal Docker IP address of a running sandbox.
+
+    Async + threaded: this runs on every proxied tool call (fs/exec/git), so a
+    synchronous docker round-trip here would stall the whole event loop.
+    """
     client = _get_docker_client()
     try:
-        container = client.containers.get(sandbox_id)
+        container = await asyncio.to_thread(client.containers.get, sandbox_id)
         return container.attrs.get("NetworkSettings", {}).get("Networks", {}).get(settings.docker_network, {}).get("IPAddress")
     except (NotFound, APIError):
         return None
@@ -590,10 +594,10 @@ async def exec_in_sandbox(
 
     client = _get_docker_client()
     try:
-        container = client.containers.get(sandbox.sandbox_id)
+        container = await asyncio.to_thread(client.containers.get, sandbox.sandbox_id)
 
         # C1/H5: Validate container is actually running before exec
-        container.reload()
+        await asyncio.to_thread(container.reload)
         if container.status != "running":
             raise RuntimeError(
                 f"Container for sandbox {sandbox_id} is not running "
@@ -632,7 +636,9 @@ async def exec_in_sandbox(
                 container, wrapped, user, env or {}, stdin, sandbox_id, effective_cwd,
             )
 
-        exit_code, output = container.exec_run(**exec_kwargs)
+        # The actual command run — can be arbitrarily long (e.g. a build or a
+        # `sleep`). Offloaded to a thread so it never blocks the event loop.
+        exit_code, output = await asyncio.to_thread(container.exec_run, **exec_kwargs)
 
         stdout_raw = (output[0] or b"").decode("utf-8", errors="replace")
         stderr = (output[1] or b"").decode("utf-8", errors="replace")
@@ -665,48 +671,56 @@ async def _exec_with_stdin(
     the lower-level ``exec_create`` + ``exec_start`` pair with ``socket=True``
     to write the input, then collect output.
     """
-    api = container.client.api
-    exec_id = api.exec_create(
-        container.id,
-        cmd=["bash", "-c", wrapped],
-        user=user,
-        environment=env,
-        stdin=True,
-        tty=False,
-        stdout=True,
-        stderr=True,
-    )["Id"]
+    # The whole exec_create + socket send/recv + exec_inspect dance is blocking
+    # docker/socket IO. Run it in a thread so a slow stdin-fed command can't
+    # freeze the event loop.
+    def _blocking() -> tuple[int, str, str]:
+        api = container.client.api
+        exec_id = api.exec_create(
+            container.id,
+            cmd=["bash", "-c", wrapped],
+            user=user,
+            environment=env,
+            stdin=True,
+            tty=False,
+            stdout=True,
+            stderr=True,
+        )["Id"]
 
-    sock = api.exec_start(exec_id, socket=True, demux=True)
-    raw = sock._sock if hasattr(sock, "_sock") else sock
-    try:
-        raw.sendall(stdin_data.encode("utf-8"))
+        sock = api.exec_start(exec_id, socket=True, demux=True)
+        raw = sock._sock if hasattr(sock, "_sock") else sock
         try:
-            raw.shutdown(1)  # SHUT_WR — signal EOF on stdin
-        except OSError:
-            pass
+            raw.sendall(stdin_data.encode("utf-8"))
+            try:
+                raw.shutdown(1)  # SHUT_WR — signal EOF on stdin
+            except OSError:
+                pass
 
-        chunks_out = bytearray()
-        chunks_err = bytearray()
-        while True:
-            data = raw.recv(65536)
-            if not data:
-                break
-            chunks_out.extend(data)
-        # NOTE: exec_start with demux=True returns multiplexed frames; we
-        # accept the simpler interleaved approach for stdin-fed execs and
-        # surface the combined stream as stdout. The frontend's primary use
-        # case for stdin is non-interactive piping (heredoc replacement).
-    finally:
-        try:
-            raw.close()
-        except OSError:
-            pass
+            chunks_out = bytearray()
+            chunks_err = bytearray()
+            while True:
+                data = raw.recv(65536)
+                if not data:
+                    break
+                chunks_out.extend(data)
+            # NOTE: exec_start with demux=True returns multiplexed frames; we
+            # accept the simpler interleaved approach for stdin-fed execs and
+            # surface the combined stream as stdout. The frontend's primary use
+            # case for stdin is non-interactive piping (heredoc replacement).
+        finally:
+            try:
+                raw.close()
+            except OSError:
+                pass
 
-    inspect = api.exec_inspect(exec_id)
-    exit_code = inspect.get("ExitCode") or 0
-    stdout_raw = chunks_out.decode("utf-8", errors="replace")
-    stderr = chunks_err.decode("utf-8", errors="replace")
+        inspect = api.exec_inspect(exec_id)
+        return (
+            inspect.get("ExitCode") or 0,
+            chunks_out.decode("utf-8", errors="replace"),
+            chunks_err.decode("utf-8", errors="replace"),
+        )
+
+    exit_code, stdout_raw, stderr = await asyncio.to_thread(_blocking)
 
     stdout, new_cwd = _parse_cwd_sentinel(stdout_raw)
     if new_cwd:
@@ -784,7 +798,7 @@ async def destroy_sandbox(
 
     client = _get_docker_client()
     try:
-        container = client.containers.get(sandbox.sandbox_id)
+        container = await asyncio.to_thread(client.containers.get, sandbox.sandbox_id)
 
         # Capture the box's .matrx/memory/ back to central memory BEFORE we stop
         # it (the dir must still be readable). Best-effort — never block teardown.
@@ -797,9 +811,9 @@ async def destroy_sandbox(
                 logger.warning("Memory capture skipped for %s: %s", sandbox_id, exc)
 
         if graceful:
-            container.stop(timeout=settings.shutdown_timeout_seconds + 10)
+            await asyncio.to_thread(container.stop, timeout=settings.shutdown_timeout_seconds + 10)
         else:
-            container.kill()
+            await asyncio.to_thread(container.kill)
 
         # ``container.remove`` deletes the container itself — anonymous
         # volumes go with it, but the *named* per-user volume we mounted
@@ -807,7 +821,7 @@ async def destroy_sandbox(
         # point of the persistence model: user data survives sandbox
         # lifecycle. Explicit volume wipe is a separate, admin-only path
         # (see ``delete_user_volume``).
-        container.remove(force=True)
+        await asyncio.to_thread(container.remove, force=True)
 
         await _finalize_terminal_status(store, sandbox_id, reason, final_status)
 
@@ -842,9 +856,8 @@ async def delete_user_volume(user_id: str) -> bool:
     client = _get_docker_client()
 
     # Refuse if any sandbox is still using the volume — would surprise the user.
-    in_use = client.containers.list(
-        all=True,
-        filters={"volume": name},
+    in_use = await asyncio.to_thread(
+        lambda: client.containers.list(all=True, filters={"volume": name})
     )
     if in_use:
         raise RuntimeError(
@@ -853,13 +866,13 @@ async def delete_user_volume(user_id: str) -> bool:
         )
 
     try:
-        volume = client.volumes.get(name)
+        volume = await asyncio.to_thread(client.volumes.get, name)
     except NotFound:
         logger.info("delete_user_volume(%s): volume not found, no-op", user_id)
         return True
 
     try:
-        volume.remove(force=False)
+        await asyncio.to_thread(volume.remove, force=False)
         logger.warning("Deleted user volume %s for user %s", name, user_id)
         return True
     except APIError as e:
@@ -867,7 +880,7 @@ async def delete_user_volume(user_id: str) -> bool:
         return False
 
 
-def get_user_volume_size(user_id: str) -> int | None:
+async def get_user_volume_size(user_id: str) -> int | None:
     """Return the current size in bytes of a user's hosted-tier volume.
 
     None if the volume doesn't exist (user has no hosted-tier data yet) or
@@ -881,7 +894,7 @@ def get_user_volume_size(user_id: str) -> int | None:
     try:
         # API endpoint /volumes returns a list with UsageData when invoked
         # with the `?status=true` flag-equivalent in the SDK.
-        volumes_data = client.api.volumes()
+        volumes_data = await asyncio.to_thread(client.api.volumes)
         for v in volumes_data.get("Volumes") or []:
             if v.get("Name") == name:
                 usage = v.get("UsageData") or {}

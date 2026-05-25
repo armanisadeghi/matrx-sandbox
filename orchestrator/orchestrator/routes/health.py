@@ -9,6 +9,7 @@ on 2026-04-26 should be visible *before* the deploy fails.
 
 from __future__ import annotations
 
+import asyncio
 import os
 import shutil
 import time
@@ -100,7 +101,7 @@ async def system_info():
     load = _read_loadavg()
     cpu_count = os.cpu_count() or 0
 
-    counts = _docker_container_counts()
+    counts = await asyncio.to_thread(_docker_container_counts)
 
     sandboxes = await sandbox_manager.list_sandboxes()
     active = sum(1 for s in sandboxes if s.status in ("ready", "running", "starting"))

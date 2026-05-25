@@ -32,6 +32,7 @@ expire path.
 
 from __future__ import annotations
 
+import asyncio
 import logging
 from datetime import datetime, timezone
 
@@ -127,9 +128,8 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
         return summary
 
     try:
-        containers = client.containers.list(
-            all=True,
-            filters={"label": "matrx.sandbox_id"},
+        containers = await asyncio.to_thread(
+            lambda: client.containers.list(all=True, filters={"label": "matrx.sandbox_id"})
         )
     except Exception as exc:
         logger.warning("Reconcile skipped: docker.containers.list failed: %s", exc)
@@ -139,7 +139,7 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
 
     for container in containers:
         try:
-            container.reload()
+            await asyncio.to_thread(container.reload)
             attrs = container.attrs or {}
             labels = (attrs.get("Config", {}) or {}).get("Labels") or {}
             sandbox_id = labels.get("matrx.sandbox_id")
@@ -206,7 +206,7 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
                     "soft-deleted" if lifecycle["deleted"] else lifecycle["status"],
                 )
                 try:
-                    container.remove(force=True)
+                    await asyncio.to_thread(container.remove, force=True)
                 except Exception as exc:
                     logger.warning("Reconcile: failed to reap orphan %s: %s", sandbox_id, exc)
                 continue
@@ -320,7 +320,7 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
         return summary
 
     try:
-        alive_ids = _alive_container_ids(client, host_tier)
+        alive_ids = await asyncio.to_thread(_alive_container_ids, client, host_tier)
     except Exception as exc:
         # If we can't enumerate containers, do NOT proceed — an empty/partial
         # alive set would wrongly stop healthy rows. Better to skip this tick.

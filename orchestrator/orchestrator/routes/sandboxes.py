@@ -408,8 +408,8 @@ async def sandbox_agent_env(sandbox_id: str) -> dict:
 
     try:
         client = sandbox_manager._get_docker_client()
-        container = client.containers.get(sandbox_id)
-        container.reload()
+        container = await asyncio.to_thread(client.containers.get, sandbox_id)
+        await asyncio.to_thread(container.reload)
 
         # 1. docker inspect Config.Env — the snapshot at run time
         cfg_env = container.attrs.get("Config", {}).get("Env", []) or []
@@ -417,7 +417,7 @@ async def sandbox_agent_env(sandbox_id: str) -> dict:
 
         # 2. fresh shell `env` inside container
         try:
-            exit_code, output = container.exec_run(["env"], stdout=True, stderr=True)
+            exit_code, output = await asyncio.to_thread(lambda: container.exec_run(["env"], stdout=True, stderr=True))
             text = output.decode(errors="replace") if output else ""
             if exit_code != 0:
                 out["runtime_env_error"] = text
@@ -429,16 +429,16 @@ async def sandbox_agent_env(sandbox_id: str) -> dict:
         # 3. aidream process env via /proc/<pid>/environ if aidream is up
         try:
             # Find PID of the uvicorn-running aidream process.
-            pid_code, pid_out = container.exec_run(
+            pid_code, pid_out = await asyncio.to_thread(lambda: container.exec_run(
                 ["sh", "-lc", "pgrep -f 'aidream|uvicorn' | head -1"],
                 stdout=True, stderr=True,
-            )
+            ))
             pid_text = (pid_out.decode(errors="replace") if pid_out else "").strip()
             if pid_code == 0 and pid_text.isdigit():
-                env_code, env_out = container.exec_run(
+                env_code, env_out = await asyncio.to_thread(lambda: container.exec_run(
                     ["sh", "-lc", f"tr '\\0' '\\n' < /proc/{pid_text}/environ"],
                     stdout=True, stderr=True,
-                )
+                ))
                 if env_code == 0:
                     out["aidream_pid"] = int(pid_text)
                     out["aidream_proc_env"] = _kv_list_from_env_lines(
@@ -563,7 +563,7 @@ async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
         await websocket.close(code=1008, reason=f"Sandbox {sandbox_id} not found")
         return
         
-    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
         await websocket.close(code=1011, reason="Could not determine sandbox IP")
         return
@@ -634,7 +634,7 @@ async def proxy_fs(sandbox_id: str, path: str, request: Request):
 
     try:
         async with activity.track(sandbox_id):
-            container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+            container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
             if not container_ip:
                 raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
@@ -679,7 +679,7 @@ async def proxy_exec_stream(sandbox_id: str, request: Request):
     if activity.is_migrating(sandbox_id):
         raise _migrating_503(sandbox_id)
 
-    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
         raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
@@ -720,7 +720,7 @@ async def proxy_git(sandbox_id: str, path: str, request: Request):
 
     try:
         async with activity.track(sandbox_id):
-            container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+            container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
             if not container_ip:
                 raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
@@ -759,7 +759,7 @@ async def proxy_credentials(sandbox_id: str, request: Request):
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
         
-    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
         raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
@@ -799,7 +799,7 @@ async def proxy_pty(sandbox_id: str, websocket: WebSocket):
         await websocket.close(code=1008, reason=f"Sandbox {sandbox_id} not found")
         return
         
-    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
         await websocket.close(code=1011, reason="Could not determine sandbox IP")
         return
@@ -865,7 +865,7 @@ async def proxy_search(sandbox_id: str, path: str, request: Request):
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
         
-    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
         raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
@@ -900,7 +900,7 @@ async def proxy_processes(sandbox_id: str, request: Request, pid: int = None):
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
         
-    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
         raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
@@ -936,7 +936,7 @@ async def proxy_ports(sandbox_id: str, request: Request):
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
         
-    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
         raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
@@ -1232,7 +1232,7 @@ async def proxy_to_container(sandbox_id: str, path: str, request: Request):
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
 
-    container_ip = sandbox_manager.get_sandbox_internal_ip(sandbox_id)
+    container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
         raise HTTPException(status_code=502, detail="Sandbox container has no reachable IP")
 
@@ -1384,8 +1384,8 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
     container_info: dict[str, object] = {"present": False}
     try:
         client = sandbox_manager._get_docker_client()
-        container = client.containers.get(sandbox_id)
-        container.reload()
+        container = await asyncio.to_thread(client.containers.get, sandbox_id)
+        await asyncio.to_thread(container.reload)
         attrs = container.attrs
         state = attrs.get("State", {})
         net = attrs.get("NetworkSettings", {}).get("Networks", {})
@@ -1491,11 +1491,11 @@ async def sandbox_logs(sandbox_id: str, source: str = "all", tail: int = 200) ->
         # subprocess-based docker exec fails with FileNotFoundError.
         try:
             client = sandbox_manager._get_docker_client()
-            container = client.containers.get(sandbox_id)
-            exit_code, output = container.exec_run(
+            container = await asyncio.to_thread(client.containers.get, sandbox_id)
+            exit_code, output = await asyncio.to_thread(lambda: container.exec_run(
                 ["tail", "-n", str(tail), path],
                 stdout=True, stderr=True, demux=False,
-            )
+            ))
             text = output.decode(errors="replace") if output else ""
             if exit_code != 0:
                 return f"(could not read {path}: exit={exit_code}) {text.strip()}"
@@ -1511,8 +1511,8 @@ async def sandbox_logs(sandbox_id: str, source: str = "all", tail: int = 200) ->
         out.append("=== docker logs (container stdout/stderr) ===")
         try:
             client = sandbox_manager._get_docker_client()
-            container = client.containers.get(sandbox_id)
-            log_bytes = container.logs(tail=tail, stdout=True, stderr=True, timestamps=False)
+            container = await asyncio.to_thread(client.containers.get, sandbox_id)
+            log_bytes = await asyncio.to_thread(lambda: container.logs(tail=tail, stdout=True, stderr=True, timestamps=False))
             out.append(log_bytes.decode(errors="replace") if log_bytes else "(no log output)")
         except Exception as exc:
             out.append(f"(error fetching docker logs: {exc})")

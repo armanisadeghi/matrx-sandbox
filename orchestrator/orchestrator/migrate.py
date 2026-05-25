@@ -46,10 +46,10 @@ async def _wait_container_ready(container, timeout: int) -> bool:
     elapsed, interval = 0, 2
     while elapsed < timeout:
         try:
-            container.reload()
+            await asyncio.to_thread(container.reload)
             if container.status == "exited":
                 return False
-            code, _ = container.exec_run("test -f /tmp/.sandbox_ready")
+            code, _ = await asyncio.to_thread(container.exec_run, "test -f /tmp/.sandbox_ready")
             if code == 0:
                 return True
         except (NotFound, APIError) as exc:
@@ -60,11 +60,11 @@ async def _wait_container_ready(container, timeout: int) -> bool:
     return False
 
 
-def _container_version(container) -> str | None:
+async def _container_version(container) -> str | None:
     """Read /etc/sandbox-image-version from inside the box (the image-baked file,
     not the overridable env) — the source of truth for what version it came up on."""
     try:
-        code, out = container.exec_run("cat /etc/sandbox-image-version")
+        code, out = await asyncio.to_thread(container.exec_run, "cat /etc/sandbox-image-version")
         if code == 0:
             return (out or b"").decode("utf-8", errors="replace").strip() or None
     except (NotFound, APIError):
@@ -85,13 +85,13 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
 
     client = _get_docker_client()
     try:
-        old = client.containers.get(sandbox_id)
+        old = await asyncio.to_thread(client.containers.get, sandbox_id)
     except NotFound:
         return {"status": "not_found", "sandbox_id": sandbox_id}
 
     labels = old.labels or {}
     template = labels.get("matrx.template")
-    cur = current_image(client, template)
+    cur = await asyncio.to_thread(current_image, client, template)
     target = target_image or cur.tag
     old_image_id = (old.attrs or {}).get("Image")
 
@@ -131,7 +131,7 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     new = None
     try:
         try:
-            client.containers.get(tmp_name).remove(force=True)  # clear any stale temp
+            await asyncio.to_thread(lambda: client.containers.get(tmp_name).remove(force=True))  # clear any stale temp
         except NotFound:
             pass
         except APIError as exc:
@@ -154,13 +154,13 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
             run_kwargs["mem_limit"] = host["Memory"]
 
         try:
-            new = client.containers.run(**run_kwargs)
+            new = await asyncio.to_thread(lambda: client.containers.run(**run_kwargs))
         except APIError as exc:
             logger.error("migrate %s: new container create failed: %s", sandbox_id, exc)
             return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"create failed: {exc}"}
 
         ready = await _wait_container_ready(new, verify_timeout)
-        new_ver = _container_version(new) if ready else None
+        new_ver = (await _container_version(new)) if ready else None
         # Skip strict version equality when the current image is itself
         # unversioned (built before the stamp) — fall back to readiness + image id.
         version_ok = cur.version is None or new_ver == cur.version
@@ -170,7 +170,7 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
                 sandbox_id, ready, new_ver, cur.version,
             )
             try:
-                new.remove(force=True)
+                await asyncio.to_thread(new.remove, force=True)
             except APIError:
                 pass
             return {
@@ -183,7 +183,7 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         if not await activity.drain_inflight(sandbox_id, timeout=20.0):
             logger.info("migrate %s: box busy, deferring (will retry later)", sandbox_id)
             try:
-                new.remove(force=True)
+                await asyncio.to_thread(new.remove, force=True)
             except APIError:
                 pass
             return {"status": "busy_deferred", "sandbox_id": sandbox_id,
@@ -193,26 +193,26 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         old_renamed = f"{sandbox_id}-old-{int(time.time())}"
         try:
             try:
-                old.stop(timeout=settings.shutdown_timeout_seconds)
+                await asyncio.to_thread(old.stop, timeout=settings.shutdown_timeout_seconds)
             except APIError:
                 pass
-            old.rename(old_renamed)
-            new.rename(sandbox_id)
+            await asyncio.to_thread(old.rename, old_renamed)
+            await asyncio.to_thread(new.rename, sandbox_id)
         except APIError as exc:
             logger.error("MIGRATE CUTOVER FAILED %s: %s — rolling back to old box", sandbox_id, exc)
             try:
-                new.remove(force=True)
+                await asyncio.to_thread(new.remove, force=True)
             except APIError:
                 pass
             try:  # best-effort restore of the old box
-                old.rename(sandbox_id)
-                old.start()
+                await asyncio.to_thread(old.rename, sandbox_id)
+                await asyncio.to_thread(old.start)
             except APIError:
                 pass
             return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"cutover failed: {exc}"}
 
         try:
-            old.remove(force=True)
+            await asyncio.to_thread(old.remove, force=True)
         except APIError as exc:
             logger.warning("migrate %s: old container cleanup failed (non-fatal): %s", sandbox_id, exc)
 
@@ -247,7 +247,10 @@ async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
 
     results: dict[str, list[str]] = {"migrated": [], "deferred": [], "failed": [], "skipped": []}
     try:
-        drifted = [b for b in compute_drift(_get_docker_client()) if b.drifted and b.sandbox_id]
+        client = _get_docker_client()
+        drifted = await asyncio.to_thread(
+            lambda: [b for b in compute_drift(client) if b.drifted and b.sandbox_id]
+        )
     except Exception as exc:
         logger.warning("migrate_all: drift scan failed: %s", exc)
         return {"error": str(exc), **results}
