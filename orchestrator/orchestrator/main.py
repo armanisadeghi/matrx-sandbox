@@ -233,6 +233,18 @@ async def version_drift():
     return drift_summary(_get_docker_client())
 
 
+@app.post("/migrate-all", tags=["meta"])
+async def migrate_all():
+    """Roll every drifted box on this tier onto the current image (master-key).
+    Busy boxes are deferred (retry later). Safe to call repeatedly — it's the
+    manual trigger for the same rolling migration the reaper runs when
+    MATRX_AUTO_MIGRATE=1."""
+    from orchestrator.migrate import migrate_all_drifted
+    from orchestrator.sandbox_manager import _get_store
+
+    return await migrate_all_drifted(store=_get_store())
+
+
 def _aidream_passthrough_status() -> dict:
     import os
     from orchestrator.sandbox_manager import _resolve_passthrough_keys

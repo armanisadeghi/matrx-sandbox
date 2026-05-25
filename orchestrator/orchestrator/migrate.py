@@ -213,3 +213,49 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         "status": "migrated", "sandbox_id": sandbox_id,
         "to_version": cur.version or new_ver, "to_image": target,
     }
+
+
+async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
+    """Migrate every live, drifted box on this host to the current image — the
+    rolling auto-migrate. Sequential (one swap at a time) so we never thrash the
+    host; busy boxes return ``busy_deferred`` and are simply retried on the next
+    pass (the reaper calls this every sweep when MATRX_AUTO_MIGRATE=1), which is
+    the "keep checking until it's idle, then migrate" behavior. ``max_per_pass``
+    caps swaps per call (0 = no cap). Never raises."""
+    from orchestrator.sandbox_manager import _get_docker_client
+    from orchestrator.versioning import compute_drift
+
+    results: dict[str, list[str]] = {"migrated": [], "deferred": [], "failed": [], "skipped": []}
+    try:
+        drifted = [b for b in compute_drift(_get_docker_client()) if b.drifted and b.sandbox_id]
+    except Exception as exc:
+        logger.warning("migrate_all: drift scan failed: %s", exc)
+        return {"error": str(exc), **results}
+
+    done = 0
+    for box in drifted:
+        if max_per_pass and done >= max_per_pass:
+            results["skipped"].append(box.sandbox_id)
+            continue
+        try:
+            res = await migrate_sandbox(box.sandbox_id, store=store)
+        except Exception as exc:  # defensive — migrate_sandbox already guards, but never let one box abort the pass
+            logger.error("migrate_all: %s raised: %s", box.sandbox_id, exc)
+            results["failed"].append(box.sandbox_id)
+            continue
+        st = res.get("status")
+        if st in ("migrated", "already_current"):
+            results["migrated"].append(box.sandbox_id)
+            done += 1
+        elif st == "busy_deferred":
+            results["deferred"].append(box.sandbox_id)
+        else:
+            results["failed"].append(box.sandbox_id)
+            done += 1
+    if results["migrated"] or results["failed"]:
+        logger.info(
+            "migrate_all pass: migrated=%d deferred=%d failed=%d skipped=%d",
+            len(results["migrated"]), len(results["deferred"]),
+            len(results["failed"]), len(results["skipped"]),
+        )
+    return results

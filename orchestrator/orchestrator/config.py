@@ -68,6 +68,15 @@ class Settings(BaseSettings):
     # Sentinel user_id stamped on unclaimed warm boxes (no real owner yet).
     warm_pool_sentinel_user: str = "00000000-0000-0000-0000-000000000000"
 
+    # Zero-drift auto-migration. When MATRX_AUTO_MIGRATE=1 the reaper, each
+    # sweep, migrates drifted boxes onto the current image (busy boxes deferred
+    # to the next sweep). Default OFF so migration is opt-in per deployment until
+    # an operator flips it on; per-box POST /sandboxes/{id}/migrate and
+    # POST /migrate-all work regardless. migrate_max_per_pass caps swaps per
+    # sweep so a big drift wave rolls gradually rather than all at once.
+    auto_migrate: bool = False          # env var: MATRX_AUTO_MIGRATE
+    migrate_max_per_pass: int = 2       # env var: MATRX_MIGRATE_MAX_PER_PASS
+
     # ── AI Dream integration ────────────────────────────────────────────────
     # Sandboxes need a way to call the AI Dream backend (cld_files,
     # conversation context, agent endpoints) on behalf of the user. Two parts:

@@ -117,6 +117,16 @@ async def _reap_once() -> dict:
     except Exception as exc:
         logger.warning("Reaper: drift check failed this tick: %s", exc)
 
+    # Opt-in rolling auto-migration: when enabled, migrate a few drifted boxes
+    # each sweep (busy ones deferred to the next sweep). Off by default.
+    if settings.auto_migrate and summary.get("drifted"):
+        try:
+            from orchestrator.migrate import migrate_all_drifted
+            mig = await migrate_all_drifted(store=store, max_per_pass=settings.migrate_max_per_pass)
+            summary["auto_migrated"] = len(mig.get("migrated", []))
+        except Exception as exc:
+            logger.warning("Reaper: auto-migrate failed this tick: %s", exc)
+
     if summary["expired_found"] or summary["liveness_stopped"] or summary.get("drifted"):
         logger.info(
             "Reaper sweep: expired_found=%d torn_down=%d failed=%d "
