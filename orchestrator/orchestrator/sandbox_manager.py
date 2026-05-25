@@ -400,6 +400,18 @@ async def create_sandbox(
         from orchestrator.routes.templates import resolve_template_image
         image_for_template = resolve_template_image(template) or settings.sandbox_image
 
+        # Stamp the box with the ACTUAL baked version of the image it's born on
+        # (not whatever the caller passed) so drift detection compares like for
+        # like. Falls back to the caller's value when the image is unstamped.
+        try:
+            from orchestrator.versioning import current_image
+            _born_version = current_image(client, template).version
+            if _born_version:
+                template_version = _born_version
+                sandbox.template_version = _born_version
+        except Exception as exc:
+            logger.debug("could not read baked image version for %s: %s", image_for_template, exc)
+
         container = client.containers.run(
             image=image_for_template,
             name=sandbox_id,

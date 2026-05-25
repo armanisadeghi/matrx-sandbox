@@ -3,6 +3,19 @@ FROM ubuntu:22.04
 LABEL maintainer="AI Matrx <team@aimatrx.com>"
 LABEL description="Ephemeral sandbox for AI agent execution"
 
+# ─── Image version stamp (zero-drift system) ─────────────────────────────────
+# Baked at build time so three parties can agree on "what version is this box":
+#   - the orchestrator (drift detection: compare a running box to the current
+#     image for its tag) reads it via `docker inspect` (the LABEL/ENV);
+#   - the box itself reads /etc/sandbox-image-version on wake to self-verify it
+#     came up on the version it was migrated to (Phase 2 resume gate);
+#   - operators see it in the UI.
+# ALWAYS build through sandbox-image/build.sh so this is set; a bare
+# `docker build` leaves it "dev" (the drift report flags that as unversioned).
+ARG MATRX_IMAGE_VERSION=dev
+ENV MATRX_IMAGE_VERSION=${MATRX_IMAGE_VERSION}
+LABEL com.aimatrx.sandbox.version="${MATRX_IMAGE_VERSION}"
+
 # Prevent interactive prompts during package install
 ENV DEBIAN_FRONTEND=noninteractive
 ENV LANG=C.UTF-8
@@ -198,6 +211,10 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # this entrypoint chain. Without it the env var said "local" even on
 # :aidream containers.
 RUN echo "core" > /etc/sandbox-image-tag
+
+# Persist the build-time version into the box so it can self-verify on wake
+# (the Phase-2 migrate/resume gate reads this) and so `mtx` / shells can show it.
+RUN echo "${MATRX_IMAGE_VERSION}" > /etc/sandbox-image-version
 
 # Use tini as init to handle signals properly
 ENTRYPOINT ["tini", "--"]

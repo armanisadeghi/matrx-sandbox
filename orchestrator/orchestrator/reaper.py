@@ -106,12 +106,24 @@ async def _reap_once() -> dict:
     except Exception as exc:
         logger.warning("Reaper: liveness reconcile failed this tick: %s", exc)
 
-    if summary["expired_found"] or summary["liveness_stopped"]:
+    # Version-drift alarm (zero-drift system, Phase 1). Tier-scoped, never
+    # raises. drift_summary() logs loudly when any live box is stale; we also
+    # surface the count in the sweep summary so it shows in the periodic line.
+    try:
+        from orchestrator.sandbox_manager import _get_docker_client
+        from orchestrator.versioning import drift_summary
+        drift = drift_summary(_get_docker_client())
+        summary["drifted"] = drift["drifted"]
+    except Exception as exc:
+        logger.warning("Reaper: drift check failed this tick: %s", exc)
+
+    if summary["expired_found"] or summary["liveness_stopped"] or summary.get("drifted"):
         logger.info(
             "Reaper sweep: expired_found=%d torn_down=%d failed=%d "
-            "liveness_stopped=%d liveness_refreshed=%d",
+            "liveness_stopped=%d liveness_refreshed=%d drifted=%d",
             summary["expired_found"], summary["torn_down"], summary["failed"],
             summary["liveness_stopped"], summary["liveness_refreshed"],
+            summary.get("drifted", 0),
         )
     return summary
 

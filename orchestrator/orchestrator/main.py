@@ -218,6 +218,21 @@ async def root():
     }
 
 
+@app.get("/drift", tags=["meta"])
+async def version_drift():
+    """Image-version drift report for THIS orchestrator's tier (master-key only,
+    enforced by the global APIKeyMiddleware).
+
+    Lists every live, claimed box and whether the image it is running matches
+    the current image for its template. The zero-drift system (and the Manager
+    UI) reads this; it also logs loudly whenever any box is stale.
+    """
+    from orchestrator.sandbox_manager import _get_docker_client
+    from orchestrator.versioning import drift_summary
+
+    return drift_summary(_get_docker_client())
+
+
 def _aidream_passthrough_status() -> dict:
     import os
     from orchestrator.sandbox_manager import _resolve_passthrough_keys
