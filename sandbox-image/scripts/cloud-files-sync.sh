@@ -55,22 +55,6 @@ mkdir -p "$CLOUD_DIR"
 
 case "$DIRECTION" in
     down)
-        # MATRX_CLOUD_FILES_LAZY=1 skips the eager boot copy — same-region S3
-        # makes "first read pulls bytes on demand via mtx files get" cheap
-        # enough to be the default in production. Combined with the
-        # in-process Realtime / polling subscriber (CloudFilesWatcher), the
-        # sandbox stays current with web-UI edits without paying a
-        # potentially-multi-GB boot tax.
-        # Default is still eager so existing deployments don't change shape
-        # without an opt-in.
-        if [ "${MATRX_CLOUD_FILES_LAZY:-0}" = "1" ]; then
-            echo "[cloud-files-sync] MATRX_CLOUD_FILES_LAZY=1 — skipping eager down-sync; watcher handles freshness."
-            # Still seed the down-complete marker so the upstream watcher
-            # knows it can start observing the (empty) dir without panicking.
-            mkdir -p "${HOME:-/home/agent}/.matrx/runtime"
-            touch "${HOME:-/home/agent}/.matrx/runtime/cloud-files-down-complete"
-            exit 0
-        fi
         echo "[cloud-files-sync] Pulling user's cld_files → $CLOUD_DIR"
         # Tight 60s budget so a flaky AI Dream doesn't block sandbox startup.
         timeout 60 /usr/bin/python3.11 -m matrx_agent.cli files sync down \
