@@ -15,6 +15,11 @@ dependencies = [
     "websockets>=11.0",
     "watchdog>=3.0",
     "python-multipart>=0.0.6",
+    # Supabase Realtime client — drives CloudFilesWatcher's RealtimeSubscriber
+    # so the sandbox gets sub-second visibility into edits the user makes via
+    # the AI Dream UI. Falls back to polling when SUPABASE_URL / KEY env are
+    # absent, so it's safe on builds that don't pass them through.
+    "realtime>=2.0",
 ]
 
 [project.optional-dependencies]
