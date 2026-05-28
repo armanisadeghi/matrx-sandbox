@@ -48,8 +48,12 @@ LOCAL_SCRIPTS_STAGE="./scripts-local"
 echo "[build-aidream] staging hosted-tier entrypoint scripts into $LOCAL_SCRIPTS_STAGE"
 rm -rf "$LOCAL_SCRIPTS_STAGE"
 mkdir -p "$LOCAL_SCRIPTS_STAGE"
-cp ../sandbox-local/scripts/entrypoint-local.sh "$LOCAL_SCRIPTS_STAGE/"
-cp ../sandbox-local/scripts/shutdown-local.sh "$LOCAL_SCRIPTS_STAGE/"
+# -f: force overwrite if a stale/concurrent file is somehow present. Plain `cp`
+# fails with "File exists" if two builds race against this staging dir; the
+# Manager's rebuild-missing endpoint now also serializes builds via a lock,
+# but this is the belt to the lock's suspenders.
+cp -f ../sandbox-local/scripts/entrypoint-local.sh "$LOCAL_SCRIPTS_STAGE/"
+cp -f ../sandbox-local/scripts/shutdown-local.sh "$LOCAL_SCRIPTS_STAGE/"
 
 echo "[build-aidream] staging aidream source ($GIT_SHA) into $STAGE_DIR"
 rm -rf "$STAGE_DIR"
