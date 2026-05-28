@@ -398,10 +398,34 @@ async def create_sandbox(
         # orchestrator defaults — the user knows their own intent better
         # than the orchestrator's heuristic env passthrough.
         config_env = config.get("env") if isinstance(config, dict) else None
-        if isinstance(config_env, dict):
+        if config_env is not None and not isinstance(config_env, dict):
+            # Don't silently drop bogus shapes — that's the failure mode
+            # this whole merge was added to fix. Log loudly so a future
+            # client sending the wrong shape gets seen in the deploy log.
+            logger.warning(
+                "config.env present but not a dict (type=%s); ignoring",
+                type(config_env).__name__,
+            )
+        elif isinstance(config_env, dict):
+            skipped: list[str] = []
             for k, v in config_env.items():
-                if isinstance(k, str) and isinstance(v, (str, int, float)):
-                    env[k] = str(v)
+                if not isinstance(k, str):
+                    skipped.append(repr(k))
+                    continue
+                # Exclude bools first (bool is a subclass of int — without
+                # this check `True` becomes `"True"`, surprising callers).
+                if isinstance(v, bool) or v is None:
+                    skipped.append(k)
+                    continue
+                if not isinstance(v, (str, int, float)):
+                    skipped.append(k)
+                    continue
+                env[k] = str(v)
+            if skipped:
+                logger.warning(
+                    "config.env had %d unusable entries skipped: %s",
+                    len(skipped), ", ".join(skipped[:10]),
+                )
 
         # Resource overrides — fall back to settings defaults
         cpu_limit = resources.get("cpu") or settings.container_cpu_limit

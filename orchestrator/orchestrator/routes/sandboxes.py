@@ -113,6 +113,25 @@ async def claim_sandbox(req: CreateSandboxRequest):
 
     from orchestrator import pool
     template = req.template or settings.warm_pool_template
+
+    # Warm-pool sandboxes are pre-booted with NO per-user env, and Docker
+    # cannot change the environment of a running container — so a /claim
+    # against a warm box would silently drop any `config.env` the caller
+    # supplied (user secrets from aidream's vault, sandbox-prefs env).
+    # When the caller has secrets to inject, skip the warm fast path and
+    # cold-create with the full env. This costs the warm-pool latency
+    # benefit but keeps the contract honest: every secret a user has set
+    # is in the container env from boot.
+    config_env = (req.config or {}).get("env") if isinstance(req.config, dict) else None
+    has_inject_env = isinstance(config_env, dict) and len(config_env) > 0
+    if has_inject_env:
+        logger.info(
+            "Skipping warm pool for user %s — config.env has %d keys "
+            "to inject (warm boxes can't accept new env post-boot)",
+            req.user_id, len(config_env),
+        )
+        return await create_sandbox(req)
+
     claimed = await pool.claim_warm(
         user_id=req.user_id,
         template=template,
