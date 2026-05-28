@@ -389,6 +389,20 @@ async def create_sandbox(
             # gracefully fall back to other auth signals (or stay unconfigured).
             env.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
 
+        # Merge per-sandbox env (user secrets + sandbox-pref env vars) on
+        # top of orchestrator defaults. aidream stuffs the user's vaulted
+        # secrets into `config.env` at create-time (see
+        # aidream/services/user_secrets/sandbox_injection.py); without this
+        # merge those keys never make it to `docker run -e`, which is the
+        # whole point of the secrets vault. User-supplied vars OVERRIDE
+        # orchestrator defaults — the user knows their own intent better
+        # than the orchestrator's heuristic env passthrough.
+        config_env = config.get("env") if isinstance(config, dict) else None
+        if isinstance(config_env, dict):
+            for k, v in config_env.items():
+                if isinstance(k, str) and isinstance(v, (str, int, float)):
+                    env[k] = str(v)
+
         # Resource overrides — fall back to settings defaults
         cpu_limit = resources.get("cpu") or settings.container_cpu_limit
         memory_limit = resources.get("memory_mb")
