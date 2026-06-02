@@ -411,8 +411,13 @@ async def create_sandbox(
             try:
                 import httpx
 
-                async with httpx.AsyncClient(timeout=10.0) as client:
-                    resp = await client.get(
+                # NOTE: must NOT be named `client` — that's the docker client
+                # (line ~279, used later for client.containers.run). Shadowing
+                # it here left a closed httpx.AsyncClient in `client`, so every
+                # create died with "'AsyncClient' object has no attribute
+                # 'containers'". Use a distinct name.
+                async with httpx.AsyncClient(timeout=10.0) as hx:
+                    resp = await hx.get(
                         f"{settings.aidream_url.rstrip('/')}/api/user-secrets/internal/sandbox-env-for-user",
                         headers={
                             "Authorization": f"Bearer {settings.aidream_service_token}",
