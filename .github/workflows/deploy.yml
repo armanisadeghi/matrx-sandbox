@@ -185,3 +185,43 @@ jobs:
           fi
 
           echo "Deploy completed successfully!"
+
+  # ── Hosted tier (/srv host) ────────────────────────────────────────────────
+  # The `deploy` job above ships the EC2 tier (ECR + SSM). This job ships the
+  # HOSTED tier that runs on the /srv dev host — the matrx-orchestrator
+  # container + the matrx-sandbox:{core,slim,aidream} images that the hosted
+  # orchestrator spawns. Previously hand-built (the source of repeated drift:
+  # stale hosted orchestrator, missing aidream image). Now auto-deployed on
+  # every push to main, health-gated with rollback (see scripts/deploy-hosted.sh).
+  #
+  # Reuses the SAME SSH secrets matrx-ship's pipeline already uses to reach /srv
+  # (DEPLOY_HOST / DEPLOY_USER / DEPLOY_SSH_KEY / DEPLOY_PORT). If those are
+  # org-level secrets they're already available here; otherwise add them to this
+  # repo once. Runs after `deploy` but does NOT depend on it succeeding — the
+  # hosted tier should update even if an EC2/ECR step had a transient failure.
+  deploy-hosted:
+    name: Deploy hosted tier (/srv)
+    needs: test
+    runs-on: ubuntu-latest
+    if: github.ref == 'refs/heads/main'
+    steps:
+      - name: Rebuild + redeploy hosted orchestrator & images via SSH
+        uses: appleboy/ssh-action@v1.0.3
+        with:
+          host: ${{ secrets.DEPLOY_HOST }}
+          username: ${{ secrets.DEPLOY_USER }}
+          key: ${{ secrets.DEPLOY_SSH_KEY }}
+          port: ${{ secrets.DEPLOY_PORT || 22 }}
+          timeout: 60s
+          command_timeout: 30m
+          script: |
+            set -e
+            cd /srv/projects/matrx-sandbox
+            # Capture the currently-deployed commit BEFORE syncing so the deploy
+            # script can diff it and rebuild only what changed. Pull first so we
+            # run the freshly-landed version of the script (not the old one).
+            OLD=$(git rev-parse HEAD 2>/dev/null || echo none)
+            git fetch origin main --quiet
+            git reset --hard origin/main
+            chmod +x scripts/deploy-hosted.sh
+            PRE_SYNCED_OLD_SHA="$OLD" bash scripts/deploy-hosted.sh
