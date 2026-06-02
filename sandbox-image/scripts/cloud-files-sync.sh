@@ -20,7 +20,16 @@
 set -euo pipefail
 
 DIRECTION="${1:-down}"
-CLOUD_DIR="${HOME:-/home/agent}/cloud-files"
+
+# Resolve the REAL home of whoever is running this script — do NOT trust $HOME.
+# The entrypoints invoke us via `sudo -E -u agent`, and `-E` preserves the root
+# entrypoint's HOME=/root. Trusting $HOME made us try `mkdir -p /root/cloud-files`
+# as the unprivileged `agent` user → "mkdir: cannot create directory '/root':
+# Permission denied". getent gives the running user's actual passwd home.
+AGENT_HOME="$(getent passwd "$(id -un)" 2>/dev/null | cut -d: -f6)"
+AGENT_HOME="${AGENT_HOME:-/home/agent}"
+export HOME="$AGENT_HOME"
+CLOUD_DIR="$AGENT_HOME/cloud-files"
 
 # Required for the bridge — quiet skip if absent so the rest of startup
 # isn't blocked.
@@ -66,8 +75,8 @@ case "$DIRECTION" in
         # that the down-sync completed and it is safe to start observing without
         # re-uploading the bytes we just pulled. The watcher seeds its hash cache
         # from the current contents of $CLOUD_DIR before it begins.
-        mkdir -p "${HOME:-/home/agent}/.matrx/runtime"
-        touch "${HOME:-/home/agent}/.matrx/runtime/cloud-files-down-complete"
+        mkdir -p "$AGENT_HOME/.matrx/runtime"
+        touch "$AGENT_HOME/.matrx/runtime/cloud-files-down-complete"
         ;;
     up)
         echo "[cloud-files-sync] Pushing ~/cloud-files/ → cld_files"

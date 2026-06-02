@@ -445,18 +445,27 @@ async def sandbox_agent_env(sandbox_id: str) -> dict:
         except Exception as exc:
             out["runtime_env_error"] = str(exc)
 
-        # 3. aidream process env via /proc/<pid>/environ if aidream is up
+        # 3. aidream process env via /proc/<pid>/environ — ONLY meaningful when
+        #    the aidream server is actually running (the 'aidream' template).
+        #    Match 'mtx aidream serve' SPECIFICALLY — NOT a bare 'uvicorn',
+        #    because the matrx_agent daemon is itself uvicorn (port 8000). On a
+        #    slim box the old 'aidream|uvicorn' pattern matched the daemon, then
+        #    failed to read its /proc/<pid>/environ as a non-root exec user
+        #    ("cannot open /proc/29/environ: Permission denied"). Reading as
+        #    root (the orchestrator owns the container; this is an operator-only
+        #    diagnostics surface) makes any pid's environ readable, and the
+        #    narrower match means slim boxes get a clean "not running" note
+        #    instead of a scary permission error.
         try:
-            # Find PID of the uvicorn-running aidream process.
             pid_code, pid_out = await asyncio.to_thread(lambda: container.exec_run(
-                ["sh", "-lc", "pgrep -f 'aidream|uvicorn' | head -1"],
-                stdout=True, stderr=True,
+                ["sh", "-lc", "pgrep -f 'aidream serve' | head -1"],
+                stdout=True, stderr=True, user="root",
             ))
             pid_text = (pid_out.decode(errors="replace") if pid_out else "").strip()
             if pid_code == 0 and pid_text.isdigit():
                 env_code, env_out = await asyncio.to_thread(lambda: container.exec_run(
                     ["sh", "-lc", f"tr '\\0' '\\n' < /proc/{pid_text}/environ"],
-                    stdout=True, stderr=True,
+                    stdout=True, stderr=True, user="root",
                 ))
                 if env_code == 0:
                     out["aidream_pid"] = int(pid_text)
@@ -468,7 +477,13 @@ async def sandbox_agent_env(sandbox_id: str) -> dict:
                         env_out.decode(errors="replace") if env_out else ""
                     )
             else:
-                out["aidream_proc_env_error"] = "aidream/uvicorn process not found"
+                # Not an error — slim/bare templates simply don't run aidream.
+                out["aidream_proc_env_note"] = (
+                    "aidream server not running on this template "
+                    f"(template={sandbox.template or 'bare'}); this view only "
+                    "applies to the 'aidream' template. The agent's env is in "
+                    "container_config_env + runtime_env above."
+                )
         except Exception as exc:
             out["aidream_proc_env_error"] = str(exc)
 
@@ -1508,11 +1523,21 @@ async def sandbox_logs(sandbox_id: str, source: str = "all", tail: int = 200) ->
         # Use the docker SDK (same one diagnostics uses) — the orchestrator
         # container is python:3.11-slim with no docker CLI installed, so
         # subprocess-based docker exec fails with FileNotFoundError.
+        #
+        # Gracefully handle logs that simply don't exist on this template:
+        # slim/bare boxes never run aidream, so aidream-server.log and
+        # aidream-autostart.log are absent. The old `tail <missing>` surfaced
+        # "tail: cannot open ... No such file or directory" as if something
+        # were broken. A shell `[ -f ]` guard turns that into a clean note.
         try:
             client = sandbox_manager._get_docker_client()
             container = await asyncio.to_thread(client.containers.get, sandbox_id)
+            cmd = (
+                f'if [ -f "{path}" ]; then tail -n {int(tail)} "{path}"; '
+                f'else echo "(not present on this template — this log only exists on boxes that run that service)"; fi'
+            )
             exit_code, output = await asyncio.to_thread(lambda: container.exec_run(
-                ["tail", "-n", str(tail), path],
+                ["sh", "-lc", cmd],
                 stdout=True, stderr=True, demux=False,
             ))
             text = output.decode(errors="replace") if output else ""
