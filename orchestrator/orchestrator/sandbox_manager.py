@@ -389,14 +389,67 @@ async def create_sandbox(
             # gracefully fall back to other auth signals (or stay unconfigured).
             env.pop("GOOGLE_APPLICATION_CREDENTIALS", None)
 
-        # Merge per-sandbox env (user secrets + sandbox-pref env vars) on
-        # top of orchestrator defaults. aidream stuffs the user's vaulted
-        # secrets into `config.env` at create-time (see
-        # aidream/services/user_secrets/sandbox_injection.py); without this
-        # merge those keys never make it to `docker run -e`, which is the
-        # whole point of the secrets vault. User-supplied vars OVERRIDE
-        # orchestrator defaults — the user knows their own intent better
-        # than the orchestrator's heuristic env passthrough.
+        # ── User-secrets vault injection (orchestrator-side, all paths) ──
+        # Fetch the user's vaulted secrets from aidream by user_id, using
+        # the existing sandbox-service token (same token cloud-files bridge
+        # uses). Putting this in the orchestrator means EVERY create-path
+        # gets secrets — matrx-frontend "New sandbox" button, Matrx Ship
+        # admin portal, Chrome extension, agent automation. The old
+        # Next.js-route-side fetch had a class-of-failures bug (server
+        # `getSession()` returns falsy access_token under @supabase/ssr).
+        # This path doesn't have that gate.
+        #
+        # Safe no-op: when aidream_url/aidream_service_token are unset OR
+        # the call fails, secrets simply aren't injected — sandbox creation
+        # never blocks on the secrets fetch.
+        secrets_env: dict[str, str] = {}
+        if (
+            user_id
+            and settings.aidream_url
+            and settings.aidream_service_token
+        ):
+            try:
+                import httpx
+
+                async with httpx.AsyncClient(timeout=10.0) as client:
+                    resp = await client.get(
+                        f"{settings.aidream_url.rstrip('/')}/api/user-secrets/internal/sandbox-env-for-user",
+                        headers={
+                            "Authorization": f"Bearer {settings.aidream_service_token}",
+                            "X-Matrx-User-Id": str(user_id),
+                            "Accept": "application/json",
+                        },
+                    )
+                if resp.status_code == 200:
+                    body = resp.json() or {}
+                    fetched = body.get("env") if isinstance(body, dict) else None
+                    if isinstance(fetched, dict):
+                        for k, v in fetched.items():
+                            if isinstance(k, str) and isinstance(v, str):
+                                secrets_env[k] = v
+                        logger.info(
+                            "user-secrets: injected %d secret(s) for user=%s",
+                            len(secrets_env), user_id,
+                        )
+                else:
+                    logger.warning(
+                        "user-secrets: aidream returned HTTP %s; sandbox will boot "
+                        "without auto-injected secrets",
+                        resp.status_code,
+                    )
+            except Exception as exc:  # network / DNS / TLS / parsing
+                logger.warning(
+                    "user-secrets: fetch failed (%s); sandbox will boot without "
+                    "auto-injected secrets",
+                    exc,
+                )
+
+        # Merge per-sandbox env from THREE sources, last-wins:
+        #   1. orchestrator-wide passthrough (already in `env` above)
+        #   2. caller-supplied `config.env` (e.g. matrx-frontend sandbox-prefs)
+        #   3. user-secrets vault (fetched above)
+        # The vault wins because the user spec is "set once, never lose it"
+        # — a stale `config.env` value can't shadow a rotated vault value.
         config_env = config.get("env") if isinstance(config, dict) else None
         if config_env is not None and not isinstance(config_env, dict):
             # Don't silently drop bogus shapes — that's the failure mode
@@ -426,6 +479,12 @@ async def create_sandbox(
                     "config.env had %d unusable entries skipped: %s",
                     len(skipped), ", ".join(skipped[:10]),
                 )
+
+        # Step 3: vault overrides — applied AFTER caller's config.env so a
+        # rotated vault value can't be shadowed by a stale caller-supplied
+        # entry. Same shape filtering as above (str/int/float, no bools).
+        for k, v in secrets_env.items():
+            env[k] = v
 
         # Resource overrides — fall back to settings defaults
         cpu_limit = resources.get("cpu") or settings.container_cpu_limit

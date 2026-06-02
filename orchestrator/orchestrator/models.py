@@ -43,7 +43,15 @@ class CreateSandboxRequest(BaseModel):
     )
     resources: ResourcesSpec | None = Field(default=None, description="Optional resource overrides (hosted tier only)")
     labels: dict[str, str] | None = Field(default=None, description="Free-form tags persisted with the sandbox")
-    ttl_seconds: int | None = Field(default=None, ge=60, le=86400, description="Override default TTL")
+    # TTL ceiling raised to 1 year so the "permanent default sandbox" path
+    # (aidream's ensure_default_sandbox) can request a TTL the user
+    # intuitively reads as "never expire while in use". Heartbeats roll
+    # expires_at forward on every ping; the TTL is the idle ceiling, not a
+    # hard wall-clock limit.
+    ttl_seconds: int | None = Field(
+        default=None, ge=60, le=31_536_000,
+        description="Override default TTL (idle ceiling; heartbeats refresh it)",
+    )
 
     @field_validator("user_id")
     @classmethod
@@ -287,7 +295,7 @@ class AccessTokenResponse(BaseModel):
 
 
 class ExtendRequest(BaseModel):
-    ttl_seconds: int = Field(default=3600, ge=60, le=86400, description="Seconds to extend from now")
+    ttl_seconds: int = Field(default=3600, ge=60, le=31_536_000, description="Seconds to extend from now")
 
 
 class ExtendResponse(BaseModel):
