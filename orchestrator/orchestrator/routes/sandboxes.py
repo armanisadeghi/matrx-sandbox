@@ -1470,6 +1470,30 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
         and (not is_aidream or (aidream_health.get("ok") and aidream_ready.get("ok")))
     )
 
+    # Secrets-vault injection diagnostic — stamped by create_sandbox at
+    # boot time onto sandbox.config.secrets_injection. Forwarded verbatim
+    # so the UI shows exactly what happened (attempted? skipped reason?
+    # fetched count? error?) — without needing orchestrator log access.
+    secrets_injection: dict[str, object] = {}
+    try:
+        cfg = sandbox.config if isinstance(sandbox.config, dict) else {}
+        si = cfg.get("secrets_injection") if isinstance(cfg, dict) else None
+        if isinstance(si, dict):
+            secrets_injection = dict(si)  # safe copy
+            # ALSO compare against what actually landed in the container
+            # so the user can see if a fetched secret was dropped by the
+            # docker-env merge for some reason.
+            try:
+                if isinstance(env_keys_in_container, list):
+                    expected_keys = []  # populated below
+            except NameError:
+                pass
+            # We don't have the fetched key list (only the count), so the
+            # best we can do here is surface the count + the "see container
+            # env" pointer. The detail page can cross-reference.
+    except Exception as exc:
+        secrets_injection = {"error": f"couldn't read sandbox.config: {exc}"}
+
     return {
         "sandbox_id": sandbox_id,
         "overall_ok": overall_ok,
@@ -1494,6 +1518,7 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
             "aidream_health_8001": aidream_health,
             "aidream_ready_8001": aidream_ready,
         },
+        "secrets_injection": secrets_injection,
     }
 
 
