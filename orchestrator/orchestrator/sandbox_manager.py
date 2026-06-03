@@ -432,7 +432,12 @@ async def create_sandbox(
             diag["attempted"] = True
             try:
                 import httpx
-                from datetime import datetime, timezone
+                # datetime/timezone come from the MODULE-level import (line 15).
+                # A local `from datetime import ...` here made `datetime` a
+                # function-local, so the earlier `created_at=datetime.now(...)`
+                # (~line 263) hit UnboundLocalError → every create + the
+                # test_create_sandbox unit test failed → the whole Deploy
+                # pipeline was blocked (test gates deploy). Do NOT re-import.
 
                 # NOTE: must NOT be named `client` — that's the docker client
                 # (line ~279, used later for client.containers.run). Shadowing
