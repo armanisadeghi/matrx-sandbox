@@ -13,6 +13,7 @@ import os
 import shlex
 import uuid
 from datetime import datetime, timezone
+from typing import Any
 
 import docker
 from docker.errors import DockerException, NotFound, APIError
@@ -402,14 +403,36 @@ async def create_sandbox(
         # Safe no-op: when aidream_url/aidream_service_token are unset OR
         # the call fails, secrets simply aren't injected — sandbox creation
         # never blocks on the secrets fetch.
+        #
+        # Diagnostic capture: every outcome is stamped on
+        # config["secrets_injection"] (and therefore on the persisted
+        # sandbox_instances.config row) so the UI can show exactly what
+        # happened — attempted? skipped (why)? fetched (how many)? errored
+        # (what message)? Without this stamp, the only signal was "did the
+        # env land", which is non-diagnostic when it didn't.
         secrets_env: dict[str, str] = {}
-        if (
-            user_id
-            and settings.aidream_url
-            and settings.aidream_service_token
-        ):
+        diag: dict[str, Any] = {
+            "attempted": False,
+            "skipped_reason": None,
+            "fetched_count": 0,
+            "fetched_at": None,
+            "status_code": None,
+            "error": None,
+            "aidream_url_set": bool(settings.aidream_url),
+            "aidream_service_token_set": bool(settings.aidream_service_token),
+            "user_id_set": bool(user_id),
+        }
+        if not user_id:
+            diag["skipped_reason"] = "user_id is empty on the create request"
+        elif not settings.aidream_url:
+            diag["skipped_reason"] = "MATRX_AIDREAM_URL env var is unset on this orchestrator"
+        elif not settings.aidream_service_token:
+            diag["skipped_reason"] = "MATRX_AIDREAM_SERVICE_TOKEN env var is unset on this orchestrator"
+        else:
+            diag["attempted"] = True
             try:
                 import httpx
+                from datetime import datetime, timezone
 
                 # NOTE: must NOT be named `client` — that's the docker client
                 # (line ~279, used later for client.containers.run). Shadowing
@@ -425,6 +448,8 @@ async def create_sandbox(
                             "Accept": "application/json",
                         },
                     )
+                diag["status_code"] = resp.status_code
+                diag["fetched_at"] = datetime.now(timezone.utc).isoformat()
                 if resp.status_code == 200:
                     body = resp.json() or {}
                     fetched = body.get("env") if isinstance(body, dict) else None
@@ -432,22 +457,41 @@ async def create_sandbox(
                         for k, v in fetched.items():
                             if isinstance(k, str) and isinstance(v, str):
                                 secrets_env[k] = v
-                        logger.info(
-                            "user-secrets: injected %d secret(s) for user=%s",
-                            len(secrets_env), user_id,
-                        )
+                    diag["fetched_count"] = len(secrets_env)
+                    logger.info(
+                        "user-secrets: injected %d secret(s) for user=%s",
+                        len(secrets_env), user_id,
+                    )
                 else:
+                    body_text = (resp.text or "")[:300]
+                    diag["error"] = (
+                        f"HTTP {resp.status_code} from aidream: {body_text}"
+                    )
                     logger.warning(
                         "user-secrets: aidream returned HTTP %s; sandbox will boot "
-                        "without auto-injected secrets",
-                        resp.status_code,
+                        "without auto-injected secrets. body=%s",
+                        resp.status_code, body_text,
                     )
             except Exception as exc:  # network / DNS / TLS / parsing
+                diag["error"] = f"{type(exc).__name__}: {exc}"
                 logger.warning(
                     "user-secrets: fetch failed (%s); sandbox will boot without "
                     "auto-injected secrets",
                     exc,
                 )
+
+        # Persist the diagnostic on the sandbox row so the UI can show the
+        # status without re-querying the orchestrator. Mutate BOTH `config`
+        # (local var still used for the dispatch + the later docker env
+        # merge) AND `sandbox.config` (the field that gets serialized into
+        # the DB row). Pydantic v2 keeps the ref for dict fields, but being
+        # explicit means future pydantic changes can't silently drop this.
+        if isinstance(config, dict):
+            config["secrets_injection"] = diag
+        if isinstance(sandbox.config, dict):
+            sandbox.config["secrets_injection"] = diag
+        else:
+            sandbox.config = {"secrets_injection": diag}
 
         # Merge per-sandbox env from THREE sources, last-wins:
         #   1. orchestrator-wide passthrough (already in `env` above)
