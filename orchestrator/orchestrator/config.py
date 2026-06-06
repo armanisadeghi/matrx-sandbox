@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 
 from pydantic import AliasChoices, Field, field_validator
@@ -253,6 +254,65 @@ class Settings(BaseSettings):
         if v.upper() not in valid:
             raise ValueError(f"log_level must be one of {valid}")
         return v.upper()
+
+    # ── Effective AI Dream credentials (with passthrough-file fallback) ──────
+    # The hosted tier already mounts /srv/projects/aidream/.env via
+    # aidream_passthrough_env_file. That file holds the real
+    # AIDREAM_SANDBOX_SERVICE_TOKEN value (aidream's name for the shared
+    # service token). Rather than force operators to ALSO set
+    # MATRX_AIDREAM_SERVICE_TOKEN as a duplicate, we fall back to reading
+    # the token straight out of that file when the explicit MATRX_ var is
+    # unset. Result: the hosted tier "just works" with zero new config; the
+    # EC2 tier (which has no such file) still needs MATRX_AIDREAM_SERVICE_TOKEN
+    # set explicitly in its systemd env — the sandbox secrets_injection
+    # diagnostic names exactly which is missing.
+
+    def resolve_aidream_service_token(self) -> str:
+        """Explicit MATRX_AIDREAM_SERVICE_TOKEN, else AIDREAM_SANDBOX_SERVICE_TOKEN
+        read from the passthrough env file, else ''."""
+        if self.aidream_service_token:
+            return self.aidream_service_token
+        return _read_env_file_value(
+            self.aidream_passthrough_env_file, "AIDREAM_SANDBOX_SERVICE_TOKEN"
+        )
+
+    def resolve_aidream_url(self) -> str:
+        """Explicit MATRX_AIDREAM_URL, else MATRX_AIDREAM_URL/AIDREAM_URL read
+        from the passthrough env file, else the production default."""
+        if self.aidream_url:
+            return self.aidream_url.rstrip("/")
+        for key in ("MATRX_AIDREAM_URL", "AIDREAM_URL", "PUBLIC_URL"):
+            val = _read_env_file_value(self.aidream_passthrough_env_file, key)
+            if val:
+                return val.rstrip("/")
+        return "https://server.app.matrxserver.com"
+
+
+def _read_env_file_value(path: str, key: str) -> str:
+    """Read a single VALUE from a .env-style file. Returns '' on any failure
+    (missing file, missing key, unreadable). Strips surrounding quotes and an
+    optional `export ` prefix — mirrors the key-parser used for passthrough."""
+    path = (path or "").strip()
+    if not path or not os.path.isfile(path):
+        return ""
+    try:
+        with open(path) as f:
+            for raw in f:
+                line = raw.strip()
+                if not line or line.startswith("#"):
+                    continue
+                if line.startswith("export "):
+                    line = line[len("export "):].lstrip()
+                k, sep, v = line.partition("=")
+                if not sep or k.strip() != key:
+                    continue
+                v = v.strip()
+                if len(v) >= 2 and v[0] == v[-1] and v[0] in ("'", '"'):
+                    v = v[1:-1]
+                return v
+    except OSError:
+        return ""
+    return ""
 
 
 settings = Settings()

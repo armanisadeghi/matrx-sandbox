@@ -410,6 +410,11 @@ async def create_sandbox(
         # happened — attempted? skipped (why)? fetched (how many)? errored
         # (what message)? Without this stamp, the only signal was "did the
         # env land", which is non-diagnostic when it didn't.
+        # Resolve URL + token with passthrough-file fallback (hosted tier
+        # reads them from /srv/projects/aidream/.env automatically; EC2 needs
+        # the explicit MATRX_ env vars).
+        resolved_aidream_url = settings.resolve_aidream_url()
+        resolved_aidream_token = settings.resolve_aidream_service_token()
         secrets_env: dict[str, str] = {}
         diag: dict[str, Any] = {
             "attempted": False,
@@ -418,16 +423,28 @@ async def create_sandbox(
             "fetched_at": None,
             "status_code": None,
             "error": None,
-            "aidream_url_set": bool(settings.aidream_url),
-            "aidream_service_token_set": bool(settings.aidream_service_token),
+            "aidream_url_set": bool(resolved_aidream_url),
+            "aidream_service_token_set": bool(resolved_aidream_token),
+            "aidream_url_used": resolved_aidream_url or None,
             "user_id_set": bool(user_id),
         }
         if not user_id:
             diag["skipped_reason"] = "user_id is empty on the create request"
-        elif not settings.aidream_url:
-            diag["skipped_reason"] = "MATRX_AIDREAM_URL env var is unset on this orchestrator"
-        elif not settings.aidream_service_token:
-            diag["skipped_reason"] = "MATRX_AIDREAM_SERVICE_TOKEN env var is unset on this orchestrator"
+        elif not resolved_aidream_url:
+            diag["skipped_reason"] = (
+                "aidream URL unavailable — set MATRX_AIDREAM_URL on this "
+                "orchestrator (hosted tier reads it from "
+                "/srv/projects/aidream/.env automatically; EC2 needs it set "
+                "explicitly)"
+            )
+        elif not resolved_aidream_token:
+            diag["skipped_reason"] = (
+                "aidream service token unavailable — set "
+                "MATRX_AIDREAM_SERVICE_TOKEN (= aidream's "
+                "AIDREAM_SANDBOX_SERVICE_TOKEN) on this orchestrator. Hosted "
+                "tier reads it from /srv/projects/aidream/.env automatically; "
+                "EC2 needs it set explicitly in the systemd env."
+            )
         else:
             diag["attempted"] = True
             try:
@@ -446,9 +463,9 @@ async def create_sandbox(
                 # 'containers'". Use a distinct name.
                 async with httpx.AsyncClient(timeout=10.0) as hx:
                     resp = await hx.get(
-                        f"{settings.aidream_url.rstrip('/')}/api/user-secrets/internal/sandbox-env-for-user",
+                        f"{resolved_aidream_url.rstrip('/')}/api/user-secrets/internal/sandbox-env-for-user",
                         headers={
-                            "Authorization": f"Bearer {settings.aidream_service_token}",
+                            "Authorization": f"Bearer {resolved_aidream_token}",
                             "X-Matrx-User-Id": str(user_id),
                             "Accept": "application/json",
                         },
