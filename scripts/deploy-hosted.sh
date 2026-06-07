@@ -96,11 +96,27 @@ else
   log "orchestrator/ unchanged — skipping orchestrator rebuild"
 fi
 
-# ── Sandbox images (independent, best-effort, each rolls back its own tag) ──
+# ── Sandbox images ──────────────────────────────────────────────────────────
+# Rebuild an image when EITHER its source changed OR it's missing. The
+# "or missing" is the SELF-HEAL: a required image pruned off /srv comes back on
+# the next deploy, no matter what the commit touched — so "Missing required
+# image: aidream" can't get stuck. Each rebuild is independent + best-effort
+# (rolls back its own tag on failure) so a heavy/broken build never takes the
+# orchestrator down. A build-status MARKER is written while each image builds so
+# the Manager's Fleet Health shows "rebuilding…" instead of a false "missing"
+# critical (same dir the Manager's own UI rebuilds use).
+BUILD_STATUS_DIR="${IMAGE_BUILD_STATUS_DIR:-/srv/apps/image-build-status}"
+mkdir -p "$BUILD_STATUS_DIR" 2>/dev/null || true
 IMAGE_FAIL=0
+SBX_CHANGED=0; changed '^sandbox-image/' && SBX_CHANGED=1
+
 rebuild_image() {
   local tag="$1"; shift
+  local variant="${tag##*:}"
+  local marker="$BUILD_STATUS_DIR/${variant}.json"
   log "rebuilding $tag"
+  printf '{"variant":"%s","started_at":"%s","source":"deploy-hosted"}\n' \
+    "$variant" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$marker" 2>/dev/null || true
   docker tag "$tag" "${tag}-rollback" 2>/dev/null || true
   if "$@"; then
     log "$tag rebuilt ✓"
@@ -109,23 +125,17 @@ rebuild_image() {
     docker image inspect "${tag}-rollback" >/dev/null 2>&1 && docker tag "${tag}-rollback" "$tag" || true
     IMAGE_FAIL=1
   fi
+  rm -f "$marker" 2>/dev/null || true
 }
 
-if changed '^sandbox-image/'; then
-  cd "$REPO_DIR/sandbox-image"
-  rebuild_image "matrx-sandbox:core" docker build -t matrx-sandbox:core .
-  rebuild_image "matrx-sandbox:slim" docker build -t matrx-sandbox:slim -f Dockerfile.slim .
-  # aidream is ~5GB and builds ON TOP of :core — only rebuild it when it's
-  # already present (don't drag a multi-minute build into every push that
-  # touched sandbox-image/; build-aidream.sh requires :core, freshly rebuilt above).
-  if docker image inspect matrx-sandbox:aidream >/dev/null 2>&1; then
-    rebuild_image "matrx-sandbox:aidream" bash build-aidream.sh
-  else
-    log "matrx-sandbox:aidream not present — skipping (rebuild on demand from the Manager)"
-  fi
-else
-  log "sandbox-image/ unchanged — skipping image rebuilds"
-fi
+# rebuild if sandbox-image/ changed OR the image is absent (self-heal)
+need_img() { [ "$SBX_CHANGED" = 1 ] || ! docker image inspect "$1" >/dev/null 2>&1; }
+
+cd "$REPO_DIR/sandbox-image"
+if need_img matrx-sandbox:core; then rebuild_image "matrx-sandbox:core" docker build -t matrx-sandbox:core . ; else log "core present + unchanged — skip"; fi
+if need_img matrx-sandbox:slim; then rebuild_image "matrx-sandbox:slim" docker build -t matrx-sandbox:slim -f Dockerfile.slim . ; else log "slim present + unchanged — skip"; fi
+# aidream is REQUIRED + ~5GB (builds ON TOP of :core, freshly rebuilt above if needed).
+if need_img matrx-sandbox:aidream; then rebuild_image "matrx-sandbox:aidream" bash build-aidream.sh ; else log "aidream present + unchanged — skip"; fi
 
 [ "$IMAGE_FAIL" = 1 ] && fail "one or more sandbox-image rebuilds failed (orchestrator unaffected)"
 log "hosted-tier deploy complete at $NEW_SHA"

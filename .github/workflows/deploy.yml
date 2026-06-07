@@ -156,18 +156,22 @@ jobs:
 
           echo "SSM Command ID: $COMMAND_ID"
 
-          # Wait for the command to complete
-          aws ssm wait command-executed \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            || true
-
-          # Get the command status
-          STATUS=$(aws ssm get-command-invocation \
-            --command-id "$COMMAND_ID" \
-            --instance-id "$EC2_INSTANCE_ID" \
-            --query "Status" \
-            --output text)
+          # Wait for the command to finish. The built-in `aws ssm wait
+          # command-executed` gives up after ~20 polls (~100s) — too short for a
+          # git clone + pip install + 60s health loop on a busy box, which left
+          # STATUS=InProgress and failed a deploy that was actually still
+          # working. Poll manually up to the command's own 600s timeout instead.
+          STATUS="Pending"
+          for _ in $(seq 1 60); do
+            STATUS=$(aws ssm get-command-invocation \
+              --command-id "$COMMAND_ID" \
+              --instance-id "$EC2_INSTANCE_ID" \
+              --query "Status" --output text 2>/dev/null || echo "Pending")
+            case "$STATUS" in
+              Success|Failed|Cancelled|TimedOut) break ;;
+            esac
+            sleep 10
+          done
 
           echo "SSM Command Status: $STATUS"
 
