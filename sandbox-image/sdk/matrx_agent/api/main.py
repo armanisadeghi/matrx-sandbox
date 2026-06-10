@@ -4,6 +4,7 @@ import logging
 import os
 import shutil
 import stat
+import tempfile
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, List, Literal, Optional
@@ -127,6 +128,34 @@ class CopyRequest(BaseModel):
 
 # --- Helpers ---
 
+def _atomic_write(path: Path, data: bytes, mode: Optional[int] = None) -> None:
+    """Write ``data`` to ``path`` atomically without a fixed temp name.
+
+    The old code wrote to ``path.with_suffix(".tmp")`` — a single shared name —
+    so two concurrent writes to the same file raced on the same temp path and
+    silently corrupted or lost one writer's data. Use a unique temp file in the
+    same directory (so os.replace stays atomic on one filesystem), then rename.
+    """
+    directory = path.parent
+    fd, tmp_name = tempfile.mkstemp(dir=str(directory), prefix=f".{path.name}.", suffix=".tmp")
+    tmp = Path(tmp_name)
+    try:
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+            f.flush()
+            os.fsync(f.fileno())
+        if mode is not None:
+            os.chmod(tmp, mode)
+        os.replace(tmp, path)
+    except BaseException:
+        # Don't leave the unique temp behind on any failure.
+        try:
+            tmp.unlink()
+        except OSError:
+            pass
+        raise
+
+
 def get_stat_dict(file_path: Path) -> dict:
     st = file_path.stat()
     return {
@@ -201,13 +230,8 @@ async def fs_write(req: WriteRequest):
         p.parent.mkdir(parents=True, exist_ok=True)
         
     data = base64.b64decode(req.content) if req.encoding == "base64" else req.content.encode("utf-8")
-    
-    # write to temp and rename for atomic write
-    temp_path = p.with_suffix(".tmp")
-    temp_path.write_bytes(data)
-    if req.mode is not None:
-        temp_path.chmod(req.mode)
-    temp_path.rename(p)
+
+    _atomic_write(p, data, req.mode)
     return get_stat_dict(p)
 
 @app.post("/fs/patch")
@@ -222,11 +246,8 @@ async def fs_patch(req: PatchRequest):
     edits = sorted(req.edits, key=lambda x: x.start, reverse=True)
     for edit in edits:
         content = content[:edit.start] + edit.replacement + content[edit.end:]
-        
-    # write to temp and rename
-    temp_path = p.with_suffix(".tmp")
-    temp_path.write_text(content, encoding="utf-8")
-    temp_path.rename(p)
+
+    _atomic_write(p, content.encode("utf-8"))
     return get_stat_dict(p)
 
 @app.delete("/fs/delete")

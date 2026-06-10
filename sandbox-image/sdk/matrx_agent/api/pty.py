@@ -60,13 +60,8 @@ async def pty_endpoint(websocket: WebSocket, cols: int = 120, rows: int = 30):
                     except OSError:
                         # PTY closed
                         break
-            except Exception as e:
+            except Exception:
                 pass
-            finally:
-                try:
-                    await websocket.close()
-                except:
-                    pass
 
         async def read_from_ws():
             try:
@@ -88,28 +83,38 @@ async def pty_endpoint(websocket: WebSocket, cols: int = 120, rows: int = 30):
                         os.write(fd, message["bytes"])
             except WebSocketDisconnect:
                 pass
-            except Exception as e:
+            except Exception:
                 pass
-            finally:
-                # Clean up
-                try:
-                    os.kill(pid, signal.SIGKILL)
-                    os.waitpid(pid, 0)
-                except OSError:
-                    pass
-                try:
-                    os.close(fd)
-                except OSError:
-                    pass
 
-        # Run both tasks concurrently
+        # Run both tasks concurrently. Whichever finishes first (PTY closed or
+        # client disconnected), we tear the other down and reap the child + fd
+        # in ONE place so it happens exactly once. The old code only cleaned up
+        # in read_from_ws's finally and cancelled the pending task without
+        # awaiting it, so a bash child + PTY fd could leak on every disconnect
+        # (fd exhaustion + zombie accumulation over time).
         task1 = asyncio.create_task(read_from_pty())
         task2 = asyncio.create_task(read_from_ws())
-
-        done, pending = await asyncio.wait(
-            [task1, task2],
-            return_when=asyncio.FIRST_COMPLETED
-        )
-
-        for task in pending:
-            task.cancel()
+        try:
+            await asyncio.wait([task1, task2], return_when=asyncio.FIRST_COMPLETED)
+        finally:
+            for task in (task1, task2):
+                if not task.done():
+                    task.cancel()
+            # Let the cancellations settle so no coroutine is still touching fd.
+            await asyncio.gather(task1, task2, return_exceptions=True)
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+            try:
+                os.waitpid(pid, 0)
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+            try:
+                await websocket.close()
+            except Exception:
+                pass
