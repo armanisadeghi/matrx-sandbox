@@ -109,11 +109,16 @@ async def capture_memory_from_container(container, user_id: str, store) -> int:
 
     captured = 0
     total = 0
+    skipped_for_cap = 0
     try:
+        # Capture smallest-first so a single big file near the cap doesn't crowd
+        # out many small notes — maximize how many memory files survive.
         with tarfile.open(fileobj=raw, mode="r") as tar:
-            for member in tar.getmembers():
-                if not member.isfile():
-                    continue
+            members = sorted(
+                (m for m in tar.getmembers() if m.isfile()),
+                key=lambda m: m.size,
+            )
+            for member in members:
                 # get_archive prefixes members with the basename of the path,
                 # i.e. "memory/<rel>". Strip that to get the path we store.
                 rel = _strip_prefix(member.name, "memory/")
@@ -121,11 +126,15 @@ async def capture_memory_from_container(container, user_id: str, store) -> int:
                 if not rel:
                     continue
                 if member.size > MAX_FILE_BYTES:
-                    logger.info("memory capture: skipping %s (%d bytes > cap)", rel, member.size)
+                    logger.warning("memory capture: skipping %s (%d bytes > per-file cap)", rel, member.size)
+                    skipped_for_cap += 1
                     continue
                 if total + member.size > MAX_TOTAL_BYTES:
-                    logger.info("memory capture: hit total cap, stopping at %s", rel)
-                    break
+                    # Don't abandon the rest: a later, smaller file may still
+                    # fit under the total cap. Skip just this one and keep going.
+                    logger.warning("memory capture: %s would exceed total cap; skipping it", rel)
+                    skipped_for_cap += 1
+                    continue
                 f = tar.extractfile(member)
                 if f is None:
                     continue
@@ -145,6 +154,12 @@ async def capture_memory_from_container(container, user_id: str, store) -> int:
         if captured:
             logger.info("memory capture: saved %d file(s) from %s for user %s",
                         captured, MEMORY_ABS, user_id)
+        if skipped_for_cap:
+            logger.warning(
+                "memory capture: %d memory file(s) for user %s were NOT saved "
+                "(size caps) — some user memory was dropped",
+                skipped_for_cap, user_id,
+            )
         return captured
     except Exception as exc:
         logger.warning("memory capture: untar failed for %s: %s", user_id, exc)

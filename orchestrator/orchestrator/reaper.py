@@ -32,6 +32,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 
 from orchestrator.config import settings
 
@@ -40,6 +41,14 @@ logger = logging.getLogger(__name__)
 # How often to sweep for expired sandboxes. 60s is responsive enough that
 # "at 2h it tears down" feels accurate without hammering Docker/Postgres.
 REAP_INTERVAL_SECONDS = 60
+
+# Auto-migrate backoff. A drifted box that FAILS to migrate (e.g. its target
+# image is missing/broken) would otherwise be retried every 60s forever —
+# Docker load + log spam with no progress. Track consecutive failing passes and
+# defer the next attempt with exponential backoff (capped at 1h). Busy/deferred
+# boxes do NOT trigger backoff — they legitimately retry every sweep.
+_MIGRATE_BACKOFF_CAP_SECONDS = 3600
+_migrate_backoff = {"next_attempt": 0.0, "fails": 0}
 
 
 async def _reap_once() -> dict:
@@ -120,12 +129,39 @@ async def _reap_once() -> dict:
     # Opt-in rolling auto-migration: when enabled, migrate a few drifted boxes
     # each sweep (busy ones deferred to the next sweep). Off by default.
     if settings.auto_migrate and summary.get("drifted"):
-        try:
-            from orchestrator.migrate import migrate_all_drifted
-            mig = await migrate_all_drifted(store=store, max_per_pass=settings.migrate_max_per_pass)
-            summary["auto_migrated"] = len(mig.get("migrated", []))
-        except Exception as exc:
-            logger.warning("Reaper: auto-migrate failed this tick: %s", exc)
+        now = time.monotonic()
+        if now < _migrate_backoff["next_attempt"]:
+            summary["auto_migrate_deferred_until"] = _migrate_backoff["next_attempt"]
+        else:
+            try:
+                from orchestrator.migrate import migrate_all_drifted
+                mig = await migrate_all_drifted(store=store, max_per_pass=settings.migrate_max_per_pass)
+                summary["auto_migrated"] = len(mig.get("migrated", []))
+                # Back off only on genuine FAILURES (broken/missing image), not
+                # on busy 'deferred' boxes which should keep retrying each sweep.
+                if mig.get("failed") or mig.get("error"):
+                    _migrate_backoff["fails"] += 1
+                    delay = min(
+                        REAP_INTERVAL_SECONDS * (2 ** _migrate_backoff["fails"]),
+                        _MIGRATE_BACKOFF_CAP_SECONDS,
+                    )
+                    _migrate_backoff["next_attempt"] = now + delay
+                    logger.warning(
+                        "Reaper: auto-migrate had %d failure(s); backing off %ds",
+                        len(mig.get("failed", [])) or 1, delay,
+                    )
+                elif mig.get("migrated"):
+                    # Progress — clear the backoff.
+                    _migrate_backoff["fails"] = 0
+                    _migrate_backoff["next_attempt"] = 0.0
+            except Exception as exc:
+                _migrate_backoff["fails"] += 1
+                delay = min(
+                    REAP_INTERVAL_SECONDS * (2 ** _migrate_backoff["fails"]),
+                    _MIGRATE_BACKOFF_CAP_SECONDS,
+                )
+                _migrate_backoff["next_attempt"] = time.monotonic() + delay
+                logger.warning("Reaper: auto-migrate raised: %s (backing off %ds)", exc, delay)
 
     if summary["expired_found"] or summary["liveness_stopped"] or summary.get("drifted"):
         logger.info(
