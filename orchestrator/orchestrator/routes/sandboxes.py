@@ -858,10 +858,11 @@ async def proxy_credentials(sandbox_id: str, request: Request):
     if not container_ip:
         raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
-    # The path will be either /credentials or /credentials/revoke
-    # Reconstruct the path part
-    path = request.url.path.split(sandbox_id)[1]
-    url = f"http://{container_ip}:8000{path}"
+    # The path will be either /credentials or /credentials/revoke.
+    # Split on the full "/{sandbox_id}/" segment (not the bare id, which could
+    # appear elsewhere in the URL) so reconstruction is unambiguous.
+    _, _, suffix = request.url.path.partition(f"/{sandbox_id}/")
+    url = f"http://{container_ip}:8000/{suffix}"
     
     async with httpx.AsyncClient() as client:
         body = await request.body()
@@ -1002,9 +1003,9 @@ async def proxy_processes(sandbox_id: str, request: Request, pid: int = None):
     if not container_ip:
         raise HTTPException(status_code=500, detail="Could not determine sandbox IP")
 
-    # Reconstruct the path
-    path = request.url.path.split(sandbox_id)[1]
-    url = f"http://{container_ip}:8000{path}"
+    # Reconstruct the path after the "/{sandbox_id}/" segment unambiguously.
+    _, _, suffix = request.url.path.partition(f"/{sandbox_id}/")
+    url = f"http://{container_ip}:8000/{suffix}"
     
     async with httpx.AsyncClient() as client:
         body = await request.body()
@@ -1549,14 +1550,6 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
         si = cfg.get("secrets_injection") if isinstance(cfg, dict) else None
         if isinstance(si, dict):
             secrets_injection = dict(si)  # safe copy
-            # ALSO compare against what actually landed in the container
-            # so the user can see if a fetched secret was dropped by the
-            # docker-env merge for some reason.
-            try:
-                if isinstance(env_keys_in_container, list):
-                    expected_keys = []  # populated below
-            except NameError:
-                pass
             # We don't have the fetched key list (only the count), so the
             # best we can do here is surface the count + the "see container
             # env" pointer. The detail page can cross-reference.
