@@ -11,6 +11,8 @@ from typing import Optional
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
+from matrx_agent.api import _auth
+
 router = APIRouter()
 
 def set_winsize(fd, row, col, xpix=0, ypix=0):
@@ -19,6 +21,9 @@ def set_winsize(fd, row, col, xpix=0, ypix=0):
 
 @router.websocket("/pty")
 async def pty_endpoint(websocket: WebSocket, cols: int = 120, rows: int = 30):
+    if not _auth.ws_token_ok(websocket):
+        await websocket.close(code=1008, reason="invalid or missing agent token")
+        return
     await websocket.accept()
 
     # Create the PTY and fork

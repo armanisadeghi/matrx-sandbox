@@ -6,6 +6,8 @@ from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 from watchdog.observers import Observer
 from watchdog.events import FileSystemEventHandler
 
+from matrx_agent.api import _auth
+
 router = APIRouter()
 
 class WebSocketEventHandler(FileSystemEventHandler):
@@ -55,6 +57,9 @@ def _stop_observer(observer) -> None:
 
 @router.websocket("/fs/watch")
 async def watch_fs(websocket: WebSocket, path: str = "/home/agent"):
+    if not _auth.ws_token_ok(websocket):
+        await websocket.close(code=1008, reason="invalid or missing agent token")
+        return
     await websocket.accept()
 
     if not os.path.exists(path):

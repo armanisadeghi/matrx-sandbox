@@ -10,8 +10,10 @@ from pathlib import Path
 from typing import Any, List, Literal, Optional
 
 from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Form
-from fastapi.responses import FileResponse, PlainTextResponse
+from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
+
+from matrx_agent.api import _auth
 
 from matrx_agent.cloud_sync import CloudFilesWatcher
 from matrx_agent.persistence import CheckpointDaemon, read_prior_manifest, render_report
@@ -93,6 +95,29 @@ async def lifespan(app: FastAPI):
 
 
 app = FastAPI(title="Matrx Sandbox Agent API", lifespan=lifespan)
+
+
+# Per-sandbox daemon auth (fail-open when MATRX_AGENT_TOKEN is unset — see
+# matrx_agent.api._auth). Exempt:
+#   /health      — the container HEALTHCHECK curls it with no token.
+#   /internal/*  — lifecycle hooks the in-container entrypoint/shutdown scripts
+#                  call over localhost without a token. (WebSocket tool routes
+#                  enforce the token inside their own handlers, since HTTP
+#                  middleware doesn't see WS connections.)
+_AGENT_AUTH_EXEMPT_PREFIXES = ("/health", "/internal/")
+
+
+@app.middleware("http")
+async def _agent_token_guard(request, call_next):
+    if _auth.enforcement_enabled():
+        path = request.url.path
+        if not path.startswith(_AGENT_AUTH_EXEMPT_PREFIXES) and request.method != "OPTIONS":
+            if not _auth.token_ok(request.headers.get(_auth.HEADER_NAME)):
+                return JSONResponse(
+                    status_code=401,
+                    content={"detail": "invalid or missing X-Matrx-Agent-Token"},
+                )
+    return await call_next(request)
 
 # --- Models ---
 

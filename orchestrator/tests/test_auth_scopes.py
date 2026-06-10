@@ -184,3 +184,25 @@ def test_server_binding_ceiling_allows_full_session():
         ttl_seconds=7200, max_ttl_seconds=7200,
     )
     assert payload["exp"] - payload["iat"] == 7200
+
+
+# ── Per-sandbox daemon token (orchestrator side) ─────────────────────────────
+
+def test_agent_token_is_deterministic_and_per_sandbox(auth_env):
+    from orchestrator.sandbox_manager import agent_token_for, agent_forward_headers
+    t1 = agent_token_for(SBX)
+    assert t1 and t1 == agent_token_for(SBX)          # deterministic
+    assert agent_token_for("sbx-other000000") != t1   # bound to the id
+    assert agent_forward_headers(SBX) == {"X-Matrx-Agent-Token": t1}
+
+
+def test_agent_token_empty_when_no_secret():
+    from orchestrator.config import settings
+    from orchestrator.sandbox_manager import agent_token_for, agent_forward_headers
+    orig = settings.access_token_secret
+    settings.access_token_secret = ""
+    try:
+        assert agent_token_for(SBX) == ""           # fail-open
+        assert agent_forward_headers(SBX) == {}
+    finally:
+        settings.access_token_secret = orig

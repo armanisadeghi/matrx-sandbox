@@ -104,6 +104,32 @@ def _parse_env_file_keys(path: str) -> frozenset[str]:
     return frozen
 
 
+def agent_token_for(sandbox_id: str) -> str:
+    """Per-sandbox shared secret the in-container daemon checks.
+
+    Derived deterministically as HMAC(access_token_secret, "agent:<id>") so the
+    orchestrator can recompute it for any sandbox without storing it, and the
+    same value it injects into the container is the value it forwards on every
+    proxied request. Returns "" when MATRX_ACCESS_TOKEN_SECRET is unset, which
+    keeps the daemon fail-open (no enforcement) for local dev / pre-rollout.
+
+    See sandbox-image/sdk/matrx_agent/api/_auth.py for the daemon side.
+    """
+    secret = settings.access_token_secret
+    if not secret:
+        return ""
+    import hashlib
+    import hmac as _hmac
+    return _hmac.new(secret.encode(), f"agent:{sandbox_id}".encode(), hashlib.sha256).hexdigest()
+
+
+def agent_forward_headers(sandbox_id: str) -> dict[str, str]:
+    """Header dict to merge into a proxied request so the daemon accepts it.
+    Empty when enforcement is off (no secret configured)."""
+    tok = agent_token_for(sandbox_id)
+    return {"X-Matrx-Agent-Token": tok} if tok else {}
+
+
 def _proxy_url_for(sandbox_id: str) -> str | None:
     """Build the public ``proxy_url`` field surfaced on SandboxResponse.
 
@@ -313,6 +339,12 @@ async def create_sandbox(
             env["SANDBOX_TEMPLATE"] = template
         if template_version:
             env["SANDBOX_TEMPLATE_VERSION"] = template_version
+
+        # Per-sandbox daemon secret. Fail-open: only set when an access-token
+        # secret is configured; the daemon only enforces when it receives this.
+        _agent_tok = agent_token_for(sandbox_id)
+        if _agent_tok:
+            env["MATRX_AGENT_TOKEN"] = _agent_tok
 
         # ── AI Dream integration env ──────────────────────────────────────────
         # When the orchestrator has a service token, hand it to the sandbox

@@ -37,6 +37,15 @@ logger = logging.getLogger(__name__)
 router = APIRouter(prefix="/sandboxes", tags=["sandboxes"])
 
 
+def _with_agent(headers: dict, sandbox_id: str) -> dict:
+    """Add the per-sandbox daemon token to forwarded headers so the in-container
+    daemon accepts the proxied request. No-op when daemon enforcement is off
+    (no access-token secret configured). Always set by us — a client-supplied
+    value must not override the orchestrator's."""
+    headers.update(sandbox_manager.agent_forward_headers(sandbox_id))
+    return headers
+
+
 @router.post("", response_model=SandboxResponse, status_code=201)
 async def create_sandbox(req: CreateSandboxRequest):
     """Create a new sandbox for a user.
@@ -669,10 +678,13 @@ async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
     
     await websocket.accept()
     
-    query_string = str(websocket.query_params)
+    params = str(websocket.query_params)
+    agent_tok = sandbox_manager.agent_token_for(sandbox_id)
+    if agent_tok:
+        params = (params + "&" if params else "") + f"agent_token={agent_tok}"
     ws_url = f"ws://{container_ip}:8000/fs/watch"
-    if query_string:
-        ws_url += f"?{query_string}"
+    if params:
+        ws_url += f"?{params}"
         
     try:
         async with websockets.connect(ws_url) as client_ws:
@@ -750,7 +762,7 @@ async def proxy_fs(sandbox_id: str, path: str, request: Request):
                         url=url,
                         params=params,
                         content=body,
-                        headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                        headers=_with_agent({k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}, sandbox_id),
                         timeout=60.0
                     )
                 except httpx.RequestError as exc:
@@ -793,7 +805,7 @@ async def proxy_exec_stream(sandbox_id: str, request: Request):
                         method=request.method,
                         url=url,
                         content=body,
-                        headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                        headers=_with_agent({k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}, sandbox_id),
                         timeout=None
                     ) as resp:
                         async for chunk in resp.aiter_bytes():
@@ -831,7 +843,7 @@ async def proxy_git(sandbox_id: str, path: str, request: Request):
                         url=url,
                         params=params,
                         content=body,
-                        headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                        headers=_with_agent({k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}, sandbox_id),
                         timeout=120.0 # Git clones can take a while
                     )
                 except httpx.RequestError as exc:
@@ -910,10 +922,13 @@ async def proxy_pty(sandbox_id: str, websocket: WebSocket):
     
     await websocket.accept()
     
-    query_string = str(websocket.query_params)
+    params = str(websocket.query_params)
+    agent_tok = sandbox_manager.agent_token_for(sandbox_id)
+    if agent_tok:
+        params = (params + "&" if params else "") + f"agent_token={agent_tok}"
     ws_url = f"ws://{container_ip}:8000/pty"
-    if query_string:
-        ws_url += f"?{query_string}"
+    if params:
+        ws_url += f"?{params}"
         
     try:
         async with websockets.connect(ws_url) as client_ws:
@@ -1359,9 +1374,10 @@ async def proxy_to_container(sandbox_id: str, path: str, request: Request):
     # (kind="scoped-bearer"). For master / scoped-header / passthrough-bearer
     # we forward Authorization unchanged so the upstream daemon can use it.
     forward_drop = _HOP_BY_HOP_FORWARD | ({"authorization"} if strip_authorization else set())
-    forward_headers = {
-        k: v for k, v in request.headers.items() if k.lower() not in forward_drop
-    }
+    forward_headers = _with_agent(
+        {k: v for k, v in request.headers.items() if k.lower() not in forward_drop},
+        sandbox_id,
+    )
     body = await request.body()
 
     # Use a long-lived client kept open across the streaming response so

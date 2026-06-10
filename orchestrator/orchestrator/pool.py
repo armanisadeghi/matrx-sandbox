@@ -168,6 +168,14 @@ def _warm_run_container(template: str):
     if template:
         env["SANDBOX_TEMPLATE"] = template
 
+    # Per-sandbox daemon secret (fail-open when no access-token secret is set).
+    # A warm box has its sandbox_id pre-generated, so the token is stable from
+    # boot — the orchestrator forwards the same value once the box is claimed.
+    from orchestrator.sandbox_manager import agent_token_for
+    _agent_tok = agent_token_for(sandbox_id)
+    if _agent_tok:
+        env["MATRX_AGENT_TOKEN"] = _agent_tok
+
     try:
         container = client.containers.run(
             image=image,
