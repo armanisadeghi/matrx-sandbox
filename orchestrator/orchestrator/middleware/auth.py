@@ -56,6 +56,39 @@ def _scoped_tool_sandbox_id(path: str) -> str | None:
     return None
 
 
+def _required_scope_for(path: str, method: str) -> str:
+    """Map a per-sandbox tool path + HTTP method to the scope a scoped token
+    must carry. A token issued for a narrow scope (e.g. only ``fs.read``) must
+    NOT unlock the rest of the tool surface — that was the hole where any valid
+    token authorized every subpath. Master-key callers bypass this entirely.
+
+    The scope names match those issued by ``POST /sandboxes/{id}/agent-binding``
+    and ``/access-tokens``: fs.read, fs.write, fs.watch, exec.run, exec.stream,
+    git, ports.read, processes.read, pty.
+    """
+    parts = path.split("/")
+    sub = parts[3] if len(parts) >= 4 else ""
+    if sub == "fs":
+        if path.endswith("/fs/watch"):
+            return "fs.watch"
+        return "fs.read" if method in ("GET", "HEAD") else "fs.write"
+    if sub == "exec":
+        return "exec.stream" if path.endswith("/exec/stream") else "exec.run"
+    if sub == "search":
+        # Read-only ripgrep over the workspace — gated by fs.read.
+        return "fs.read"
+    if sub == "processes":
+        return "processes.read"
+    if sub == "ports":
+        return "ports.read"
+    if sub == "git":
+        return "git"
+    if sub == "pty":
+        return "pty"
+    # Unknown tool subpath — fail closed with a scope no token grants.
+    return "__unknown__"
+
+
 class APIKeyMiddleware(BaseHTTPMiddleware):
     """Middleware that enforces API key authentication on all routes
     except health checks, docs, and CORS preflight + the per-sandbox
@@ -95,17 +128,20 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
             provided_key = _extract_api_key(request)
             if provided_key and hmac.compare_digest(provided_key, settings.api_key):
                 return await call_next(request)
-            if _verify_scoped_token(request, tool_sandbox_id):
+            required_scope = _required_scope_for(request.url.path, request.method)
+            if _verify_scoped_token(request, tool_sandbox_id, required_scope):
                 return await call_next(request)
             logger.warning(
-                "Rejected tool call to %s: no valid master key or scoped token",
-                request.url.path,
+                "Rejected tool call to %s: no valid master key or scoped token "
+                "with the required scope %r",
+                request.url.path, required_scope,
             )
             return JSONResponse(
                 status_code=401,
                 content={"detail": (
                     "This route accepts the master X-API-Key or a sandbox-scoped "
-                    "X-Sandbox-Access-Token issued by POST /sandboxes/{id}/access-tokens."
+                    "X-Sandbox-Access-Token issued by POST /sandboxes/{id}/access-tokens "
+                    f"that carries the '{required_scope}' scope."
                 )},
             )
 
@@ -153,13 +189,17 @@ def _extract_api_key(request: Request) -> str | None:
     return None
 
 
-def _verify_scoped_token(request: Request, sandbox_id: str) -> bool:
+def _verify_scoped_token(
+    request: Request, sandbox_id: str, required_scope: str | None = None
+) -> bool:
     """True if the request carries a valid sandbox-scoped token bound to
-    ``sandbox_id`` (via X-Sandbox-Access-Token or Authorization: Bearer).
+    ``sandbox_id`` (via X-Sandbox-Access-Token or Authorization: Bearer) that
+    also carries ``required_scope``.
 
-    Mirrors the per-route check in ``proxy_to_container``. ``required_scope``
-    is left None — a token validly issued for THIS sandbox (HMAC-signed by us,
-    bound to its id, unexpired) authorizes its tool surface, same as /proxy.
+    Mirrors the per-route check in ``proxy_to_container``. ``required_scope`` is
+    now enforced (it used to be left None, which let any valid token for the
+    sandbox reach every tool subpath regardless of the scopes it was issued
+    with). Pass None only for callers that intentionally accept any scope.
     """
     if not settings.access_token_secret:
         return False
@@ -180,6 +220,7 @@ def _verify_scoped_token(request: Request, sandbox_id: str) -> bool:
             token=token,
             secret=settings.access_token_secret,
             expected_sandbox_id=sandbox_id,
+            required_scope=required_scope,
         )
         return True
     except sandbox_token.TokenError:

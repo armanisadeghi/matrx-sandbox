@@ -589,9 +589,63 @@ async def extend_sandbox(
     )
 
 
+def _authenticate_websocket(websocket: WebSocket, sandbox_id: str, required_scope: str) -> bool:
+    """Auth gate for the WebSocket tool routes (/pty, /fs/watch).
+
+    The HTTP APIKeyMiddleware is a BaseHTTPMiddleware and never sees WebSocket
+    connections, so these routes have to authenticate themselves or they are an
+    open, unauthenticated terminal/file-watch into any sandbox by id. Accepts:
+
+      * master ``X-API-Key`` (header) or ``?api_key=`` query param, OR
+      * a sandbox-scoped token bound to ``sandbox_id`` carrying ``required_scope``
+        — supplied via ``X-Sandbox-Access-Token`` / ``Authorization: Bearer``
+        header, or (since browsers can't set WS headers) a ``?token=`` /
+        ``?access_token=`` query param.
+
+    When no master key is configured the orchestrator is in local-dev unauth
+    mode (mirrors the HTTP middleware), so connections are allowed.
+    """
+    if not settings.api_key:
+        return True  # local dev: middleware allows all HTTP too
+
+    qp = websocket.query_params
+
+    # Master key (header or query param)
+    master = websocket.headers.get(settings.api_key_header) or qp.get("api_key")
+    if master and hmac.compare_digest(master, settings.api_key):
+        return True
+
+    # Sandbox-scoped token (header or query param)
+    token = (
+        websocket.headers.get("x-sandbox-access-token")
+        or websocket.headers.get("X-Sandbox-Access-Token")
+        or qp.get("token")
+        or qp.get("access_token")
+    )
+    if not token:
+        auth_header = websocket.headers.get("authorization") or websocket.headers.get("Authorization") or ""
+        if auth_header.lower().startswith("bearer "):
+            token = auth_header.split(" ", 1)[1].strip()
+    if not token or not settings.access_token_secret:
+        return False
+    try:
+        sandbox_token.verify_token(
+            token=token,
+            secret=settings.access_token_secret,
+            expected_sandbox_id=sandbox_id,
+            required_scope=required_scope,
+        )
+        return True
+    except sandbox_token.TokenError:
+        return False
+
+
 @router.websocket("/{sandbox_id}/fs/watch")
 async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
     """Proxy WebSocket for file watching to the internal sandbox daemon."""
+    if not _authenticate_websocket(websocket, sandbox_id, required_scope="fs.watch"):
+        await websocket.close(code=1008, reason="Unauthorized: master key or fs.watch-scoped token required")
+        return
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         await websocket.close(code=1008, reason=f"Sandbox {sandbox_id} not found")
@@ -828,6 +882,9 @@ async def proxy_credentials(sandbox_id: str, request: Request):
 @router.websocket("/{sandbox_id}/pty")
 async def proxy_pty(sandbox_id: str, websocket: WebSocket):
     """Proxy PTY WebSocket to the internal sandbox daemon."""
+    if not _authenticate_websocket(websocket, sandbox_id, required_scope="pty"):
+        await websocket.close(code=1008, reason="Unauthorized: master key or pty-scoped token required")
+        return
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         await websocket.close(code=1008, reason=f"Sandbox {sandbox_id} not found")
@@ -1209,11 +1266,12 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
         raise HTTPException(status_code=503, detail="Could not resolve a base URL (set MATRX_INTERNAL_URL or MATRX_PUBLIC_URL)")
 
     ttl = (body.ttl_seconds if body else None) or settings.max_session_duration_seconds
-    # The agent's hands need the full tool surface. The middleware accepts any
-    # valid token bound to this id on the structured tool routes; these scopes
-    # additionally satisfy the /proxy/* scope checks for the same box.
+    # The agent's hands need the full tool surface. The middleware now enforces a
+    # per-subpath scope (see _required_scope_for), so this default set must cover
+    # every structured tool route; it also satisfies the /proxy/* "ai" scope.
     scopes = (body.scopes if body and body.scopes else None) or [
-        "ai", "exec.run", "exec.stream", "fs.read", "fs.write", "fs.watch", "git", "ports.read", "pty",
+        "ai", "exec.run", "exec.stream", "fs.read", "fs.write", "fs.watch",
+        "git", "ports.read", "processes.read", "pty",
     ]
     try:
         token, payload = sandbox_token.issue_token(
