@@ -77,6 +77,17 @@ class Settings(BaseSettings):
     # sweep so a big drift wave rolls gradually rather than all at once.
     auto_migrate: bool = False          # env var: MATRX_AUTO_MIGRATE
     migrate_max_per_pass: int = 2       # env var: MATRX_MIGRATE_MAX_PER_PASS
+    # A box is treated as "in use" (migration deferred) if it has in-flight tool
+    # calls OR a heartbeat newer than this many seconds — so a recently-active
+    # session is never interrupted by a rolling migrate.
+    migrate_recent_heartbeat_seconds: int = 120  # env var: MATRX_MIGRATE_RECENT_HEARTBEAT_SECONDS
+    # S3-backed (EC2-tier) in-place migration. OFF by default: the swap must
+    # flush the old box to S3 BEFORE booting the new one, or the new box would
+    # hot-sync stale S3 and lose the final edits. The code path exists
+    # (migrate._migrate_s3_ordered) but MUST be validated end-to-end against a
+    # throwaway EC2/S3 sandbox before enabling. When off, S3 boxes are refused
+    # (unsupported_storage), exactly as before.
+    enable_s3_migrate: bool = False     # env var: MATRX_ENABLE_S3_MIGRATE
 
     # ── AI Dream integration ────────────────────────────────────────────────
     # Sandboxes need a way to call the AI Dream backend (cld_files,

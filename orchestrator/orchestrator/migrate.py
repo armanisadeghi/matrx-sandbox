@@ -72,6 +72,27 @@ async def _container_version(container) -> str | None:
     return None
 
 
+async def _safe_get(store, sandbox_id: str):
+    try:
+        return await store.get(sandbox_id)
+    except Exception:
+        return None
+
+
+def _has_recent_heartbeat(sbx) -> bool:
+    """True if the sandbox row has a heartbeat within the configured window."""
+    if sbx is None:
+        return False
+    hb = getattr(sbx, "last_heartbeat_at", None)
+    if hb is None:
+        return False
+    from datetime import datetime, timezone
+    if hb.tzinfo is None:
+        hb = hb.replace(tzinfo=timezone.utc)
+    age = (datetime.now(timezone.utc) - hb).total_seconds()
+    return age < settings.migrate_recent_heartbeat_seconds
+
+
 async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = None,
                           verify_timeout: int = 90, require_idle: bool = False) -> dict:
     """Migrate one box to the current image (or an explicit target_image).
@@ -98,9 +119,16 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     if not target_image and cur.image_id and old_image_id == cur.image_id:
         return {"status": "already_current", "sandbox_id": sandbox_id, "version": cur.version}
 
-    if require_idle and activity.inflight_count(sandbox_id) > 0:
-        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                "reason": "box has in-flight tool calls; defer migration to an idle gap"}
+    if require_idle:
+        if activity.inflight_count(sandbox_id) > 0:
+            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                    "reason": "box has in-flight tool calls; defer migration to an idle gap"}
+        # Also treat a recently-active session (fresh heartbeat) as in-use, even
+        # with no request in flight — so a user mid-think between tool calls is
+        # never swapped out from under their session.
+        if _has_recent_heartbeat(await _safe_get(store, sandbox_id)):
+            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                    "reason": "box had a recent heartbeat; defer migration until idle"}
 
     cfg = old.attrs.get("Config") or {}
     host = old.attrs.get("HostConfig") or {}
@@ -129,16 +157,22 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     # from fresh S3 → cutover), REFUSE to migrate a box whose /home/agent isn't a
     # shared volume. This makes auto-migrate structurally safe on every tier.
     if "/home/agent" not in {v.get("bind") for v in volumes.values()}:
-        logger.info(
-            "migrate %s: home dir not on a shared volume (S3-backed/ec2) — refusing "
-            "(sync-ordered migration for this storage model not yet implemented)",
-            sandbox_id,
+        if not settings.enable_s3_migrate:
+            logger.info(
+                "migrate %s: home dir not on a shared volume (S3-backed/ec2) — refusing "
+                "(set MATRX_ENABLE_S3_MIGRATE=1 after validating the sync-ordered path)",
+                sandbox_id,
+            )
+            return {
+                "status": "unsupported_storage", "sandbox_id": sandbox_id,
+                "reason": ("home dir is not on a shared persistent volume (S3-backed / ec2 tier); "
+                           "S3-ordered migration is implemented but disabled — enable "
+                           "MATRX_ENABLE_S3_MIGRATE only after validating it end-to-end"),
+            }
+        return await _migrate_s3_ordered(
+            sandbox_id, old=old, target=target, env=env, volumes=volumes,
+            labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
         )
-        return {
-            "status": "unsupported_storage", "sandbox_id": sandbox_id,
-            "reason": ("home dir is not on a shared persistent volume (S3-backed / ec2 tier); "
-                       "sync-ordered migration for this storage model is not yet implemented"),
-        }
 
     # Lock for the WHOLE migration up front. While building the new container,
     # both it and the old one carry the same matrx.sandbox_id label, and the
@@ -255,6 +289,146 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         "status": "migrated", "sandbox_id": sandbox_id,
         "to_version": cur.version or new_ver, "to_image": target,
     }
+
+
+async def _restart_container(container) -> None:
+    try:
+        await asyncio.to_thread(container.start)
+    except APIError as exc:
+        logger.error("migrate(s3): could not restart old container %s: %s",
+                     getattr(container, "name", "?"), exc)
+
+
+async def _migrate_s3_ordered(
+    sandbox_id: str, *, old, target: str, env: list, volumes: dict, labels: dict,
+    host: dict, cur, store, verify_timeout: int,
+) -> dict:
+    """In-place migrate for an S3-backed (EC2-tier) box, ordered so no edit is
+    lost. There is no shared /home/agent volume here — the home dir is S3-backed
+    (hot-sync down on boot, up-sync on graceful shutdown) — so the swap MUST:
+
+        1. drain in-flight calls, then GRACEFULLY stop the old box. Its
+           shutdown.sh trap runs the full flush (cloud-files up + hot-sync up),
+           so /home/agent is persisted to S3 BEFORE anything else boots.
+        2. boot the new box as a FRESH boot (SANDBOX_MIGRATION stripped) so its
+           entrypoint hot-syncs the just-flushed S3 down + re-pulls cloud-files.
+        3. verify readiness + version, then rename old->old-ts, new->sandbox_id.
+        4. remove the old box.
+
+    On ANY failure before cutover the OLD box is restarted (it re-hydrates the
+    flushed state from S3, so no data is lost) and the migration reports failed.
+
+    GATED by settings.enable_s3_migrate. This path cannot be unit-tested without
+    real S3 + an EC2 sandbox image; the server agent MUST validate it against a
+    throwaway sandbox before enabling the flag. Never raises."""
+    from orchestrator import activity
+    from orchestrator.sandbox_manager import _get_docker_client
+
+    client = _get_docker_client()
+    tmp_name = f"{sandbox_id}-mig"
+    # Fresh boot for the new box: it has no shared volume, so it must down-sync
+    # everything the old box just flushed.
+    env_fresh = [e for e in env if not e.startswith("SANDBOX_MIGRATION=")]
+
+    await activity.mark_migrating(sandbox_id)
+    new = None
+    try:
+        if not await activity.drain_inflight(sandbox_id, timeout=20.0):
+            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                    "reason": "in-flight tool calls did not drain; retry later"}
+
+        # 1. Graceful stop = full flush to S3 via the old box's shutdown trap.
+        # Give docker stop headroom over the in-container shutdown budget.
+        stop_timeout = settings.shutdown_timeout_seconds + 30
+        try:
+            await asyncio.to_thread(old.stop, timeout=stop_timeout)
+        except APIError as exc:
+            logger.error("migrate(s3) %s: graceful stop/flush failed: %s — old box kept", sandbox_id, exc)
+            await _restart_container(old)
+            return {"status": "failed", "sandbox_id": sandbox_id,
+                    "reason": f"pre-migrate graceful flush failed: {exc}"}
+
+        # clear any stale temp container
+        try:
+            await asyncio.to_thread(lambda: client.containers.get(tmp_name).remove(force=True))
+        except NotFound:
+            pass
+        except APIError as exc:
+            logger.warning("migrate(s3) %s: stale temp cleanup: %s", sandbox_id, exc)
+
+        # 2. Boot the new box (fresh boot → hot-sync down from the flushed S3).
+        run_kwargs: dict = dict(
+            image=target, name=tmp_name, detach=True, environment=env_fresh,
+            volumes=volumes or None, network=settings.docker_network,
+            cap_add=["SYS_ADMIN"], devices=["/dev/fuse"], cap_drop=[],
+            ports={"22/tcp": None}, extra_hosts={"host.docker.internal": "host-gateway"},
+            labels=labels, restart_policy={"Name": "no", "MaximumRetryCount": 0},
+        )
+        if host.get("NanoCpus"):
+            run_kwargs["nano_cpus"] = host["NanoCpus"]
+        if host.get("Memory"):
+            run_kwargs["mem_limit"] = host["Memory"]
+        try:
+            new = await asyncio.to_thread(lambda: client.containers.run(**run_kwargs))
+        except APIError as exc:
+            logger.error("migrate(s3) %s: new create failed: %s — restarting old", sandbox_id, exc)
+            await _restart_container(old)
+            return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"create failed: {exc}"}
+
+        ready = await _wait_container_ready(new, verify_timeout)
+        new_ver = (await _container_version(new)) if ready else None
+        version_ok = cur.version is None or new_ver == cur.version
+        if not ready or not version_ok:
+            logger.error(
+                "MIGRATE(s3) FAILED %s: ready=%s ver=%s exp=%s — removing new, restarting old",
+                sandbox_id, ready, new_ver, cur.version,
+            )
+            try:
+                await asyncio.to_thread(new.remove, force=True)
+            except APIError:
+                pass
+            await _restart_container(old)
+            return {"status": "failed", "sandbox_id": sandbox_id,
+                    "reason": f"new box not ready / version mismatch (ready={ready})"}
+
+        # 3. Cutover — old is already stopped.
+        old_renamed = f"{sandbox_id}-old-{int(time.time())}"
+        try:
+            await asyncio.to_thread(old.rename, old_renamed)
+            await asyncio.to_thread(new.rename, sandbox_id)
+        except APIError as exc:
+            logger.error("MIGRATE(s3) CUTOVER FAILED %s: %s — removing new, restoring old", sandbox_id, exc)
+            try:
+                await asyncio.to_thread(new.remove, force=True)
+            except APIError:
+                pass
+            try:
+                await asyncio.to_thread(old.rename, sandbox_id)
+            except APIError:
+                pass
+            await _restart_container(old)
+            return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"cutover failed: {exc}"}
+
+        # 4. Remove the old box; the new one now answers as sandbox_id.
+        try:
+            await asyncio.to_thread(old.remove, force=True)
+        except APIError as exc:
+            logger.warning("migrate(s3) %s: old cleanup failed (non-fatal): %s", sandbox_id, exc)
+
+        try:
+            sbx = await store.get(sandbox_id)
+            if sbx:
+                sbx.template_version = cur.version or new_ver
+                sbx.container_id = new.id
+                await store.save(sbx)
+        except Exception as exc:
+            logger.warning("migrate(s3) %s: store update failed (non-fatal): %s", sandbox_id, exc)
+    finally:
+        await activity.release_migration(sandbox_id)
+
+    logger.info("MIGRATED(s3) %s -> %s (version=%s)", sandbox_id, target, cur.version or new_ver)
+    return {"status": "migrated", "sandbox_id": sandbox_id,
+            "to_version": cur.version or new_ver, "to_image": target}
 
 
 async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
