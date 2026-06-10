@@ -160,11 +160,28 @@ class InMemorySandboxStore(SandboxStore):
         self._sandboxes[sandbox_id] = sandbox
         return True
 
+    async def update_heartbeat(self, sandbox_id: str) -> bool:
+        # Match the Postgres store: a heartbeat only stamps last_heartbeat_at,
+        # it does NOT force the status to RUNNING. The inherited base impl did
+        # the latter, so dev (in-memory) and prod (Postgres) disagreed — a box
+        # in READY/STARTING would jump to RUNNING on its first ping only in dev.
+        sandbox = self._sandboxes.get(sandbox_id)
+        if not sandbox:
+            return False
+        sandbox.last_heartbeat_at = datetime.now(timezone.utc)
+        self._sandboxes[sandbox_id] = sandbox
+        return True
+
     async def mark_stopped(self, sandbox_id: str, reason: str) -> bool:
+        # Match the Postgres store: also stamp stopped_at + stop_reason. The old
+        # in-memory impl dropped both, so audit/diagnostics lost the reason and
+        # timestamp in dev mode.
         sandbox = self._sandboxes.get(sandbox_id)
         if not sandbox:
             return False
         sandbox.status = SandboxStatus.STOPPED
+        sandbox.stopped_at = datetime.now(timezone.utc)
+        sandbox.stop_reason = reason
         self._sandboxes[sandbox_id] = sandbox
         return True
 

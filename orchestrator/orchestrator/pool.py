@@ -33,7 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 
 from orchestrator.config import settings
 from orchestrator.models import SandboxResponse, SandboxStatus
@@ -42,6 +42,14 @@ logger = logging.getLogger(__name__)
 
 WARM_LABEL = "matrx.warm_pool"
 POOL_INTERVAL_SECONDS = 30
+
+# Serializes the select-a-candidate → save-the-row critical section of
+# claim_warm so two concurrent /claim requests can't both adopt the same warm
+# box (the second save would overwrite the first user's row, handing two users
+# one container). Process-local — sufficient because the orchestrator runs a
+# single uvicorn worker (see orchestrator/Dockerfile). If that ever changes,
+# this must become a DB-level atomic claim (UPDATE ... WHERE ... RETURNING).
+_claim_lock = asyncio.Lock()
 
 
 def _warm_template() -> str:
@@ -245,54 +253,75 @@ async def claim_warm(
     if not _pool_enabled():
         return None
 
-    candidates = await _unclaimed_warm(template)
-    if not candidates:
-        return None
-
     from orchestrator.sandbox_manager import _get_store, _get_docker_client, _proxy_url_for
 
     store = _get_store()
-    container = candidates[0]
-    await asyncio.to_thread(container.reload)
-    labels = (container.attrs.get("Config", {}) or {}).get("Labels") or {}
-    sandbox_id = labels.get("matrx.sandbox_id")
-    if not sandbox_id:
-        return None
 
-    # Read the SSH host port the warm box already mapped.
-    ssh_port = None
-    try:
-        bindings = (container.attrs["NetworkSettings"]["Ports"] or {}).get("22/tcp")
-        if bindings:
-            ssh_port = int(bindings[0]["HostPort"])
-    except (KeyError, TypeError, ValueError):
-        pass
+    # Critical section: pick an unclaimed box and reserve it (save its row)
+    # atomically, so a concurrent claim can't grab the same container. Once the
+    # row exists, _unclaimed_warm excludes it.
+    async with _claim_lock:
+        candidates = await _unclaimed_warm(template)
+        if not candidates:
+            return None
 
-    sandbox = SandboxResponse(
-        sandbox_id=sandbox_id,
-        user_id=user_id,
-        status=SandboxStatus.READY,
-        container_id=container.id,
-        created_at=datetime.now(timezone.utc),
-        hot_path="/home/agent",
-        cold_path="/data/cold",
-        config={"warm_claimed": True},
-        ttl_seconds=ttl_seconds or settings.max_session_duration_seconds,
-        tier=settings.host_tier or None,
-        template=template,
-        ssh_port=ssh_port,
-        proxy_url=_proxy_url_for(sandbox_id),
-    )
-    # Create the row, then stamp expires_at explicitly — the DB's auto-expire
-    # trigger only fires on UPDATE into ready/running, but we INSERT as ready,
-    # so without this expire_stale would never reap a claimed warm box.
-    await store.save(sandbox)
+        container = candidates[0]
+        await asyncio.to_thread(container.reload)
+        labels = (container.attrs.get("Config", {}) or {}).get("Labels") or {}
+        sandbox_id = labels.get("matrx.sandbox_id")
+        if not sandbox_id:
+            return None
+
+        # Read the SSH host port the warm box already mapped.
+        ssh_port = None
+        try:
+            bindings = (container.attrs["NetworkSettings"]["Ports"] or {}).get("22/tcp")
+            if bindings:
+                ssh_port = int(bindings[0]["HostPort"])
+        except (KeyError, TypeError, ValueError):
+            pass
+
+        sandbox = SandboxResponse(
+            sandbox_id=sandbox_id,
+            user_id=user_id,
+            status=SandboxStatus.READY,
+            container_id=container.id,
+            created_at=datetime.now(timezone.utc),
+            hot_path="/home/agent",
+            cold_path="/data/cold",
+            config={"warm_claimed": True},
+            ttl_seconds=ttl_seconds or settings.max_session_duration_seconds,
+            tier=settings.host_tier or None,
+            template=template,
+            ssh_port=ssh_port,
+            proxy_url=_proxy_url_for(sandbox_id),
+        )
+        # Reserve the box: create the row inside the lock so the next claim sees
+        # it as claimed. (expires_at is stamped just below — the DB auto-expire
+        # trigger only fires on UPDATE into ready/running, but we INSERT ready.)
+        await store.save(sandbox)
+
     try:
         new_expires = await store.extend_ttl(sandbox_id, sandbox.ttl_seconds)
         if new_expires:
             sandbox.expires_at = new_expires
+        else:
+            raise RuntimeError("extend_ttl returned None (row vanished?)")
     except Exception as exc:
-        logger.warning("Pool: claim could not set expires_at for %s: %s", sandbox_id, exc)
+        # A claimed box with no persisted expires_at would never be reaped
+        # (expire_stale keys on expires_at) — a slow leak. Log loudly (not a
+        # silent warning) and stamp a local fallback so the returned response
+        # and the in-memory store are at least honest. NOTE: against Postgres
+        # the ROW may still lack expires_at until extend_ttl succeeds; the
+        # liveness sweep keeps the box visible, but operators should treat a
+        # recurring message here as a DB-write problem to investigate.
+        sandbox.expires_at = datetime.now(timezone.utc) + timedelta(seconds=sandbox.ttl_seconds)
+        await store.save(sandbox)
+        logger.error(
+            "Pool: claim could NOT persist expires_at for %s (%s); applied a "
+            "local fallback expiry — investigate the store write path",
+            sandbox_id, exc,
+        )
 
     # Hydrate this user's central memory into the freshly-claimed box.
     try:
