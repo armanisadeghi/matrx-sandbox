@@ -103,6 +103,30 @@ async def _read_image(file_path: str) -> ToolResult:
     )
 
 
+def _parse_pdf_page_range(pages: str) -> tuple[int, int]:
+    """Parse a ``"N"`` or ``"N-M"`` page spec into ``(first, last)`` integers.
+
+    Validates as integers BEFORE the value reaches the pdftotext argv. The old
+    code split the raw string into the command and ran it through a shell, so
+    ``"1-5 && cat /etc/passwd"`` or ``"--help"`` was injected verbatim. Raises
+    ``ValueError`` (surfaced as a clean tool error) on anything non-numeric or
+    out of order.
+    """
+    parts = [p.strip() for p in pages.split("-")]
+    try:
+        if len(parts) == 2:
+            first, last = int(parts[0]), int(parts[1])
+        elif len(parts) == 1:
+            first = last = int(parts[0])
+        else:
+            raise ValueError
+    except ValueError:
+        raise ValueError(f"Invalid page range {pages!r}; expected 'N' or 'N-M' (integers).")
+    if first < 1 or last < first:
+        raise ValueError(f"Invalid page range {pages!r}; need 1 <= first <= last.")
+    return first, last
+
+
 async def _read_pdf(file_path: str, pages: str | None) -> ToolResult:
     pdftotext = shutil.which("pdftotext")
     if not pdftotext:
@@ -116,15 +140,17 @@ async def _read_pdf(file_path: str, pages: str | None) -> ToolResult:
 
     cmd_parts = ["pdftotext"]
     if pages:
-        parts = pages.split("-")
-        if len(parts) == 2:
-            cmd_parts.extend(["-f", parts[0].strip(), "-l", parts[1].strip()])
-        elif len(parts) == 1:
-            cmd_parts.extend(["-f", parts[0].strip(), "-l", parts[0].strip()])
-    cmd_parts.extend([shlex.quote(file_path), "-"])
+        try:
+            first, last = _parse_pdf_page_range(pages)
+        except ValueError as exc:
+            return ToolResult(type=ToolResultType.ERROR, output=str(exc))
+        cmd_parts.extend(["-f", str(first), "-l", str(last)])
+    cmd_parts.extend([file_path, "-"])
 
-    proc = await asyncio.create_subprocess_shell(
-        " ".join(cmd_parts),
+    # exec (not shell): argv is passed directly to pdftotext, so no value can be
+    # interpreted as a shell metacharacter or an extra flag.
+    proc = await asyncio.create_subprocess_exec(
+        *cmd_parts,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
