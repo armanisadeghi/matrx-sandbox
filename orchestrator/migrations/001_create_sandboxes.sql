@@ -34,15 +34,19 @@ CREATE INDEX IF NOT EXISTS idx_sandbox_instances_expires_at ON sandbox_instances
 -- RLS
 ALTER TABLE sandbox_instances ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS sandbox_instances_select ON sandbox_instances;
 CREATE POLICY sandbox_instances_select ON sandbox_instances
     FOR SELECT USING (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS sandbox_instances_insert ON sandbox_instances;
 CREATE POLICY sandbox_instances_insert ON sandbox_instances
     FOR INSERT WITH CHECK (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS sandbox_instances_update ON sandbox_instances;
 CREATE POLICY sandbox_instances_update ON sandbox_instances
     FOR UPDATE USING (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS sandbox_instances_delete ON sandbox_instances;
 CREATE POLICY sandbox_instances_delete ON sandbox_instances
     FOR DELETE USING (auth.uid() = user_id);
 
@@ -55,6 +59,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS sandbox_instances_updated_at ON sandbox_instances;
 CREATE TRIGGER sandbox_instances_updated_at
     BEFORE UPDATE ON sandbox_instances
     FOR EACH ROW
@@ -73,6 +78,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS sandbox_instances_set_expires ON sandbox_instances;
 CREATE TRIGGER sandbox_instances_set_expires
     BEFORE UPDATE ON sandbox_instances
     FOR EACH ROW

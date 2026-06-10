@@ -38,15 +38,19 @@ CREATE INDEX IF NOT EXISTS idx_user_memory_user_id ON user_memory(user_id);
 -- behalf; the matrx-frontend proxy enforces per-user ownership on top.
 ALTER TABLE user_memory ENABLE ROW LEVEL SECURITY;
 
+DROP POLICY IF EXISTS user_memory_select ON user_memory;
 CREATE POLICY user_memory_select ON user_memory
     FOR SELECT USING (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS user_memory_insert ON user_memory;
 CREATE POLICY user_memory_insert ON user_memory
     FOR INSERT WITH CHECK (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS user_memory_update ON user_memory;
 CREATE POLICY user_memory_update ON user_memory
     FOR UPDATE USING (auth.uid() = user_id);
 
+DROP POLICY IF EXISTS user_memory_delete ON user_memory;
 CREATE POLICY user_memory_delete ON user_memory
     FOR DELETE USING (auth.uid() = user_id);
 
@@ -59,6 +63,7 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+DROP TRIGGER IF EXISTS user_memory_updated_at ON user_memory;
 CREATE TRIGGER user_memory_updated_at
     BEFORE UPDATE ON user_memory
     FOR EACH ROW

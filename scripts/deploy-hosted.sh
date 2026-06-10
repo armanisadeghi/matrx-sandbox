@@ -42,6 +42,20 @@ ORCH_IMAGE="matrx-orchestrator:latest"
 log()  { echo "[deploy-hosted] $*"; }
 fail() { echo "[deploy-hosted] ERROR: $*" >&2; exit 1; }
 
+# Bring the shared sandbox DB schema forward before the new orchestrator serves
+# traffic. Runs inside the orchestrator image (has asyncpg + the migration
+# runner + the migrations/ dir baked in) against the orchestrator's own .env.
+# Idempotent: already-applied migrations are skipped via the schema_migrations
+# ledger, so this is safe to run on every deploy. Fails the deploy on error.
+run_db_migrations() {
+  log "applying DB migrations (orchestrator.migrate_runner)…"
+  if ! docker run --rm --env-file "$ORCH_COMPOSE_DIR/.env" "$ORCH_IMAGE" \
+        python -m orchestrator.migrate_runner; then
+    fail "DB migrations failed — aborting before recreating orchestrator"
+  fi
+  log "DB migrations applied ✓"
+}
+
 cd "$REPO_DIR" || fail "repo dir $REPO_DIR not found"
 
 # ── Resolve OLD/NEW commit + change set ─────────────────────────────────────
@@ -74,6 +88,9 @@ if changed '^orchestrator/'; then
   if ! docker build -t "$ORCH_IMAGE" "$REPO_DIR/orchestrator"; then
     fail "orchestrator build failed — running container left untouched"
   fi
+  # Schema forward using the freshly-built image (carries the latest
+  # migrations/) before the new container starts serving.
+  run_db_migrations
   ( cd "$ORCH_COMPOSE_DIR" && docker compose up -d --force-recreate ) \
     || fail "orchestrator recreate failed"
   log "waiting for orchestrator /health (up to 60s)…"
@@ -132,8 +149,11 @@ rebuild_image() {
 need_img() { [ "$SBX_CHANGED" = 1 ] || ! docker image inspect "$1" >/dev/null 2>&1; }
 
 cd "$REPO_DIR/sandbox-image"
-if need_img matrx-sandbox:core; then rebuild_image "matrx-sandbox:core" docker build -t matrx-sandbox:core . ; else log "core present + unchanged — skip"; fi
-if need_img matrx-sandbox:slim; then rebuild_image "matrx-sandbox:slim" docker build -t matrx-sandbox:slim -f Dockerfile.slim . ; else log "slim present + unchanged — skip"; fi
+# Stamp the zero-drift version (commit SHA) so /etc/sandbox-image-version +
+# /drift report the build that produced the image, matching the EC2 job.
+# aidream builds FROM matrx-sandbox:core, so it inherits this version file.
+if need_img matrx-sandbox:core; then rebuild_image "matrx-sandbox:core" docker build --build-arg MATRX_IMAGE_VERSION="$NEW_SHA" -t matrx-sandbox:core . ; else log "core present + unchanged — skip"; fi
+if need_img matrx-sandbox:slim; then rebuild_image "matrx-sandbox:slim" docker build --build-arg MATRX_IMAGE_VERSION="$NEW_SHA" -t matrx-sandbox:slim -f Dockerfile.slim . ; else log "slim present + unchanged — skip"; fi
 # aidream is REQUIRED + ~5GB (builds ON TOP of :core, freshly rebuilt above if needed).
 if need_img matrx-sandbox:aidream; then rebuild_image "matrx-sandbox:aidream" bash build-aidream.sh ; else log "aidream present + unchanged — skip"; fi
 
