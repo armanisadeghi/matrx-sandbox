@@ -131,7 +131,7 @@ jobs:
               "echo === [4/5] Reinstall editable Python package ===",
               "sudo -u ec2-user bash -c \"cd /home/ec2-user/orchestrator && /usr/bin/python3.11 -m pip install --user --quiet -e .\"",
 
-              "echo === [4.5/5] Apply DB migrations (idempotent) ===",
+              "echo === [4.5/5] Apply DB migrations - idempotent ===",
               "DBURL=$(sudo systemctl show matrx-orchestrator -p Environment --value 2>/dev/null | tr \" \" \"\\n\" | grep \"^MATRX_DATABASE_URL=\" | head -1 | cut -d= -f2-); if [ -z \"$DBURL\" ] && [ -f /home/ec2-user/orchestrator/.env ]; then DBURL=$(grep \"^MATRX_DATABASE_URL=\" /home/ec2-user/orchestrator/.env | head -1 | cut -d= -f2-); fi; if [ -z \"$DBURL\" ]; then echo WARN: MATRX_DATABASE_URL not resolved on EC2 - skipping migrations; else sudo -u ec2-user env MATRX_DATABASE_URL=$DBURL bash -c \"cd /home/ec2-user/orchestrator && /usr/bin/python3.11 -m orchestrator.migrate_runner\" || { echo ERROR: EC2 DB migrations failed; exit 1; }; fi",
 
               "echo === [5/5] Restart and health-check ===",

@@ -103,9 +103,13 @@ STAGED_SIZE=$(du -sh "$STAGE_DIR" | cut -f1)
 echo "[build-aidream] staged $STAGED_SIZE"
 
 echo "[build-aidream] docker build → $TAG (this is the slow step — uv sync takes 5–10 min first time)"
+# Forward MATRX_IMAGE_VERSION (the orchestrator/sandbox-monorepo SHA) when the
+# caller (deploy-hosted.sh / CI) sets it, so /etc/sandbox-image-version on the
+# aidream variant matches core/slim and drift detection works. Defaults to "dev".
 docker build \
     -f Dockerfile.aidream \
     --build-arg AIDREAM_GIT_SHA="$GIT_SHA" \
+    --build-arg MATRX_IMAGE_VERSION="${MATRX_IMAGE_VERSION:-dev}" \
     -t "$TAG" \
     .
 

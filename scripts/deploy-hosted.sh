@@ -125,7 +125,8 @@ fi
 BUILD_STATUS_DIR="${IMAGE_BUILD_STATUS_DIR:-/srv/apps/image-build-status}"
 mkdir -p "$BUILD_STATUS_DIR" 2>/dev/null || true
 IMAGE_FAIL=0
-SBX_CHANGED=0; changed '^sandbox-image/' && SBX_CHANGED=1
+SBX_CHANGED=0;   changed '^sandbox-image/' && SBX_CHANGED=1
+LOCAL_CHANGED=0; changed '^sandbox-local/' && LOCAL_CHANGED=1
 
 rebuild_image() {
   local tag="$1"; shift
@@ -146,7 +147,9 @@ rebuild_image() {
 }
 
 # rebuild if sandbox-image/ changed OR the image is absent (self-heal)
-need_img() { [ "$SBX_CHANGED" = 1 ] || ! docker image inspect "$1" >/dev/null 2>&1; }
+need_img()       { [ "$SBX_CHANGED"   = 1 ] || ! docker image inspect "$1" >/dev/null 2>&1; }
+# local rebuilds when sandbox-image/ OR sandbox-local/ changes (or the image is missing)
+need_local_img() { [ "$SBX_CHANGED"   = 1 ] || [ "$LOCAL_CHANGED" = 1 ] || ! docker image inspect "$1" >/dev/null 2>&1; }
 
 cd "$REPO_DIR/sandbox-image"
 # Stamp the zero-drift version (commit SHA) so /etc/sandbox-image-version +
@@ -155,7 +158,33 @@ cd "$REPO_DIR/sandbox-image"
 if need_img matrx-sandbox:core; then rebuild_image "matrx-sandbox:core" docker build --build-arg MATRX_IMAGE_VERSION="$NEW_SHA" -t matrx-sandbox:core . ; else log "core present + unchanged — skip"; fi
 if need_img matrx-sandbox:slim; then rebuild_image "matrx-sandbox:slim" docker build --build-arg MATRX_IMAGE_VERSION="$NEW_SHA" -t matrx-sandbox:slim -f Dockerfile.slim . ; else log "slim present + unchanged — skip"; fi
 # aidream is REQUIRED + ~5GB (builds ON TOP of :core, freshly rebuilt above if needed).
-if need_img matrx-sandbox:aidream; then rebuild_image "matrx-sandbox:aidream" bash build-aidream.sh ; else log "aidream present + unchanged — skip"; fi
+# Export MATRX_IMAGE_VERSION so build-aidream.sh forwards it as a build-arg and
+# the aidream layer's /etc/sandbox-image-version matches the deploy SHA.
+if need_img matrx-sandbox:aidream; then
+  rebuild_image "matrx-sandbox:aidream" env MATRX_IMAGE_VERSION="$NEW_SHA" bash build-aidream.sh
+else
+  log "aidream present + unchanged — skip"
+fi
+
+# ── Local starter pool (sandbox-1..5) ───────────────────────────────────────
+# The static starter pool predates the dynamic orchestrator and is marked
+# deprecated, but it's still serving traffic. Rebuild matrx-sandbox:local +
+# recreate the pool when sandbox-image/ OR sandbox-local/ changes (or the image
+# is missing) so a push-to-main brings it forward too. The rolling auto-migrate
+# loop is orchestrator-driven and does NOT touch these static containers — they
+# refresh via this docker-compose recreate. If/when the pool is retired, remove
+# this block entirely (don't leave it half-maintained).
+if need_local_img matrx-sandbox:local; then
+  cd "$REPO_DIR/sandbox-local"
+  rebuild_image "matrx-sandbox:local" docker build --build-arg MATRX_IMAGE_VERSION="$NEW_SHA" -t matrx-sandbox:local .
+  if [ "$IMAGE_FAIL" != 1 ] && [ -f docker-compose.yml ]; then
+    log "recreating local starter pool (sandbox-1..5) on the fresh image"
+    docker compose up -d 2>&1 | sed 's/^/[deploy-hosted] starter-pool: /' || \
+      log "WARNING: starter pool compose up failed (image is built; pool may be stale)"
+  fi
+else
+  log "local present + unchanged (and sandbox-local/ unchanged) — skip"
+fi
 
 [ "$IMAGE_FAIL" = 1 ] && fail "one or more sandbox-image rebuilds failed (orchestrator unaffected)"
 log "hosted-tier deploy complete at $NEW_SHA"

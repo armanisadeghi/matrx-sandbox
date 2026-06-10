@@ -22,11 +22,20 @@ FROM matrx-sandbox:core AS base
 ARG AIDREAM_GIT_SHA=unknown
 ENV AIDREAM_GIT_SHA=${AIDREAM_GIT_SHA}
 
+# Zero-drift version stamp. Defaults to "dev" so local builds don't fail. The
+# hosted/EC2 deploy passes the commit SHA so /etc/sandbox-image-version returned
+# by GET /drift can tell old aidream layers apart from a fresh rebuild. See
+# docs/ZERO_DRIFT.md.
+ARG MATRX_IMAGE_VERSION=dev
+ENV MATRX_IMAGE_VERSION=${MATRX_IMAGE_VERSION}
+LABEL com.aimatrx.sandbox.version="${MATRX_IMAGE_VERSION}"
+
 # Image-variant tag — overrides the "core" stamp from the base image so
 # entrypoint-local.sh's SANDBOX_MODE picks the right value when this image
 # layers on top of :local. Read by /home/agent/.sandbox_env on every boot.
 USER root
-RUN echo "aidream" > /etc/sandbox-image-tag
+RUN echo "aidream" > /etc/sandbox-image-tag \
+    && echo "${MATRX_IMAGE_VERSION}" > /etc/sandbox-image-version
 
 # ─── System deps for aidream (mirroring aidream/Dockerfile) ────────────────
 # Skipping software-properties-common / deadsnakes PPA — it's brittle on

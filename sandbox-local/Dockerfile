@@ -20,10 +20,18 @@
 ARG CORE_VERSION=core
 FROM matrx-sandbox:${CORE_VERSION}
 
+# Zero-drift version stamp. Defaults to "dev" so local builds don't fail. The
+# hosted deploy passes the commit SHA so /etc/sandbox-image-version returned by
+# GET /drift can tell old :local layers apart from a fresh rebuild. See
+# docs/ZERO_DRIFT.md.
+ARG MATRX_IMAGE_VERSION=dev
+ENV MATRX_IMAGE_VERSION=${MATRX_IMAGE_VERSION}
 LABEL variant="local"
 LABEL description="Self-hosted sandbox with web terminal — no AWS dependencies"
+LABEL com.aimatrx.sandbox.version="${MATRX_IMAGE_VERSION}"
 
 USER root
+RUN echo "${MATRX_IMAGE_VERSION}" > /etc/sandbox-image-version
 
 # ─── Install ttyd (web-based terminal) ────────────────────────────────────────
 # ttyd shares a terminal via HTTP — gives each sandbox a browser-accessible shell
