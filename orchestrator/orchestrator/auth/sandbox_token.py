@@ -35,9 +35,12 @@ import base64
 import hashlib
 import hmac
 import json
+import logging
 import secrets
 import time
 from typing import Any
+
+logger = logging.getLogger(__name__)
 
 # Constant header — alg + typ are fixed for our use.
 _HEADER = {"alg": "HS256", "typ": "JWT"}
@@ -77,12 +80,16 @@ def issue_token(
     ttl_seconds: int = DEFAULT_TTL_SECONDS,
     actor: dict[str, Any] | None = None,
     single_use: bool = False,
+    max_ttl_seconds: int = MAX_TTL_SECONDS,
 ) -> tuple[str, dict[str, Any]]:
     """Mint a bearer token. Returns (token, payload).
 
-    Caller is expected to enforce ``ttl_seconds`` capping before calling — we
-    clamp to ``MAX_TTL_SECONDS`` here as defence-in-depth so an admin endpoint
-    bug can't issue 100-year tokens.
+    ``ttl_seconds`` is clamped to ``max_ttl_seconds`` as defence-in-depth so an
+    admin-endpoint bug can't issue 100-year tokens. Browser-facing callers keep
+    the short default ceiling (``MAX_TTL_SECONDS`` = 15 min); server-to-server
+    callers (the agent binding) pass a higher ceiling so a long agent session
+    isn't silently cut to 15 minutes mid-run. The clamp is logged when it
+    actually shortens the requested TTL so it's never silent.
     """
     if not secret:
         raise TokenError("token signing secret is empty")
@@ -92,7 +99,13 @@ def issue_token(
         raise TokenError("scopes is required")
 
     now = int(time.time())
-    capped_ttl = max(1, min(int(ttl_seconds), MAX_TTL_SECONDS))
+    ceiling = max(1, int(max_ttl_seconds))
+    capped_ttl = max(1, min(int(ttl_seconds), ceiling))
+    if int(ttl_seconds) > ceiling:
+        logger.warning(
+            "issue_token: requested ttl %ss for sandbox %s clamped to %ss",
+            ttl_seconds, sandbox_id, ceiling,
+        )
     payload: dict[str, Any] = {
         "iss": ISSUER,
         "sub": sandbox_id,

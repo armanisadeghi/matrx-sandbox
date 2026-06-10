@@ -154,3 +154,33 @@ def test_ws_auth_rejects_wrong_scope_token(auth_env):
 def test_ws_auth_rejects_token_for_other_sandbox(auth_env):
     ws = _FakeWS(query=f"token={_token(['pty'], sandbox_id='sbx-other000000')}")
     assert _authenticate_websocket(ws, SBX, "pty") is False
+
+
+def test_ws_auth_consumes_single_use_token(auth_env):
+    token, payload = sandbox_token.issue_token(
+        secret=TEST_TOKEN_SECRET, sandbox_id=SBX, scopes=["pty"], tier="hosted",
+        single_use=True,
+    )
+    ws = _FakeWS(query=f"token={token}")
+    assert _authenticate_websocket(ws, SBX, "pty") is True
+    assert sandbox_token.is_jti_consumed(payload["jti"]) is True
+    # A second use of the same single-use token is rejected.
+    assert _authenticate_websocket(_FakeWS(query=f"token={token}"), SBX, "pty") is False
+
+
+# ── TTL ceiling ──────────────────────────────────────────────────────────────
+
+def test_default_ttl_ceiling_clamps_to_15_min():
+    _, payload = sandbox_token.issue_token(
+        secret=TEST_TOKEN_SECRET, sandbox_id=SBX, scopes=["ai"], tier="hosted",
+        ttl_seconds=7200,
+    )
+    assert payload["exp"] - payload["iat"] == sandbox_token.MAX_TTL_SECONDS
+
+
+def test_server_binding_ceiling_allows_full_session():
+    _, payload = sandbox_token.issue_token(
+        secret=TEST_TOKEN_SECRET, sandbox_id=SBX, scopes=["ai"], tier="hosted",
+        ttl_seconds=7200, max_ttl_seconds=7200,
+    )
+    assert payload["exp"] - payload["iat"] == 7200

@@ -629,15 +629,22 @@ def _authenticate_websocket(websocket: WebSocket, sandbox_id: str, required_scop
     if not token or not settings.access_token_secret:
         return False
     try:
-        sandbox_token.verify_token(
+        payload = sandbox_token.verify_token(
             token=token,
             secret=settings.access_token_secret,
             expected_sandbox_id=sandbox_id,
             required_scope=required_scope,
         )
-        return True
     except sandbox_token.TokenError:
         return False
+    # Spend a single-use token now that it has authorized this connection. This
+    # is the WebSocket-upgrade consumption point the token contract describes;
+    # without it, single_use=True was decorative (the token stayed replayable).
+    if payload.get("single_use"):
+        jti = payload.get("jti")
+        if jti:
+            sandbox_token.consume_jti(jti)
+    return True
 
 
 @router.websocket("/{sandbox_id}/fs/watch")
@@ -1280,6 +1287,10 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
             scopes=scopes,
             tier=settings.host_tier or (sandbox.tier.value if sandbox.tier else "ec2"),
             ttl_seconds=ttl,
+            # Server-to-server binding (co-located AI Dream): allow a full
+            # session, not the 15-min browser ceiling, so a long agent run
+            # isn't silently cut off mid-turn.
+            max_ttl_seconds=settings.max_session_duration_seconds,
         )
     except sandbox_token.TokenError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
