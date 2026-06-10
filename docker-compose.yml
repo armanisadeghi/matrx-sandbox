@@ -29,6 +29,10 @@ services:
       - MATRX_SANDBOX_IMAGE=matrx-sandbox:latest
       # Route S3 requests to LocalStack instead of real AWS
       - AWS_ENDPOINT_URL_S3=http://localstack:4566
+    # Local dev only: hot-reload against the bind-mounted source. The image's
+    # default CMD is production-safe (single worker, no --reload); this override
+    # restores the dev workflow without baking it into the image.
+    command: ["uvicorn", "orchestrator.main:app", "--host", "0.0.0.0", "--port", "8000", "--reload"]
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./orchestrator:/app
