@@ -37,6 +37,8 @@ from matrx_agent.cloud_sync.client import AsyncBridgeClient, BridgeConfig
 from matrx_agent.cloud_sync.downstream import RemoteChange, make_subscriber
 from matrx_agent.cloud_sync.queue import (
     DEFAULT_PATH as DEFAULT_QUEUE_PATH,
+)
+from matrx_agent.cloud_sync.queue import (
     PendingEvent,
     PersistentQueue,
 )
@@ -69,6 +71,18 @@ COMPACT_CHECK_INTERVAL = 50  # check queue compaction every N completed events
 RECENTLY_APPLIED_TTL_SECONDS = 30.0
 RECENTLY_APPLIED_MAX = 1024
 
+# Suffix used by the downstream apply path for its atomic write+rename
+# (see _apply_remote_change: local.suffix + CLOUD_FILES_TMP_SUFFIX). The
+# filesystem observer sees these scratch files appear-then-vanish and would
+# otherwise enqueue an upsert+delete for each — the delete then hits the bridge
+# with a path that was never a cld_files row, producing a continuous stream of
+# spurious 404s. They are internal scratch, never user content: always ignore.
+CLOUD_FILES_TMP_SUFFIX = ".cloud-files.tmp"
+
+
+def _is_ignored_scratch(path: str) -> bool:
+    return path.endswith(CLOUD_FILES_TMP_SUFFIX)
+
 
 class _Handler(FileSystemEventHandler):
     """Watchdog handler — runs in the observer thread, hands events to the asyncio loop."""
@@ -79,6 +93,8 @@ class _Handler(FileSystemEventHandler):
         self.loop = loop
 
     def _enqueue(self, kind: str, path: str) -> None:
+        if _is_ignored_scratch(path):
+            return
         try:
             self.loop.call_soon_threadsafe(
                 self.queue.put_nowait, (kind, path, time.monotonic())
@@ -134,9 +150,14 @@ class _Metrics:
         self.errors_total += 1
         self.last_error_ts = time.time()
         self.last_error_message = error[:200]
-        self.recent_errors.appendleft({
-            "kind": kind, "rel_path": rel, "error": error[:200], "ts": time.time(),
-        })
+        self.recent_errors.appendleft(
+            {
+                "kind": kind,
+                "rel_path": rel,
+                "error": error[:200],
+                "ts": time.time(),
+            }
+        )
 
     def percentile(self, p: float) -> Optional[int]:
         n = len(self.recent_latencies_ms)
@@ -153,7 +174,9 @@ class CloudFilesWatcher:
     def __init__(
         self,
         cloud_root: Path = Path("/home/agent/cloud-files"),
-        marker_path: Path = Path("/home/agent/.matrx/runtime/cloud-files-down-complete"),
+        marker_path: Path = Path(
+            "/home/agent/.matrx/runtime/cloud-files-down-complete"
+        ),
         queue_path: Optional[Path] = None,
     ):
         self.cloud_root = cloud_root
@@ -167,11 +190,15 @@ class CloudFilesWatcher:
         self._drain_task: Optional[asyncio.Task] = None
         self._startup_task: Optional[asyncio.Task] = None
         # Maps rel_path → (TimerHandle, event_id) — at most one pending timer per path.
-        self._pending: "OrderedDict[str, tuple[asyncio.TimerHandle, str]]" = OrderedDict()
+        self._pending: "OrderedDict[str, tuple[asyncio.TimerHandle, str]]" = (
+            OrderedDict()
+        )
         self._inflight_sem: Optional[asyncio.Semaphore] = None
         self._last_hash: dict[str, str] = {}
         self._event_arrivals: dict[str, float] = {}
-        self._mode: str = "init"  # init|dormant|waiting|degraded|active|stopping|stopped
+        self._mode: str = (
+            "init"  # init|dormant|waiting|degraded|active|stopping|stopped
+        )
         self._mode_since: float = time.time()
         self._stop_requested = False
         self._persistent_queue: Optional[PersistentQueue] = None
@@ -306,7 +333,8 @@ class CloudFilesWatcher:
                 _logger.warning(
                     "cloud-files: marker absent + bridge unreachable; "
                     "retrying in %.0fs (attempt %d)",
-                    delay, attempt + 1,
+                    delay,
+                    attempt + 1,
                 )
                 attempt += 1
                 await asyncio.sleep(delay)
@@ -371,11 +399,15 @@ class CloudFilesWatcher:
                         queued,
                     )
             except Exception as e:  # noqa: BLE001
-                _logger.warning("cloud-files: reconcile against cld_files failed: %s", e)
+                _logger.warning(
+                    "cloud-files: reconcile against cld_files failed: %s", e
+                )
 
         self._observer = Observer()
         self._observer.schedule(
-            _Handler(self._fs_queue, self._loop), str(self.cloud_root), recursive=True,
+            _Handler(self._fs_queue, self._loop),
+            str(self.cloud_root),
+            recursive=True,
         )
         self._observer.start()
 
@@ -388,7 +420,8 @@ class CloudFilesWatcher:
                 self._enqueue_replay(replayed)
                 _logger.info(
                     "cloud-files: replayed %d pending events from %s",
-                    len(replayed), self._persistent_queue.path,
+                    len(replayed),
+                    self._persistent_queue.path,
                 )
         except Exception as e:  # noqa: BLE001
             _logger.warning("cloud-files: queue replay failed: %s", e)
@@ -404,7 +437,10 @@ class CloudFilesWatcher:
         self._set_mode("degraded" if degraded else "active")
         _logger.info(
             "cloud-files: watcher %s (root=%s, %d seeded hashes, debounce=%.1fs)",
-            self._mode, self.cloud_root, len(self._last_hash), DEBOUNCE_SECONDS,
+            self._mode,
+            self.cloud_root,
+            len(self._last_hash),
+            DEBOUNCE_SECONDS,
         )
 
     def _enqueue_replay(self, events: list[PendingEvent]) -> None:
@@ -413,11 +449,15 @@ class CloudFilesWatcher:
         for evt in events:
             handle = self._loop.call_later(
                 0.0,
-                (lambda r=evt.rel_path, eid=evt.event_id, k=evt.kind:
-                    asyncio.create_task(
-                        self._flush_upsert(r, eid) if k == "upsert"
+                (
+                    lambda r=evt.rel_path,
+                    eid=evt.event_id,
+                    k=evt.kind: asyncio.create_task(
+                        self._flush_upsert(r, eid)
+                        if k == "upsert"
                         else self._flush_delete(r, eid)
-                    )),
+                    )
+                ),
             )
             # Replays don't go through _persistent_queue.enqueue again — they're
             # already on disk. We just track them in _pending for stop() cleanup.
@@ -436,6 +476,8 @@ class CloudFilesWatcher:
                 if rel is None:
                     continue
                 if self._is_dotpath(rel):
+                    continue
+                if _is_ignored_scratch(rel):
                     continue
                 if p.stat().st_size > MAX_FILE_SIZE:
                     continue
@@ -535,6 +577,8 @@ class CloudFilesWatcher:
                     continue
                 if self._is_dotpath(rel):
                     continue
+                if _is_ignored_scratch(rel):
+                    continue
 
                 # Echo-loop guard. If we just applied a remote change to this
                 # path AND the local bytes still match what we wrote, watchdog
@@ -556,7 +600,9 @@ class CloudFilesWatcher:
 
                 # Backpressure cap.
                 if len(self._pending) >= MAX_PENDING:
-                    drop_rel, (drop_handle, drop_eid) = self._pending.popitem(last=False)
+                    drop_rel, (drop_handle, drop_eid) = self._pending.popitem(
+                        last=False
+                    )
                     drop_handle.cancel()
                     self._safe_mark_done(drop_eid)
                     _logger.warning(
@@ -567,7 +613,11 @@ class CloudFilesWatcher:
                 self._event_arrivals.setdefault(rel, t_arrival)
 
                 # Persist + schedule.
-                evt = self._persistent_queue.enqueue(kind, rel) if self._persistent_queue else None
+                evt = (
+                    self._persistent_queue.enqueue(kind, rel)
+                    if self._persistent_queue
+                    else None
+                )
                 event_id = evt.event_id if evt else f"mem-{id(rel):x}"
 
                 if kind == "delete":
@@ -618,7 +668,8 @@ class CloudFilesWatcher:
             try:
                 if local.is_symlink():
                     _logger.info(
-                        "cloud-files: skipping %s (symlink, v1 limitation)", rel,
+                        "cloud-files: skipping %s (symlink, v1 limitation)",
+                        rel,
                     )
                     self._event_arrivals.pop(rel, None)
                     self._safe_mark_done(event_id)
@@ -631,7 +682,9 @@ class CloudFilesWatcher:
                 size = local.stat().st_size
                 if size > MAX_FILE_SIZE:
                     _logger.info(
-                        "cloud-files: skipping %s (>1 GiB cap, size=%d)", rel, size,
+                        "cloud-files: skipping %s (>1 GiB cap, size=%d)",
+                        rel,
+                        size,
                     )
                     self._event_arrivals.pop(rel, None)
                     self._safe_mark_done(event_id)
@@ -648,7 +701,8 @@ class CloudFilesWatcher:
                     if self._loop is not None:
                         new_evt = (
                             self._persistent_queue.enqueue("upsert", rel)
-                            if self._persistent_queue else None
+                            if self._persistent_queue
+                            else None
                         )
                         new_eid = new_evt.event_id if new_evt else f"mem-{id(rel):x}"
                         handle = self._loop.call_later(
@@ -677,13 +731,13 @@ class CloudFilesWatcher:
                     try:
                         result = await self._client.put_one(local, rel)
                         latency_ms = (time.monotonic() - t0) * 1000
-                        is_new = (
-                            isinstance(result, dict)
-                            and result.get("version") == 1
-                        )
+                        is_new = isinstance(result, dict) and result.get("version") == 1
                         _logger.info(
                             "cloud-files: PUT %s %d bytes new=%s latency_ms=%d",
-                            rel, size, is_new, int(latency_ms),
+                            rel,
+                            size,
+                            is_new,
+                            int(latency_ms),
                         )
                         self._last_hash[rel] = new_hash
                         self._metrics.record_put(size, latency_ms)
@@ -693,7 +747,9 @@ class CloudFilesWatcher:
                     except Exception as e:  # noqa: BLE001
                         last_err = e
                 _logger.warning(
-                    "cloud-files: PUT %s failed after retries: %s", rel, last_err,
+                    "cloud-files: PUT %s failed after retries: %s",
+                    rel,
+                    last_err,
                 )
                 self._metrics.record_error("upsert", rel, str(last_err))
                 self._event_arrivals.pop(rel, None)
@@ -721,7 +777,8 @@ class CloudFilesWatcher:
                     if self._loop is not None:
                         new_evt = (
                             self._persistent_queue.enqueue("upsert", rel)
-                            if self._persistent_queue else None
+                            if self._persistent_queue
+                            else None
                         )
                         new_eid = new_evt.event_id if new_evt else f"mem-{id(rel):x}"
                         handle = self._loop.call_later(
@@ -743,7 +800,9 @@ class CloudFilesWatcher:
                         await self._client.delete_one(rel)
                         latency_ms = (time.monotonic() - t0) * 1000
                         _logger.info(
-                            "cloud-files: DELETE %s latency_ms=%d", rel, int(latency_ms),
+                            "cloud-files: DELETE %s latency_ms=%d",
+                            rel,
+                            int(latency_ms),
                         )
                         self._last_hash.pop(rel, None)
                         self._metrics.record_delete(latency_ms)
@@ -753,7 +812,9 @@ class CloudFilesWatcher:
                     except Exception as e:  # noqa: BLE001
                         last_err = e
                 _logger.warning(
-                    "cloud-files: DELETE %s failed after retries: %s", rel, last_err,
+                    "cloud-files: DELETE %s failed after retries: %s",
+                    rel,
+                    last_err,
                 )
                 self._metrics.record_error("delete", rel, str(last_err))
                 self._event_arrivals.pop(rel, None)
@@ -816,7 +877,7 @@ class CloudFilesWatcher:
         # Path safety: refuse anything that resolves outside cloud_root.
         # Build the candidate path the same way _rel_path does the inverse,
         # but resolve manually for absolute parent dirs.
-        local = (self.cloud_root / rel)
+        local = self.cloud_root / rel
         try:
             local_resolved = local.resolve()
             root_resolved = self.cloud_root.resolve()
@@ -849,7 +910,10 @@ class CloudFilesWatcher:
         try:
             getter = getattr(self._client, "get_one", None)
             if getter is None:
-                _logger.warning("cloud-files: client missing get_one; skipping remote pull for %s", rel)
+                _logger.warning(
+                    "cloud-files: client missing get_one; skipping remote pull for %s",
+                    rel,
+                )
                 return
             data: bytes = await getter(rel)
         except FileNotFoundError:
@@ -861,7 +925,11 @@ class CloudFilesWatcher:
         new_hash = hashlib.sha256(data).hexdigest()
         # Skip if local already matches what we'd write.
         try:
-            if local.exists() and not local.is_symlink() and self._sha256(local) == new_hash:
+            if (
+                local.exists()
+                and not local.is_symlink()
+                and self._sha256(local) == new_hash
+            ):
                 self._last_hash[rel] = new_hash
                 self._remember_apply(rel, new_hash)
                 return
@@ -883,7 +951,9 @@ class CloudFilesWatcher:
         self._remote_applied += 1
         _logger.info(
             "cloud-files: applied remote MODIFY %s (%d bytes, version=%s)",
-            rel, len(data), change.current_version,
+            rel,
+            len(data),
+            change.current_version,
         )
 
     # ─── Status / Stats (A3 + A4) ────────────────────────────────────────────
@@ -892,17 +962,16 @@ class CloudFilesWatcher:
         """Snapshot for /internal/cloud-sync-status. Designed to be cheap."""
         m = self._metrics
         queue_stats = (
-            self._persistent_queue.stats() if self._persistent_queue else
-            {"enqueued": 0, "done": 0, "pending": 0, "bytes": 0}
+            self._persistent_queue.stats()
+            if self._persistent_queue
+            else {"enqueued": 0, "done": 0, "pending": 0, "bytes": 0}
         )
         inflight = 0
         if self._inflight_sem is not None:
             # Best-effort — semaphores don't expose count directly; approximate
             # via the pending dict (paths with timers + paths actively flushing).
             inflight = len(self._pending)
-        sub_kind = (
-            type(self._subscriber).__name__ if self._subscriber else None
-        )
+        sub_kind = type(self._subscriber).__name__ if self._subscriber else None
         return {
             "mode": self._mode,
             "mode_since_ts": self._mode_since,
@@ -952,7 +1021,9 @@ class CloudFilesWatcher:
             "latency_ms_p50": m.percentile(0.50),
             "latency_ms_p95": m.percentile(0.95),
             "queue_pending": (
-                self._persistent_queue.stats()["pending"] if self._persistent_queue else 0
+                self._persistent_queue.stats()["pending"]
+                if self._persistent_queue
+                else 0
             ),
             "downstream_received": self._remote_received,
             "downstream_applied": self._remote_applied,
