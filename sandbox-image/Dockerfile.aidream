@@ -44,15 +44,15 @@ RUN echo "aidream" > /etc/sandbox-image-tag \
 USER root
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
-        build-essential \
-        portaudio19-dev \
-        libasound2-dev \
-        libpulse-dev \
-        ffmpeg \
-        chromium-driver \
-        libmagic1 \
-        libpq-dev \
-        tesseract-ocr \
+    build-essential \
+    portaudio19-dev \
+    libasound2-dev \
+    libpulse-dev \
+    ffmpeg \
+    chromium-driver \
+    libmagic1 \
+    libpq-dev \
+    tesseract-ocr \
     && rm -rf /var/lib/apt/lists/*
 
 # ─── uv installer + uv-managed Python 3.13 ─────────────────────────────────
@@ -91,7 +91,7 @@ COPY --chown=agent:agent ./aidream-src/ ${AIDREAM_TEMPLATE_DIR}/
 # leaked through, OS junk). Saves ~3 MB but mostly improves clarity.
 RUN cd "$AIDREAM_TEMPLATE_DIR" \
     && rm -rf dashboard workflow-studio knowledgebase tmp .DS_Store \
-              .agent .arman .claude .cursor .treasure-maps \
+    .agent .arman .claude .cursor .treasure-maps \
     && find . -name "__pycache__" -type d -prune -exec rm -rf {} + \
     && find . -name "*.pyc" -delete \
     && find . -name ".DS_Store" -delete
