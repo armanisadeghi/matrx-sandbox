@@ -66,6 +66,14 @@ echo "[3.5/5] Ensuring canonical sandbox layout..."
 /opt/sandbox/scripts/ensure-layout.sh
 echo "[3.5/5] Layout ready."
 
+# ─── Step 3.6: Configure git credentials ────────────────────────────────────
+# User secrets are injected into the container env by the orchestrator. Git
+# does not read GITHUB_PAT/GH_TOKEN by itself, so install the standard helper
+# config for both env-backed tokens and POST /credentials cache tokens.
+echo "[3.6/5] Configuring git credential helpers..."
+sudo -H -E -u agent /opt/sandbox/scripts/configure-git-credentials.sh || true
+echo "[3.6/5] Git credential helpers ready."
+
 # ─── Step 4: Start SSH server ────────────────────────────────────────────────
 echo "[4/5] Starting SSH server..."
 /usr/sbin/sshd

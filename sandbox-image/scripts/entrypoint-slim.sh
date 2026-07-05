@@ -59,6 +59,14 @@ echo "[1.5/4] Ensuring canonical sandbox layout..."
 /opt/sandbox/scripts/ensure-layout.sh
 echo "[1.5/4] Layout ready."
 
+# ─── Step 1.6: Configure git credentials ────────────────────────────────────
+# Slim boxes use git as the persistence/update path. Make injected GitHub
+# tokens usable by plain `git pull` / `git push` without writing the token into
+# the mounted home volume.
+echo "[1.6/4] Configuring git credential helpers..."
+sudo -H -E -u agent /opt/sandbox/scripts/configure-git-credentials.sh || true
+echo "[1.6/4] Git credential helpers ready."
+
 # ─── Step 2: Start SSH server (optional human shell-in) ──────────────────────
 echo "[2/4] Starting SSH server..."
 /usr/sbin/sshd

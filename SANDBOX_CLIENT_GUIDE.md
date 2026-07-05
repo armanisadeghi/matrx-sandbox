@@ -263,7 +263,7 @@ POST /credentials                  { kind: "ssh", private_key, known_hosts? }
 POST /credentials/revoke
 ```
 
-Configures `git config --global credential.helper` against an in-memory store with restricted permissions. Tokens never appear in `/fs/read` listings. Revoked on sandbox stop.
+Configures `git config --global credential.helper` against an in-memory `git-credential-cache` store with restricted permissions. Tokens never appear in `/fs/read` listings. If a sandbox boots with `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`, or `MATRX_GITHUB_TOKEN` injected from the user-secrets vault, the image configures a token-free helper automatically so plain `git pull` / `git push` work without a separate `/credentials` call. Explicit `/credentials` tokens win for the current session and are revoked on sandbox stop.
 
 ---
 

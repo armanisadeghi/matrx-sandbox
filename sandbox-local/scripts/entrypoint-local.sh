@@ -79,6 +79,13 @@ echo "[3.5/5] Ensuring canonical sandbox layout..."
 /opt/sandbox/scripts/ensure-layout.sh
 echo "[3.5/5] Layout ready."
 
+# ─── Step 3.6: Configure git credentials ────────────────────────────────────
+# Local/hosted boxes share the same git auth contract as production images:
+# injected GitHub token env vars and POST /credentials both feed plain git.
+echo "[3.6/5] Configuring git credential helpers..."
+sudo -H -E -u agent /opt/sandbox/scripts/configure-git-credentials.sh || true
+echo "[3.6/5] Git credential helpers ready."
+
 # ─── Step 4: Start SSH server ────────────────────────────────────────────────
 echo "[4/5] Starting SSH server..."
 mkdir -p /run/sshd

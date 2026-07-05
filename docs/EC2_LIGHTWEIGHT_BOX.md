@@ -82,7 +82,9 @@ orchestrator with API-key auth. The flow is just a sequence of existing calls:
    → sbx-… (ready in seconds; see §4)
 
 2. POST /sandboxes/{id}/credentials     { kind:"github", token:"<PAT>" }
-   → writes the git credential helper (credentials.py:17)
+   → caches a session-only git credential. If the user's secrets vault already
+     injected `GITHUB_TOKEN`, `GH_TOKEN`, `GITHUB_PAT`, or `MATRX_GITHUB_TOKEN`,
+     this step is optional: the image configures a token-free env helper at boot.
 
 3. POST /sandboxes/{id}/git/clone       { url, dest:"repo", depth:1, branch }
    → /home/agent/repo  (git.py:57)
