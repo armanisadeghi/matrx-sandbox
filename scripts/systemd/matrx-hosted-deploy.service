@@ -1,0 +1,26 @@
+[Unit]
+# Pull-based deploy for the hosted sandbox tier on the /srv host.
+#
+# WHY THIS EXISTS: the GitHub Actions "deploy-hosted" job reaches this host
+# over inbound SSH, and GitHub runner IPs (shared Azure ranges) intermittently
+# trip fail2ban here — so push-triggered SSH deploys failed at random and the
+# hosted tier silently fell behind main. This unit inverts the direction:
+# the host polls origin/main itself (outbound HTTPS only) and runs the same
+# scripts/deploy-hosted.sh. No inbound connectivity, nothing to ban.
+#
+# deploy-hosted.sh is idempotent + cheap when nothing changed (state-file SHA
+# diff → early exit), takes a flock against the GHA fast path, health-gates
+# the orchestrator swap, and rolls back on failure.
+Description=Matrx hosted-tier pull deploy (matrx-sandbox origin/main -> /srv)
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+# The runner is installed to /usr/local/bin (NOT run from the checkout) so the
+# git reset it performs can never rewrite the executing script mid-run.
+ExecStart=/usr/local/bin/matrx-hosted-deploy-runner
+# Image builds can take a while (aidream ~5GB); don't let systemd kill a
+# legitimate deploy. The flock in the script prevents pile-ups regardless.
+TimeoutStartSec=45min
+Nice=5

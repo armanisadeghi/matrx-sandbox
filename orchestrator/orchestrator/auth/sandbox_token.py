@@ -52,6 +52,12 @@ ISSUER = "matrx-sandbox-orchestrator"
 DEFAULT_TTL_SECONDS = 300
 MAX_TTL_SECONDS = 900
 
+# The advertised-as-broadest scope (see AccessTokenRequest in models.py): a
+# token carrying it satisfies ANY required_scope. Browsers mint ["ai"] tokens
+# (the matrx-frontend default) and expect them to work on the structured tool
+# routes (/fs, /exec, …), not just /proxy/*.
+SUPERSET_SCOPE = "ai"
+
 # Single-use jti consumption set. In-memory; rotates on orchestrator
 # restart (acceptable — tokens are 5-15 min). Move to Postgres if we
 # ever need cross-process coherence.
@@ -138,8 +144,9 @@ def verify_token(
 
     Raises ``TokenError`` on any of: malformed, bad signature, expired,
     sandbox_id mismatch (if ``expected_sandbox_id`` provided), scope
-    mismatch (if ``required_scope`` provided), or already-consumed JTI on
-    a single-use token. Returns the payload dict on success.
+    mismatch (if ``required_scope`` provided — a token carrying
+    ``SUPERSET_SCOPE`` satisfies any required scope), or already-consumed
+    JTI on a single-use token. Returns the payload dict on success.
 
     This function does NOT consume a single-use jti automatically — the
     caller decides when to commit (e.g., only after a WebSocket upgrade
@@ -192,7 +199,7 @@ def verify_token(
 
     if required_scope is not None:
         scopes = payload.get("scopes") or []
-        if required_scope not in scopes:
+        if required_scope not in scopes and SUPERSET_SCOPE not in scopes:
             raise TokenError(f"missing required scope: {required_scope}")
 
     if payload.get("single_use"):

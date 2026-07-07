@@ -42,6 +42,19 @@ ORCH_IMAGE="matrx-orchestrator:latest"
 log()  { echo "[deploy-hosted] $*"; }
 fail() { echo "[deploy-hosted] ERROR: $*" >&2; exit 1; }
 
+# ── Single-flight lock ───────────────────────────────────────────────────────
+# Two deploy paths exist (GHA-over-SSH fast path + the local systemd poller,
+# scripts/systemd/). Without a lock they can race the same checkout + images
+# mid-build. First one wins; the loser exits 0 quietly — the state-file diff
+# makes the next poller tick a no-op if the winner already deployed.
+LOCK_FILE="${DEPLOY_LOCK_FILE:-/srv/apps/deploy-state/.deploy-hosted.lock}"
+mkdir -p "$(dirname "$LOCK_FILE")" 2>/dev/null || true
+exec 9>"$LOCK_FILE"
+if ! flock -n 9; then
+  log "another deploy is already running (lock: $LOCK_FILE) — skipping this run"
+  exit 0
+fi
+
 # Bring the shared sandbox DB schema forward before the new orchestrator serves
 # traffic. Runs inside the orchestrator image (has asyncpg + the migration
 # runner + the migrations/ dir baked in) against the orchestrator's own .env.
@@ -59,12 +72,21 @@ run_db_migrations() {
 cd "$REPO_DIR" || fail "repo dir $REPO_DIR not found"
 
 # ── Resolve OLD/NEW commit + change set ─────────────────────────────────────
+# OLD comes from the last-successful-deploy STATE FILE, not the checkout's
+# HEAD. The checkout doubles as a working repo: when an agent commits + pushes
+# FROM this server, HEAD already equals origin/main by the time the deploy
+# lands, so a HEAD-based diff sees "no changes" and silently deploys nothing
+# while the run still goes green. The state file is written only after a
+# successful deploy, so a failed run automatically re-diffs from the older
+# SHA on the next attempt (self-healing).
+STATE_FILE="${DEPLOY_STATE_FILE:-/srv/apps/deploy-state/matrx-sandbox.last-deployed-sha}"
 if [ -n "${PRE_SYNCED_OLD_SHA:-}" ]; then
-  # GHA already fetched + reset to origin/main and handed us the prior HEAD.
-  OLD_SHA="$PRE_SYNCED_OLD_SHA"
+  # GHA already fetched + reset to origin/main and handed us the prior HEAD
+  # (fallback only — the state file wins when present).
+  OLD_SHA="$(cat "$STATE_FILE" 2>/dev/null || echo "$PRE_SYNCED_OLD_SHA")"
   NEW_SHA="$(git rev-parse HEAD)"
 else
-  OLD_SHA="$(git rev-parse HEAD 2>/dev/null || echo none)"
+  OLD_SHA="$(cat "$STATE_FILE" 2>/dev/null || git rev-parse HEAD 2>/dev/null || echo none)"
   git fetch origin main --quiet || fail "git fetch failed"
   NEW_SHA="$(git rev-parse origin/main)"
   git reset --hard origin/main || fail "git reset failed"
@@ -187,4 +209,8 @@ else
 fi
 
 [ "$IMAGE_FAIL" = 1 ] && fail "one or more sandbox-image rebuilds failed (orchestrator unaffected)"
+# Record the deployed SHA only now — every step above succeeded. This is what
+# the next run diffs against (see the state-file comment at the top).
+mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true
+echo "$NEW_SHA" > "$STATE_FILE" || log "WARNING: could not write $STATE_FILE"
 log "hosted-tier deploy complete at $NEW_SHA"

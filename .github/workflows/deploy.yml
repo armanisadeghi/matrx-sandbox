@@ -206,11 +206,20 @@ jobs:
   # org-level secrets they're already available here; otherwise add them to this
   # repo once. Runs after `deploy` but does NOT depend on it succeeding — the
   # hosted tier should update even if an EC2/ECR step had a transient failure.
+  # BEST-EFFORT fast path only. SSH from GitHub runners to this host times out
+  # intermittently (runner IPs share Azure ranges that trip the host's
+  # fail2ban), which used to make this job fail ~half the time and, worse, made
+  # a red X here read as "the deploy is broken". The AUTHORITATIVE deploy is
+  # now the pull-based poller ON the host (scripts/systemd/ — a 2-min timer
+  # running deploy-hosted.sh), which needs no inbound connectivity at all.
+  # This job just makes a lucky run deploy a couple of minutes sooner.
+  # continue-on-error keeps a timeout from failing the whole workflow.
   deploy-hosted:
-    name: Deploy hosted tier (/srv)
+    name: Deploy hosted tier (/srv) — best-effort; host poller is authoritative
     needs: test
     runs-on: ubuntu-latest
     if: github.ref == 'refs/heads/main'
+    continue-on-error: true
     steps:
       - name: Rebuild + redeploy hosted orchestrator & images via SSH
         uses: appleboy/ssh-action@v1.0.3
@@ -223,12 +232,20 @@ jobs:
           command_timeout: 30m
           script: |
             set -e
-            cd /srv/projects/matrx-sandbox
-            # Capture the currently-deployed commit BEFORE syncing so the deploy
-            # script can diff it and rebuild only what changed. Pull first so we
-            # run the freshly-landed version of the script (not the old one).
-            OLD=$(git rev-parse HEAD 2>/dev/null || echo none)
-            git fetch origin main --quiet
-            git reset --hard origin/main
-            chmod +x scripts/deploy-hosted.sh
-            PRE_SYNCED_OLD_SHA="$OLD" bash scripts/deploy-hosted.sh
+            # Serialize with the host poller BEFORE touching the checkout —
+            # a bare `git reset` here could clobber a poller build mid-flight.
+            # We hold the main lock for the whole sync+deploy section; the
+            # inner deploy-hosted.sh is pointed at a separate lock file
+            # (flock isn't reentrant across processes, and holding the main
+            # lock is exactly the point).
+            mkdir -p /srv/apps/deploy-state
+            flock /srv/apps/deploy-state/.deploy-hosted.lock bash -c '
+              set -e
+              cd /srv/projects/matrx-sandbox
+              OLD=$(git rev-parse HEAD 2>/dev/null || echo none)
+              git fetch origin main --quiet
+              git reset --hard origin/main
+              chmod +x scripts/deploy-hosted.sh
+              DEPLOY_LOCK_FILE=/srv/apps/deploy-state/.deploy-hosted.inner.lock \
+                PRE_SYNCED_OLD_SHA="$OLD" bash scripts/deploy-hosted.sh
+            '

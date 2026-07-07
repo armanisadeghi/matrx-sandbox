@@ -135,6 +135,19 @@ def compute_drift(client) -> list[BoxDrift]:
     return out
 
 
+def _short_id(image_id: str | None) -> str:
+    return (image_id or "?").removeprefix("sha256:")[:12]
+
+
+def _stale_label(b: BoxDrift) -> str:
+    # When the baked versions can't tell the images apart (both unversioned
+    # "dev" builds), fall back to the image ids — "dev->dev" reads like a
+    # false alarm when the drift is real.
+    if b.running_version != b.current_version:
+        return f"{b.sandbox_id}({b.running_version}->{b.current_version})"
+    return f"{b.sandbox_id}(image {_short_id(b.running_image_id)}->{_short_id(b.current_image_id)})"
+
+
 def drift_summary(client, *, log: bool = True) -> dict:
     """Drift report for this orchestrator's tier. Logs loudly when any box is
     stale (the Phase-1 alarm) so drift is never silent."""
@@ -146,7 +159,7 @@ def drift_summary(client, *, log: bool = True) -> dict:
             settings.host_tier or "?",
             len(stale),
             len(boxes),
-            ", ".join(f"{b.sandbox_id}({b.running_version}->{b.current_version})" for b in stale),
+            ", ".join(_stale_label(b) for b in stale),
         )
     return {
         "tier": settings.host_tier or None,

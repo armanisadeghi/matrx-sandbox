@@ -92,6 +92,27 @@ async def test_right_scope_token_passes_auth_on_exec(auth_env):
 
 
 @pytest.mark.asyncio
+async def test_superset_ai_scope_passes_auth_on_tool_routes(auth_env):
+    """A ["ai"]-scoped token (the matrx-frontend browser default) must reach
+    the structured tool routes, not just /proxy/* — 'ai' is documented as the
+    broadest scope in AccessTokenRequest."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        fs_resp = await client.get(
+            f"/sandboxes/{SBX}/fs/list",
+            headers={"X-Sandbox-Access-Token": _token(["ai"])},
+        )
+        exec_resp = await client.post(
+            f"/sandboxes/{SBX}/exec",
+            json={"command": "echo hi"},
+            headers={"X-Sandbox-Access-Token": _token(["ai"])},
+        )
+    # Auth passed; handlers 404 because the sandbox doesn't exist.
+    assert fs_resp.status_code == 404
+    assert exec_resp.status_code == 404
+
+
+@pytest.mark.asyncio
 async def test_token_for_other_sandbox_rejected(auth_env):
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
