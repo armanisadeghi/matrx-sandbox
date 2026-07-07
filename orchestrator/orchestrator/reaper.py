@@ -110,6 +110,22 @@ async def _reap_once() -> dict:
     except Exception as exc:
         logger.warning("Reaper: zombie reap failed this tick: %s", exc)
 
+    # Retention sweep: rows finished (stopped/expired/failed) for more than
+    # terminal_retention_days get soft-deleted so every UI's default list
+    # forgets them. Resumable until then; the row + per-user volume survive.
+    if settings.terminal_retention_days > 0:
+        try:
+            purged = await store.purge_terminal_older_than(settings.terminal_retention_days)
+            summary["retention_purged"] = len(purged)
+            if purged:
+                logger.info(
+                    "Retention sweep: soft-deleted %d finished sandbox(es) older "
+                    "than %dd: %s",
+                    len(purged), settings.terminal_retention_days, ", ".join(purged),
+                )
+        except Exception as exc:
+            logger.warning("Reaper: retention sweep failed this tick: %s", exc)
+
     # Liveness reconcile every tick — two jobs the TTL sweep above can't do:
     #   1. Mark rows whose container has VANISHED as stopped within ~60s,
     #      instead of waiting for the next orchestrator reboot. These are the

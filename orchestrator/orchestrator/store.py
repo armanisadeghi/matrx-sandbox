@@ -29,12 +29,29 @@ class SandboxStore(ABC):
         """Get a sandbox by ID. Returns None if not found."""
 
     @abstractmethod
-    async def list(self, user_id: str | None = None) -> list[SandboxResponse]:
-        """List all sandboxes, optionally filtered by user_id."""
+    async def list(
+        self, user_id: str | None = None, include_deleted: bool = False
+    ) -> list[SandboxResponse]:
+        """List sandboxes, optionally filtered by user_id. Soft-deleted rows
+        are EXCLUDED unless ``include_deleted`` — every UI's default view
+        (frontend history, Manager, aidream admin) keys off this."""
 
     @abstractmethod
     async def delete(self, sandbox_id: str) -> bool:
         """Delete a sandbox record. Returns True if deleted."""
+
+    async def soft_delete(self, sandbox_id: str) -> bool:
+        """Hide a sandbox from every default list (sets ``deleted_at``) while
+        keeping the row for audit. Idempotent. Returns True when a row was
+        newly marked."""
+        return False
+
+    async def purge_terminal_older_than(self, days: int) -> list[str]:
+        """Soft-delete every non-deleted row that has been in a terminal
+        status (stopped/expired/failed) for more than ``days`` days — the
+        retention sweep behind "finished sandboxes disappear after a while".
+        Returns the affected sandbox_ids."""
+        return []
 
     @abstractmethod
     async def update_status(self, sandbox_id: str, status: SandboxStatus) -> bool:
@@ -134,6 +151,8 @@ class InMemorySandboxStore(SandboxStore):
 
     def __init__(self) -> None:
         self._sandboxes: dict[str, SandboxResponse] = {}
+        # sandbox_id -> deleted_at (soft-delete marker, mirrors Postgres)
+        self._deleted: dict[str, datetime] = {}
         # user_id -> {path -> (content, updated_at)}
         self._memory: dict[str, dict[str, tuple[str, datetime]]] = {}
 
@@ -143,14 +162,49 @@ class InMemorySandboxStore(SandboxStore):
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
         return self._sandboxes.get(sandbox_id)
 
-    async def list(self, user_id: str | None = None) -> list[SandboxResponse]:
+    async def list(
+        self, user_id: str | None = None, include_deleted: bool = False
+    ) -> list[SandboxResponse]:
         sandboxes = list(self._sandboxes.values())
+        if not include_deleted:
+            sandboxes = [s for s in sandboxes if s.sandbox_id not in self._deleted]
         if user_id:
             sandboxes = [s for s in sandboxes if s.user_id == user_id]
         return sandboxes
 
     async def delete(self, sandbox_id: str) -> bool:
+        self._deleted.pop(sandbox_id, None)
         return self._sandboxes.pop(sandbox_id, None) is not None
+
+    async def soft_delete(self, sandbox_id: str) -> bool:
+        if sandbox_id not in self._sandboxes or sandbox_id in self._deleted:
+            return False
+        self._deleted[sandbox_id] = datetime.now(timezone.utc)
+        return True
+
+    async def purge_terminal_older_than(self, days: int) -> list[str]:
+        cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+        purged: list[str] = []
+        for sid, sb in self._sandboxes.items():
+            if sid in self._deleted:
+                continue
+            status = getattr(sb.status, "value", sb.status)
+            if status not in ("stopped", "expired", "failed"):
+                continue
+            marker = sb.stopped_at or sb.created_at
+            if marker and marker < cutoff:
+                self._deleted[sid] = datetime.now(timezone.utc)
+                purged.append(sid)
+        return purged
+
+    async def get_lifecycle(self, sandbox_id: str) -> dict | None:
+        sb = self._sandboxes.get(sandbox_id)
+        if sb is None:
+            return None
+        return {
+            "status": getattr(sb.status, "value", sb.status),
+            "deleted": sandbox_id in self._deleted,
+        }
 
     async def update_status(self, sandbox_id: str, status: SandboxStatus) -> bool:
         sandbox = self._sandboxes.get(sandbox_id)
@@ -352,18 +406,23 @@ class PostgresSandboxStore(SandboxStore):
                 return _row_to_sandbox(row)
         return await self._execute_with_retry(_do)
 
-    async def list(self, user_id: str | None = None) -> list[SandboxResponse]:
+    async def list(
+        self, user_id: str | None = None, include_deleted: bool = False
+    ) -> list[SandboxResponse]:
         async def _do() -> list[SandboxResponse]:
             pool = await self._get_pool()
             async with pool.acquire() as conn:
+                deleted_clause = "" if include_deleted else " AND deleted_at IS NULL"
                 if user_id:
                     rows = await conn.fetch(
-                        "SELECT * FROM sandbox_instances WHERE user_id = $1 ORDER BY created_at DESC",
+                        "SELECT * FROM sandbox_instances WHERE user_id = $1"
+                        + deleted_clause + " ORDER BY created_at DESC",
                         UUID(user_id),
                     )
                 else:
                     rows = await conn.fetch(
-                        "SELECT * FROM sandbox_instances ORDER BY created_at DESC"
+                        "SELECT * FROM sandbox_instances WHERE TRUE"
+                        + deleted_clause + " ORDER BY created_at DESC"
                     )
                 return [_row_to_sandbox(row) for row in rows]
         # ``list()`` is the hot path that wedged the orchestrator for 3 weeks
@@ -380,6 +439,32 @@ class PostgresSandboxStore(SandboxStore):
                 sandbox_id,
             )
             return result == "DELETE 1"
+
+    async def soft_delete(self, sandbox_id: str) -> bool:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """UPDATE sandbox_instances
+                   SET deleted_at = NOW(), updated_at = NOW()
+                   WHERE sandbox_id = $1 AND deleted_at IS NULL""",
+                sandbox_id,
+            )
+            return result == "UPDATE 1"
+
+    async def purge_terminal_older_than(self, days: int) -> list[str]:
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            rows = await conn.fetch(
+                """UPDATE sandbox_instances
+                   SET deleted_at = NOW(), updated_at = NOW()
+                   WHERE deleted_at IS NULL
+                     AND status IN ('stopped', 'expired', 'failed')
+                     AND COALESCE(stopped_at, updated_at, created_at)
+                         < NOW() - make_interval(days => $1)
+                   RETURNING sandbox_id""",
+                days,
+            )
+            return [r["sandbox_id"] for r in rows]
 
     async def update_status(self, sandbox_id: str, status: SandboxStatus) -> bool:
         pool = await self._get_pool()

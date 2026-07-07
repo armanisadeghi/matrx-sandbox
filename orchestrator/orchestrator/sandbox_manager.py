@@ -732,10 +732,13 @@ async def get_sandbox(sandbox_id: str) -> SandboxResponse | None:
     return _backfill_proxy_url(await store.get(sandbox_id))
 
 
-async def list_sandboxes(user_id: str | None = None) -> list[SandboxResponse]:
-    """List all sandboxes, optionally filtered by user."""
+async def list_sandboxes(
+    user_id: str | None = None, include_deleted: bool = False
+) -> list[SandboxResponse]:
+    """List sandboxes, optionally filtered by user. Soft-deleted rows are
+    excluded unless ``include_deleted`` (admin/debug only)."""
     store = _get_store()
-    rows = await store.list(user_id=user_id)
+    rows = await store.list(user_id=user_id, include_deleted=include_deleted)
     for sb in rows:
         _backfill_proxy_url(sb)
     return rows

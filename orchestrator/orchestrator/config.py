@@ -77,6 +77,12 @@ class Settings(BaseSettings):
     # sweep so a big drift wave rolls gradually rather than all at once.
     auto_migrate: bool = False          # env var: MATRX_AUTO_MIGRATE
     migrate_max_per_pass: int = 2       # env var: MATRX_MIGRATE_MAX_PER_PASS
+    # Retention for FINISHED sandboxes. A stopped/expired/failed row stays
+    # visible (and resumable) this many days after it stopped, then the reaper
+    # soft-deletes it (sets deleted_at) so every UI's default list drops it.
+    # The row itself is kept for audit; per-user volumes are untouched. 0
+    # disables the sweep entirely.
+    terminal_retention_days: int = 7    # env var: MATRX_TERMINAL_RETENTION_DAYS
     # A box is treated as "in use" (migration deferred) if it has in-flight tool
     # calls OR a heartbeat newer than this many seconds — so a recently-active
     # session is never interrupted by a rolling migrate.

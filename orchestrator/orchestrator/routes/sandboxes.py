@@ -156,9 +156,12 @@ async def claim_sandbox(req: CreateSandboxRequest):
 
 
 @router.get("", response_model=SandboxListResponse)
-async def list_sandboxes(user_id: str | None = None):
-    """List all sandboxes, optionally filtered by user."""
-    sandboxes = await sandbox_manager.list_sandboxes(user_id=user_id)
+async def list_sandboxes(user_id: str | None = None, include_deleted: bool = False):
+    """List sandboxes, optionally filtered by user. Soft-deleted rows are
+    hidden by default — pass ``include_deleted=true`` for admin/audit views."""
+    sandboxes = await sandbox_manager.list_sandboxes(
+        user_id=user_id, include_deleted=include_deleted
+    )
     return SandboxListResponse(sandboxes=sandboxes, total=len(sandboxes))
 
 
@@ -276,8 +279,15 @@ async def request_access(sandbox_id: str):
 
 
 @router.delete("/{sandbox_id}", status_code=204)
-async def destroy_sandbox(sandbox_id: str, graceful: bool = True):
-    """Destroy a sandbox."""
+async def destroy_sandbox(sandbox_id: str, graceful: bool = True, purge: bool = False):
+    """Destroy a sandbox.
+
+    Default: container torn down, row marked stopped — still visible in
+    history and resumable until the retention sweep ages it out.
+    ``purge=true``: additionally soft-delete the row so it disappears from
+    every default list immediately ("delete" in user-facing UIs). The
+    per-user volume is preserved either way.
+    """
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -287,6 +297,9 @@ async def destroy_sandbox(sandbox_id: str, graceful: bool = True):
     )
     if not success:
         raise HTTPException(status_code=500, detail="Failed to destroy sandbox")
+    if purge:
+        from orchestrator.sandbox_manager import _get_store
+        await _get_store().soft_delete(sandbox_id)
 
 
 @router.post("/{sandbox_id}/reset", response_model=SandboxResponse)
