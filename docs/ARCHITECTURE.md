@@ -97,7 +97,9 @@ rarely touched, so lazy loading is the right tradeoff.
 5. Graceful shutdown triggered (API call, timeout, or agent signal):
    a. Hot sync: aws s3 sync /home/agent/ s3://bucket/users/{uid}/hot/
    b. Cold flush: ensure pending writes are flushed, unmount FUSE
-   c. Container stops — sandbox marked STOPPED in database (not deleted)
+   c. Container stops — sandbox marked STOPPED in database (resumable; the
+      retention sweep soft-deletes terminal rows after
+      MATRX_TERMINAL_RETENTION_DAYS, default 7)
 6. On crash/ungraceful shutdown (or any time a container disappears):
    a. The **liveness reconcile** notices the row is still in a live status
       (ready/running/starting) but its container is gone, and marks it STOPPED.
@@ -151,7 +153,7 @@ Sandbox metadata is persisted in Supabase Postgres (`sandbox_instances` table):
 - **Store abstraction**: `SandboxStore` ABC with `InMemorySandboxStore` (dev) and `PostgresSandboxStore` (prod)
 - **RLS**: Row-level security scoped to `auth.uid() = user_id`
 - **Triggers**: Auto-set `updated_at` and `expires_at` (2-hour TTL default)
-- **Lifecycle**: Sandboxes are marked STOPPED on destroy (not deleted) for audit trail
+- **Lifecycle**: destroy marks STOPPED (resumable). Terminal rows (stopped/expired/failed) are **soft-deleted after `MATRX_TERMINAL_RETENTION_DAYS` (default 7)** by the reaper's retention sweep; `DELETE ?purge=true` soft-deletes immediately; `GET /sandboxes` hides soft-deleted rows (`include_deleted=true` for audit). A daily `cleanup-deleted-sandboxes` DB cron hard-purges rows soft-deleted 7+ days — **this is the ONLY DB-side sandbox job; all other lifecycle (TTL reaper, zombie sweep, retention) is orchestrator-owned. Never add DB-side liveness/reaper jobs** (a heartbeat-based one killed live sandboxes — see aidream migrations 0148/0150)
 - **Reconciliation**: Background task syncs Docker container state with DB records
 
 ## Networking & Security

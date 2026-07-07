@@ -106,11 +106,11 @@ All endpoints except `/health` require the `X-API-Key` header.
 
 ## Deployment
 
-Pushing to `main` triggers automatic deployment:
-1. GitHub Actions runs tests
-2. Builds and pushes Docker images to ECR
-3. Deploys to EC2 via AWS SSM (no SSH required)
-4. Health check confirms orchestrator is healthy
+Pushing to `main` triggers automatic deployment **of both tiers**:
+
+**EC2 tier:** GitHub Actions runs tests → builds/pushes images to ECR → deploys to EC2 via AWS SSM → health check.
+
+**Hosted tier (/srv):** the host itself polls `origin/main` every 2 min (`matrx-hosted-deploy.timer` → `scripts/deploy-hosted.sh`) and rebuilds the orchestrator (with DB migrations + health-gate + rollback) and any changed sandbox images. The GHA SSH deploy job is a best-effort fast path only. ⚠️ the poller `git reset --hard`s the /srv checkout — commit+push as you go.
 
 See [ARMAN_TASKS.md](ARMAN_TASKS.md) for infrastructure reference and commands.
 

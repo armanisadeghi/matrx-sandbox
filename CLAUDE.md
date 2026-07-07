@@ -84,7 +84,7 @@ Provisions the production EC2 host, S3 buckets, IAM roles (incl. SSM permissions
 - Web terminal via ttyd on port 7681, routed by Traefik with TLS.
 - **Use case:** quick agent shells, browser-accessible, no orchestrator overhead. Good for manual testing or hand-driven agent sessions.
 
-To rebuild and restart:
+These images (and the starter pool) are rebuilt **automatically on push to `main`** by the deploy poller (`scripts/deploy-hosted.sh` — path-diff triggered, self-heals missing tags). Manual build is a local-iteration fallback only:
 ```bash
 cd /srv/projects/matrx-sandbox/sandbox-image && docker build -t matrx-sandbox:core .
 cd /srv/projects/matrx-sandbox/sandbox-local && docker build -t matrx-sandbox:local . && docker compose up -d

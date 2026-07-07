@@ -13,10 +13,10 @@ Operational runbook for the two sandbox tiers. For architecture (storage tiers, 
 | Where it lives | EC2 instance, single host | This server (`/srv/apps/sandbox-orchestrator/`) |
 | Sandbox storage | S3 hot-sync + FUSE cold | Docker named volumes per sandbox |
 | Sandbox image | `matrx-sandbox:latest` (production build, no ttyd) | `matrx-sandbox:local` (adds ttyd for browser shells) |
-| Metadata store | Supabase Postgres (`sandbox_instances` table, RLS per user) | In-memory today (state lost on restart). Postgres-backed is a follow-up. |
+| Metadata store | Supabase Postgres (`sandbox_instances` table, RLS per user) | Supabase Postgres — the SAME shared `sandbox_instances` table as EC2 (tier-scoped). State survives restarts. |
 | Default TTL | 7200 s (2 h), auto-shutdown | 7200 s (extendable; sessions can stay alive indefinitely if pinged) |
 | Per-sandbox limits | 2 CPU / 4 GB / 20 GB | Configurable via `resources` field on create; default same as EC2 |
-| Deploy mechanism | Push to `main` → GHA → ECR build → SSM → restart on EC2 | Local `docker compose up -d` after `docker build` |
+| Deploy mechanism | Push to `main` → GHA → ECR build → SSM → restart on EC2 | Push to `main` → `matrx-hosted-deploy.timer` (2-min host poller) runs `scripts/deploy-hosted.sh` (migrations + health-gate + rollback). GHA SSH is best-effort only. |
 | API key | `MATRX_API_KEY` on EC2 | `MATRX_API_KEY` in `/srv/apps/sandbox-orchestrator/.env` (also recorded in `/srv/.credentials`) |
 
 Both orchestrators advertise their tier via `GET /` and `GET /api-surface`. A `POST /sandboxes` request whose `tier` doesn't match the orchestrator's `MATRX_HOST_TIER` is rejected with HTTP 400 — there is no cross-tier proxying. Frontends route by reading the sandbox row's `tier` column.
@@ -44,9 +44,11 @@ docker logs matrx-orchestrator --tail 50 -f
 # Restart (no rebuild)
 cd /srv/apps/sandbox-orchestrator && docker compose restart
 
-# Rebuild after a code change in the orchestrator source
-cd /srv/projects/matrx-sandbox/orchestrator && docker build -t matrx-orchestrator:latest .
-cd /srv/apps/sandbox-orchestrator && docker compose up -d --force-recreate
+# Rebuild after a code change: NORMALLY AUTOMATIC — commit + push to main and
+# the deploy poller rebuilds, runs DB migrations, health-gates, and rolls back
+# on failure (journalctl -u matrx-hosted-deploy.service -f to watch).
+# Manual fallback only (skips nothing — same script the poller runs):
+FORCE=1 bash /srv/projects/matrx-sandbox/scripts/deploy-hosted.sh
 
 # Health
 curl https://orchestrator.dev.codematrx.com/health
@@ -61,7 +63,7 @@ docker ps --filter label=matrx.sandbox_id --format "table {{.Names}}\t{{.Status}
 
 ### Sandbox image rebuild + recreate the starter pool
 
-When the sandbox image (`matrx-sandbox:core` / `matrx-sandbox:local`) changes — e.g. you edited the in-container `matrx_agent` daemon, added a tool to the Dockerfile, or fixed `entrypoint-local.sh`:
+**Automatic on push to `main`** — the deploy poller rebuilds every changed image variant (and self-heals missing tags) and recreates the starter pool. The commands below are a manual fallback for local iteration only:
 
 ```bash
 # Rebuild the core image
@@ -92,10 +94,14 @@ docker ps -a --filter name=$SANDBOX_ID
 curl -X DELETE -H "X-API-Key: $KEY" \
   "https://orchestrator.dev.codematrx.com/sandboxes/$SANDBOX_ID?graceful=false"
 
-# 3. If the orchestrator is unhappy, kill the container directly
+# 3. If the orchestrator is unhappy, kill the container directly.
+#    NOTE: zombie containers (row terminal, container alive) are auto-reaped
+#    by the orchestrator every 60s sweep — manual removal is only needed if
+#    the orchestrator itself is down.
 docker rm -f $SANDBOX_ID
 
-# 4. Restart the orchestrator (clears in-memory state when using memory store)
+# 4. Restarting the orchestrator does NOT lose state (Postgres-backed store;
+#    boot reconcile + zombie reap resync it against docker ps).
 cd /srv/apps/sandbox-orchestrator && docker compose restart
 ```
 
@@ -108,18 +114,9 @@ This host has **32 GB RAM / 8 cores / 388 GB disk**. With the default 4 GB per s
 
 To temporarily reduce per-sandbox footprint: edit `MATRX_CONTAINER_MEMORY_LIMIT` in `/srv/apps/sandbox-orchestrator/.env` (defaults to `4g`) and restart. New sandboxes get the new limit; existing ones keep theirs.
 
-### Switching the metadata store to Postgres
+### Metadata store (already Postgres) & migrations
 
-The hosted orchestrator runs in-memory today. To move to Postgres on the shared instance:
-
-1. Pick a database name (e.g. `sandbox_orchestrator_hosted`) and create it on the shared cluster.
-2. Run [migrations/001_create_sandboxes.sql](../orchestrator/migrations/001_create_sandboxes.sql) and [migrations/002_add_tier_template_columns.sql](../orchestrator/migrations/002_add_tier_template_columns.sql) — but **strip the FK references** to `auth.users(id)` and `projects(id)` first (those are Supabase tables that don't exist locally). A hosted-tier-specific migration file is the cleanest approach.
-3. In `/srv/apps/sandbox-orchestrator/.env`, set:
-   ```
-   MATRX_SANDBOX_STORE=postgres
-   MATRX_DATABASE_URL=postgresql://matrx:<password>@postgres:5432/sandbox_orchestrator_hosted
-   ```
-4. `docker compose restart` — orchestrator will pick up the new store.
+The hosted store is **already Postgres** — the shared Supabase `sandbox_instances` table both tiers use. Schema migrations live in [orchestrator/migrations/](../orchestrator/migrations/) and are applied **automatically** by `orchestrator.migrate_runner` (tracked in `schema_migrations`): the deploy poller runs it before every orchestrator swap, and the Manager UI's "Rebuild orchestrator" button does too. **Never apply migrations by hand with psql** — add a numbered idempotent file and push.
 
 ### Rotating the hosted-tier API key
 
@@ -373,7 +370,6 @@ gh workflow run deploy.yml --repo armanisadeghi/matrx-sandbox
 | `POST /sandboxes` succeeds on EC2 but fs/git/pty proxies 502 | In-container daemon not running | EC2: SSM into the host, check `docker exec <sbx> ss -tlnp \| grep 8000`. If missing, the sandbox image is stale — rebuild and redeploy. |
 | Hosted `/exec` works but `/fs/list` 502s | Spawned sandbox is on the wrong network — orchestrator can't reach `<container_ip>:8000` | Confirm `MATRX_DOCKER_NETWORK=proxy` in the orchestrator .env, and that the sandbox image inherits this via the orchestrator's `network=` argument |
 | `/extend` returns 200 but `expires_at` doesn't change | Pre-v0.2.0 orchestrator (stub still in place) | Redeploy with the latest image |
-| In-memory store loses sandboxes on orchestrator restart | Expected (in-memory); switch to Postgres per "Switching the metadata store" above | |
 | Traefik 404 on `orchestrator.dev.codematrx.com` | DNS not resolving or Traefik labels missing | `dig orchestrator.dev.codematrx.com` (must point at `77.37.62.64`); `docker inspect matrx-orchestrator \| grep traefik` |
 
 ## Passing the full aidream env into spawned sandboxes (added 2026-04-28)

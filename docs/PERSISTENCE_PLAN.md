@@ -413,7 +413,7 @@ Goal: hosted sandboxes survive `docker rm` with the user's home dir intact.
 - [ ] Volume cleanup endpoint (`DELETE /users/{uid}/volume?force=true`) for explicit reset.
 - [ ] **Tests:** create a hosted sandbox, write to /home/agent, destroy, create another → file is there.
 
-**Risk:** none on EC2 (no changes). Hosted tier currently broken in this regard, so worst case = stays broken in Phase 1's scope.
+**Risk:** none on EC2 (no changes). ~~Hosted tier currently broken in this regard~~ **SHIPPED — hosted per-user volumes (`matrx-user-<uid>`) are live and survive container destroy.**
 
 ### Phase 2 — In-container persistence module — ~2 days
 

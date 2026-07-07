@@ -22,10 +22,10 @@ All calls go `browser → Next.js route → orchestrator`. The Next.js layer is 
 | `POST /api/sandbox` | `POST {ORCH}/sandboxes` with `{ user_id, config }` | Create sandbox. Enforces max 5 active per user. |
 | `GET  /api/sandbox/[id]` | — | Read one row. |
 | `PUT  /api/sandbox/[id]` | `DELETE {ORCH}/sandboxes/{sandbox_id}?graceful=true` (for `stop`) | `{ action: "stop" \| "extend", ttl_seconds? }`. `extend` only updates our DB — **does not call orchestrator**. |
-| `DEL  /api/sandbox/[id]` | `DELETE {ORCH}/sandboxes/{sandbox_id}?graceful=false` | Soft delete row, hard stop container. |
+| `DEL  /api/sandbox/[id]` | `DELETE {ORCH}/sandboxes/{sandbox_id}?graceful=false&purge=true` | Hard stop container + orchestrator soft-deletes the row atomically (`purge=true`). |
 | `POST /api/sandbox/[id]/exec` | `POST {ORCH}/sandboxes/{sandbox_id}/exec` | The only execution primitive we have. |
 | `POST /api/sandbox/[id]/access` | `POST {ORCH}/sandboxes/{sandbox_id}/access` | Returns SSH key + host + port for external human use. |
-| `POST /api/sandbox/cleanup` | RPC `cleanup_deleted_sandboxes` | Retention cleanup. |
+| `POST /api/sandbox/cleanup` | — (obsolete) | Retention is orchestrator-owned now (7-day soft-delete sweep) + a daily DB hard-purge of rows soft-deleted 7+ days. No FE call needed. |
 
 **Source:** `app/api/sandbox/**/*.ts`, `hooks/sandbox/use-sandbox.ts`, `types/sandbox.ts`.
 
