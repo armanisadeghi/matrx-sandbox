@@ -185,6 +185,34 @@ def _migrating_503(sandbox_id: str) -> HTTPException:
     )
 
 
+# Statuses whose container is gone but whose volume survives — a resume brings
+# the box back. Tool calls against these used to fall through to a baffling
+# 500 ("Could not determine sandbox IP"); the FE needs an actionable signal.
+_RESUMABLE_STATUSES = {"expired", "stopped"}
+_DEAD_STATUSES = {"failed", "deleted"}
+
+
+def _require_live(sandbox) -> None:
+    """Raise 410 with a resume hint when a TOOL route is called on a sandbox
+    whose container is gone. Lifecycle routes (resume/extend/destroy/details)
+    must NOT use this — operating on terminal rows is their whole job."""
+    status = getattr(sandbox.status, "value", None) or str(sandbox.status)
+    if status in _RESUMABLE_STATUSES:
+        raise HTTPException(
+            status_code=410,
+            detail=(
+                f"Sandbox {sandbox.sandbox_id} is {status} — its container is gone "
+                f"but the user volume is preserved. POST /sandboxes/{sandbox.sandbox_id}/resume "
+                "to bring it back, then retry this call."
+            ),
+        )
+    if status in _DEAD_STATUSES:
+        raise HTTPException(
+            status_code=410,
+            detail=f"Sandbox {sandbox.sandbox_id} is {status} and cannot serve tool calls.",
+        )
+
+
 @router.post("/{sandbox_id}/exec", response_model=ExecResponse)
 async def exec_command(sandbox_id: str, req: ExecRequest):
     """Execute a command inside a running sandbox."""
@@ -193,6 +221,7 @@ async def exec_command(sandbox_id: str, req: ExecRequest):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _require_live(sandbox)
 
     try:
         async with activity.track(sandbox_id):
@@ -666,7 +695,13 @@ async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
     if not sandbox:
         await websocket.close(code=1008, reason=f"Sandbox {sandbox_id} not found")
         return
-        
+    _status = getattr(sandbox.status, "value", None) or str(sandbox.status)
+    if _status in _RESUMABLE_STATUSES | _DEAD_STATUSES:
+        # Actionable close instead of the generic 1011 "Could not determine
+        # sandbox IP" the dead container would otherwise produce downstream.
+        await websocket.close(code=1008, reason=f"Sandbox {sandbox_id} is {_status} — resume it and reconnect")
+        return
+
     container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
         await websocket.close(code=1011, reason="Could not determine sandbox IP")
@@ -738,6 +773,7 @@ async def proxy_fs(sandbox_id: str, path: str, request: Request):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _require_live(sandbox)
 
     try:
         async with activity.track(sandbox_id):
@@ -783,6 +819,7 @@ async def proxy_exec_stream(sandbox_id: str, request: Request):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _require_live(sandbox)
     if activity.is_migrating(sandbox_id):
         raise _migrating_503(sandbox_id)
 
@@ -824,6 +861,7 @@ async def proxy_git(sandbox_id: str, path: str, request: Request):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _require_live(sandbox)
 
     try:
         async with activity.track(sandbox_id):
@@ -865,6 +903,7 @@ async def proxy_credentials(sandbox_id: str, request: Request):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _require_live(sandbox)
         
     container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
@@ -909,7 +948,13 @@ async def proxy_pty(sandbox_id: str, websocket: WebSocket):
     if not sandbox:
         await websocket.close(code=1008, reason=f"Sandbox {sandbox_id} not found")
         return
-        
+    _status = getattr(sandbox.status, "value", None) or str(sandbox.status)
+    if _status in _RESUMABLE_STATUSES | _DEAD_STATUSES:
+        # Actionable close instead of the generic 1011 "Could not determine
+        # sandbox IP" the dead container would otherwise produce downstream.
+        await websocket.close(code=1008, reason=f"Sandbox {sandbox_id} is {_status} — resume it and reconnect")
+        return
+
     container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
         await websocket.close(code=1011, reason="Could not determine sandbox IP")
@@ -978,6 +1023,7 @@ async def proxy_search(sandbox_id: str, path: str, request: Request):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _require_live(sandbox)
         
     container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
@@ -1013,6 +1059,7 @@ async def proxy_processes(sandbox_id: str, request: Request, pid: int = None):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _require_live(sandbox)
         
     container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
@@ -1049,6 +1096,7 @@ async def proxy_ports(sandbox_id: str, request: Request):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _require_live(sandbox)
         
     container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:
@@ -1350,6 +1398,7 @@ async def proxy_to_container(sandbox_id: str, path: str, request: Request):
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _require_live(sandbox)
 
     container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
     if not container_ip:

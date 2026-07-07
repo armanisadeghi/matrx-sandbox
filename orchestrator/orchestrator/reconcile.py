@@ -290,6 +290,59 @@ def _alive_container_ids(client, host_tier: str | None) -> set[str]:
     return alive
 
 
+async def reap_zombie_containers(store: SandboxStore) -> list[str]:
+    """Destroy containers whose DB row records end-of-life but which are still
+    alive on this host. Same rule as the boot-time orphan reap above, run from
+    the reaper's 60s sweep — because ``expire_stale`` only returns rows on
+    their FIRST transition past expires_at, a teardown that fails once (or an
+    orchestrator restart between mark and destroy) used to leak the container
+    until the next boot. 15 zombies accumulated exactly this way in July 2026.
+
+    Tier-scoped, never raises, returns the reaped sandbox_ids.
+    """
+    reaped: list[str] = []
+    host_tier = settings.host_tier or None
+    try:
+        from orchestrator.sandbox_manager import _get_docker_client
+        client = _get_docker_client()
+        containers = await asyncio.to_thread(
+            lambda: client.containers.list(filters={"label": "matrx.sandbox_id"})
+        )
+    except Exception as exc:
+        logger.warning("Zombie reap skipped: docker unavailable: %s", exc)
+        return reaped
+
+    for container in containers:
+        try:
+            labels = ((container.attrs or {}).get("Config", {}) or {}).get("Labels") or {}
+            sandbox_id = labels.get("matrx.sandbox_id")
+            if not sandbox_id:
+                continue
+            tier = labels.get("matrx.tier") or host_tier
+            if host_tier and tier and tier != host_tier:
+                continue
+            if labels.get("matrx.warm_pool") == "1":
+                continue
+            lifecycle = await store.get_lifecycle(sandbox_id)
+            if not lifecycle:
+                continue
+            if lifecycle["deleted"] or lifecycle["status"] in _TERMINAL_STATUSES:
+                logger.info(
+                    "Zombie reap: %s row is %s but container is alive — removing "
+                    "container (volume preserved, row untouched).",
+                    sandbox_id,
+                    "soft-deleted" if lifecycle["deleted"] else lifecycle["status"],
+                )
+                await asyncio.to_thread(container.remove, force=True)
+                reaped.append(sandbox_id)
+        except Exception as exc:
+            logger.warning(
+                "Zombie reap failed for container %s: %s",
+                getattr(container, "id", "?")[:12], exc,
+            )
+    return reaped
+
+
 async def reconcile_liveness(store: SandboxStore) -> dict:
     """Tier-scoped liveness sweep: stop rows whose container vanished, refresh
     rows whose container is alive.
@@ -334,4 +387,4 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
         return summary
 
 
-__all__ = ["reconcile_from_docker", "reconcile_liveness"]
+__all__ = ["reconcile_from_docker", "reconcile_liveness", "reap_zombie_containers"]

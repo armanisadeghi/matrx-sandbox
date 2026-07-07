@@ -99,6 +99,17 @@ async def _reap_once() -> dict:
             summary["failed"] += 1
             logger.warning("Reaper: teardown of expired %s failed: %s", sandbox_id, exc)
 
+    # Zombie reap every tick: containers whose row already records end-of-life
+    # (a prior destroy failed, or an orchestrator restart landed between the
+    # expire-mark and the teardown). expire_stale() never returns those rows
+    # again, so without this they leak until the next orchestrator boot.
+    try:
+        from orchestrator.reconcile import reap_zombie_containers
+        zombies = await reap_zombie_containers(store)
+        summary["zombies_reaped"] = len(zombies)
+    except Exception as exc:
+        logger.warning("Reaper: zombie reap failed this tick: %s", exc)
+
     # Liveness reconcile every tick — two jobs the TTL sweep above can't do:
     #   1. Mark rows whose container has VANISHED as stopped within ~60s,
     #      instead of waiting for the next orchestrator reboot. These are the
@@ -163,13 +174,14 @@ async def _reap_once() -> dict:
                 _migrate_backoff["next_attempt"] = time.monotonic() + delay
                 logger.warning("Reaper: auto-migrate raised: %s (backing off %ds)", exc, delay)
 
-    if summary["expired_found"] or summary["liveness_stopped"] or summary.get("drifted"):
+    if (summary["expired_found"] or summary["liveness_stopped"]
+            or summary.get("drifted") or summary.get("zombies_reaped")):
         logger.info(
             "Reaper sweep: expired_found=%d torn_down=%d failed=%d "
-            "liveness_stopped=%d liveness_refreshed=%d drifted=%d",
+            "liveness_stopped=%d liveness_refreshed=%d drifted=%d zombies_reaped=%d",
             summary["expired_found"], summary["torn_down"], summary["failed"],
             summary["liveness_stopped"], summary["liveness_refreshed"],
-            summary.get("drifted", 0),
+            summary.get("drifted", 0), summary.get("zombies_reaped", 0),
         )
     return summary
 
