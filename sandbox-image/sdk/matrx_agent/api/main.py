@@ -129,13 +129,19 @@ class WriteRequest(BaseModel):
     create_parents: bool = False
 
 class EditChunk(BaseModel):
-    start: int
-    end: int
-    replacement: str
+    """Anchor-based (search-and-replace) edit — matches matrx-ai's fs_patch/fs_edit
+    tool contract (old_text -> new_text), NOT the legacy offset-based
+    start/end/replacement shape this daemon used to require. That mismatch was
+    causing every sandbox-bound fs_edit/fs_patch call to fail with
+    "Field required: edits.0.start", since the client never sends offsets."""
+    old_text: str
+    new_text: str
+    replace_all: bool = False
 
 class PatchRequest(BaseModel):
     path: str
     edits: List[EditChunk]
+    create_if_missing: bool = False
 
 class MkdirRequest(BaseModel):
     path: str
@@ -261,19 +267,68 @@ async def fs_write(req: WriteRequest):
 
 @app.post("/fs/patch")
 async def fs_patch(req: PatchRequest):
-    p = Path(req.path)
-    if not p.is_file():
-        raise HTTPException(status_code=404, detail="File not found")
-        
-    content = p.read_text(encoding="utf-8")
-    
-    # apply edits in reverse order so indices don't shift
-    edits = sorted(req.edits, key=lambda x: x.start, reverse=True)
-    for edit in edits:
-        content = content[:edit.start] + edit.replacement + content[edit.end:]
+    """Apply 1+ sequential search-and-replace edits (old_text -> new_text).
 
+    Mirrors matrx-ai's local (non-sandbox) fs_patch semantics exactly, so a
+    sandbox-bound chat and a non-sandbox chat behave identically: each edit's
+    old_text must appear exactly once in the current content unless
+    replace_all is set; edits are applied in order (each sees the previous
+    edit's result); the file is only written if at least one edit succeeds.
+    """
+    p = Path(req.path)
+    existed = p.is_file()
+
+    if not existed:
+        if not req.create_if_missing:
+            raise HTTPException(status_code=404, detail="File not found")
+        if not req.edits or req.edits[0].old_text != "":
+            raise HTTPException(
+                status_code=400,
+                detail="create_if_missing=True requires the first edit to have empty old_text (insert mode).",
+            )
+        content = ""
+    else:
+        content = p.read_text(encoding="utf-8")
+
+    applied = []
+    failures = []
+    for i, edit in enumerate(req.edits):
+        if not existed and i == 0 and edit.old_text == "":
+            content = edit.new_text
+            applied.append({"edit_index": i, "mode": "create"})
+            continue
+
+        count = content.count(edit.old_text)
+        if count == 0:
+            failures.append({"edit_index": i, "reason": "old_text not found"})
+            continue
+        if count > 1 and not edit.replace_all:
+            failures.append({
+                "edit_index": i,
+                "reason": f"old_text matches {count} locations — add context or set replace_all=True",
+            })
+            continue
+
+        if edit.replace_all:
+            content = content.replace(edit.old_text, edit.new_text)
+            applied.append({"edit_index": i, "mode": "replace_all", "matches_replaced": count})
+        else:
+            content = content.replace(edit.old_text, edit.new_text, 1)
+            applied.append({"edit_index": i, "mode": "replace"})
+
+    if not applied:
+        raise HTTPException(
+            status_code=422,
+            detail={"message": f"All {len(req.edits)} edit(s) failed; file unchanged.", "failures": failures},
+        )
+
+    if not existed:
+        p.parent.mkdir(parents=True, exist_ok=True)
     _atomic_write(p, content.encode("utf-8"))
-    return get_stat_dict(p)
+    result = get_stat_dict(p)
+    result["edits_applied"] = applied
+    result["edits_failed"] = failures
+    return result
 
 @app.delete("/fs/delete")
 async def fs_delete(path: str, recursive: bool = False):
