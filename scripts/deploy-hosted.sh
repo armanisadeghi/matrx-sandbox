@@ -71,6 +71,31 @@ run_db_migrations() {
 
 cd "$REPO_DIR" || fail "repo dir $REPO_DIR not found"
 
+# ── aidream image freshness ──────────────────────────────────────────────────
+# The aidream variant bakes /srv/projects/aidream's origin/main at build time
+# (build-aidream.sh fetches + stamps label com.aimatrx.aidream.sha). It goes
+# stale whenever the AIDREAM repo moves — independent of this repo — so the
+# check runs on EVERY tick (incl. the "nothing to do" early-exit path below).
+# LOUD on lookup failure: a silent empty remote hid a broken git credential
+# setup (unit missing HOME) for a day while the check reported "current".
+AIDREAM_SRC_DIR="${AIDREAM_SRC_DIR:-/srv/projects/aidream}"
+aidream_stale() {
+  docker image inspect matrx-sandbox:aidream >/dev/null 2>&1 || return 0   # missing → need_img covers it anyway
+  local baked remote
+  baked=$(docker image inspect matrx-sandbox:aidream --format '{{index .Config.Labels "com.aimatrx.aidream.sha"}}' 2>/dev/null)
+  remote=$(git -C "$AIDREAM_SRC_DIR" ls-remote origin refs/heads/main 2>/dev/null | cut -f1)
+  if [ -z "$remote" ]; then
+    log "WARNING: aidream freshness UNKNOWN — ls-remote returned nothing (git auth/HOME broken?). Skipping rebuild rather than churning."
+    return 1
+  fi
+  [ -z "$baked" ] && { log "aidream image is unlabeled (pre-freshness build) — rebuilding to stamp it"; return 0; }
+  if [ "$baked" != "$remote" ]; then
+    log "aidream repo moved: baked ${baked:0:9} → main ${remote:0:9} — aidream image rebuild queued"
+    return 0
+  fi
+  return 1
+}
+
 # ── Resolve OLD/NEW commit + change set ─────────────────────────────────────
 # OLD comes from the last-successful-deploy STATE FILE, not the checkout's
 # HEAD. The checkout doubles as a working repo: when an agent commits + pushes
@@ -96,8 +121,14 @@ log "current=$OLD_SHA target=$NEW_SHA force=${FORCE:-0}"
 if [ "${FORCE:-0}" = "1" ] || [ "$OLD_SHA" = "none" ]; then
   CHANGED="ALL"
 elif [ "$OLD_SHA" = "$NEW_SHA" ]; then
-  log "already at origin/main; nothing to do (FORCE=1 to rebuild anyway)"
-  exit 0
+  if aidream_stale; then
+    # This repo is unchanged but the AIDREAM repo moved — fall through with an
+    # empty change set so ONLY the aidream image branch fires below.
+    CHANGED=""
+  else
+    log "already at origin/main; nothing to do (FORCE=1 to rebuild anyway)"
+    exit 0
+  fi
 else
   CHANGED="$(git diff --name-only "$OLD_SHA" "$NEW_SHA" 2>/dev/null || echo ALL)"
 fi
@@ -171,22 +202,6 @@ rebuild_image() {
 # rebuild if sandbox-image/ changed OR the image is absent (self-heal)
 need_img()       { [ "$SBX_CHANGED"   = 1 ] || ! docker image inspect "$1" >/dev/null 2>&1; }
 
-# The aidream variant additionally goes stale when the AIDREAM repo moves —
-# its source is baked at build time from /srv/projects/aidream's origin/main
-# (build-aidream.sh fetches + stamps com.aimatrx.aidream.sha). Compare that
-# label to the remote main SHA; differ → rebuild so orchestrator-spawned
-# aidream sandboxes boot current code (images shipped 100+ commits stale
-# before this, 2026-07-09). Network-failure-safe: unknown remote → no rebuild.
-AIDREAM_SRC_DIR="${AIDREAM_SRC_DIR:-/srv/projects/aidream}"
-aidream_stale() {
-  docker image inspect matrx-sandbox:aidream >/dev/null 2>&1 || return 0   # missing → need_img covers it anyway
-  local baked remote
-  baked=$(docker image inspect matrx-sandbox:aidream --format '{{index .Config.Labels "com.aimatrx.aidream.sha"}}' 2>/dev/null)
-  remote=$(git -C "$AIDREAM_SRC_DIR" ls-remote origin refs/heads/main 2>/dev/null | cut -f1)
-  [ -z "$remote" ] && return 1          # can't reach GitHub — don't churn
-  [ -z "$baked" ] && return 0           # pre-label image — rebuild once to stamp it
-  [ "$baked" != "$remote" ]
-}
 # local rebuilds when sandbox-image/ OR sandbox-local/ changes (or the image is missing)
 need_local_img() { [ "$SBX_CHANGED"   = 1 ] || [ "$LOCAL_CHANGED" = 1 ] || ! docker image inspect "$1" >/dev/null 2>&1; }
 

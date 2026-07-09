@@ -17,6 +17,10 @@ Wants=network-online.target
 
 [Service]
 Type=oneshot
+# Root's HOME is NOT set for User=-less units — without it git finds no
+# ~/.gitconfig credential helper and every fetch/ls-remote of a PRIVATE repo
+# fails silently (the aidream freshness check returned empty for a day).
+Environment=HOME=/root
 # The runner is installed to /usr/local/bin (NOT run from the checkout) so the
 # git reset it performs can never rewrite the executing script mid-run.
 ExecStart=/usr/local/bin/matrx-hosted-deploy-runner
