@@ -725,7 +725,11 @@ async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
     import asyncio
     
     await websocket.accept()
-    
+    # An attached PTY/watch session marks the box BUSY for the rolling
+    # auto-migrator — never swap a container out from under an open terminal
+    # or editor. Balanced by session_closed in this handler's finally.
+    activity.session_opened(sandbox_id)
+
     params = str(websocket.query_params)
     agent_tok = sandbox_manager.agent_token_for(sandbox_id)
     if agent_tok:
@@ -772,6 +776,7 @@ async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket proxy error: {e}")
     finally:
+        activity.session_closed(sandbox_id)
         try:
             await websocket.close()
         except:
@@ -979,7 +984,11 @@ async def proxy_pty(sandbox_id: str, websocket: WebSocket):
     import asyncio
     
     await websocket.accept()
-    
+    # An attached PTY/watch session marks the box BUSY for the rolling
+    # auto-migrator — never swap a container out from under an open terminal
+    # or editor. Balanced by session_closed in this handler's finally.
+    activity.session_opened(sandbox_id)
+
     params = str(websocket.query_params)
     agent_tok = sandbox_manager.agent_token_for(sandbox_id)
     if agent_tok:
@@ -1026,6 +1035,7 @@ async def proxy_pty(sandbox_id: str, websocket: WebSocket):
     except Exception as e:
         logger.error(f"WebSocket proxy error: {e}")
     finally:
+        activity.session_closed(sandbox_id)
         try:
             await websocket.close()
         except:

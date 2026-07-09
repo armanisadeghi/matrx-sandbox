@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from contextlib import asynccontextmanager
 
 logger = logging.getLogger(__name__)
@@ -33,6 +34,44 @@ class SandboxMigratingError(Exception):
 _inflight: dict[str, int] = {}
 _migrating: set[str] = set()
 _cond = asyncio.Condition()
+
+# Idle-gate signals beyond in-flight counts (an agent "between commands" and a
+# human with an open terminal both look idle to _inflight alone):
+#   _last_activity — monotonic timestamp of the most recent tool-call FINISH.
+#   _open_sessions — live interactive attachments (PTY terminals, fs-watch
+#     websockets). ANY open session = busy: never swap a box out from under an
+#     attached human/editor. Process-local; an orchestrator restart clears them
+#     (the in-flight + heartbeat gates still apply after).
+_last_activity: dict[str, float] = {}
+_open_sessions: dict[str, int] = {}
+
+
+def note_activity(sandbox_id: str) -> None:
+    _last_activity[sandbox_id] = time.monotonic()
+
+
+def last_activity_age(sandbox_id: str) -> float | None:
+    """Seconds since the last tracked tool call finished, or None if never."""
+    ts = _last_activity.get(sandbox_id)
+    return None if ts is None else time.monotonic() - ts
+
+
+def session_opened(sandbox_id: str) -> None:
+    _open_sessions[sandbox_id] = _open_sessions.get(sandbox_id, 0) + 1
+    note_activity(sandbox_id)
+
+
+def session_closed(sandbox_id: str) -> None:
+    n = _open_sessions.get(sandbox_id, 0) - 1
+    if n <= 0:
+        _open_sessions.pop(sandbox_id, None)
+    else:
+        _open_sessions[sandbox_id] = n
+    note_activity(sandbox_id)
+
+
+def open_session_count(sandbox_id: str) -> int:
+    return _open_sessions.get(sandbox_id, 0)
 
 
 def is_migrating(sandbox_id: str) -> bool:
@@ -58,6 +97,7 @@ async def track(sandbox_id: str):
     try:
         yield
     finally:
+        note_activity(sandbox_id)
         async with _cond:
             n = _inflight.get(sandbox_id, 0) - 1
             if n <= 0:

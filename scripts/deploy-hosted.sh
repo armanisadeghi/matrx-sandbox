@@ -226,6 +226,16 @@ else
 fi
 
 [ "$IMAGE_FAIL" = 1 ] && fail "one or more sandbox-image rebuilds failed (orchestrator unaffected)"
+
+# ── GC: keep frequent image rebuilds from eating the disk ────────────────────
+# The aidream variant rebuilds on every aidream push (several times/day), each
+# leaving GBs of dangling layers. Prune ONLY dangling images (untagged — never
+# touches :latest/:rollback/anything named) + cap build cache. Best-effort:
+# GC failure must never fail a deploy.
+reclaimed=$(docker image prune -f 2>/dev/null | grep -oE "reclaimed space: .*" || true)
+docker builder prune -f --keep-storage=20GB >/dev/null 2>&1 || true
+log "image GC: ${reclaimed:-nothing dangling}; build cache capped at 20GB; disk free: $(df -h / | awk 'NR==2{print $4}')"
+
 # Record the deployed SHA only now — every step above succeeded. This is what
 # the next run diffs against (see the state-file comment at the top).
 mkdir -p "$(dirname "$STATE_FILE")" 2>/dev/null || true

@@ -104,6 +104,29 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     from orchestrator import activity
     from orchestrator.sandbox_manager import _get_docker_client
 
+    # The idle gate runs FIRST — before any docker lookups — so a busy box
+    # defers with zero side effects (and the gate is testable without docker).
+    if require_idle:
+        if activity.inflight_count(sandbox_id) > 0:
+            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                    "reason": "box has in-flight tool calls; defer migration to an idle gap"}
+        # An attached interactive session (PTY terminal, fs-watch websocket) is
+        # ALWAYS busy — never swap a box out from under an open editor/terminal,
+        # even if no command is executing this instant.
+        if activity.open_session_count(sandbox_id) > 0:
+            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                    "reason": "box has an open interactive session (PTY/watch); defer until it closes"}
+        # Recent tool activity = an agent mid-task between commands. Hosted
+        # boxes rarely heartbeat, so orchestrator-side activity is the real
+        # "recently in use" signal; reuse the heartbeat window as the cutoff.
+        age = activity.last_activity_age(sandbox_id)
+        if age is not None and age < settings.migrate_recent_heartbeat_seconds:
+            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                    "reason": f"tool activity {int(age)}s ago (< {settings.migrate_recent_heartbeat_seconds}s); defer until idle"}
+        if _has_recent_heartbeat(await _safe_get(store, sandbox_id)):
+            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                    "reason": "box had a recent heartbeat; defer migration until idle"}
+
     client = _get_docker_client()
     try:
         old = await asyncio.to_thread(client.containers.get, sandbox_id)
@@ -118,17 +141,6 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
 
     if not target_image and cur.image_id and old_image_id == cur.image_id:
         return {"status": "already_current", "sandbox_id": sandbox_id, "version": cur.version}
-
-    if require_idle:
-        if activity.inflight_count(sandbox_id) > 0:
-            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                    "reason": "box has in-flight tool calls; defer migration to an idle gap"}
-        # Also treat a recently-active session (fresh heartbeat) as in-use, even
-        # with no request in flight — so a user mid-think between tool calls is
-        # never swapped out from under their session.
-        if _has_recent_heartbeat(await _safe_get(store, sandbox_id)):
-            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                    "reason": "box had a recent heartbeat; defer migration until idle"}
 
     cfg = old.attrs.get("Config") or {}
     host = old.attrs.get("HostConfig") or {}
