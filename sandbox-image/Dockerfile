@@ -83,7 +83,10 @@ RUN python3 -m pip install --no-cache-dir --upgrade pip setuptools wheel
 RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && rm -rf /var/lib/apt/lists/* \
-    && npm install -g npm@latest
+    # npm pinned to major 11 (supports Node 20). NEVER @latest here: npm@12
+    # dropped Node 20 and one unpinned @latest broke every image build on both
+    # deploy pipelines for a day (2026-07-08) the moment it was published.
+    && npm install -g npm@11
 
 # ─── AWS CLI v2 (multi-arch) ─────────────────────────────────────────────────
 RUN UARCH=$(uname -m) \
