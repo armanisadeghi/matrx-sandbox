@@ -38,7 +38,13 @@ fi
 
 cd "$(dirname "$0")"  # cd into sandbox-image/
 
-GIT_SHA=$(git -C "$AIDREAM_SRC" rev-parse --short HEAD 2>/dev/null || echo "unknown")
+# Bake origin/main, NOT the local working tree. /srv/projects/aidream is a
+# reference clone with no auto-pull — building from its HEAD shipped images
+# 100+ commits stale (2026-07-09). Fetch is best-effort: offline builds bake
+# the last-fetched origin/main rather than failing.
+git -C "$AIDREAM_SRC" fetch origin main --quiet     || echo "[build-aidream] WARN: git fetch failed — baking last-known origin/main"
+GIT_SHA=$(git -C "$AIDREAM_SRC" rev-parse --short origin/main 2>/dev/null || echo "unknown")
+AIDREAM_FULL_SHA=$(git -C "$AIDREAM_SRC" rev-parse origin/main 2>/dev/null || echo "unknown")
 STAGE_DIR="./aidream-src"
 LOCAL_SCRIPTS_STAGE="./scripts-local"
 
@@ -59,28 +65,15 @@ echo "[build-aidream] staging aidream source ($GIT_SHA) into $STAGE_DIR"
 rm -rf "$STAGE_DIR"
 mkdir -p "$STAGE_DIR"
 
-# Mirror only what we need; .dockerignore.aidream documents intent but
-# rsync's --exclude is what actually filters on copy.
-rsync -a \
-    --exclude='.git' \
-    --exclude='__pycache__' \
-    --exclude='*.pyc' \
-    --exclude='.DS_Store' \
-    --exclude='.cursor' \
-    --exclude='.claude' \
-    --exclude='.agent' \
-    --exclude='.arman' \
-    --exclude='.treasure-maps' \
-    --exclude='node_modules' \
-    --exclude='.venv' \
-    --exclude='.next' \
-    --exclude='dist/' \
-    --exclude='build/' \
-    --exclude='tmp/' \
-    --exclude='dashboard/' \
-    --exclude='workflow-studio/' \
-    --exclude='knowledgebase/' \
-    "$AIDREAM_SRC/" "$STAGE_DIR/"
+# Stage tracked files from origin/main via `git archive` — reads the object
+# store only, so the reference clone's working tree (and any uncommitted agent
+# work in it) is never touched, and the image content matches GitHub exactly.
+# Untracked junk (__pycache__, node_modules, .venv, .env) never ships because
+# archive only emits tracked files.
+git -C "$AIDREAM_SRC" archive --format=tar origin/main | tar -x -C "$STAGE_DIR"
+# Tracked-but-heavy dirs the sandbox variant doesn't need:
+rm -rf "$STAGE_DIR/dashboard" "$STAGE_DIR/workflow-studio" "$STAGE_DIR/knowledgebase" \
+       "$STAGE_DIR/.cursor" "$STAGE_DIR/.claude" "$STAGE_DIR/.agent" "$STAGE_DIR/.arman" "$STAGE_DIR/.treasure-maps"
 
 # We DO want a .git dir for `mtx aidream update` to work — but we want
 # the small one (refs + remotes only), not the full history. Use a
@@ -107,6 +100,7 @@ echo "[build-aidream] docker build → $TAG (this is the slow step — uv sync t
 # caller (deploy-hosted.sh / CI) sets it, so /etc/sandbox-image-version on the
 # aidream variant matches core/slim and drift detection works. Defaults to "dev".
 docker build \
+    --label "com.aimatrx.aidream.sha=$AIDREAM_FULL_SHA" \
     -f Dockerfile.aidream \
     --build-arg AIDREAM_GIT_SHA="$GIT_SHA" \
     --build-arg MATRX_IMAGE_VERSION="${MATRX_IMAGE_VERSION:-dev}" \

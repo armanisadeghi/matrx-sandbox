@@ -170,6 +170,23 @@ rebuild_image() {
 
 # rebuild if sandbox-image/ changed OR the image is absent (self-heal)
 need_img()       { [ "$SBX_CHANGED"   = 1 ] || ! docker image inspect "$1" >/dev/null 2>&1; }
+
+# The aidream variant additionally goes stale when the AIDREAM repo moves —
+# its source is baked at build time from /srv/projects/aidream's origin/main
+# (build-aidream.sh fetches + stamps com.aimatrx.aidream.sha). Compare that
+# label to the remote main SHA; differ → rebuild so orchestrator-spawned
+# aidream sandboxes boot current code (images shipped 100+ commits stale
+# before this, 2026-07-09). Network-failure-safe: unknown remote → no rebuild.
+AIDREAM_SRC_DIR="${AIDREAM_SRC_DIR:-/srv/projects/aidream}"
+aidream_stale() {
+  docker image inspect matrx-sandbox:aidream >/dev/null 2>&1 || return 0   # missing → need_img covers it anyway
+  local baked remote
+  baked=$(docker image inspect matrx-sandbox:aidream --format '{{index .Config.Labels "com.aimatrx.aidream.sha"}}' 2>/dev/null)
+  remote=$(git -C "$AIDREAM_SRC_DIR" ls-remote origin refs/heads/main 2>/dev/null | cut -f1)
+  [ -z "$remote" ] && return 1          # can't reach GitHub — don't churn
+  [ -z "$baked" ] && return 0           # pre-label image — rebuild once to stamp it
+  [ "$baked" != "$remote" ]
+}
 # local rebuilds when sandbox-image/ OR sandbox-local/ changes (or the image is missing)
 need_local_img() { [ "$SBX_CHANGED"   = 1 ] || [ "$LOCAL_CHANGED" = 1 ] || ! docker image inspect "$1" >/dev/null 2>&1; }
 
@@ -182,10 +199,10 @@ if need_img matrx-sandbox:slim; then rebuild_image "matrx-sandbox:slim" docker b
 # aidream is REQUIRED + ~5GB (builds ON TOP of :core, freshly rebuilt above if needed).
 # Export MATRX_IMAGE_VERSION so build-aidream.sh forwards it as a build-arg and
 # the aidream layer's /etc/sandbox-image-version matches the deploy SHA.
-if need_img matrx-sandbox:aidream; then
+if need_img matrx-sandbox:aidream || aidream_stale; then
   rebuild_image "matrx-sandbox:aidream" env MATRX_IMAGE_VERSION="$NEW_SHA" bash build-aidream.sh
 else
-  log "aidream present + unchanged — skip"
+  log "aidream present + unchanged (aidream repo SHA current) — skip"
 fi
 
 # ── Local starter pool (sandbox-1..5) ───────────────────────────────────────
