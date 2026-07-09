@@ -64,3 +64,26 @@ Only `/home/agent` is the persistent workspace; paths outside it do not survive 
 ## Template-specific
 
 The `:aidream` template adds extra paths under `/home/agent/aidream/` (e.g. `temp/`, `common/sample_data/`) via orchestrator env vars — not part of the core layout above.
+
+## Where it lives outside the sandbox
+
+There is **no separate bucket** for `repos/` vs `.matrx/` — everything under `/home/agent/` (except `cloud-files/`, see below) is one unit.
+
+| Tier | Backing store |
+|---|---|
+| **EC2** | `s3://{bucket}/users/{user_id}/hot/` — full `/home/agent/` tree synced at boot/shutdown |
+| **EC2 cold** | `s3://{bucket}/users/{user_id}/cold/` → `/data/cold/` (FUSE, large files) |
+| **Hosted** | Docker volume `matrx-user-{user_id}` on the host → `/home/agent` (survives container destroy) |
+
+Git remotes (GitHub, etc.) are separate; only the local checkout lives in hot storage.
+
+## Database-backed paths (hybrid)
+
+Two areas have a **canonical DB copy** plus a sandbox filesystem mirror. Everything else (`.matrx/plans`, `skills`, `repos`, `session.json`, etc.) is **filesystem-only** — persisted only via hot S3 or the hosted volume.
+
+| Sandbox path | Canonical store | Notes |
+|---|---|---|
+| `cloud-files/` | AI Dream **`cld_files`** (Supabase) | File bytes in S3 via `storage_uri`; path/metadata in DB. Local dir is a mirror; live upload via watcher (~5s). See [AIDREAM_INTEGRATION.md](AIDREAM_INTEGRATION.md). |
+| `.matrx/memory/` | **`user_memory`** table (Supabase) | Text content in DB. Orchestrator **hydrates** on create, **captures** on graceful teardown. See [MEMORY_API.md](MEMORY_API.md). |
+
+Other product surfaces (editor docs, UI-only content, etc.) may live entirely outside this repo — they are not part of the sandbox filesystem contract above.

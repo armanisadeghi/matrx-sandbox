@@ -938,7 +938,7 @@ async def proxy_credentials(sandbox_id: str, request: Request):
                 url=url,
                 params=params,
                 content=body,
-                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                headers=_with_agent({k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}, sandbox_id),
                 timeout=60.0
             )
         except httpx.RequestError as exc:
@@ -1054,7 +1054,7 @@ async def proxy_search(sandbox_id: str, path: str, request: Request):
                 url=url,
                 params=params,
                 content=body,
-                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                headers=_with_agent({k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}, sandbox_id),
                 timeout=60.0
             )
         except httpx.RequestError as exc:
@@ -1092,7 +1092,7 @@ async def proxy_processes(sandbox_id: str, request: Request, pid: int = None):
                 url=url,
                 params=params,
                 content=body,
-                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                headers=_with_agent({k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}, sandbox_id),
                 timeout=10.0
             )
         except httpx.RequestError as exc:
@@ -1122,7 +1122,7 @@ async def proxy_ports(sandbox_id: str, request: Request):
             resp = await client.request(
                 method=request.method,
                 url=url,
-                headers={k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")},
+                headers=_with_agent({k: v for k, v in request.headers.items() if k.lower() not in ("host", "content-length")}, sandbox_id),
                 timeout=10.0
             )
         except httpx.RequestError as exc:
