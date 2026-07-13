@@ -1,4 +1,4 @@
-# Known Defects
+# FOUND DEFECTS
 
 > Open defects + their workarounds, surfaced loudly so every agent and operator sees them. Each entry stays open until a human explicitly acknowledges and removes it.
 

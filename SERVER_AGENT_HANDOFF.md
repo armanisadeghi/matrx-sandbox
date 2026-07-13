@@ -41,7 +41,7 @@ validate**, not to reimplement:
 `MATRX_MIGRATE_RECENT_HEARTBEAT_SECONDS` (120), `MATRX_ENABLE_S3_MIGRATE`
 (false). Existing but **must be set** for the goal: `MATRX_AUTO_MIGRATE`,
 `MATRX_ACCESS_TOKEN_SECRET`, and (EC2) `MATRX_AIDREAM_SERVICE_TOKEN`
-(KNOWN_DEFECTS Bug 7).
+(FOUND_DEFECTS Bug 7).
 
 ---
 
@@ -123,7 +123,7 @@ SSM), then restart each orchestrator.
 | `MATRX_MIGRATE_RECENT_HEARTBEAT_SECONDS` | `120` (tune) | How long after the last heartbeat a box is still "in use". |
 | `MATRX_ACCESS_TOKEN_SECRET` | a strong random secret (**same value across restarts**) | Required for browser/proxy tokens **and** activates the per-sandbox daemon secret. Generate: `python3 -c "import secrets;print(secrets.token_urlsafe(48))"`. |
 | `MATRX_ENABLE_S3_MIGRATE` | **leave unset for now** | Enable only after Task E passes. |
-| `MATRX_AIDREAM_SERVICE_TOKEN` (EC2 only) | aidream's `AIDREAM_SANDBOX_SERVICE_TOKEN` | Fixes KNOWN_DEFECTS Bug 7 (EC2 cloud-files bridge). Hosted reads it from `/srv/projects/aidream/.env` automatically. |
+| `MATRX_AIDREAM_SERVICE_TOKEN` (EC2 only) | aidream's `AIDREAM_SANDBOX_SERVICE_TOKEN` | Fixes FOUND_DEFECTS Bug 7 (EC2 cloud-files bridge). Hosted reads it from `/srv/projects/aidream/.env` automatically. |
 
 > **Single-worker invariant:** the orchestrator keeps process-local state
 > (CWD cache, migration gating, warm-pool bookkeeping, single-use token JTIs).
@@ -323,4 +323,4 @@ Do not declare done until every box passes. Re-run after any change.
 - Drift / migrate endpoints: `GET /drift`, `POST /migrate-all`,
   `POST /sandboxes/{id}/migrate`, `GET /sandboxes/{id}/diagnostics`.
 - Background on zero-drift: `docs/ZERO_DRIFT.md`. Persistence model:
-  `docs/PERSISTENCE_PLAN.md`. EC2 cloud-files defect: `KNOWN_DEFECTS.md`.
+  `docs/PERSISTENCE_PLAN.md`. EC2 cloud-files defect: `FOUND_DEFECTS.md`.
