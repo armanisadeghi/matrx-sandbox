@@ -31,8 +31,9 @@ if [ ! -d "$AIDREAM_SRC" ]; then
     echo "[build-aidream] aidream source not found at $AIDREAM_SRC" >&2
     exit 1
 fi
-if ! docker image inspect matrx-sandbox:core >/dev/null 2>&1; then
-    echo "[build-aidream] matrx-sandbox:core not built — run 'docker build -t matrx-sandbox:core sandbox-image/' first" >&2
+CORE_IMAGE="matrx-sandbox:${MATRX_CORE_VERSION:-core}"
+if ! docker image inspect "$CORE_IMAGE" >/dev/null 2>&1; then
+    echo "[build-aidream] $CORE_IMAGE not built" >&2
     exit 1
 fi
 
@@ -104,6 +105,7 @@ docker build \
     -f Dockerfile.aidream \
     --build-arg AIDREAM_GIT_SHA="$GIT_SHA" \
     --build-arg MATRX_IMAGE_VERSION="${MATRX_IMAGE_VERSION:-dev}" \
+    --build-arg CORE_VERSION="${MATRX_CORE_VERSION:-core}" \
     -t "$TAG" \
     .
 

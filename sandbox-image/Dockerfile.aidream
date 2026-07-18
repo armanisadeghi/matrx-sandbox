@@ -17,7 +17,8 @@
 # opencv-python-headless, pymupdf, playwright (deduped against :core's layer
 # where possible), and the matrx-* workspace packages.
 
-FROM matrx-sandbox:core AS base
+ARG CORE_VERSION=core
+FROM matrx-sandbox:${CORE_VERSION} AS base
 
 ARG AIDREAM_GIT_SHA=unknown
 ENV AIDREAM_GIT_SHA=${AIDREAM_GIT_SHA}

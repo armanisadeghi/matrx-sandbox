@@ -5,13 +5,13 @@
 # over inbound SSH, and GitHub runner IPs (shared Azure ranges) intermittently
 # trip fail2ban here — so push-triggered SSH deploys failed at random and the
 # hosted tier silently fell behind main. This unit inverts the direction:
-# the host polls origin/main itself (outbound HTTPS only) and runs the same
+# the host polls the CI-approved deploy/hosted ref (outbound HTTPS only) and runs the same
 # scripts/deploy-hosted.sh. No inbound connectivity, nothing to ban.
 #
 # deploy-hosted.sh is idempotent + cheap when nothing changed (state-file SHA
 # diff → early exit), takes a flock against the GHA fast path, health-gates
 # the orchestrator swap, and rolls back on failure.
-Description=Matrx hosted-tier pull deploy (matrx-sandbox origin/main -> /srv)
+Description=Matrx hosted-tier pull deploy (tested matrx-sandbox SHA -> /srv)
 After=network-online.target docker.service
 Wants=network-online.target
 
