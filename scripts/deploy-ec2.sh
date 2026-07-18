@@ -102,6 +102,8 @@ rollback() {
 trap 'rollback' ERR INT TERM
 
 log "promoting candidates"
+# Freeze creates while the default + per-template tags move together.
+systemctl stop "$UNIT"
 CORE_HAD_LIVE=0
 SLIM_HAD_LIVE=0
 if docker image inspect matrx-sandbox:latest >/dev/null 2>&1; then
@@ -120,7 +122,6 @@ IMAGES_PROMOTED=1
 docker tag "$ECR_REPO:$TARGET_SHA" matrx-sandbox:latest
 docker tag "$ECR_REPO:slim-$TARGET_SHA" matrx-sandbox:slim
 
-systemctl stop "$UNIT"
 rm -rf "$ROLLBACK_DIR"
 LIVE_MOVED=0
 if [ -d "$LIVE_DIR" ]; then
