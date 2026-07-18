@@ -21,8 +21,10 @@
 # commit doesn't trigger a ~5GB aidream rebuild.
 #
 # Env knobs (all optional):
-#   DEPLOY_TARGET_SHA   — required full commit SHA from the CI-controlled
-#                         deploy/hosted ref. The script never follows main.
+#   DEPLOY_TARGET_SHA   — full commit SHA from the CI-controlled deploy/hosted
+#                         ref. If omitted by the legacy poller during rollout,
+#                         the script resolves that ref itself and still fails
+#                         closed unless the checkout exactly matches it.
 #   FORCE=1             — rebuild everything regardless of the diff.
 #   MATRX_SANDBOX_DIR / ORCH_COMPOSE_DIR / ORCH_HEALTH_URL — path overrides.
 
@@ -70,9 +72,14 @@ run_db_migrations() {
 
 cd "$REPO_DIR" || fail "repo dir $REPO_DIR not found"
 
-TARGET_SHA="${DEPLOY_TARGET_SHA:-}"
-[[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "DEPLOY_TARGET_SHA must be a full approved commit SHA"
 HEAD_SHA="$(git rev-parse HEAD 2>/dev/null)" || fail "cannot resolve checkout HEAD"
+TARGET_SHA="${DEPLOY_TARGET_SHA:-}"
+if [ -z "$TARGET_SHA" ]; then
+  git fetch origin refs/heads/deploy/hosted --quiet \
+    || fail "cannot resolve CI-approved deploy/hosted ref"
+  TARGET_SHA="$(git rev-parse FETCH_HEAD)"
+fi
+[[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "approved target must be a full commit SHA"
 [ "$HEAD_SHA" = "$TARGET_SHA" ] || fail "checkout $HEAD_SHA does not match approved target $TARGET_SHA"
 git diff --quiet && git diff --cached --quiet \
   || fail "refusing to build a dirty checkout; release images must be reproducible"
