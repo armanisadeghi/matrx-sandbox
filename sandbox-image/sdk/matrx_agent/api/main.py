@@ -1,5 +1,9 @@
 import asyncio
 import base64
+import binascii
+import fnmatch
+import hashlib
+import json
 import logging
 import os
 import shutil
@@ -9,7 +13,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, List, Literal, Optional
 
-from fastapi import FastAPI, HTTPException, Response, UploadFile, File, Form
+from fastapi import FastAPI, File, Form, HTTPException, Query, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, PlainTextResponse
 from pydantic import BaseModel
 
@@ -34,6 +38,17 @@ _checkpoint = CheckpointDaemon(interval_seconds=int(os.environ.get(
     "MATRX_CHECKPOINT_INTERVAL_SECONDS", str(DEFAULT_INTERVAL_SECONDS),
 )))
 _cloud_watcher = CloudFilesWatcher()
+
+
+# Filesystem inspection endpoints are agent-facing and can be invoked on trees
+# or files whose size is not known in advance. Keep every response bounded.
+# Callers can paginate list results or continue reads from the returned offset.
+DEFAULT_FS_LIST_LIMIT = 1_000
+MAX_FS_LIST_LIMIT = 5_000
+MAX_FS_LIST_DEPTH = 32
+DEFAULT_FS_READ_LIMIT = 1_048_576  # characters for utf8; bytes for base64
+MAX_FS_READ_LIMIT = 4_194_304
+MAX_FS_OFFSET = 9_223_372_036_854_775_807
 
 
 @asynccontextmanager
@@ -188,16 +203,128 @@ def _atomic_write(path: Path, data: bytes, mode: Optional[int] = None) -> None:
 
 
 def get_stat_dict(file_path: Path) -> dict:
-    st = file_path.stat()
+    """Return one stable filesystem entry without following symlinks."""
+    st = file_path.lstat()
+    is_symlink = file_path.is_symlink()
+    kind = "symlink" if is_symlink else "dir" if file_path.is_dir() else "file"
     return {
         "name": file_path.name,
         "path": str(file_path),
-        "kind": "file" if file_path.is_file() else "dir" if file_path.is_dir() else "symlink",
+        "kind": kind,
         "size": st.st_size,
         "mtime": st.st_mtime,
         "mode": stat.S_IMODE(st.st_mode),
-        "target": str(file_path.resolve()) if file_path.is_symlink() else None
+        "target": str(file_path.resolve()) if is_symlink else None,
     }
+
+
+def _iter_directory_entries(root: Path, *, recursive: bool, depth: int):
+    """Yield entries in deterministic depth-first order, never following links."""
+
+    def walk(directory: Path, level: int):
+        try:
+            children = sorted(directory.iterdir(), key=lambda item: item.name)
+        except (FileNotFoundError, NotADirectoryError):
+            return
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Permission denied: {directory}",
+            ) from exc
+
+        for child in children:
+            yield child
+            if recursive and level < depth:
+                try:
+                    descend = not child.is_symlink() and child.is_dir()
+                except OSError:
+                    descend = False
+                if descend:
+                    yield from walk(child, level + 1)
+
+    yield from walk(root, 1)
+
+
+def _list_scope(path: Path, *, recursive: bool, depth: int, pattern: str | None) -> str:
+    payload = json.dumps(
+        {
+            "path": os.path.abspath(path),
+            "recursive": recursive,
+            "depth": depth,
+            "pattern": pattern or "",
+        },
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+    return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
+
+
+def _encode_page_token(offset: int, scope: str) -> str:
+    payload = json.dumps(
+        {"v": 1, "offset": offset, "scope": scope},
+        sort_keys=True,
+        separators=(",", ":"),
+    ).encode("utf-8")
+    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
+
+
+def _decode_page_token(token: str, expected_scope: str) -> int:
+    try:
+        padded = token + "=" * (-len(token) % 4)
+        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
+        if (
+            not isinstance(payload, dict)
+            or payload.get("v") != 1
+            or payload.get("scope") != expected_scope
+            or not isinstance(payload.get("offset"), int)
+            or payload["offset"] < 0
+            or payload["offset"] > MAX_FS_OFFSET
+        ):
+            raise ValueError
+        return payload["offset"]
+    except (
+        ValueError,
+        UnicodeDecodeError,
+        json.JSONDecodeError,
+        binascii.Error,
+    ) as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="Invalid or expired pageToken for this directory listing",
+        ) from exc
+
+
+def _matches_list_pattern(path: Path, root: Path, pattern: str | None) -> bool:
+    if not pattern:
+        return True
+    relative = path.relative_to(root).as_posix()
+    # fnmatchcase keeps matching behavior identical on Windows and Unix.
+    return fnmatch.fnmatchcase(path.name, pattern) or fnmatch.fnmatchcase(
+        relative,
+        pattern,
+    )
+
+
+def _parse_byte_range(value: str) -> tuple[int, int]:
+    """Parse the documented inclusive ``range=start-end`` compatibility form."""
+    try:
+        raw_start, raw_end = value.split("-", 1)
+        start = int(raw_start)
+        end = int(raw_end)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=416, detail="range must be start-end") from exc
+    if start < 0 or end < start:
+        raise HTTPException(
+            status_code=416,
+            detail="range must satisfy 0 <= start <= end",
+        )
+    limit = end - start + 1
+    if limit > MAX_FS_READ_LIMIT:
+        raise HTTPException(
+            status_code=416,
+            detail=f"range exceeds the {MAX_FS_READ_LIMIT}-byte maximum",
+        )
+    return start, limit
 
 # --- Health ---
 
@@ -217,20 +344,60 @@ async def health() -> dict:
 # --- FS Routes ---
 
 @app.get("/fs/list")
-async def fs_list(path: str, recursive: bool = False, depth: int = 1):
+async def fs_list(
+    path: str,
+    recursive: bool = False,
+    depth: int = Query(default=1, ge=1, le=MAX_FS_LIST_DEPTH),
+    pattern: str | None = None,
+    limit: int = Query(default=DEFAULT_FS_LIST_LIMIT, ge=1, le=MAX_FS_LIST_LIMIT),
+    offset: int = Query(default=0, ge=0, le=MAX_FS_OFFSET),
+    page_token: str | None = Query(default=None, alias="pageToken"),
+):
+    """Return a bounded, optionally recursive page of directory entries.
+
+    ``depth`` counts the requested directory's children as level one. Symlinked
+    directories are returned as entries but never traversed. Results use a
+    deterministic depth-first order so ``nextPageToken`` can continue the same
+    query without materializing an unbounded tree in memory.
+    """
     p = Path(path)
     if not p.exists() or not p.is_dir():
         raise HTTPException(status_code=404, detail="Directory not found")
-    
-    entries = []
-    # simplistic listing for depth=1
-    for child in p.iterdir():
+
+    scope = _list_scope(p, recursive=recursive, depth=depth, pattern=pattern)
+    if page_token is not None:
+        if offset:
+            raise HTTPException(
+                status_code=400,
+                detail="Use either offset or pageToken, not both",
+            )
+        offset = _decode_page_token(page_token, scope)
+
+    entries: list[dict] = []
+    matched = 0
+    for child in _iter_directory_entries(p, recursive=recursive, depth=depth):
+        if not _matches_list_pattern(child, p, pattern):
+            continue
+        if matched < offset:
+            matched += 1
+            continue
         try:
             entries.append(get_stat_dict(child))
         except FileNotFoundError:
             continue
-            
-    return {"entries": entries}
+        matched += 1
+        if len(entries) > limit:
+            break
+
+    truncated = len(entries) > limit
+    if truncated:
+        entries.pop()
+    next_offset = offset + len(entries)
+    return {
+        "entries": entries,
+        "truncated": truncated,
+        "nextPageToken": _encode_page_token(next_offset, scope) if truncated else None,
+    }
 
 @app.get("/fs/stat")
 async def fs_stat(path: str):
@@ -240,19 +407,101 @@ async def fs_stat(path: str):
     return get_stat_dict(p)
 
 @app.get("/fs/read")
-async def fs_read(path: str, encoding: Literal["utf8", "base64"] = "utf8"):
+async def fs_read(
+    path: str,
+    encoding: Literal["utf8", "base64"] = "utf8",
+    offset: int | None = Query(default=None, ge=0, le=MAX_FS_OFFSET),
+    limit: int | None = Query(default=None, ge=1, le=MAX_FS_READ_LIMIT),
+    byte_range: str | None = Query(default=None, alias="range"),
+):
+    """Read a bounded file segment without loading the whole file.
+
+    ``offset`` is a byte offset. For UTF-8 responses, ``limit`` bounds decoded
+    characters (matching the filesystem tool contract); for base64 it bounds
+    source bytes. The older inclusive ``range=start-end`` query remains
+    supported as an alias for byte-oriented consumers.
+    """
     p = Path(path)
     if not p.is_file():
         raise HTTPException(status_code=404, detail="File not found")
-        
-    content = p.read_bytes()
-    if encoding == "base64":
-        return Response(content=base64.b64encode(content).decode("utf-8"), media_type="text/plain")
+
+    is_range_read = byte_range is not None
+    if is_range_read:
+        if offset is not None or limit is not None:
+            raise HTTPException(
+                status_code=400,
+                detail="Use either range or offset/limit, not both",
+            )
+        offset, limit = _parse_byte_range(byte_range)
     else:
+        offset = offset or 0
+        limit = limit or DEFAULT_FS_READ_LIMIT
+
+    size = p.stat().st_size
+    headers = {
+        "Accept-Ranges": "bytes",
+        "X-Matrx-File-Size": str(size),
+        "X-Matrx-Read-Offset": str(offset),
+        "X-Matrx-Read-Limit": str(limit),
+    }
+
+    if encoding == "base64":
+        with p.open("rb") as file:
+            file.seek(offset)
+            content = file.read(limit)
+        next_offset = offset + len(content)
+        headers.update(
+            {
+                "X-Matrx-Read-Length": str(len(content)),
+                "X-Matrx-Next-Offset": str(next_offset),
+                "X-Matrx-Truncated": str(next_offset < size).lower(),
+            }
+        )
+        return Response(
+            content=base64.b64encode(content).decode("ascii"),
+            media_type="text/plain",
+            headers=headers,
+        )
+
+    if is_range_read:
+        with p.open("rb") as file:
+            file.seek(offset)
+            raw_content = file.read(limit)
+        next_offset = offset + len(raw_content)
         try:
-            return Response(content=content.decode("utf-8"), media_type="text/plain")
-        except UnicodeDecodeError:
-            raise HTTPException(status_code=400, detail="File is binary, use encoding=base64")
+            content = raw_content.decode("utf-8")
+        except UnicodeDecodeError as exc:
+            raise HTTPException(
+                status_code=400,
+                detail="File is binary or range is not on UTF-8 boundaries; use encoding=base64",
+            ) from exc
+        headers.update(
+            {
+                "X-Matrx-Read-Length": str(len(raw_content)),
+                "X-Matrx-Next-Offset": str(next_offset),
+                "X-Matrx-Truncated": str(next_offset < size).lower(),
+            }
+        )
+        return Response(content=content, media_type="text/plain", headers=headers)
+
+    try:
+        with p.open("r", encoding="utf-8") as file:
+            file.seek(offset)
+            content = file.read(limit)
+            next_offset = file.tell()
+        headers.update(
+            {
+                "X-Matrx-Read-Length": str(len(content)),
+                "X-Matrx-Next-Offset": str(next_offset),
+                "X-Matrx-Truncated": str(next_offset < size).lower(),
+            }
+        )
+        return Response(content=content, media_type="text/plain", headers=headers)
+    except UnicodeDecodeError as exc:
+        raise HTTPException(
+            status_code=400,
+            detail="File is binary or offset is not on a UTF-8 boundary; use encoding=base64",
+        ) from exc
 
 @app.put("/fs/write")
 async def fs_write(req: WriteRequest):

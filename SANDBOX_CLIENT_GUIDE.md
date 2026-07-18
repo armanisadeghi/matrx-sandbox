@@ -201,9 +201,9 @@ For higher-fidelity interactive use (vim, REPLs, ctrl-c), prefer the PTY WebSock
 The orchestrator proxies these straight to the in-container `matrx_agent` daemon. Paths are absolute and start with `/`. Binary content uses `encoding=base64`.
 
 ### Basic CRUD
-- `GET /fs/list?path=/home/agent` — returns `{ entries: [{ name, path, kind: "file"|"dir"|"symlink", size, mtime, mode, target? }, ...] }`.
+- `GET /fs/list?path=/home/agent&recursive=false&depth=1&pattern=*.py&limit=1000&pageToken=...` — bounded directory listing. `depth` counts immediate children as level 1 (max 32); symlinked directories are never traversed. `pattern` is a case-sensitive glob matched against both the basename and `/`-normalized relative path. `limit` defaults to 1000 and is capped at 5000. Returns `{ entries: [{ name, path, kind: "file"|"dir"|"symlink", size, mtime, mode, target? }, ...], truncated, nextPageToken }`. Pass `nextPageToken` back as `pageToken` for the next page; a numeric `offset` query is also accepted.
 - `GET /fs/stat?path=...`
-- `GET /fs/read?path=...&encoding=utf8|base64&range=0-65535`
+- `GET /fs/read?path=...&encoding=utf8|base64&offset=0&limit=1048576` — bounded read. `offset` is a byte offset; `limit` bounds UTF-8 characters for `utf8` and source bytes for `base64`. The default is 1,048,576 units and the maximum is 4,194,304. The documented inclusive compatibility form `range=0-65535` is also supported (do not combine it with `offset`/`limit`). The response body remains raw text/base64 for compatibility. `X-Matrx-File-Size`, `X-Matrx-Read-Length`, `X-Matrx-Next-Offset`, and `X-Matrx-Truncated` describe continuation state.
 - `PUT /fs/write` — body `{ path, content, encoding?, mode?, create_parents? }`. Atomic temp+rename.
 - `POST /fs/patch` — body `{ path, edits: [{ start, end, replacement }] }`.
 - `DELETE /fs/delete?path=...&recursive=true`
