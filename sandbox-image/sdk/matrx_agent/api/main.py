@@ -1,14 +1,17 @@
 import asyncio
 import base64
-import binascii
 import fnmatch
 import hashlib
 import json
 import logging
 import os
+import secrets
 import shutil
+import sqlite3
 import stat
 import tempfile
+import threading
+import time
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, List, Literal, Optional
@@ -46,6 +49,10 @@ _cloud_watcher = CloudFilesWatcher()
 DEFAULT_FS_LIST_LIMIT = 1_000
 MAX_FS_LIST_LIMIT = 5_000
 MAX_FS_LIST_DEPTH = 32
+MAX_FS_LIST_SCAN_PER_PAGE = 20_000
+MAX_FS_LIST_SNAPSHOT_ENTRIES = 250_000
+MAX_FS_LIST_SESSIONS = 16
+FS_LIST_SESSION_TTL_SECONDS = 300
 DEFAULT_FS_READ_LIMIT = 1_048_576  # characters for utf8; bytes for base64
 MAX_FS_READ_LIMIT = 4_194_304
 MAX_FS_OFFSET = 9_223_372_036_854_775_807
@@ -78,6 +85,7 @@ async def lifespan(app: FastAPI):
     # Runs as a background task so a slow down-marker wait doesn't block the
     # daemon from accepting requests.
     cloud_watcher_starter = asyncio.create_task(_cloud_watcher.start())
+    list_session_reaper = asyncio.create_task(_reap_list_sessions())
 
     yield
 
@@ -87,6 +95,18 @@ async def lifespan(app: FastAPI):
         await _checkpoint.stop()
     except Exception as e:  # noqa: BLE001
         _logger.warning("matrx_agent: checkpoint daemon stop error: %s", e)
+    try:
+        list_session_reaper.cancel()
+        try:
+            await list_session_reaper
+        except asyncio.CancelledError:
+            pass
+        with _fs_list_sessions_lock:
+            for session in _fs_list_sessions.values():
+                session.close()
+            _fs_list_sessions.clear()
+    except Exception as e:  # noqa: BLE001
+        _logger.warning("matrx_agent: list-session cleanup error: %s", e)
     try:
         # Cancel the starter in case it's still waiting on the down-marker; then
         # stop the watcher itself (idempotent if it never started).
@@ -218,31 +238,277 @@ def get_stat_dict(file_path: Path) -> dict:
     }
 
 
-def _iter_directory_entries(root: Path, *, recursive: bool, depth: int):
-    """Yield entries in deterministic depth-first order, never following links."""
+class _SnapshotFrame:
+    def __init__(self, frame_id: int, directory: Path, level: int) -> None:
+        self.frame_id = frame_id
+        self.directory = directory
+        self.level = level
+        self.iterator: os.ScandirIterator | None = None
+        self.scanned = False
+        self.after_name = ""
+        self.after_path = ""
 
-    def walk(directory: Path, level: int):
+
+class _DirectoryWalker:
+    """Bounded-work deterministic traversal backed by a disk snapshot.
+
+    Lexical order requires seeing all siblings before emitting the first one.
+    Doing that with ``sorted(directory.iterdir())`` made a one-item request
+    allocate memory proportional to directory size. This walker incrementally
+    snapshots at most a fixed number of entries per request into a temporary
+    SQLite file, then keyset-pages that snapshot in binary lexical order.
+    Memory and request work stay bounded even for million-entry directories.
+    """
+
+    def __init__(
+        self,
+        root: Path,
+        *,
+        recursive: bool,
+        depth: int,
+        pattern: str | None,
+    ) -> None:
+        self._recursive = recursive
+        self._depth = depth
+        self._pattern = pattern
+        self._tempdir = tempfile.TemporaryDirectory(prefix="matrx-fs-list-")
+        self._db = sqlite3.connect(str(Path(self._tempdir.name) / "listing.sqlite3"))
+        self._db.execute("PRAGMA journal_mode=OFF")
+        self._db.execute("PRAGMA synchronous=OFF")
+        self._db.execute("PRAGMA temp_store=FILE")
+        self._db.execute(
+            """CREATE TABLE entries (
+                   frame_id INTEGER NOT NULL,
+                   name TEXT NOT NULL COLLATE BINARY,
+                   path TEXT NOT NULL COLLATE BINARY,
+                   payload TEXT NOT NULL,
+                   descend INTEGER NOT NULL,
+                   matches INTEGER NOT NULL,
+                   PRIMARY KEY (frame_id, name, path)
+               ) WITHOUT ROWID"""
+        )
+        self._next_frame_id = 1
+        self._snapshot_entries = 0
+        self._stack = [_SnapshotFrame(0, root, 1)]
+        self._closed = False
+
+    @staticmethod
+    def _open(frame: _SnapshotFrame) -> None:
         try:
-            children = sorted(directory.iterdir(), key=lambda item: item.name)
+            frame.iterator = os.scandir(frame.directory)
         except (FileNotFoundError, NotADirectoryError):
-            return
+            frame.scanned = True
         except PermissionError as exc:
             raise HTTPException(
                 status_code=403,
-                detail=f"Permission denied: {directory}",
+                detail=f"Permission denied: {frame.directory}",
             ) from exc
 
-        for child in children:
-            yield child
-            if recursive and level < depth:
-                try:
-                    descend = not child.is_symlink() and child.is_dir()
-                except OSError:
-                    descend = False
-                if descend:
-                    yield from walk(child, level + 1)
+    def _snapshot_one(self, frame: _SnapshotFrame) -> bool:
+        """Snapshot one raw sibling. Return false when the frame is complete."""
+        if frame.iterator is None:
+            self._open(frame)
+        if frame.scanned:
+            return False
+        assert frame.iterator is not None
+        try:
+            entry = next(frame.iterator)
+        except StopIteration:
+            frame.iterator.close()
+            frame.iterator = None
+            frame.scanned = True
+            self._db.commit()
+            return False
+        except PermissionError as exc:
+            raise HTTPException(
+                status_code=403,
+                detail=f"Permission denied: {frame.directory}",
+            ) from exc
 
-    yield from walk(root, 1)
+        path = Path(entry.path)
+        try:
+            payload = get_stat_dict(path)
+            descend = (
+                self._recursive
+                and frame.level < self._depth
+                and payload["kind"] == "dir"
+            )
+            matches = _matches_list_pattern(path, self._stack[0].directory, self._pattern)
+        except (FileNotFoundError, NotADirectoryError):
+            return True
+        # Unmatched leaf files cannot affect recursive traversal order, so a
+        # narrow pattern should also narrow snapshot disk usage.
+        if not matches and not descend:
+            return True
+        if self._snapshot_entries >= MAX_FS_LIST_SNAPSHOT_ENTRIES:
+            raise HTTPException(
+                status_code=413,
+                detail=(
+                    "Directory listing exceeds the deterministic snapshot limit "
+                    f"of {MAX_FS_LIST_SNAPSHOT_ENTRIES} entries; narrow the path "
+                    "or pattern"
+                ),
+            )
+        self._db.execute(
+            "INSERT OR REPLACE INTO entries VALUES (?, ?, ?, ?, ?, ?)",
+            (
+                frame.frame_id,
+                path.name,
+                str(path),
+                json.dumps(payload, separators=(",", ":")),
+                int(descend),
+                int(matches),
+            ),
+        )
+        self._snapshot_entries += 1
+        return True
+
+    def next(self, work_remaining: int) -> tuple[dict | None, int, bool]:
+        """Find the next matching entry within ``work_remaining`` operations.
+
+        Returns ``(entry, work_used, finished)``. ``entry`` is ``None`` when
+        the budget ended while snapshotting or skipping unmatched entries.
+        """
+        used = 0
+        while used < work_remaining and self._stack:
+            frame = self._stack[-1]
+            if not frame.scanned:
+                consumed = self._snapshot_one(frame)
+                if consumed:
+                    used += 1
+                continue
+
+            row = self._db.execute(
+                """SELECT name, path, payload, descend, matches
+                     FROM entries
+                    WHERE frame_id = ?
+                      AND (name > ? OR (name = ? AND path > ?))
+                 ORDER BY name COLLATE BINARY, path COLLATE BINARY
+                    LIMIT 1""",
+                (frame.frame_id, frame.after_name, frame.after_name, frame.after_path),
+            ).fetchone()
+            if row is None:
+                deleted = self._db.execute(
+                    "SELECT COUNT(*) FROM entries WHERE frame_id = ?",
+                    (frame.frame_id,),
+                ).fetchone()[0]
+                self._db.execute("DELETE FROM entries WHERE frame_id = ?", (frame.frame_id,))
+                self._snapshot_entries -= deleted
+                self._db.commit()
+                self._stack.pop()
+                continue
+
+            name, path_value, payload_json, descend, matches = row
+            frame.after_name = name
+            frame.after_path = path_value
+            used += 1
+            if descend:
+                child = _SnapshotFrame(self._next_frame_id, Path(path_value), frame.level + 1)
+                self._next_frame_id += 1
+                self._stack.append(child)
+            if matches:
+                return json.loads(payload_json), used, False
+
+        return None, used, not self._stack
+
+    def close(self) -> None:
+        if self._closed:
+            return
+        self._closed = True
+        for frame in self._stack:
+            if frame.iterator is not None:
+                frame.iterator.close()
+        self._stack.clear()
+        self._db.close()
+        self._tempdir.cleanup()
+
+
+class _DirectoryListSession:
+    def __init__(
+        self,
+        root: Path,
+        *,
+        recursive: bool,
+        depth: int,
+        pattern: str | None,
+        scope: str,
+    ) -> None:
+        self.root = root
+        self.pattern = pattern
+        self.scope = scope
+        self.walker = _DirectoryWalker(
+            root,
+            recursive=recursive,
+            depth=depth,
+            pattern=pattern,
+        )
+        self.pending: dict | None = None
+        self.expires_at = time.monotonic() + FS_LIST_SESSION_TTL_SECONDS
+
+    def page(self, limit: int) -> tuple[list[dict], bool, int]:
+        """Return at most ``limit`` entries after bounded traversal work."""
+        entries: list[dict] = []
+        work = 0
+        if self.pending is not None:
+            entries.append(self.pending)
+            self.pending = None
+
+        while work < MAX_FS_LIST_SCAN_PER_PAGE:
+            item, used, finished = self.walker.next(MAX_FS_LIST_SCAN_PER_PAGE - work)
+            work += used
+            if finished:
+                return entries, False, work
+            if item is None:
+                break
+            if len(entries) < limit:
+                entries.append(item)
+            else:
+                self.pending = item
+                return entries, True, work
+
+        # The scan budget can be exhausted before a sparse pattern matches.
+        # Returning an empty page with a token is intentional: it makes work
+        # per request finite without falsely claiming the traversal is done.
+        return entries, True, work
+
+    def close(self) -> None:
+        self.walker.close()
+
+
+_fs_list_sessions: dict[str, _DirectoryListSession] = {}
+_fs_list_sessions_lock = threading.Lock()
+
+
+def _discard_expired_list_sessions(now: float) -> None:
+    expired = [
+        token for token, session in _fs_list_sessions.items()
+        if session.expires_at <= now
+    ]
+    for token in expired:
+        _fs_list_sessions.pop(token).close()
+
+
+def _store_list_session(session: _DirectoryListSession) -> str:
+    now = time.monotonic()
+    _discard_expired_list_sessions(now)
+    while len(_fs_list_sessions) >= MAX_FS_LIST_SESSIONS:
+        oldest_token = min(
+            _fs_list_sessions,
+            key=lambda token: _fs_list_sessions[token].expires_at,
+        )
+        _fs_list_sessions.pop(oldest_token).close()
+    session.expires_at = now + FS_LIST_SESSION_TTL_SECONDS
+    token = secrets.token_urlsafe(24)
+    _fs_list_sessions[token] = session
+    return token
+
+
+async def _reap_list_sessions() -> None:
+    """Close expired directory handles and delete their disk snapshots."""
+    while True:
+        await asyncio.sleep(min(60, FS_LIST_SESSION_TTL_SECONDS))
+        with _fs_list_sessions_lock:
+            _discard_expired_list_sessions(time.monotonic())
 
 
 def _list_scope(path: Path, *, recursive: bool, depth: int, pattern: str | None) -> str:
@@ -257,41 +523,6 @@ def _list_scope(path: Path, *, recursive: bool, depth: int, pattern: str | None)
         separators=(",", ":"),
     )
     return hashlib.sha256(payload.encode("utf-8")).hexdigest()[:24]
-
-
-def _encode_page_token(offset: int, scope: str) -> str:
-    payload = json.dumps(
-        {"v": 1, "offset": offset, "scope": scope},
-        sort_keys=True,
-        separators=(",", ":"),
-    ).encode("utf-8")
-    return base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
-
-
-def _decode_page_token(token: str, expected_scope: str) -> int:
-    try:
-        padded = token + "=" * (-len(token) % 4)
-        payload = json.loads(base64.urlsafe_b64decode(padded).decode("utf-8"))
-        if (
-            not isinstance(payload, dict)
-            or payload.get("v") != 1
-            or payload.get("scope") != expected_scope
-            or not isinstance(payload.get("offset"), int)
-            or payload["offset"] < 0
-            or payload["offset"] > MAX_FS_OFFSET
-        ):
-            raise ValueError
-        return payload["offset"]
-    except (
-        ValueError,
-        UnicodeDecodeError,
-        json.JSONDecodeError,
-        binascii.Error,
-    ) as exc:
-        raise HTTPException(
-            status_code=400,
-            detail="Invalid or expired pageToken for this directory listing",
-        ) from exc
 
 
 def _matches_list_pattern(path: Path, root: Path, pattern: str | None) -> bool:
@@ -350,53 +581,54 @@ async def fs_list(
     depth: int = Query(default=1, ge=1, le=MAX_FS_LIST_DEPTH),
     pattern: str | None = None,
     limit: int = Query(default=DEFAULT_FS_LIST_LIMIT, ge=1, le=MAX_FS_LIST_LIMIT),
-    offset: int = Query(default=0, ge=0, le=MAX_FS_OFFSET),
     page_token: str | None = Query(default=None, alias="pageToken"),
 ):
     """Return a bounded, optionally recursive page of directory entries.
 
     ``depth`` counts the requested directory's children as level one. Symlinked
     directories are returned as entries but never traversed. Results use a
-    deterministic depth-first order so ``nextPageToken`` can continue the same
-    query without materializing an unbounded tree in memory.
+    cursor-stable depth-first order so ``nextPageToken`` continues the exact
+    open traversal without materializing or rescanning an unbounded tree.
     """
     p = Path(path)
     if not p.exists() or not p.is_dir():
         raise HTTPException(status_code=404, detail="Directory not found")
 
     scope = _list_scope(p, recursive=recursive, depth=depth, pattern=pattern)
-    if page_token is not None:
-        if offset:
-            raise HTTPException(
-                status_code=400,
-                detail="Use either offset or pageToken, not both",
+    with _fs_list_sessions_lock:
+        if page_token is None:
+            session = _DirectoryListSession(
+                p,
+                recursive=recursive,
+                depth=depth,
+                pattern=pattern,
+                scope=scope,
             )
-        offset = _decode_page_token(page_token, scope)
+        else:
+            _discard_expired_list_sessions(time.monotonic())
+            session = _fs_list_sessions.pop(page_token, None)
+            if session is None or session.scope != scope:
+                if session is not None:
+                    session.close()
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid or expired pageToken for this directory listing",
+                )
 
-    entries: list[dict] = []
-    matched = 0
-    for child in _iter_directory_entries(p, recursive=recursive, depth=depth):
-        if not _matches_list_pattern(child, p, pattern):
-            continue
-        if matched < offset:
-            matched += 1
-            continue
         try:
-            entries.append(get_stat_dict(child))
-        except FileNotFoundError:
-            continue
-        matched += 1
-        if len(entries) > limit:
-            break
+            entries, truncated, scanned = session.page(limit)
+        except BaseException:
+            session.close()
+            raise
+        next_page_token = _store_list_session(session) if truncated else None
+        if not truncated:
+            session.close()
 
-    truncated = len(entries) > limit
-    if truncated:
-        entries.pop()
-    next_offset = offset + len(entries)
     return {
         "entries": entries,
         "truncated": truncated,
-        "nextPageToken": _encode_page_token(next_offset, scope) if truncated else None,
+        "nextPageToken": next_page_token,
+        "scanned": scanned,
     }
 
 @app.get("/fs/stat")

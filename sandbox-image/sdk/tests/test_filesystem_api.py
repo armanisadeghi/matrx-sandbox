@@ -7,6 +7,7 @@ from pathlib import Path
 
 from fastapi.testclient import TestClient
 
+from matrx_agent.api import main as api_main
 from matrx_agent.api.main import DEFAULT_FS_READ_LIMIT, app
 
 
@@ -146,6 +147,72 @@ def test_list_reports_symlinks_without_traversing_them(tmp_path: Path):
     linked = next(entry for entry in entries if entry["name"] == "linked")
     assert linked["kind"] == "symlink"
     assert not any(link in Path(entry["path"]).parents for entry in entries)
+
+
+def test_list_large_directory_is_deterministic_and_work_bounded(
+    tmp_path: Path,
+    monkeypatch,
+):
+    # A small budget makes this a fast regression for the same behavior a
+    # million-entry directory exercises in production. The first request must
+    # yield instead of materializing/sorting the entire directory in memory.
+    monkeypatch.setattr(api_main, "MAX_FS_LIST_SCAN_PER_PAGE", 20)
+    expected = [f"item-{index:02d}.txt" for index in range(25)]
+    for name in reversed(expected):
+        _write(tmp_path / name, name)
+
+    params = {"path": str(tmp_path), "limit": 3}
+    first = client.get("/fs/list", params=params)
+    assert first.status_code == 200
+    assert first.json()["entries"] == []
+    assert first.json()["scanned"] == 20
+    assert first.json()["nextPageToken"]
+
+    names: list[str] = []
+    token = first.json()["nextPageToken"]
+    seen_tokens = {token}
+    while token:
+        page = client.get("/fs/list", params={**params, "pageToken": token})
+        assert page.status_code == 200
+        body = page.json()
+        assert body["scanned"] <= 20
+        names.extend(entry["name"] for entry in body["entries"])
+        token = body["nextPageToken"]
+        if token:
+            assert token not in seen_tokens
+            seen_tokens.add(token)
+
+    assert names == expected
+
+
+def test_list_page_tokens_are_single_use(tmp_path: Path):
+    _write(tmp_path / "a.txt", "a")
+    _write(tmp_path / "b.txt", "b")
+    first = client.get("/fs/list", params={"path": str(tmp_path), "limit": 1})
+    token = first.json()["nextPageToken"]
+
+    continued = client.get(
+        "/fs/list",
+        params={"path": str(tmp_path), "limit": 1, "pageToken": token},
+    )
+    replayed = client.get(
+        "/fs/list",
+        params={"path": str(tmp_path), "limit": 1, "pageToken": token},
+    )
+
+    assert continued.status_code == 200
+    assert replayed.status_code == 400
+
+
+def test_list_snapshot_disk_usage_is_capped(tmp_path: Path, monkeypatch):
+    monkeypatch.setattr(api_main, "MAX_FS_LIST_SNAPSHOT_ENTRIES", 2)
+    for name in ("a.txt", "b.txt", "c.txt"):
+        _write(tmp_path / name, name)
+
+    response = client.get("/fs/list", params={"path": str(tmp_path)})
+
+    assert response.status_code == 413
+    assert "snapshot limit of 2 entries" in response.json()["detail"]
 
 
 def test_read_honors_text_offset_and_limit_server_side(tmp_path: Path):
