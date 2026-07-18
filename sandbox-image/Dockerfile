@@ -184,7 +184,9 @@ RUN mkdir -p /home/agent/.ssh \
 
 # ─── Install Matrx SDK (agent utilities + Claude Code-compatible tools) ───────
 COPY sdk/ /opt/sandbox/sdk/
-RUN cd /opt/sandbox/sdk && python3 -m pip install --no-cache-dir -e .
+RUN python3 -m pip install --no-cache-dir --require-hashes \
+        -r /opt/sandbox/sdk/requirements.lock \
+    && python3 -m pip install --no-cache-dir --no-deps -e /opt/sandbox/sdk
 
 # ─── ``mtx`` CLI shim — users/agents type ``mtx <subcommand>`` in any shell ──
 # Wraps ``python3 -m matrx_agent.cli`` so the SDK's CLI feels like a first-class

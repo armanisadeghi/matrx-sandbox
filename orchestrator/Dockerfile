@@ -2,13 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
-COPY pyproject.toml .
-# Production image: runtime deps only (no ".[dev]" — no pytest/moto), and no
-# editable install. Local development restores hot-reload + the bind mount via
-# a `command:` override in docker-compose.yml.
-RUN pip install --no-cache-dir .
+ARG UV_VERSION=0.10.8
+COPY pyproject.toml uv.lock ./
+# Resolve only from the reviewed lockfile. The project itself is installed
+# after source is copied so dependency layers remain cacheable.
+RUN pip install --no-cache-dir "uv==${UV_VERSION}" \
+    && uv sync --locked --no-dev --no-install-project
 
 COPY . .
+RUN uv sync --locked --no-dev
+
+ENV PATH="/app/.venv/bin:${PATH}"
 
 EXPOSE 8000
 
