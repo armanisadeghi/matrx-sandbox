@@ -334,5 +334,7 @@ class APISurfaceResponse(BaseModel):
     """
     service: str
     version: str
+    source_sha: str
     tier: SandboxTier | None = None
+    contracts: dict[str, int]
     routes: list[RouteInfo]

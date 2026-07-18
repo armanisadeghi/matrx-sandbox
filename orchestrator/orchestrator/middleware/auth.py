@@ -5,7 +5,7 @@ the MATRX_API_KEY environment variable. Uses constant-time comparison
 to prevent timing attacks.
 
 If MATRX_API_KEY is empty, all requests are allowed (local dev mode).
-GET /health is always exempt from authentication.
+Only GET /health is exempt from authentication.
 """
 
 from __future__ import annotations
@@ -23,7 +23,7 @@ from orchestrator.config import settings
 logger = logging.getLogger(__name__)
 
 # Paths that are exempt from API key authentication
-_EXEMPT_PATHS = frozenset({"/health", "/docs", "/openapi.json", "/redoc", "/api-surface"})
+_EXEMPT_PATHS = frozenset({"/health"})
 
 
 def _is_proxy_path(path: str) -> bool:
@@ -103,10 +103,6 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
 
         # Exempt certain paths from auth
         if request.url.path in _EXEMPT_PATHS:
-            return await call_next(request)
-
-        # Also exempt the root info endpoint
-        if request.url.path == "/":
             return await call_next(request)
 
         # CORS preflight must pass through; the response is shaped by the

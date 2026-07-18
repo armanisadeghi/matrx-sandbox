@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 from contextlib import asynccontextmanager
+from pathlib import Path
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
@@ -132,6 +134,21 @@ try:
 except Exception:  # pragma: no cover — fallback if package isn't installed
     SERVICE_VERSION = "0.0.0+local"
 
+
+def _source_sha() -> str:
+    """Return the immutable source revision stamped by the build/deployer."""
+    value = os.environ.get("MATRX_SOURCE_SHA", "").strip().lower()
+    if not value:
+        try:
+            value = (Path(__file__).resolve().parents[1] / ".source-sha").read_text().strip().lower()
+        except OSError:
+            value = ""
+    return value if len(value) == 40 and all(c in "0123456789abcdef" for c in value) else "dev"
+
+
+SOURCE_SHA = _source_sha()
+API_CONTRACTS = {"filesystem": 2}
+
 app = FastAPI(
     title="Matrx Sandbox Orchestrator",
     description="Manages ephemeral AI agent sandboxes",
@@ -194,6 +211,7 @@ async def root():
     return {
         "service": "matrx-sandbox-orchestrator",
         "version": SERVICE_VERSION,
+        "source_sha": SOURCE_SHA,
         "tier": settings.host_tier or None,
         "docs": "/docs",
         "api_surface": "/api-surface",
@@ -292,7 +310,9 @@ async def api_surface() -> APISurfaceResponse:
     return APISurfaceResponse(
         service="matrx-sandbox-orchestrator",
         version=SERVICE_VERSION,
+        source_sha=SOURCE_SHA,
         tier=settings.host_tier or None,
+        contracts=API_CONTRACTS,
         routes=routes,
     )
 

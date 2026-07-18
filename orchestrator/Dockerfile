@@ -3,6 +3,7 @@ FROM python:3.11-slim
 WORKDIR /app
 
 ARG UV_VERSION=0.10.8
+ARG MATRX_SOURCE_SHA=dev
 COPY pyproject.toml uv.lock ./
 # Resolve only from the reviewed lockfile. The project itself is installed
 # after source is copied so dependency layers remain cacheable.
@@ -11,8 +12,10 @@ RUN pip install --no-cache-dir "uv==${UV_VERSION}" \
 
 COPY . .
 RUN uv sync --locked --no-dev
+RUN printf '%s\n' "${MATRX_SOURCE_SHA}" > /app/.source-sha
 
 ENV PATH="/app/.venv/bin:${PATH}"
+LABEL com.aimatrx.source.sha="${MATRX_SOURCE_SHA}"
 
 EXPOSE 8000
 

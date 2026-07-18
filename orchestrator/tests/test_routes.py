@@ -196,3 +196,26 @@ async def test_health_without_key_returns_200(
     assert response.status_code == 200
     assert response.json()["status"] == "healthy"
 
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("path", ["/", "/docs", "/openapi.json", "/api-surface"])
+async def test_metadata_routes_require_key_in_authenticated_mode(path, mock_api_key):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(path)
+
+    assert response.status_code == 401
+
+
+@pytest.mark.asyncio
+async def test_api_surface_exposes_revision_and_filesystem_contract(mock_api_key):
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            "/api-surface",
+            headers={"X-API-Key": TEST_API_KEY},
+        )
+
+    assert response.status_code == 200
+    assert response.json()["source_sha"]
+    assert response.json()["contracts"]["filesystem"] == 2
