@@ -52,7 +52,7 @@ FORCE=1 bash /srv/projects/matrx-sandbox/scripts/deploy-hosted.sh
 
 # Health
 curl https://orchestrator.dev.codematrx.com/health
-curl https://orchestrator.dev.codematrx.com/api-surface | jq
+curl -H "X-API-Key: $KEY" https://orchestrator.dev.codematrx.com/api-surface | jq
 
 # List currently-spawned sandboxes (orchestrator's own view)
 curl -H "X-API-Key: $KEY" https://orchestrator.dev.codematrx.com/sandboxes
@@ -155,16 +155,16 @@ gh run watch
 ```
 
 The pipeline:
-1. `pytest` on orchestrator/
-2. ECR login + build + push of sandbox-image and orchestrator images
-3. SSM command to EC2: pull, tag, restart `matrx-orchestrator.service`
-4. Health check loop (30 attempts × 2 s) against `http://<EC2_PUBLIC_IP>:8000/health`
+1. Runs the locked orchestrator and sandbox-SDK suites.
+2. Builds or reuses immutable commit-SHA images and verifies their embedded revisions.
+3. SSM stages a locked venv, fails closed on migrations, and rollback-swaps code plus image tags.
+4. Authenticates to `/api-surface` and asserts the exact source SHA, filesystem contract, and required proxy routes before promoting ECR aliases.
 
 ### Verify EC2 has the latest code
 
 ```bash
-curl http://54.144.86.132:8000/                # version field
-curl http://54.144.86.132:8000/api-surface     # full route list (added in v0.2.0)
+curl -H "X-API-Key: $KEY" http://54.144.86.132:8000/            # source_sha + version
+curl -H "X-API-Key: $KEY" http://54.144.86.132:8000/api-surface # exact contract
 ```
 
 If `version` is older than the latest tag in `git log --oneline`, the pipeline either failed or didn't trigger. Check:
@@ -283,37 +283,15 @@ Recovery via Session Manager (no SSH needed):
 4. `df -h /` (confirm space freed).
 5. Re-trigger: `gh workflow run deploy.yml --repo armanisadeghi/matrx-sandbox` (run from anywhere with `gh` auth).
 
-The deploy pipeline (post‑v0.2.0) auto-prunes before each pull, so this should be self-healing going forward. If it still happens, the prune isn't working (maybe `docker` permissions issue) — investigate the SSM command output.
+The deploy pipeline prunes dangling images before each pull and removes pulled candidate aliases after a verified release. If disk pressure persists, investigate the SSM output and ECR/Docker retention instead of deleting live or rollback tags.
 
 ### 2. Orchestrator code on EC2 is stale even though deploy "succeeded"
 
-Symptom: `curl http://54.144.86.132:8000/` shows an old version. `/api-surface` returns 401 (old middleware blocked it) or 404.
+Symptom: authenticated `/api-surface` reports a `source_sha` other than the approved release, or returns 404.
 
 Root cause (legacy): pre-v0.2.0 deploy.yml only built/pushed Docker images and called `systemctl restart`. But the systemd unit runs Python from `/home/ec2-user/orchestrator/` — not from any Docker container. So `restart` reloaded the same old on-disk code over and over.
 
-Manual recovery:
-```bash
-# In Session Manager:
-sudo bash -c '
-  set -e
-  cp -a /home/ec2-user/orchestrator /home/ec2-user/orchestrator.backup-$(date +%Y%m%d)
-  rm -rf /tmp/matrx-sandbox-recover
-  git clone --depth 1 https://github.com/armanisadeghi/matrx-sandbox.git /tmp/matrx-sandbox-recover
-  find /home/ec2-user/orchestrator -mindepth 1 -maxdepth 1 ! -name ".*" -exec rm -rf {} +
-  cp -a /tmp/matrx-sandbox-recover/orchestrator/. /home/ec2-user/orchestrator/
-  chown -R ec2-user:ec2-user /home/ec2-user/orchestrator
-  rm -rf /tmp/matrx-sandbox-recover
-  su - ec2-user -c "cd /home/ec2-user/orchestrator && /usr/bin/python3.11 -m pip install --user -e \".[dev]\""
-  systemctl restart matrx-orchestrator
-  sleep 4
-  curl -sS http://localhost:8000/
-  curl -sS http://localhost:8000/api-surface | python3 -c "import sys,json; d=json.load(sys.stdin); print(\"routes=\",len(d.get(\"routes\",[])),\"version=\",d.get(\"version\"))"
-'
-```
-
-Verify `/` shows the expected version and `/api-surface` returns ≥23 routes.
-
-The deploy pipeline (post‑v0.2.0) does this automatically on every push, so this is only needed for one-off recovery if the pipeline itself breaks.
+Recovery: re-run `deploy.yml` for `main`. Do not hand-copy files or install an editable package into the live directory; that bypasses the locked candidate, migration gate, rollback capture, and exact contract assertion in `scripts/deploy-ec2.sh`. If the workflow itself is broken, repair and re-run the pipeline while the last-known-good service remains live.
 
 ### Tier env var
 

@@ -9,7 +9,7 @@ This is the authoritative reference for the orchestrator HTTP API as of orchestr
 ## 0. Discovering the surface
 
 ```
-GET /api-surface         → no auth required
+GET /api-surface         → master X-API-Key required
 ```
 
 Returns:
@@ -17,7 +17,9 @@ Returns:
 {
   "service": "matrx-sandbox-orchestrator",
   "version": "0.2.0",
+  "source_sha": "<40-character release commit>",
   "tier": "ec2" | "hosted" | null,
+  "contracts": { "filesystem": 2 },
   "routes": [
     { "path": "/sandboxes", "methods": ["POST"], "name": "create_sandbox", "kind": "http" },
     { "path": "/sandboxes/{sandbox_id}/pty", "methods": ["WS"], "name": "proxy_pty", "kind": "websocket" },
@@ -295,12 +297,12 @@ Generates a one-time Ed25519 keypair, injects the public half into the container
 
 | Endpoint | Auth? | Purpose |
 |---|---|---|
-| `GET /` | No | Service banner: `{ service, version, tier, docs, api_surface }` |
+| `GET /` | **Yes** | Service banner: `{ service, version, source_sha, tier, docs, api_surface }` |
 | `GET /health` | No | `{ status, active_sandboxes, uptime_seconds }` — fast liveness probe |
 | `GET /system` | **Yes** | Full host pressure + container counts — see §11.1 |
-| `GET /api-surface` | No | Full route list (see §0) |
-| `GET /docs` | No | FastAPI auto-doc (incomplete — missing proxy routes) |
-| `GET /openapi.json` | No | Same caveat as `/docs` |
+| `GET /api-surface` | **Yes** | Full route list + release contracts (see §0) |
+| `GET /docs` | **Yes** | FastAPI auto-doc (incomplete — missing proxy routes) |
+| `GET /openapi.json` | **Yes** | Same caveat as `/docs` |
 
 All other endpoints require `X-API-Key: <key>` (or `Authorization: Bearer <key>`). The key is set via `MATRX_API_KEY` per orchestrator, separate per tier.
 
