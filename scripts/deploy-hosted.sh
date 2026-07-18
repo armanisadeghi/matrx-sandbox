@@ -272,10 +272,12 @@ rollback_release() {
   if [ "$ORCH_CHANGED" = 1 ]; then
     if docker image inspect matrx-orchestrator:rollback >/dev/null 2>&1; then
       docker tag matrx-orchestrator:rollback "$ORCH_IMAGE"
-      ( cd "$ORCH_COMPOSE_DIR" && docker compose up -d --force-recreate ) || true
     else
       docker image rm "$ORCH_IMAGE" >/dev/null 2>&1 || true
     fi
+  fi
+  if [ "${ORCH_STOPPED:-0}" = 1 ]; then
+    ( cd "$ORCH_COMPOSE_DIR" && docker compose up -d --force-recreate ) || true
   fi
   if [ -n "${LOCAL_CANDIDATE:-}" ] && [ -f "$REPO_DIR/sandbox-local/docker-compose.yml" ]; then
     ( cd "$REPO_DIR/sandbox-local" && docker compose up -d ) || true
@@ -285,7 +287,15 @@ fail_release() { PROMOTION_ACTIVE=0; rollback_release; fail "$*"; }
 
 PROMOTED_TAGS=()
 PROMOTION_ACTIVE=1
+ORCH_STOPPED=0
 trap 'status=$?; trap - EXIT INT TERM; if [ "${PROMOTION_ACTIVE:-0}" = 1 ]; then PROMOTION_ACTIVE=0; rollback_release; fi; exit $status' EXIT INT TERM
+if [ "$ORCH_CHANGED" = 1 ] || [ "${#LIVE_TAGS[@]}" -gt 0 ]; then
+  # Prevent the old orchestrator from spawning a box between individual tag
+  # promotions. The service resumes only after the complete tag set is live.
+  ORCH_STOPPED=1
+  ( cd "$ORCH_COMPOSE_DIR" && docker compose stop ) \
+    || fail_release "could not enter the release promotion window"
+fi
 for index in "${!LIVE_TAGS[@]}"; do
   live="${LIVE_TAGS[$index]}"
   candidate="${CANDIDATE_TAGS[$index]}"
@@ -306,6 +316,9 @@ if [ "$ORCH_CHANGED" = 1 ]; then
   fi
   docker tag "$ORCH_CANDIDATE" "$ORCH_IMAGE" \
     || fail_release "could not promote $ORCH_CANDIDATE"
+fi
+
+if [ "$ORCH_STOPPED" = 1 ]; then
   ( cd "$ORCH_COMPOSE_DIR" && docker compose up -d --force-recreate ) \
     || fail_release "orchestrator recreate failed"
 fi
@@ -372,5 +385,6 @@ printf '%s\n' "$NEW_SHA" > "$STATE_TMP" \
   && mv -f "$STATE_TMP" "$STATE_FILE" \
   || fail_release "could not atomically record deployed SHA"
 PROMOTION_ACTIVE=0
+ORCH_STOPPED=0
 trap - EXIT INT TERM
 log "hosted-tier deploy complete at $NEW_SHA"
