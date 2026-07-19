@@ -207,7 +207,7 @@ The orchestrator proxies these straight to the in-container `matrx_agent` daemon
 - `GET /fs/stat?path=...`
 - `GET /fs/read?path=...&encoding=utf8|base64&offset=0&limit=1048576` — bounded read. `offset` is a byte offset; `limit` bounds UTF-8 characters for `utf8` and source bytes for `base64`. The default is 1,048,576 units and the maximum is 4,194,304. The documented inclusive compatibility form `range=0-65535` is also supported (do not combine it with `offset`/`limit`). The response body remains raw text/base64 for compatibility. `X-Matrx-File-Size`, `X-Matrx-Read-Length`, `X-Matrx-Next-Offset`, and `X-Matrx-Truncated` describe continuation state.
 - `PUT /fs/write` — body `{ path, content, encoding?, mode?, create_parents? }`. Atomic temp+rename.
-- `POST /fs/patch` — body `{ path, edits: [{ start, end, replacement }] }`.
+- `POST /fs/patch` — body `{ path, edits: [{ old_text, new_text, replace_all? }], create_if_missing? }`. Each edit is applied in order; `old_text` must match exactly once unless `replace_all=true`. To create a missing file, set `create_if_missing=true` and make the first edit's `old_text` empty.
 - `DELETE /fs/delete?path=...&recursive=true`
 - `POST /fs/mkdir` — `{ path, parents? }`
 - `POST /fs/rename`, `POST /fs/copy` — `{ from_path, to_path, recursive? }`
