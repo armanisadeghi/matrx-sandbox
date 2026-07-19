@@ -12,6 +12,7 @@ import stat
 import tempfile
 import threading
 import time
+from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, List, Literal, Optional
@@ -430,6 +431,97 @@ class _DirectoryWalker:
         self._tempdir.cleanup()
 
 
+class _ListAdmissionWaiter:
+    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
+        self.loop = loop
+        self.future = loop.create_future()
+        self.granted = False
+        self.cancelled = False
+
+
+class _ListSessionAdmission:
+    """Loop-agnostic async admission for the process-wide session registry."""
+
+    def __init__(self, limit: int) -> None:
+        self._limit = limit
+        self._available = limit
+        self._lock = threading.Lock()
+        self._waiters: deque[_ListAdmissionWaiter] = deque()
+
+    async def acquire(self) -> None:
+        loop = asyncio.get_running_loop()
+        with self._lock:
+            if self._available:
+                self._available -= 1
+                return
+            waiter = _ListAdmissionWaiter(loop)
+            self._waiters.append(waiter)
+        try:
+            await asyncio.shield(waiter.future)
+        except asyncio.CancelledError:
+            release_grant = False
+            with self._lock:
+                waiter.cancelled = True
+                if waiter.granted:
+                    release_grant = True
+                else:
+                    try:
+                        self._waiters.remove(waiter)
+                    except ValueError:
+                        release_grant = waiter.granted
+            waiter.future.cancel()
+            if release_grant:
+                self.release()
+            raise
+
+    def release(self) -> None:
+        while True:
+            with self._lock:
+                waiter = next(
+                    (item for item in self._waiters if not item.cancelled),
+                    None,
+                )
+                if waiter is None:
+                    self._available += 1
+                    if self._available > self._limit:
+                        self._available -= 1
+                        raise ValueError("list-session admission released too often")
+                    return
+                self._waiters.remove(waiter)
+                waiter.granted = True
+            try:
+                waiter.loop.call_soon_threadsafe(self._finish_grant, waiter)
+                return
+            except RuntimeError:
+                with self._lock:
+                    waiter.cancelled = True
+
+    def _finish_grant(self, waiter: _ListAdmissionWaiter) -> None:
+        with self._lock:
+            cancelled = waiter.cancelled
+        if cancelled or waiter.future.done():
+            return
+        waiter.future.set_result(None)
+
+
+_fs_list_session_slots = _ListSessionAdmission(MAX_FS_LIST_SESSIONS)
+
+
+class _ListSessionLease:
+    """One idempotent admission permit that follows a session across pages."""
+
+    def __init__(self) -> None:
+        self._released = False
+        self._lock = threading.Lock()
+
+    def release(self) -> None:
+        with self._lock:
+            if self._released:
+                return
+            self._released = True
+        _fs_list_session_slots.release()
+
+
 class _DirectoryListSession:
     def __init__(
         self,
@@ -439,6 +531,7 @@ class _DirectoryListSession:
         depth: int,
         pattern: str | None,
         scope: str,
+        lease: _ListSessionLease,
     ) -> None:
         self.root = root
         self.pattern = pattern
@@ -451,6 +544,9 @@ class _DirectoryListSession:
         )
         self.pending: dict | None = None
         self.expires_at = time.monotonic() + FS_LIST_SESSION_TTL_SECONDS
+        self._lease = lease
+        self._close_lock = threading.Lock()
+        self._closed = False
 
     def page(self, limit: int) -> tuple[list[dict], bool, int]:
         """Return at most ``limit`` entries after bounded traversal work."""
@@ -479,7 +575,19 @@ class _DirectoryListSession:
         return entries, True, work
 
     def close(self) -> None:
-        self.walker.close()
+        with self._close_lock:
+            if self._closed:
+                return
+            self._closed = True
+        try:
+            self.walker.close()
+        finally:
+            self._lease.release()
+
+    @property
+    def closed(self) -> bool:
+        with self._close_lock:
+            return self._closed
 
 
 _fs_list_sessions: dict[str, _DirectoryListSession] = {}
@@ -530,8 +638,18 @@ async def _blocking_call(
     try:
         return await asyncio.shield(task)
     except asyncio.CancelledError:
+        # A task may be cancelled repeatedly while its non-cancellable worker
+        # is still running. Keep joining through every cancellation delivery;
+        # cleanup ownership must not depend on the caller cancelling only once.
+        while not task.done():
+            try:
+                await asyncio.shield(task)
+            except asyncio.CancelledError:
+                continue
+            except BaseException:
+                break
         try:
-            result = await task
+            result = task.result()
         except BaseException:
             pass
         else:
@@ -539,8 +657,15 @@ async def _blocking_call(
                 cleanup_task = asyncio.create_task(
                     asyncio.to_thread(cancel_cleanup, result),
                 )
+                while not cleanup_task.done():
+                    try:
+                        await asyncio.shield(cleanup_task)
+                    except asyncio.CancelledError:
+                        continue
+                    except BaseException:
+                        break
                 try:
-                    await asyncio.shield(cleanup_task)
+                    cleanup_task.result()
                 except BaseException as exc:  # noqa: BLE001
                     _logger.warning(
                         "matrx_agent: cancelled blocking-call cleanup error: %s",
@@ -658,56 +783,74 @@ async def fs_list(
 
     scope = _list_scope(p, recursive=recursive, depth=depth, pattern=pattern)
     expired: list[_DirectoryListSession] = []
-    if page_token is None:
-        session = await _blocking_call(
-            _DirectoryListSession,
-            p,
-            recursive=recursive,
-            depth=depth,
-            pattern=pattern,
-            scope=scope,
-            cancel_cleanup=lambda created: created.close(),
-        )
-    else:
-        with _fs_list_sessions_lock:
-            expired = _take_expired_list_sessions(time.monotonic())
-            session = _fs_list_sessions.pop(page_token, None)
-        await _close_list_sessions(expired)
-        if session is None or session.scope != scope:
-            if session is not None:
-                await _blocking_call(session.close)
-            raise HTTPException(
-                status_code=400,
-                detail="Invalid or expired pageToken for this directory listing",
-            )
-
+    session: _DirectoryListSession | None = None
+    next_page_token: str | None = None
     try:
+        if page_token is None:
+            await _fs_list_session_slots.acquire()
+            lease = _ListSessionLease()
+            try:
+                session = await _blocking_call(
+                    _DirectoryListSession,
+                    p,
+                    recursive=recursive,
+                    depth=depth,
+                    pattern=pattern,
+                    scope=scope,
+                    lease=lease,
+                    cancel_cleanup=lambda created: created.close(),
+                )
+            except BaseException:
+                lease.release()
+                raise
+        else:
+            with _fs_list_sessions_lock:
+                expired = _take_expired_list_sessions(time.monotonic())
+                session = _fs_list_sessions.pop(page_token, None)
+            await _close_list_sessions(expired)
+            if session is None or session.scope != scope:
+                if session is not None:
+                    await _blocking_call(session.close)
+                raise HTTPException(
+                    status_code=400,
+                    detail="Invalid or expired pageToken for this directory listing",
+                )
+
         entries, truncated, scanned = await _blocking_call(
             session.page,
             limit,
             cancel_cleanup=lambda _result: session.close(),
         )
-    except asyncio.CancelledError:
-        raise
+
+        evicted: list[_DirectoryListSession] = []
+        if truncated:
+            with _fs_list_sessions_lock:
+                next_page_token, evicted = _store_list_session(session)
+        else:
+            await _blocking_call(session.close)
+        await _close_list_sessions(evicted)
+
+        return {
+            "entries": entries,
+            "truncated": truncated,
+            "nextPageToken": next_page_token,
+            "scanned": scanned,
+        }
     except BaseException:
-        await _blocking_call(session.close)
+        if next_page_token is not None:
+            with _fs_list_sessions_lock:
+                stored = _fs_list_sessions.get(next_page_token)
+                if stored is session:
+                    _fs_list_sessions.pop(next_page_token, None)
+        if session is not None and not session.closed:
+            try:
+                await _blocking_call(session.close)
+            except BaseException:
+                # Preserve the request's original exception/cancellation. The
+                # idempotent session lease is released by close even if another
+                # cancellation is delivered while we are joining it.
+                pass
         raise
-
-    evicted: list[_DirectoryListSession] = []
-    if truncated:
-        with _fs_list_sessions_lock:
-            next_page_token, evicted = _store_list_session(session)
-    else:
-        next_page_token = None
-        await _blocking_call(session.close)
-    await _close_list_sessions(evicted)
-
-    return {
-        "entries": entries,
-        "truncated": truncated,
-        "nextPageToken": next_page_token,
-        "scanned": scanned,
-    }
 
 @app.get("/fs/stat")
 async def fs_stat(path: str):

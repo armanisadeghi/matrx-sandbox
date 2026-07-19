@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import threading
 import time
 from pathlib import Path
 
@@ -315,11 +316,135 @@ async def test_cancelled_list_waits_for_worker_before_closing_session(
     )
     await page_started.wait()
     request.cancel()
+    await asyncio.sleep(0.01)
+    request.cancel()
 
     with pytest.raises(asyncio.CancelledError):
         await request
 
     assert closed_after_page == [True]
+
+
+@pytest.mark.asyncio
+async def test_list_session_cap_is_admitted_before_constructor_offload(
+    tmp_path: Path,
+    monkeypatch,
+):
+    gate = threading.Event()
+    counter_lock = threading.Lock()
+    started = 0
+    active = 0
+    peak_active = 0
+
+    class ControlledSession:
+        def __init__(self, *_args, scope, lease, **_kwargs):
+            nonlocal started, active, peak_active
+            self.scope = scope
+            self._lease = lease
+            self._closed = False
+            with counter_lock:
+                started += 1
+                active += 1
+                peak_active = max(peak_active, active)
+            gate.wait(timeout=2.0)
+
+        def page(self, _limit):
+            return [], False, 0
+
+        def close(self):
+            nonlocal active
+            if self._closed:
+                return
+            self._closed = True
+            with counter_lock:
+                active -= 1
+            self._lease.release()
+
+    monkeypatch.setattr(api_main, "_DirectoryListSession", ControlledSession)
+    requests = [
+        asyncio.create_task(
+            api_main.fs_list(
+                str(tmp_path),
+                recursive=False,
+                depth=1,
+                pattern=None,
+                limit=1,
+                page_token=None,
+            )
+        )
+        for _ in range(api_main.MAX_FS_LIST_SESSIONS + 1)
+    ]
+    deadline = asyncio.get_running_loop().time() + 1.0
+    while started < api_main.MAX_FS_LIST_SESSIONS:
+        assert asyncio.get_running_loop().time() < deadline
+        await asyncio.sleep(0)
+    await asyncio.sleep(0.02)
+
+    assert started == api_main.MAX_FS_LIST_SESSIONS
+    assert peak_active == api_main.MAX_FS_LIST_SESSIONS
+
+    gate.set()
+    await asyncio.gather(*requests)
+
+    assert started == api_main.MAX_FS_LIST_SESSIONS + 1
+    assert peak_active == api_main.MAX_FS_LIST_SESSIONS
+    assert active == 0
+
+
+@pytest.mark.asyncio
+async def test_cancelled_continuation_closes_popped_and_expired_sessions(
+    tmp_path: Path,
+    monkeypatch,
+):
+    first_root = tmp_path / "first"
+    second_root = tmp_path / "second"
+    for root in (first_root, second_root):
+        _write(root / "a.txt", "a")
+        _write(root / "b.txt", "b")
+
+    first = await api_main.fs_list(
+        str(first_root), False, 1, None, 1, None
+    )
+    second = await api_main.fs_list(
+        str(second_root), False, 1, None, 1, None
+    )
+    first_token = first["nextPageToken"]
+    second_token = second["nextPageToken"]
+    with api_main._fs_list_sessions_lock:
+        expired_session = api_main._fs_list_sessions[first_token]
+        popped_session = api_main._fs_list_sessions[second_token]
+        expired_session.expires_at = 0
+    expired_snapshot = Path(expired_session.walker._tempdir.name)
+    popped_snapshot = Path(popped_session.walker._tempdir.name)
+    original_close = api_main._DirectoryListSession.close
+    loop = asyncio.get_running_loop()
+    expired_close_started = asyncio.Event()
+
+    def slow_expired_close(session):
+        if session is expired_session:
+            loop.call_soon_threadsafe(expired_close_started.set)
+            time.sleep(0.10)
+        return original_close(session)
+
+    monkeypatch.setattr(api_main._DirectoryListSession, "close", slow_expired_close)
+    continuation = asyncio.create_task(
+        api_main.fs_list(
+            str(second_root), False, 1, None, 1, second_token
+        )
+    )
+    await expired_close_started.wait()
+    continuation.cancel()
+    await asyncio.sleep(0.01)
+    continuation.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await continuation
+
+    with api_main._fs_list_sessions_lock:
+        assert first_token not in api_main._fs_list_sessions
+        assert second_token not in api_main._fs_list_sessions
+    assert not expired_snapshot.exists()
+    assert not popped_snapshot.exists()
 
 
 def test_read_honors_text_offset_and_limit_server_side(tmp_path: Path):
