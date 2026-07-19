@@ -513,6 +513,42 @@ def _store_list_session(
     return token, evicted
 
 
+async def _blocking_call(
+    function,
+    *args,
+    cancel_cleanup=None,
+    **kwargs,
+):
+    """Run blocking work to completion, even when its request is cancelled.
+
+    ``asyncio.to_thread`` does not stop its worker when the awaiting task is
+    cancelled. Shielding and joining the worker prevents a cleanup thread from
+    racing an in-flight SQLite/scandir operation. Constructors may also supply
+    ``cancel_cleanup`` so a result produced after cancellation is not leaked.
+    """
+    task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        try:
+            result = await task
+        except BaseException:
+            pass
+        else:
+            if cancel_cleanup is not None:
+                cleanup_task = asyncio.create_task(
+                    asyncio.to_thread(cancel_cleanup, result),
+                )
+                try:
+                    await asyncio.shield(cleanup_task)
+                except BaseException as exc:  # noqa: BLE001
+                    _logger.warning(
+                        "matrx_agent: cancelled blocking-call cleanup error: %s",
+                        exc,
+                    )
+        raise
+
+
 async def _close_list_sessions(sessions: list[_DirectoryListSession]) -> None:
     """Close directory handles and SQLite snapshots outside the event loop."""
     if not sessions:
@@ -525,7 +561,7 @@ async def _close_list_sessions(sessions: list[_DirectoryListSession]) -> None:
             except Exception as exc:  # noqa: BLE001
                 _logger.warning("matrx_agent: list-session close error: %s", exc)
 
-    await asyncio.to_thread(close_all)
+    await _blocking_call(close_all)
 
 
 async def _reap_list_sessions() -> None:
@@ -623,13 +659,14 @@ async def fs_list(
     scope = _list_scope(p, recursive=recursive, depth=depth, pattern=pattern)
     expired: list[_DirectoryListSession] = []
     if page_token is None:
-        session = await asyncio.to_thread(
+        session = await _blocking_call(
             _DirectoryListSession,
             p,
             recursive=recursive,
             depth=depth,
             pattern=pattern,
             scope=scope,
+            cancel_cleanup=lambda created: created.close(),
         )
     else:
         with _fs_list_sessions_lock:
@@ -638,16 +675,22 @@ async def fs_list(
         await _close_list_sessions(expired)
         if session is None or session.scope != scope:
             if session is not None:
-                await asyncio.to_thread(session.close)
+                await _blocking_call(session.close)
             raise HTTPException(
                 status_code=400,
                 detail="Invalid or expired pageToken for this directory listing",
             )
 
     try:
-        entries, truncated, scanned = await asyncio.to_thread(session.page, limit)
+        entries, truncated, scanned = await _blocking_call(
+            session.page,
+            limit,
+            cancel_cleanup=lambda _result: session.close(),
+        )
+    except asyncio.CancelledError:
+        raise
     except BaseException:
-        await asyncio.to_thread(session.close)
+        await _blocking_call(session.close)
         raise
 
     evicted: list[_DirectoryListSession] = []
@@ -656,7 +699,7 @@ async def fs_list(
             next_page_token, evicted = _store_list_session(session)
     else:
         next_page_token = None
-        await asyncio.to_thread(session.close)
+        await _blocking_call(session.close)
     await _close_list_sessions(evicted)
 
     return {

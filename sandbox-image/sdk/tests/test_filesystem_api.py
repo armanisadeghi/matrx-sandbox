@@ -253,6 +253,52 @@ async def test_list_snapshot_work_does_not_block_event_loop(
     assert pulse_at[0] - started < 0.10
 
 
+@pytest.mark.asyncio
+async def test_cancelled_list_waits_for_worker_before_closing_session(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write(tmp_path / "entry.txt", "content")
+    original_page = api_main._DirectoryListSession.page
+    original_close = api_main._DirectoryListSession.close
+    loop = asyncio.get_running_loop()
+    page_started = asyncio.Event()
+    page_finished = False
+    closed_after_page: list[bool] = []
+
+    def slow_page(session, limit):
+        nonlocal page_finished
+        loop.call_soon_threadsafe(page_started.set)
+        time.sleep(0.10)
+        result = original_page(session, limit)
+        page_finished = True
+        return result
+
+    def tracked_close(session):
+        closed_after_page.append(page_finished)
+        return original_close(session)
+
+    monkeypatch.setattr(api_main._DirectoryListSession, "page", slow_page)
+    monkeypatch.setattr(api_main._DirectoryListSession, "close", tracked_close)
+    request = asyncio.create_task(
+        api_main.fs_list(
+            str(tmp_path),
+            recursive=False,
+            depth=1,
+            pattern=None,
+            limit=1_000,
+            page_token=None,
+        )
+    )
+    await page_started.wait()
+    request.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await request
+
+    assert closed_after_page == [True]
+
+
 def test_read_honors_text_offset_and_limit_server_side(tmp_path: Path):
     path = tmp_path / "letters.txt"
     _write(path, "abcdef")
