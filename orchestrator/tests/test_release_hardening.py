@@ -185,7 +185,8 @@ def test_workflow_approves_only_current_main_then_revalidates_immutable_ref():
 
     assert 'git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"' in approval
     assert 'refs/tags/deploy-approved/$GITHUB_SHA' in approval
-    assert "git push --atomic origin" in approval
+    assert "git push --atomic" in approval
+    assert "--force-with-lease=refs/heads/main:$GITHUB_SHA origin" in approval
     assert '"${GITHUB_SHA}:refs/heads/main"' in approval
     assert '"${GITHUB_SHA}:${APPROVAL_REF}"' in approval
     assert 'refs/tags/deploy-approved/$GITHUB_SHA' in revalidation

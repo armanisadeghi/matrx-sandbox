@@ -79,10 +79,11 @@ jobs:
               exit 1
             }
           fi
-          # Include main as a no-op update in the same atomic transaction. If
-          # main advances after the check above, its non-fast-forward rejection
-          # prevents both approval refs from being created or advanced.
-          git push --atomic origin \
+          # Include main as a leased no-op update in the same atomic
+          # transaction. If main changes after the check above in either
+          # direction, the exact lease prevents every approval ref update.
+          git push --atomic \
+            --force-with-lease=refs/heads/main:$GITHUB_SHA origin \
             "${GITHUB_SHA}:refs/heads/main" \
             "${GITHUB_SHA}:${APPROVAL_REF}" \
             "${GITHUB_SHA}:refs/heads/deploy/hosted"
