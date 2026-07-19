@@ -158,7 +158,8 @@ The pipeline:
 1. Runs the locked orchestrator and sandbox-SDK suites.
 2. Builds or reuses immutable commit-SHA images and verifies their embedded revisions.
 3. SSM stages a locked venv, fails closed on migrations, and rollback-swaps code plus image tags.
-4. Authenticates to `/api-surface` and asserts the exact source SHA, filesystem contract, and required proxy routes. The approved commit SHA remains the single release pointer; immutable ECR candidates are never republished through a partially mutable alias set.
+4. Records a SHA-qualified immutable approval while the commit is current `main`, then revalidates that approval (not the moving branch) throughout rollout. This lets an approved release finish if a later push fails checks, while deployed-source ancestry still rejects stale or divergent releases.
+5. Authenticates to `/api-surface` and asserts the exact source SHA, filesystem contract, and required proxy routes. Immutable ECR candidates are never republished through a partially mutable alias set.
 
 ### Verify EC2 has the latest code
 

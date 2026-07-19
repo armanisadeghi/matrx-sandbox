@@ -32,11 +32,11 @@ release_guard_validate_sha "$TARGET_SHA" "target"
 exec 9>/var/lock/matrx-sandbox-deploy.lock
 flock -n 9 || fail "another EC2 release is already running"
 
-# Migrations are forward-only. Re-check the moving branch and deployed code at
-# every irreversible boundary so a workflow that becomes historical while it
-# builds cannot roll the service back after newer work reaches main.
+# Migrations are forward-only. Re-check the immutable CI approval and deployed
+# code at every irreversible boundary. A later, unapproved main commit must not
+# strand an already approved rollout, while stale/downgrade releases stay shut.
 validate_release_authority() {
-  release_guard_fetch_current_main "$RELEASE_ROOT" "$TARGET_SHA"
+  release_guard_fetch_approved_release "$RELEASE_ROOT" "$TARGET_SHA"
   if [ -d "$LIVE_DIR" ]; then
     if [ ! -e "$LIVE_DIR/.source-sha" ]; then
       log "verifying one-time legacy live-source bootstrap"

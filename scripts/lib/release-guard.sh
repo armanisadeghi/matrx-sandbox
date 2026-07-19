@@ -78,6 +78,18 @@ release_guard_fetch_current_main() {
     || fail "release target $target is not current origin/main $current"
 }
 
+release_guard_fetch_approved_release() {
+  local repo="$1" target="$2" approved approval_ref
+  release_guard_validate_sha "$target" "release target"
+  approval_ref="refs/tags/deploy-approved/$target"
+  git -C "$repo" fetch origin "$approval_ref" --quiet \
+    || fail "cannot resolve immutable approval ref $approval_ref"
+  approved=$(git -C "$repo" rev-parse FETCH_HEAD 2>/dev/null) \
+    || fail "cannot parse immutable approval ref $approval_ref"
+  [ "$approved" = "$target" ] \
+    || fail "approval ref $approval_ref resolves to $approved, not $target"
+}
+
 release_guard_assert_descendant() {
   local repo="$1" deployed="$2" target="$3" label="$4"
   release_guard_validate_sha "$deployed" "$label"

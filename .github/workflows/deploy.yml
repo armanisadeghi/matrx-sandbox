@@ -42,9 +42,9 @@ jobs:
       - name: Run sandbox SDK tests
         run: sandbox-image/sdk/.venv/bin/pytest sandbox-image/sdk/tests -v --tb=short
 
-  # The host poller follows this approval ref, never origin/main. Updating it
-  # only after both test suites pass closes the race where a 2-minute poller
-  # could deploy a push while its GitHub checks were still running.
+  # The host poller follows the moving deploy/hosted pointer, never origin/main.
+  # Every approved SHA also gets a SHA-qualified immutable approval ref so a
+  # later unapproved main push cannot invalidate an in-flight rollout.
   approve-hosted:
     needs: test
     runs-on: ubuntu-latest
@@ -71,6 +71,16 @@ jobs:
               exit 1
             }
           fi
+          APPROVAL_REF="refs/tags/deploy-approved/$GITHUB_SHA"
+          if EXISTING=$(git ls-remote origin "$APPROVAL_REF" | cut -f1) \
+              && test -n "$EXISTING"; then
+            test "$EXISTING" = "$GITHUB_SHA" || {
+              echo "Immutable approval ref $APPROVAL_REF was moved." >&2
+              exit 1
+            }
+          else
+            git push origin "${GITHUB_SHA}:${APPROVAL_REF}"
+          fi
           git push origin "${GITHUB_SHA}:refs/heads/deploy/hosted"
 
   deploy:
@@ -85,13 +95,14 @@ jobs:
         with:
           fetch-depth: 0
 
-      - name: Revalidate current approved release
+      - name: Revalidate immutable approved release
         run: |
+          APPROVAL_REF="refs/tags/deploy-approved/$GITHUB_SHA"
           git fetch origin \
-            refs/heads/main:refs/remotes/origin/main \
+            "${APPROVAL_REF}:${APPROVAL_REF}" \
             refs/heads/deploy/hosted:refs/remotes/origin/deploy/hosted \
             --quiet
-          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
+          test "$(git rev-parse "$APPROVAL_REF")" = "$GITHUB_SHA"
           test "$(git rev-parse refs/remotes/origin/deploy/hosted)" = "$GITHUB_SHA"
 
       - name: Configure AWS credentials
@@ -175,7 +186,7 @@ jobs:
               ("sudo rm -rf /tmp/matrx-sandbox-deploy-" + $sha),
               ("sudo git init -q /tmp/matrx-sandbox-deploy-" + $sha),
               ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " remote add origin https://github.com/armanisadeghi/matrx-sandbox.git"),
-              ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " fetch origin refs/heads/main"),
+              ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " fetch origin refs/tags/deploy-approved/" + $sha),
               ("test $(sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " rev-parse FETCH_HEAD) = " + $sha),
               ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " checkout --detach " + $sha),
               ("test $(sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " rev-parse HEAD) = " + $sha),

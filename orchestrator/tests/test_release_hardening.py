@@ -59,6 +59,32 @@ release_guard_assert_descendant "$2" "$3" "$4" "deployed revision"
     )
 
 
+def _run_approved_guard(
+    checkout: Path, deployed: str, target: str
+) -> subprocess.CompletedProcess[str]:
+    script = """
+set -u
+fail() { echo "$*" >&2; exit 1; }
+source "$1"
+release_guard_fetch_approved_release "$2" "$4"
+release_guard_assert_descendant "$2" "$3" "$4" "deployed revision"
+"""
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            script,
+            "guard-test",
+            str(RELEASE_GUARD),
+            str(checkout),
+            deployed,
+            target,
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+
 def _run_legacy_bootstrap(
     checkout: Path, live_dir: Path
 ) -> subprocess.CompletedProcess[str]:
@@ -116,6 +142,45 @@ def test_release_guard_accepts_only_current_forward_release(tmp_path: Path):
     assert "not current origin/main" in historical_rerun.stderr
     assert downgrade.returncode != 0
     assert "does not descend" in downgrade.stderr
+
+
+def test_approved_release_survives_unapproved_main_advance(tmp_path: Path):
+    checkout, author, first, second = _release_history(tmp_path)
+    approval_ref = f"refs/tags/deploy-approved/{first}"
+
+    # A was current when approved. B then becomes main but remains unapproved;
+    # rollout of A is still authorized by its immutable approval identity.
+    _git(author, "push", "--force", "origin", f"{first}:refs/heads/main")
+    _git(author, "push", "origin", f"{first}:{approval_ref}")
+    _git(author, "push", "origin", f"{second}:refs/heads/main")
+
+    approved_a = _run_approved_guard(checkout, first, first)
+    unapproved_b = _run_approved_guard(checkout, first, second)
+    downgrade_to_a = _run_approved_guard(checkout, second, first)
+
+    assert approved_a.returncode == 0, approved_a.stderr
+    assert unapproved_b.returncode != 0
+    assert "cannot resolve immutable approval ref" in unapproved_b.stderr
+    assert downgrade_to_a.returncode != 0
+    assert "does not descend" in downgrade_to_a.stderr
+
+
+def test_workflow_approves_only_current_main_then_revalidates_immutable_ref():
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    approval = workflow[
+        workflow.index("- name: Promote tested commit to hosted approval ref") :
+        workflow.index("\n  deploy:")
+    ]
+    revalidation = workflow[
+        workflow.index("- name: Revalidate immutable approved release") :
+        workflow.index("- name: Configure AWS credentials")
+    ]
+
+    assert 'git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"' in approval
+    assert 'refs/tags/deploy-approved/$GITHUB_SHA' in approval
+    assert 'git push origin "${GITHUB_SHA}:${APPROVAL_REF}"' in approval
+    assert 'refs/tags/deploy-approved/$GITHUB_SHA' in revalidation
+    assert "origin/main" not in revalidation
 
 
 def test_ec2_legacy_source_bootstraps_only_exact_known_layout(tmp_path: Path):
@@ -210,6 +275,13 @@ def test_deploy_scripts_guard_ancestry_before_migrations():
         assert guard_at < migration_at
         assert any(guard_at < position < migration_at for position in validations)
         assert any(position > migration_at for position in validations)
+
+
+def test_deploy_scripts_revalidate_immutable_approval_not_moving_main():
+    for relative_path in ("scripts/deploy-ec2.sh", "scripts/deploy-hosted.sh"):
+        script = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
+        assert "release_guard_fetch_approved_release" in script
+        assert "release_guard_fetch_current_main" not in script
 
 
 def test_hosted_noop_requires_every_live_release_alias():

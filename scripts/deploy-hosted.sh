@@ -95,7 +95,7 @@ STATE_FILE="${DEPLOY_STATE_FILE:-/srv/apps/deploy-state/matrx-sandbox.last-deplo
 IMAGE_STATE_FILE="${DEPLOY_IMAGE_STATE_FILE:-${STATE_FILE}.images}"
 OLD_SHA="$(cat "$STATE_FILE" 2>/dev/null || echo none)"
 validate_release_authority() {
-  release_guard_fetch_current_main "$REPO_DIR" "$TARGET_SHA"
+  release_guard_fetch_approved_release "$REPO_DIR" "$TARGET_SHA"
   if [ "$OLD_SHA" != "none" ]; then
     release_guard_assert_descendant \
       "$REPO_DIR" "$OLD_SHA" "$TARGET_SHA" "hosted deploy state"

@@ -108,7 +108,7 @@ All endpoints except `/health` require the `X-API-Key` header.
 
 Pushing to `main` triggers automatic deployment **of both tiers**:
 
-**EC2 tier:** GitHub Actions runs tests → builds immutable SHA-tagged candidates → deploys atomically via AWS SSM → verifies the exact source/API/filesystem contract. The approved commit SHA is the single release pointer; no mutable ECR aliases can expose a partially promoted image set. Any failed verification restores the prior code and local image tags.
+**EC2 tier:** GitHub Actions runs tests → records a SHA-qualified immutable approval → builds immutable SHA-tagged candidates → deploys atomically via AWS SSM → verifies the exact source/API/filesystem contract. Approval happens only while the SHA is current `main`; rollout then follows that approval instead of the moving branch, so a later unapproved push cannot strand the release. Monotonic deployed ancestry still rejects stale or divergent releases, and any failed verification restores the prior code and local image tags.
 
 **Hosted tier (/srv):** tests advance the CI-controlled `deploy/hosted` ref to one approved commit. The host polls only that ref every 2 min (`matrx-hosted-deploy.timer` → `scripts/deploy-hosted.sh`), builds immutable candidates, runs required migrations, promotes the complete release, and verifies the exact contract. The GHA SSH deploy job is a best-effort fast path; the poller is authoritative.
 
