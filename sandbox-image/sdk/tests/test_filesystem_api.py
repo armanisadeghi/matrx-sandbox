@@ -2,9 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import base64
+import time
 from pathlib import Path
 
+import httpx
+import pytest
 from fastapi.testclient import TestClient
 
 from matrx_agent.api import main as api_main
@@ -213,6 +217,40 @@ def test_list_snapshot_disk_usage_is_capped(tmp_path: Path, monkeypatch):
 
     assert response.status_code == 413
     assert "snapshot limit of 2 entries" in response.json()["detail"]
+
+
+@pytest.mark.asyncio
+async def test_list_snapshot_work_does_not_block_event_loop(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write(tmp_path / "entry.txt", "content")
+    original_page = api_main._DirectoryListSession.page
+
+    def slow_page(session, limit):
+        # Model a slow filesystem/SQLite page without relying on host disk
+        # timing. A loop-bound implementation delays the independent pulse.
+        time.sleep(0.15)
+        return original_page(session, limit)
+
+    monkeypatch.setattr(api_main._DirectoryListSession, "page", slow_page)
+    transport = httpx.ASGITransport(app=app)
+    async with httpx.AsyncClient(transport=transport, base_url="http://test") as async_client:
+        loop = asyncio.get_running_loop()
+        started = loop.time()
+        pulse_at: list[float] = []
+
+        async def pulse() -> None:
+            await asyncio.sleep(0.02)
+            pulse_at.append(loop.time())
+
+        response, _ = await asyncio.gather(
+            async_client.get("/fs/list", params={"path": str(tmp_path)}),
+            pulse(),
+        )
+
+    assert response.status_code == 200
+    assert pulse_at[0] - started < 0.10
 
 
 def test_read_honors_text_offset_and_limit_server_side(tmp_path: Path):

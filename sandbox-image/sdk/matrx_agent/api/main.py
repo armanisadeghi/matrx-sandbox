@@ -102,9 +102,9 @@ async def lifespan(app: FastAPI):
         except asyncio.CancelledError:
             pass
         with _fs_list_sessions_lock:
-            for session in _fs_list_sessions.values():
-                session.close()
+            sessions = list(_fs_list_sessions.values())
             _fs_list_sessions.clear()
+        await _close_list_sessions(sessions)
     except Exception as e:  # noqa: BLE001
         _logger.warning("matrx_agent: list-session cleanup error: %s", e)
     try:
@@ -272,7 +272,14 @@ class _DirectoryWalker:
         self._depth = depth
         self._pattern = pattern
         self._tempdir = tempfile.TemporaryDirectory(prefix="matrx-fs-list-")
-        self._db = sqlite3.connect(str(Path(self._tempdir.name) / "listing.sqlite3"))
+        # A session is single-consumer but successive HTTP pages can run on
+        # different worker threads. The session registry guarantees exclusive
+        # ownership; disabling SQLite's thread affinity lets that ownership
+        # move between workers without moving blocking I/O back to the loop.
+        self._db = sqlite3.connect(
+            str(Path(self._tempdir.name) / "listing.sqlite3"),
+            check_same_thread=False,
+        )
         self._db.execute("PRAGMA journal_mode=OFF")
         self._db.execute("PRAGMA synchronous=OFF")
         self._db.execute("PRAGMA temp_store=FILE")
@@ -479,28 +486,46 @@ _fs_list_sessions: dict[str, _DirectoryListSession] = {}
 _fs_list_sessions_lock = threading.Lock()
 
 
-def _discard_expired_list_sessions(now: float) -> None:
+def _take_expired_list_sessions(now: float) -> list[_DirectoryListSession]:
+    """Remove and return expired sessions while the registry lock is held."""
     expired = [
         token for token, session in _fs_list_sessions.items()
         if session.expires_at <= now
     ]
-    for token in expired:
-        _fs_list_sessions.pop(token).close()
+    return [_fs_list_sessions.pop(token) for token in expired]
 
 
-def _store_list_session(session: _DirectoryListSession) -> str:
+def _store_list_session(
+    session: _DirectoryListSession,
+) -> tuple[str, list[_DirectoryListSession]]:
+    """Store one session and return any evictions for off-loop cleanup."""
     now = time.monotonic()
-    _discard_expired_list_sessions(now)
+    evicted = _take_expired_list_sessions(now)
     while len(_fs_list_sessions) >= MAX_FS_LIST_SESSIONS:
         oldest_token = min(
             _fs_list_sessions,
             key=lambda token: _fs_list_sessions[token].expires_at,
         )
-        _fs_list_sessions.pop(oldest_token).close()
+        evicted.append(_fs_list_sessions.pop(oldest_token))
     session.expires_at = now + FS_LIST_SESSION_TTL_SECONDS
     token = secrets.token_urlsafe(24)
     _fs_list_sessions[token] = session
-    return token
+    return token, evicted
+
+
+async def _close_list_sessions(sessions: list[_DirectoryListSession]) -> None:
+    """Close directory handles and SQLite snapshots outside the event loop."""
+    if not sessions:
+        return
+
+    def close_all() -> None:
+        for session in sessions:
+            try:
+                session.close()
+            except Exception as exc:  # noqa: BLE001
+                _logger.warning("matrx_agent: list-session close error: %s", exc)
+
+    await asyncio.to_thread(close_all)
 
 
 async def _reap_list_sessions() -> None:
@@ -508,7 +533,8 @@ async def _reap_list_sessions() -> None:
     while True:
         await asyncio.sleep(min(60, FS_LIST_SESSION_TTL_SECONDS))
         with _fs_list_sessions_lock:
-            _discard_expired_list_sessions(time.monotonic())
+            expired = _take_expired_list_sessions(time.monotonic())
+        await _close_list_sessions(expired)
 
 
 def _list_scope(path: Path, *, recursive: bool, depth: int, pattern: str | None) -> str:
@@ -595,34 +621,43 @@ async def fs_list(
         raise HTTPException(status_code=404, detail="Directory not found")
 
     scope = _list_scope(p, recursive=recursive, depth=depth, pattern=pattern)
-    with _fs_list_sessions_lock:
-        if page_token is None:
-            session = _DirectoryListSession(
-                p,
-                recursive=recursive,
-                depth=depth,
-                pattern=pattern,
-                scope=scope,
-            )
-        else:
-            _discard_expired_list_sessions(time.monotonic())
+    expired: list[_DirectoryListSession] = []
+    if page_token is None:
+        session = await asyncio.to_thread(
+            _DirectoryListSession,
+            p,
+            recursive=recursive,
+            depth=depth,
+            pattern=pattern,
+            scope=scope,
+        )
+    else:
+        with _fs_list_sessions_lock:
+            expired = _take_expired_list_sessions(time.monotonic())
             session = _fs_list_sessions.pop(page_token, None)
-            if session is None or session.scope != scope:
-                if session is not None:
-                    session.close()
-                raise HTTPException(
-                    status_code=400,
-                    detail="Invalid or expired pageToken for this directory listing",
-                )
+        await _close_list_sessions(expired)
+        if session is None or session.scope != scope:
+            if session is not None:
+                await asyncio.to_thread(session.close)
+            raise HTTPException(
+                status_code=400,
+                detail="Invalid or expired pageToken for this directory listing",
+            )
 
-        try:
-            entries, truncated, scanned = session.page(limit)
-        except BaseException:
-            session.close()
-            raise
-        next_page_token = _store_list_session(session) if truncated else None
-        if not truncated:
-            session.close()
+    try:
+        entries, truncated, scanned = await asyncio.to_thread(session.page, limit)
+    except BaseException:
+        await asyncio.to_thread(session.close)
+        raise
+
+    evicted: list[_DirectoryListSession] = []
+    if truncated:
+        with _fs_list_sessions_lock:
+            next_page_token, evicted = _store_list_session(session)
+    else:
+        next_page_token = None
+        await asyncio.to_thread(session.close)
+    await _close_list_sessions(evicted)
 
     return {
         "entries": entries,
