@@ -153,6 +153,29 @@ def test_list_reports_symlinks_without_traversing_them(tmp_path: Path):
     assert not any(link in Path(entry["path"]).parents for entry in entries)
 
 
+def test_stat_and_delete_address_dangling_symlinks(tmp_path: Path):
+    missing_target = tmp_path / "missing-target"
+    dangling_link = tmp_path / "dangling-link"
+    try:
+        dangling_link.symlink_to(missing_target)
+    except OSError:
+        return  # Some Windows test environments do not grant symlink privileges.
+
+    stat_response = client.get("/fs/stat", params={"path": str(dangling_link)})
+
+    assert stat_response.status_code == 200
+    assert stat_response.json()["kind"] == "symlink"
+    assert stat_response.json()["target"] == str(missing_target)
+
+    delete_response = client.delete(
+        "/fs/delete", params={"path": str(dangling_link)}
+    )
+
+    assert delete_response.status_code == 200
+    assert delete_response.json() == {"deleted": True}
+    assert not dangling_link.is_symlink()
+
+
 def test_list_large_directory_is_deterministic_and_work_bounded(
     tmp_path: Path,
     monkeypatch,

@@ -712,7 +712,7 @@ async def fs_list(
 @app.get("/fs/stat")
 async def fs_stat(path: str):
     p = Path(path)
-    if not p.exists():
+    if not os.path.lexists(p):
         raise HTTPException(status_code=404, detail="Path not found")
     return get_stat_dict(p)
 
@@ -892,7 +892,7 @@ async def fs_patch(req: PatchRequest):
 @app.delete("/fs/delete")
 async def fs_delete(path: str, recursive: bool = False):
     p = Path(path)
-    if not p.exists():
+    if not os.path.lexists(p):
         raise HTTPException(status_code=404, detail="Path not found")
         
     if p.is_file() or p.is_symlink():
