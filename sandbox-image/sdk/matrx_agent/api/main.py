@@ -12,7 +12,6 @@ import stat
 import tempfile
 import threading
 import time
-from collections import deque
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, List, Literal, Optional
@@ -431,77 +430,27 @@ class _DirectoryWalker:
         self._tempdir.cleanup()
 
 
-class _ListAdmissionWaiter:
-    def __init__(self, loop: asyncio.AbstractEventLoop) -> None:
-        self.loop = loop
-        self.future = loop.create_future()
-        self.granted = False
-        self.cancelled = False
-
-
 class _ListSessionAdmission:
-    """Loop-agnostic async admission for the process-wide session registry."""
+    """Thread-safe admission for process-wide filesystem listing work."""
 
     def __init__(self, limit: int) -> None:
         self._limit = limit
         self._available = limit
         self._lock = threading.Lock()
-        self._waiters: deque[_ListAdmissionWaiter] = deque()
 
-    async def acquire(self) -> None:
-        loop = asyncio.get_running_loop()
+    def try_acquire(self) -> bool:
         with self._lock:
-            if self._available:
-                self._available -= 1
-                return
-            waiter = _ListAdmissionWaiter(loop)
-            self._waiters.append(waiter)
-        try:
-            await asyncio.shield(waiter.future)
-        except asyncio.CancelledError:
-            release_grant = False
-            with self._lock:
-                waiter.cancelled = True
-                if waiter.granted:
-                    release_grant = True
-                else:
-                    try:
-                        self._waiters.remove(waiter)
-                    except ValueError:
-                        release_grant = waiter.granted
-            waiter.future.cancel()
-            if release_grant:
-                self.release()
-            raise
+            if not self._available:
+                return False
+            self._available -= 1
+            return True
 
     def release(self) -> None:
-        while True:
-            with self._lock:
-                waiter = next(
-                    (item for item in self._waiters if not item.cancelled),
-                    None,
-                )
-                if waiter is None:
-                    self._available += 1
-                    if self._available > self._limit:
-                        self._available -= 1
-                        raise ValueError("list-session admission released too often")
-                    return
-                self._waiters.remove(waiter)
-                waiter.granted = True
-            try:
-                waiter.loop.call_soon_threadsafe(self._finish_grant, waiter)
-                return
-            except RuntimeError:
-                with self._lock:
-                    waiter.cancelled = True
-
-    def _finish_grant(self, waiter: _ListAdmissionWaiter) -> None:
         with self._lock:
-            cancelled = waiter.cancelled
-        if cancelled or waiter.future.done():
-            return
-        waiter.future.set_result(None)
+            self._available += 1
+            if self._available > self._limit:
+                self._available -= 1
+                raise ValueError("list-session admission released too often")
 
 
 _fs_list_session_slots = _ListSessionAdmission(MAX_FS_LIST_SESSIONS)
@@ -513,6 +462,14 @@ class _ListSessionLease:
     def __init__(self) -> None:
         self._released = False
         self._lock = threading.Lock()
+
+    def transfer(self) -> Optional["_ListSessionLease"]:
+        """Move this permit to a new owner without exposing it to a race."""
+        with self._lock:
+            if self._released:
+                return None
+            self._released = True
+        return _ListSessionLease()
 
     def release(self) -> None:
         with self._lock:
@@ -583,6 +540,13 @@ class _DirectoryListSession:
             self.walker.close()
         finally:
             self._lease.release()
+
+    def transfer_lease(self) -> Optional[_ListSessionLease]:
+        """Transfer this live session's permit before an atomic eviction."""
+        with self._close_lock:
+            if self._closed:
+                return None
+            return self._lease.transfer()
 
     @property
     def closed(self) -> bool:
@@ -672,6 +636,39 @@ async def _blocking_call(
                         exc,
                     )
         raise
+
+
+async def _acquire_list_session_lease() -> _ListSessionLease:
+    """Reserve listing capacity, evicting one abandoned cursor if necessary.
+
+    Persisted cursors are the only idle owners of permits. Reclaim the oldest
+    one deterministically instead of parking an unbounded number of requests
+    behind cursors that may remain abandoned for their full TTL. If all slots
+    are doing active work, fail fast so request memory is bounded too.
+    """
+    while True:
+        if _fs_list_session_slots.try_acquire():
+            return _ListSessionLease()
+        with _fs_list_sessions_lock:
+            if not _fs_list_sessions:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Filesystem listing capacity is busy; retry shortly",
+                )
+            oldest_token = min(
+                _fs_list_sessions,
+                key=lambda token: _fs_list_sessions[token].expires_at,
+            )
+            evicted = _fs_list_sessions.pop(oldest_token)
+            lease = evicted.transfer_lease()
+        if lease is None:
+            continue
+        try:
+            await _blocking_call(evicted.close)
+        except BaseException:
+            lease.release()
+            raise
+        return lease
 
 
 async def _close_list_sessions(sessions: list[_DirectoryListSession]) -> None:
@@ -787,8 +784,7 @@ async def fs_list(
     next_page_token: str | None = None
     try:
         if page_token is None:
-            await _fs_list_session_slots.acquire()
-            lease = _ListSessionLease()
+            lease = await _acquire_list_session_lease()
             try:
                 session = await _blocking_call(
                     _DirectoryListSession,

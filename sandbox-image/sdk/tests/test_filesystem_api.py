@@ -10,6 +10,7 @@ from pathlib import Path
 
 import httpx
 import pytest
+from fastapi import HTTPException
 from fastapi.testclient import TestClient
 
 from matrx_agent.api import main as api_main
@@ -372,7 +373,7 @@ async def test_list_session_cap_is_admitted_before_constructor_offload(
                 page_token=None,
             )
         )
-        for _ in range(api_main.MAX_FS_LIST_SESSIONS + 1)
+        for _ in range(api_main.MAX_FS_LIST_SESSIONS)
     ]
     deadline = asyncio.get_running_loop().time() + 1.0
     while started < api_main.MAX_FS_LIST_SESSIONS:
@@ -383,12 +384,121 @@ async def test_list_session_cap_is_admitted_before_constructor_offload(
     assert started == api_main.MAX_FS_LIST_SESSIONS
     assert peak_active == api_main.MAX_FS_LIST_SESSIONS
 
+    with pytest.raises(HTTPException) as exc_info:
+        await api_main.fs_list(
+            str(tmp_path),
+            recursive=False,
+            depth=1,
+            pattern=None,
+            limit=1,
+            page_token=None,
+        )
+    assert exc_info.value.status_code == 503
+    assert started == api_main.MAX_FS_LIST_SESSIONS
+
     gate.set()
     await asyncio.gather(*requests)
 
-    assert started == api_main.MAX_FS_LIST_SESSIONS + 1
     assert peak_active == api_main.MAX_FS_LIST_SESSIONS
     assert active == 0
+
+
+@pytest.mark.asyncio
+async def test_list_capacity_evicts_oldest_abandoned_page_token(tmp_path: Path):
+    _write(tmp_path / "a.txt", "a")
+    _write(tmp_path / "b.txt", "b")
+    sessions: list[api_main._DirectoryListSession] = []
+    try:
+        pages = [
+            await api_main.fs_list(str(tmp_path), False, 1, None, 1, None)
+            for _ in range(api_main.MAX_FS_LIST_SESSIONS)
+        ]
+        tokens = [page["nextPageToken"] for page in pages]
+        assert all(tokens)
+
+        oldest_token = tokens[0]
+        with api_main._fs_list_sessions_lock:
+            oldest_session = api_main._fs_list_sessions[oldest_token]
+            oldest_session.expires_at = 0
+        oldest_snapshot = Path(oldest_session.walker._tempdir.name)
+
+        replacement = await asyncio.wait_for(
+            api_main.fs_list(str(tmp_path), False, 1, None, 1, None),
+            timeout=0.5,
+        )
+
+        assert replacement["nextPageToken"]
+        with api_main._fs_list_sessions_lock:
+            assert oldest_token not in api_main._fs_list_sessions
+            assert replacement["nextPageToken"] in api_main._fs_list_sessions
+            assert len(api_main._fs_list_sessions) == api_main.MAX_FS_LIST_SESSIONS
+        assert not oldest_snapshot.exists()
+    finally:
+        with api_main._fs_list_sessions_lock:
+            sessions = list(api_main._fs_list_sessions.values())
+            api_main._fs_list_sessions.clear()
+        await api_main._close_list_sessions(sessions)
+
+
+@pytest.mark.asyncio
+async def test_cancelled_page_token_eviction_releases_transferred_lease(
+    tmp_path: Path,
+    monkeypatch,
+):
+    _write(tmp_path / "a.txt", "a")
+    _write(tmp_path / "b.txt", "b")
+    sessions: list[api_main._DirectoryListSession] = []
+    try:
+        pages = [
+            await api_main.fs_list(str(tmp_path), False, 1, None, 1, None)
+            for _ in range(api_main.MAX_FS_LIST_SESSIONS)
+        ]
+        tokens = [page["nextPageToken"] for page in pages]
+        oldest_token = tokens[0]
+        with api_main._fs_list_sessions_lock:
+            oldest_session = api_main._fs_list_sessions[oldest_token]
+            oldest_session.expires_at = 0
+
+        original_close = api_main._DirectoryListSession.close
+        close_started = asyncio.Event()
+        loop = asyncio.get_running_loop()
+
+        def slow_oldest_close(session):
+            if session is oldest_session:
+                loop.call_soon_threadsafe(close_started.set)
+                time.sleep(0.10)
+            return original_close(session)
+
+        monkeypatch.setattr(
+            api_main._DirectoryListSession,
+            "close",
+            slow_oldest_close,
+        )
+        replacement = asyncio.create_task(
+            api_main.fs_list(str(tmp_path), False, 1, None, 1, None)
+        )
+        await close_started.wait()
+        replacement.cancel()
+        replacement.cancel()
+
+        with pytest.raises(asyncio.CancelledError):
+            await replacement
+
+        recovered = await api_main.fs_list(
+            str(tmp_path), False, 1, None, 1, None
+        )
+        with api_main._fs_list_sessions_lock:
+            assert oldest_token not in api_main._fs_list_sessions
+            assert all(
+                token in api_main._fs_list_sessions for token in tokens[1:]
+            )
+            assert recovered["nextPageToken"] in api_main._fs_list_sessions
+            assert len(api_main._fs_list_sessions) == api_main.MAX_FS_LIST_SESSIONS
+    finally:
+        with api_main._fs_list_sessions_lock:
+            sessions = list(api_main._fs_list_sessions.values())
+            api_main._fs_list_sessions.clear()
+        await api_main._close_list_sessions(sessions)
 
 
 @pytest.mark.asyncio
