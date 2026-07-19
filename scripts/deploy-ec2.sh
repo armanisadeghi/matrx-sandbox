@@ -15,6 +15,9 @@ UV_VERSION=0.10.8
 DROPIN_DIR=/etc/systemd/system/matrx-orchestrator.service.d
 RELEASE_DROPIN="$DROPIN_DIR/release.conf"
 DROPIN_BACKUP="/tmp/matrx-orchestrator-release-conf-$TARGET_SHA"
+# The final copy-in-place release immediately before atomic, revision-stamped
+# deployments. This is intentionally a single immutable source identity.
+LEGACY_EC2_SOURCE_SHA=30ed118b431b72e8f73f1b199fd9398d78361ed5
 
 log() { echo "[deploy-ec2] $*"; }
 fail() { echo "[deploy-ec2] ERROR: $*" >&2; exit 1; }
@@ -35,8 +38,13 @@ flock -n 9 || fail "another EC2 release is already running"
 validate_release_authority() {
   release_guard_fetch_current_main "$RELEASE_ROOT" "$TARGET_SHA"
   if [ -d "$LIVE_DIR" ]; then
+    if [ ! -e "$LIVE_DIR/.source-sha" ]; then
+      log "verifying one-time legacy live-source bootstrap"
+      release_guard_bootstrap_legacy_source \
+        "$RELEASE_ROOT" "$LIVE_DIR" "$LEGACY_EC2_SOURCE_SHA" orchestrator
+    fi
     [ -r "$LIVE_DIR/.source-sha" ] \
-      || fail "live orchestrator is missing its deployed source revision"
+      || fail "live orchestrator source revision is unreadable"
     DEPLOYED_SHA=$(tr -d '[:space:]' < "$LIVE_DIR/.source-sha")
     release_guard_assert_descendant \
       "$RELEASE_ROOT" "$DEPLOYED_SHA" "$TARGET_SHA" "deployed EC2 revision"

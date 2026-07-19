@@ -10,6 +10,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_GUARD = REPO_ROOT / "scripts" / "lib" / "release-guard.sh"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
+LEGACY_EC2_SOURCE_SHA = "30ed118b431b72e8f73f1b199fd9398d78361ed5"
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -58,6 +59,48 @@ release_guard_assert_descendant "$2" "$3" "$4" "deployed revision"
     )
 
 
+def _run_legacy_bootstrap(
+    checkout: Path, live_dir: Path
+) -> subprocess.CompletedProcess[str]:
+    script = """
+set -u
+fail() { echo "$*" >&2; exit 1; }
+source "$1"
+release_guard_bootstrap_legacy_source "$2" "$3" "$4" orchestrator
+"""
+    return subprocess.run(
+        [
+            "bash",
+            "-c",
+            script,
+            "legacy-test",
+            str(RELEASE_GUARD),
+            str(checkout),
+            str(live_dir),
+            LEGACY_EC2_SOURCE_SHA,
+        ],
+        text=True,
+        capture_output=True,
+    )
+
+
+def _extract_legacy_orchestrator(checkout: Path, destination: Path) -> None:
+    destination.mkdir()
+    archive = subprocess.Popen(
+        ["git", "archive", LEGACY_EC2_SOURCE_SHA, "orchestrator"],
+        cwd=checkout,
+        stdout=subprocess.PIPE,
+    )
+    assert archive.stdout is not None
+    subprocess.run(
+        ["tar", "-x", "--strip-components=1", "-C", str(destination)],
+        stdin=archive.stdout,
+        check=True,
+    )
+    archive.stdout.close()
+    assert archive.wait() == 0
+
+
 def test_release_guard_accepts_only_current_forward_release(tmp_path: Path):
     checkout, author, first, second = _release_history(tmp_path)
 
@@ -73,6 +116,46 @@ def test_release_guard_accepts_only_current_forward_release(tmp_path: Path):
     assert "not current origin/main" in historical_rerun.stderr
     assert downgrade.returncode != 0
     assert "does not descend" in downgrade.stderr
+
+
+def test_ec2_legacy_source_bootstraps_only_exact_known_layout(tmp_path: Path):
+    checkout = tmp_path / "checkout"
+    _git(tmp_path, "clone", str(REPO_ROOT), str(checkout))
+    live_dir = tmp_path / "live"
+    _extract_legacy_orchestrator(checkout, live_dir)
+    (live_dir / ".env").write_text("MATRX_API_KEY=test\n", encoding="utf-8")
+    (live_dir / ".venv").mkdir()
+    cache = live_dir / "orchestrator" / "__pycache__"
+    cache.mkdir()
+    (cache / "main.cpython-311.pyc").write_bytes(b"runtime cache")
+
+    result = _run_legacy_bootstrap(checkout, live_dir)
+
+    assert result.returncode == 0, result.stderr
+    assert (live_dir / ".source-sha").read_text(encoding="utf-8") == (
+        f"{LEGACY_EC2_SOURCE_SHA}\n"
+    )
+
+
+def test_ec2_legacy_source_rejects_missing_tampered_and_ambiguous_layouts(
+    tmp_path: Path,
+):
+    checkout = tmp_path / "checkout"
+    _git(tmp_path, "clone", str(REPO_ROOT), str(checkout))
+
+    missing = tmp_path / "missing"
+    missing.mkdir()
+    tampered = tmp_path / "tampered"
+    _extract_legacy_orchestrator(checkout, tampered)
+    (tampered / "orchestrator" / "main.py").write_text("# tampered\n", encoding="utf-8")
+    ambiguous = tmp_path / "ambiguous"
+    _extract_legacy_orchestrator(checkout, ambiguous)
+    (ambiguous / "unexpected.py").write_text("pass\n", encoding="utf-8")
+
+    for live_dir in (missing, tampered, ambiguous):
+        result = _run_legacy_bootstrap(checkout, live_dir)
+        assert result.returncode != 0
+        assert not (live_dir / ".source-sha").exists()
 
 
 def test_workflow_uses_sha_as_single_ecr_release_pointer():
