@@ -12,16 +12,12 @@ release_guard_validate_sha() {
 # pre-marker release. Runtime-only state is excluded from the tree identity;
 # none of it is executed by the candidate release.
 release_guard_bootstrap_legacy_source() {
-  local repo="$1" live_dir="$2" legacy_sha="$3" subtree="$4"
-  local expected_tree actual_tree verify_root actual_root index_dir marker_tmp
+  local repo="$1" live_dir="$2" legacy_shas="$3" subtree="$4"
+  local legacy_sha expected_tree actual_tree verify_root actual_root index_dir marker_tmp matched_sha=""
 
-  release_guard_validate_sha "$legacy_sha" "known legacy source"
   [ -d "$live_dir" ] || fail "legacy live directory is missing: $live_dir"
   [ ! -e "$live_dir/.source-sha" ] && [ ! -L "$live_dir/.source-sha" ] \
     || fail "legacy bootstrap requires a missing source revision marker"
-  expected_tree=$(git -C "$repo" rev-parse "${legacy_sha}:${subtree}" 2>/dev/null) \
-    || fail "known legacy source $legacy_sha is unavailable"
-
   verify_root=$(mktemp -d) || fail "cannot create legacy verification workspace"
   actual_root="$verify_root/actual"
   index_dir="$verify_root/index.git"
@@ -55,12 +51,26 @@ release_guard_bootstrap_legacy_source() {
     fail "cannot compute legacy live source identity"
   fi
   rm -rf "$verify_root"
-  [ "$actual_tree" = "$expected_tree" ] \
-    || fail "unversioned live orchestrator does not match the known legacy source"
+
+  # The copy-in-place workflow ran at more than one independently known
+  # production revision before source markers became mandatory. Accept only an
+  # exact Git-tree identity from this explicit allowlist and stamp the revision
+  # that actually matched; never infer provenance from a partial file set.
+  for legacy_sha in $legacy_shas; do
+    release_guard_validate_sha "$legacy_sha" "known legacy source"
+    expected_tree=$(git -C "$repo" rev-parse "${legacy_sha}:${subtree}" 2>/dev/null) \
+      || fail "known legacy source $legacy_sha is unavailable"
+    if [ "$actual_tree" = "$expected_tree" ]; then
+      matched_sha="$legacy_sha"
+      break
+    fi
+  done
+  [ -n "$matched_sha" ] \
+    || fail "unversioned live orchestrator does not match any known legacy source"
 
   marker_tmp=$(mktemp "$live_dir/.source-sha.tmp.XXXXXX") \
     || fail "cannot create legacy source revision marker"
-  if ! printf '%s\n' "$legacy_sha" > "$marker_tmp" \
+  if ! printf '%s\n' "$matched_sha" > "$marker_tmp" \
       || ! chmod 0644 "$marker_tmp" \
       || ! mv -f "$marker_tmp" "$live_dir/.source-sha"; then
     rm -f "$marker_tmp"

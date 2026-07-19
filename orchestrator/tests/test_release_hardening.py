@@ -10,7 +10,10 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_GUARD = REPO_ROOT / "scripts" / "lib" / "release-guard.sh"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
-LEGACY_EC2_SOURCE_SHA = "30ed118b431b72e8f73f1b199fd9398d78361ed5"
+LEGACY_EC2_SOURCE_SHAS = (
+    "30ed118b431b72e8f73f1b199fd9398d78361ed5",
+    "f229d4b9347a66b3e8e8d8235f122d31dc336436",
+)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -86,7 +89,9 @@ release_guard_assert_descendant "$2" "$3" "$4" "deployed revision"
 
 
 def _run_legacy_bootstrap(
-    checkout: Path, live_dir: Path
+    checkout: Path,
+    live_dir: Path,
+    legacy_shas: tuple[str, ...] = LEGACY_EC2_SOURCE_SHAS,
 ) -> subprocess.CompletedProcess[str]:
     script = """
 set -u
@@ -103,17 +108,19 @@ release_guard_bootstrap_legacy_source "$2" "$3" "$4" orchestrator
             str(RELEASE_GUARD),
             str(checkout),
             str(live_dir),
-            LEGACY_EC2_SOURCE_SHA,
+            " ".join(legacy_shas),
         ],
         text=True,
         capture_output=True,
     )
 
 
-def _extract_legacy_orchestrator(checkout: Path, destination: Path) -> None:
+def _extract_legacy_orchestrator(
+    checkout: Path, destination: Path, legacy_sha: str = LEGACY_EC2_SOURCE_SHAS[0]
+) -> None:
     destination.mkdir()
     archive = subprocess.Popen(
-        ["git", "archive", LEGACY_EC2_SOURCE_SHA, "orchestrator"],
+        ["git", "archive", legacy_sha, "orchestrator"],
         cwd=checkout,
         stdout=subprocess.PIPE,
     )
@@ -185,23 +192,24 @@ def test_workflow_approves_only_current_main_then_revalidates_immutable_ref():
     assert "origin/main" not in revalidation
 
 
-def test_ec2_legacy_source_bootstraps_only_exact_known_layout(tmp_path: Path):
+def test_ec2_legacy_source_bootstraps_each_exact_known_layout(tmp_path: Path):
     checkout = tmp_path / "checkout"
     _git(tmp_path, "clone", str(REPO_ROOT), str(checkout))
-    live_dir = tmp_path / "live"
-    _extract_legacy_orchestrator(checkout, live_dir)
-    (live_dir / ".env").write_text("MATRX_API_KEY=test\n", encoding="utf-8")
-    (live_dir / ".venv").mkdir()
-    cache = live_dir / "orchestrator" / "__pycache__"
-    cache.mkdir()
-    (cache / "main.cpython-311.pyc").write_bytes(b"runtime cache")
+    for index, legacy_sha in enumerate(LEGACY_EC2_SOURCE_SHAS):
+        live_dir = tmp_path / f"live-{index}"
+        _extract_legacy_orchestrator(checkout, live_dir, legacy_sha)
+        (live_dir / ".env").write_text("MATRX_API_KEY=test\n", encoding="utf-8")
+        (live_dir / ".venv").mkdir()
+        cache = live_dir / "orchestrator" / "__pycache__"
+        cache.mkdir()
+        (cache / "main.cpython-311.pyc").write_bytes(b"runtime cache")
 
-    result = _run_legacy_bootstrap(checkout, live_dir)
+        result = _run_legacy_bootstrap(checkout, live_dir)
 
-    assert result.returncode == 0, result.stderr
-    assert (live_dir / ".source-sha").read_text(encoding="utf-8") == (
-        f"{LEGACY_EC2_SOURCE_SHA}\n"
-    )
+        assert result.returncode == 0, result.stderr
+        assert (live_dir / ".source-sha").read_text(encoding="utf-8") == (
+            f"{legacy_sha}\n"
+        )
 
 
 def test_ec2_legacy_source_rejects_missing_tampered_and_ambiguous_layouts(

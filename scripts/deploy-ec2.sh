@@ -15,9 +15,9 @@ UV_VERSION=0.10.8
 DROPIN_DIR=/etc/systemd/system/matrx-orchestrator.service.d
 RELEASE_DROPIN="$DROPIN_DIR/release.conf"
 DROPIN_BACKUP="/tmp/matrx-orchestrator-release-conf-$TARGET_SHA"
-# The final copy-in-place release immediately before atomic, revision-stamped
-# deployments. This is intentionally a single immutable source identity.
-LEGACY_EC2_SOURCE_SHA=30ed118b431b72e8f73f1b199fd9398d78361ed5
+# Exact production revisions served by the copy-in-place workflow before
+# atomic, revision-stamped deployments. Bootstrap accepts no other tree.
+LEGACY_EC2_SOURCE_SHAS="30ed118b431b72e8f73f1b199fd9398d78361ed5 f229d4b9347a66b3e8e8d8235f122d31dc336436"
 
 log() { echo "[deploy-ec2] $*"; }
 fail() { echo "[deploy-ec2] ERROR: $*" >&2; exit 1; }
@@ -41,7 +41,7 @@ validate_release_authority() {
     if [ ! -e "$LIVE_DIR/.source-sha" ] && [ ! -L "$LIVE_DIR/.source-sha" ]; then
       log "verifying one-time legacy live-source bootstrap"
       release_guard_bootstrap_legacy_source \
-        "$RELEASE_ROOT" "$LIVE_DIR" "$LEGACY_EC2_SOURCE_SHA" orchestrator
+        "$RELEASE_ROOT" "$LIVE_DIR" "$LEGACY_EC2_SOURCE_SHAS" orchestrator
     fi
     [ -f "$LIVE_DIR/.source-sha" ] && [ ! -L "$LIVE_DIR/.source-sha" ] \
       && [ -r "$LIVE_DIR/.source-sha" ] \
