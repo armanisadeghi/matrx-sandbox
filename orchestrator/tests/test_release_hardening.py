@@ -116,7 +116,17 @@ def test_deploy_scripts_guard_ancestry_before_migrations():
         script = (REPO_ROOT / relative_path).read_text(encoding="utf-8")
         guard_at = script.index("release_guard_assert_descendant")
         migration_at = script.index(migration_call, guard_at)
+        validations = [
+            match.start()
+            for match in re.finditer(
+                r"^\s*validate_release_authority\s*$",
+                script,
+                re.MULTILINE,
+            )
+        ]
         assert guard_at < migration_at
+        assert any(guard_at < position < migration_at for position in validations)
+        assert any(position > migration_at for position in validations)
 
 
 def test_hosted_noop_requires_every_live_release_alias():
