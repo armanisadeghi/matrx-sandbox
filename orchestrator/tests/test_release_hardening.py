@@ -178,7 +178,9 @@ def test_workflow_approves_only_current_main_then_revalidates_immutable_ref():
 
     assert 'git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"' in approval
     assert 'refs/tags/deploy-approved/$GITHUB_SHA' in approval
-    assert 'git push origin "${GITHUB_SHA}:${APPROVAL_REF}"' in approval
+    assert "git push --atomic origin" in approval
+    assert '"${GITHUB_SHA}:refs/heads/main"' in approval
+    assert '"${GITHUB_SHA}:${APPROVAL_REF}"' in approval
     assert 'refs/tags/deploy-approved/$GITHUB_SHA' in revalidation
     assert "origin/main" not in revalidation
 
@@ -216,11 +218,14 @@ def test_ec2_legacy_source_rejects_missing_tampered_and_ambiguous_layouts(
     ambiguous = tmp_path / "ambiguous"
     _extract_legacy_orchestrator(checkout, ambiguous)
     (ambiguous / "unexpected.py").write_text("pass\n", encoding="utf-8")
+    symlinked_marker = tmp_path / "symlinked-marker"
+    _extract_legacy_orchestrator(checkout, symlinked_marker)
+    (symlinked_marker / ".source-sha").symlink_to(tmp_path / "absent-marker")
 
-    for live_dir in (missing, tampered, ambiguous):
+    for live_dir in (missing, tampered, ambiguous, symlinked_marker):
         result = _run_legacy_bootstrap(checkout, live_dir)
         assert result.returncode != 0
-        assert not (live_dir / ".source-sha").exists()
+        assert not (live_dir / ".source-sha").is_file()
 
 
 def test_workflow_uses_sha_as_single_ecr_release_pointer():

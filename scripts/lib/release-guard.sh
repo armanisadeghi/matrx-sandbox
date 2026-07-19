@@ -17,7 +17,7 @@ release_guard_bootstrap_legacy_source() {
 
   release_guard_validate_sha "$legacy_sha" "known legacy source"
   [ -d "$live_dir" ] || fail "legacy live directory is missing: $live_dir"
-  [ ! -e "$live_dir/.source-sha" ] \
+  [ ! -e "$live_dir/.source-sha" ] && [ ! -L "$live_dir/.source-sha" ] \
     || fail "legacy bootstrap requires a missing source revision marker"
   expected_tree=$(git -C "$repo" rev-parse "${legacy_sha}:${subtree}" 2>/dev/null) \
     || fail "known legacy source $legacy_sha is unavailable"

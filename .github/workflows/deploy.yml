@@ -78,10 +78,14 @@ jobs:
               echo "Immutable approval ref $APPROVAL_REF was moved." >&2
               exit 1
             }
-          else
-            git push origin "${GITHUB_SHA}:${APPROVAL_REF}"
           fi
-          git push origin "${GITHUB_SHA}:refs/heads/deploy/hosted"
+          # Include main as a no-op update in the same atomic transaction. If
+          # main advances after the check above, its non-fast-forward rejection
+          # prevents both approval refs from being created or advanced.
+          git push --atomic origin \
+            "${GITHUB_SHA}:refs/heads/main" \
+            "${GITHUB_SHA}:${APPROVAL_REF}" \
+            "${GITHUB_SHA}:refs/heads/deploy/hosted"
 
   deploy:
     needs: [test, approve-hosted]

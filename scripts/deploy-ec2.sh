@@ -38,12 +38,13 @@ flock -n 9 || fail "another EC2 release is already running"
 validate_release_authority() {
   release_guard_fetch_approved_release "$RELEASE_ROOT" "$TARGET_SHA"
   if [ -d "$LIVE_DIR" ]; then
-    if [ ! -e "$LIVE_DIR/.source-sha" ]; then
+    if [ ! -e "$LIVE_DIR/.source-sha" ] && [ ! -L "$LIVE_DIR/.source-sha" ]; then
       log "verifying one-time legacy live-source bootstrap"
       release_guard_bootstrap_legacy_source \
         "$RELEASE_ROOT" "$LIVE_DIR" "$LEGACY_EC2_SOURCE_SHA" orchestrator
     fi
-    [ -r "$LIVE_DIR/.source-sha" ] \
+    [ -f "$LIVE_DIR/.source-sha" ] && [ ! -L "$LIVE_DIR/.source-sha" ] \
+      && [ -r "$LIVE_DIR/.source-sha" ] \
       || fail "live orchestrator source revision is unreadable"
     DEPLOYED_SHA=$(tr -d '[:space:]' < "$LIVE_DIR/.source-sha")
     release_guard_assert_descendant \
