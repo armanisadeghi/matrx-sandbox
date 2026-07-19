@@ -29,17 +29,20 @@ release_guard_validate_sha "$TARGET_SHA" "target"
 exec 9>/var/lock/matrx-sandbox-deploy.lock
 flock -n 9 || fail "another EC2 release is already running"
 
-# Migrations are forward-only. Re-check the moving branch and deployed code
-# before pulling candidates or touching the database so a historical workflow
-# rerun can never roll the service back after newer migrations have landed.
-release_guard_fetch_current_main "$RELEASE_ROOT" "$TARGET_SHA"
-if [ -d "$LIVE_DIR" ]; then
-  [ -r "$LIVE_DIR/.source-sha" ] \
-    || fail "live orchestrator is missing its deployed source revision"
-  DEPLOYED_SHA=$(tr -d '[:space:]' < "$LIVE_DIR/.source-sha")
-  release_guard_assert_descendant \
-    "$RELEASE_ROOT" "$DEPLOYED_SHA" "$TARGET_SHA" "deployed EC2 revision"
-fi
+# Migrations are forward-only. Re-check the moving branch and deployed code at
+# every irreversible boundary so a workflow that becomes historical while it
+# builds cannot roll the service back after newer work reaches main.
+validate_release_authority() {
+  release_guard_fetch_current_main "$RELEASE_ROOT" "$TARGET_SHA"
+  if [ -d "$LIVE_DIR" ]; then
+    [ -r "$LIVE_DIR/.source-sha" ] \
+      || fail "live orchestrator is missing its deployed source revision"
+    DEPLOYED_SHA=$(tr -d '[:space:]' < "$LIVE_DIR/.source-sha")
+    release_guard_assert_descendant \
+      "$RELEASE_ROOT" "$DEPLOYED_SHA" "$TARGET_SHA" "deployed EC2 revision"
+  fi
+}
+validate_release_authority
 
 resolve_setting() {
   local name="$1" value
@@ -81,8 +84,10 @@ sudo -u ec2-user env PATH="/home/ec2-user/.local/bin:$PATH" \
   uv sync --directory "$CANDIDATE_DIR" --locked --no-dev --python /usr/bin/python3.11
 
 log "applying required migrations before promotion"
+validate_release_authority
 sudo -u ec2-user env MATRX_DATABASE_URL="$DB_URL" \
   "$CANDIDATE_DIR/.venv/bin/python" -m orchestrator.migrate_runner
+validate_release_authority
 
 rollback() {
   trap - ERR INT TERM

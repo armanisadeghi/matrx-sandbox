@@ -91,26 +91,29 @@ git diff --quiet && git diff --cached --quiet \
 # Database migrations only move forward. Reject stale workflow reruns and any
 # target that does not descend from every locally observable deployed revision
 # before a candidate can run migrations.
-release_guard_fetch_current_main "$REPO_DIR" "$TARGET_SHA"
 STATE_FILE="${DEPLOY_STATE_FILE:-/srv/apps/deploy-state/matrx-sandbox.last-deployed-sha}"
 IMAGE_STATE_FILE="${DEPLOY_IMAGE_STATE_FILE:-${STATE_FILE}.images}"
 OLD_SHA="$(cat "$STATE_FILE" 2>/dev/null || echo none)"
-if [ "$OLD_SHA" != "none" ]; then
-  release_guard_assert_descendant \
-    "$REPO_DIR" "$OLD_SHA" "$TARGET_SHA" "hosted deploy state"
-fi
-if docker image inspect "$ORCH_IMAGE" >/dev/null 2>&1; then
-  LIVE_SOURCE=$(docker image inspect "$ORCH_IMAGE" \
-    --format '{{index .Config.Labels "com.aimatrx.source.sha"}}' 2>/dev/null)
-  if [[ "$LIVE_SOURCE" =~ ^[0-9a-f]{40}$ ]]; then
+validate_release_authority() {
+  release_guard_fetch_current_main "$REPO_DIR" "$TARGET_SHA"
+  if [ "$OLD_SHA" != "none" ]; then
     release_guard_assert_descendant \
-      "$REPO_DIR" "$LIVE_SOURCE" "$TARGET_SHA" "live hosted orchestrator"
-  elif [ "$OLD_SHA" = "none" ]; then
-    fail "live hosted orchestrator is unversioned and no deploy state exists"
-  else
-    log "live hosted orchestrator label is missing/invalid — state ancestry passed; self-heal required"
+      "$REPO_DIR" "$OLD_SHA" "$TARGET_SHA" "hosted deploy state"
   fi
-fi
+  if docker image inspect "$ORCH_IMAGE" >/dev/null 2>&1; then
+    LIVE_SOURCE=$(docker image inspect "$ORCH_IMAGE" \
+      --format '{{index .Config.Labels "com.aimatrx.source.sha"}}' 2>/dev/null)
+    if [[ "$LIVE_SOURCE" =~ ^[0-9a-f]{40}$ ]]; then
+      release_guard_assert_descendant \
+        "$REPO_DIR" "$LIVE_SOURCE" "$TARGET_SHA" "live hosted orchestrator"
+    elif [ "$OLD_SHA" = "none" ]; then
+      fail "live hosted orchestrator is unversioned and no deploy state exists"
+    else
+      log "live hosted orchestrator label is missing/invalid — state ancestry passed; self-heal required"
+    fi
+  fi
+}
+validate_release_authority
 
 # ── aidream image freshness ──────────────────────────────────────────────────
 # The aidream variant bakes /srv/projects/aidream's origin/main at build time
@@ -345,8 +348,10 @@ else
 fi
 
 # ── Promote the complete candidate set as one rollback-capable release ──────
+validate_release_authority
 if [ "$ORCH_CHANGED" = 1 ]; then
   run_db_migrations "$ORCH_CANDIDATE"
+  validate_release_authority
 fi
 
 rollback_release() {
