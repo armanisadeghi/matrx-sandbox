@@ -63,7 +63,7 @@ docker ps --filter label=matrx.sandbox_id --format "table {{.Names}}\t{{.Status}
 
 ### Sandbox image rebuild + recreate the starter pool
 
-**Automatic on push to `main`** — the deploy poller rebuilds every changed image variant (and self-heals missing tags) and recreates the starter pool. The commands below are a manual fallback for local iteration only:
+**Automatic on push to `main`** — the deploy poller rebuilds every changed image variant, records the exact successful live image IDs beside the deployed SHA, and self-heals missing or unexpectedly retagged aliases before any no-op exit. It recreates the starter pool when its image changes. The commands below are a manual fallback for local iteration only:
 
 ```bash
 # Rebuild the core image
@@ -158,7 +158,7 @@ The pipeline:
 1. Runs the locked orchestrator and sandbox-SDK suites.
 2. Builds or reuses immutable commit-SHA images and verifies their embedded revisions.
 3. SSM stages a locked venv, fails closed on migrations, and rollback-swaps code plus image tags.
-4. Authenticates to `/api-surface` and asserts the exact source SHA, filesystem contract, and required proxy routes before promoting ECR aliases.
+4. Authenticates to `/api-surface` and asserts the exact source SHA, filesystem contract, and required proxy routes. The approved commit SHA remains the single release pointer; immutable ECR candidates are never republished through a partially mutable alias set.
 
 ### Verify EC2 has the latest code
 
@@ -397,7 +397,7 @@ The lightweight coding box is built from [`sandbox-image/Dockerfile.slim`](../sa
 cd /srv/projects/matrx-sandbox/sandbox-image && docker build -f Dockerfile.slim -t matrx-sandbox:slim .
 ```
 
-On EC2 the CI builds + pushes `:slim` to ECR and the SSM deploy pulls + tags it (see `.github/workflows/deploy.yml`). The hosted warm pool spawns from this local `matrx-sandbox:slim`.
+On EC2 the CI builds + pushes immutable `:slim-<commit-sha>` candidates to ECR and the SSM deploy pulls the approved revision and tags it locally (see `.github/workflows/deploy.yml`). The hosted warm pool spawns from this local `matrx-sandbox:slim`.
 
 ### 4. New orchestrator capabilities (all in-repo, no separate action)
 

@@ -18,12 +18,28 @@ DROPIN_BACKUP="/tmp/matrx-orchestrator-release-conf-$TARGET_SHA"
 
 log() { echo "[deploy-ec2] $*"; }
 fail() { echo "[deploy-ec2] ERROR: $*" >&2; exit 1; }
-[[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "target must be a full commit SHA"
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/release-guard.sh
+source "$SCRIPT_DIR/lib/release-guard.sh" \
+  || fail "cannot load release ancestry guard"
+release_guard_validate_sha "$TARGET_SHA" "target"
 [ -n "$ECR_REPO" ] || fail "ECR repository is required"
 [ "$(git -C "$RELEASE_ROOT" rev-parse HEAD)" = "$TARGET_SHA" ] \
   || fail "release checkout does not match $TARGET_SHA"
 exec 9>/var/lock/matrx-sandbox-deploy.lock
 flock -n 9 || fail "another EC2 release is already running"
+
+# Migrations are forward-only. Re-check the moving branch and deployed code
+# before pulling candidates or touching the database so a historical workflow
+# rerun can never roll the service back after newer migrations have landed.
+release_guard_fetch_current_main "$RELEASE_ROOT" "$TARGET_SHA"
+if [ -d "$LIVE_DIR" ]; then
+  [ -r "$LIVE_DIR/.source-sha" ] \
+    || fail "live orchestrator is missing its deployed source revision"
+  DEPLOYED_SHA=$(tr -d '[:space:]' < "$LIVE_DIR/.source-sha")
+  release_guard_assert_descendant \
+    "$RELEASE_ROOT" "$DEPLOYED_SHA" "$TARGET_SHA" "deployed EC2 revision"
+fi
 
 resolve_setting() {
   local name="$1" value

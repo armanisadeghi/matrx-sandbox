@@ -107,8 +107,9 @@ cost is instance boot + image pull, which the controller can't remove. To get
 chat-speed claims on EC2:
 
 - Keep 1–2 EC2 instances running with `matrx-sandbox:slim` **already resident**
-  (CI now builds + pushes `:slim` to ECR and the SSM deploy pulls + tags it;
-  baking it into the AMI removes even the pull).
+  (CI pushes immutable `:slim-<commit-sha>` candidates to ECR and the SSM
+  deploy pulls the approved revision and tags it locally; baking it into the
+  AMI removes even the pull).
 - Set `MATRX_WARM_POOL_SIZE=2` on the EC2 orchestrator so it keeps 2 warm
   containers ready on each warm instance.
 

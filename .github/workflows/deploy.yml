@@ -56,7 +56,22 @@ jobs:
         with:
           fetch-depth: 0
       - name: Promote tested commit to hosted approval ref
-        run: git push origin "${GITHUB_SHA}:refs/heads/deploy/hosted" --force
+        run: |
+          git fetch origin refs/heads/main:refs/remotes/origin/main --quiet
+          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA" || {
+            echo "Refusing to approve a historical workflow run; main has moved." >&2
+            exit 1
+          }
+          if APPROVED=$(git ls-remote origin refs/heads/deploy/hosted | cut -f1) \
+              && test -n "$APPROVED"; then
+            git cat-file -e "${APPROVED}^{commit}" 2>/dev/null \
+              || git fetch origin "$APPROVED" --quiet
+            git merge-base --is-ancestor "$APPROVED" "$GITHUB_SHA" || {
+              echo "Refusing to move deploy/hosted backwards or across history." >&2
+              exit 1
+            }
+          fi
+          git push origin "${GITHUB_SHA}:refs/heads/deploy/hosted"
 
   deploy:
     needs: [test, approve-hosted]
@@ -67,6 +82,17 @@ jobs:
       contents: read
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          fetch-depth: 0
+
+      - name: Revalidate current approved release
+        run: |
+          git fetch origin \
+            refs/heads/main:refs/remotes/origin/main \
+            refs/heads/deploy/hosted:refs/remotes/origin/deploy/hosted \
+            --quiet
+          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"
+          test "$(git rev-parse refs/remotes/origin/deploy/hosted)" = "$GITHUB_SHA"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
@@ -149,8 +175,9 @@ jobs:
               ("sudo rm -rf /tmp/matrx-sandbox-deploy-" + $sha),
               ("sudo git init -q /tmp/matrx-sandbox-deploy-" + $sha),
               ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " remote add origin https://github.com/armanisadeghi/matrx-sandbox.git"),
-              ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " fetch --depth 1 origin " + $sha),
-              ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " checkout --detach FETCH_HEAD"),
+              ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " fetch origin refs/heads/main"),
+              ("test $(sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " rev-parse FETCH_HEAD) = " + $sha),
+              ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " checkout --detach " + $sha),
               ("test $(sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " rev-parse HEAD) = " + $sha),
               ("sudo bash /tmp/matrx-sandbox-deploy-" + $sha + "/scripts/deploy-ec2.sh " + $sha + " " + $ecr + " /tmp/matrx-sandbox-deploy-" + $sha),
               ("sudo rm -rf /tmp/matrx-sandbox-deploy-" + $sha)
@@ -202,16 +229,6 @@ jobs:
           fi
 
           echo "Deploy completed successfully!"
-
-      - name: Promote verified ECR aliases
-        run: |
-          ECR_REPO=${{ secrets.ECR_REPO_URI }}
-          docker tag "$ECR_REPO:${{ github.sha }}" "$ECR_REPO:latest"
-          docker tag "$ECR_REPO:slim-${{ github.sha }}" "$ECR_REPO:slim"
-          docker tag "$ECR_REPO-orchestrator:${{ github.sha }}" "$ECR_REPO-orchestrator:latest"
-          docker push "$ECR_REPO:latest"
-          docker push "$ECR_REPO:slim"
-          docker push "$ECR_REPO-orchestrator:latest"
 
   # ── Hosted tier (/srv host) ────────────────────────────────────────────────
   # The `deploy` job above ships the EC2 tier (ECR + SSM). This job ships the

@@ -37,6 +37,10 @@ ORCH_IMAGE="matrx-orchestrator:latest"
 
 log()  { echo "[deploy-hosted] $*"; }
 fail() { echo "[deploy-hosted] ERROR: $*" >&2; exit 1; }
+SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# shellcheck source=scripts/lib/release-guard.sh
+source "$SCRIPT_DIR/lib/release-guard.sh" \
+  || fail "cannot load release ancestry guard"
 
 # ── Single-flight lock ───────────────────────────────────────────────────────
 # Two deploy paths exist (GHA-over-SSH fast path + the local systemd poller,
@@ -79,10 +83,34 @@ if [ -z "$TARGET_SHA" ]; then
     || fail "cannot resolve CI-approved deploy/hosted ref"
   TARGET_SHA="$(git rev-parse FETCH_HEAD)"
 fi
-[[ "$TARGET_SHA" =~ ^[0-9a-f]{40}$ ]] || fail "approved target must be a full commit SHA"
+release_guard_validate_sha "$TARGET_SHA" "approved target"
 [ "$HEAD_SHA" = "$TARGET_SHA" ] || fail "checkout $HEAD_SHA does not match approved target $TARGET_SHA"
 git diff --quiet && git diff --cached --quiet \
   || fail "refusing to build a dirty checkout; release images must be reproducible"
+
+# Database migrations only move forward. Reject stale workflow reruns and any
+# target that does not descend from every locally observable deployed revision
+# before a candidate can run migrations.
+release_guard_fetch_current_main "$REPO_DIR" "$TARGET_SHA"
+STATE_FILE="${DEPLOY_STATE_FILE:-/srv/apps/deploy-state/matrx-sandbox.last-deployed-sha}"
+IMAGE_STATE_FILE="${DEPLOY_IMAGE_STATE_FILE:-${STATE_FILE}.images}"
+OLD_SHA="$(cat "$STATE_FILE" 2>/dev/null || echo none)"
+if [ "$OLD_SHA" != "none" ]; then
+  release_guard_assert_descendant \
+    "$REPO_DIR" "$OLD_SHA" "$TARGET_SHA" "hosted deploy state"
+fi
+if docker image inspect "$ORCH_IMAGE" >/dev/null 2>&1; then
+  LIVE_SOURCE=$(docker image inspect "$ORCH_IMAGE" \
+    --format '{{index .Config.Labels "com.aimatrx.source.sha"}}' 2>/dev/null)
+  if [[ "$LIVE_SOURCE" =~ ^[0-9a-f]{40}$ ]]; then
+    release_guard_assert_descendant \
+      "$REPO_DIR" "$LIVE_SOURCE" "$TARGET_SHA" "live hosted orchestrator"
+  elif [ "$OLD_SHA" = "none" ]; then
+    fail "live hosted orchestrator is unversioned and no deploy state exists"
+  else
+    log "live hosted orchestrator label is missing/invalid — state ancestry passed; self-heal required"
+  fi
+fi
 
 # ── aidream image freshness ──────────────────────────────────────────────────
 # The aidream variant bakes /srv/projects/aidream's origin/main at build time
@@ -117,15 +145,60 @@ aidream_stale() {
 # while the run still goes green. The state file is written only after a
 # successful deploy, so a failed run automatically re-diffs from the older
 # SHA on the next attempt (self-healing).
-STATE_FILE="${DEPLOY_STATE_FILE:-/srv/apps/deploy-state/matrx-sandbox.last-deployed-sha}"
-OLD_SHA="$(cat "$STATE_FILE" 2>/dev/null || echo none)"
 NEW_SHA="$TARGET_SHA"
 log "current=$OLD_SHA target=$NEW_SHA force=${FORCE:-0}"
 
+image_label_matches() {
+  local image="$1" label="$2" expected="$3" actual
+  docker image inspect "$image" >/dev/null 2>&1 || return 1
+  actual=$(docker image inspect "$image" \
+    --format "{{index .Config.Labels \"$label\"}}" 2>/dev/null) || return 1
+  [ "$actual" = "$expected" ]
+}
+
+image_version_compatible() {
+  local image="$1" actual
+  docker image inspect "$image" >/dev/null 2>&1 || return 1
+  actual=$(docker image inspect "$image" \
+    --format '{{index .Config.Labels "com.aimatrx.sandbox.version"}}' 2>/dev/null) \
+    || return 1
+  [[ "$actual" =~ ^[0-9a-f]{40}$ ]] || return 1
+  git merge-base --is-ancestor "$actual" "$NEW_SHA" 2>/dev/null
+}
+
+image_state_matches() {
+  local image="$1" expected actual
+  [ -r "$IMAGE_STATE_FILE" ] || return 1
+  expected=$(awk -F '\t' -v image="$image" '$1 == image {print $2; found++} END {if (found != 1) exit 1}' \
+    "$IMAGE_STATE_FILE") || return 1
+  actual=$(docker image inspect "$image" --format '{{.Id}}' 2>/dev/null) || return 1
+  [ "$actual" = "$expected" ]
+}
+
+hosted_release_complete() {
+  image_label_matches "$ORCH_IMAGE" com.aimatrx.source.sha "$NEW_SHA" \
+    && image_state_matches "$ORCH_IMAGE" \
+    && image_version_compatible matrx-sandbox:core \
+    && image_state_matches matrx-sandbox:core \
+    && image_version_compatible matrx-sandbox:slim \
+    && image_state_matches matrx-sandbox:slim \
+    && image_version_compatible matrx-sandbox:aidream \
+    && image_state_matches matrx-sandbox:aidream \
+    && image_version_compatible matrx-sandbox:local \
+    && image_state_matches matrx-sandbox:local
+}
+
+SELF_HEAL=0
+IMAGE_STATE_PRESENT=0
+[ -r "$IMAGE_STATE_FILE" ] && IMAGE_STATE_PRESENT=1
 if [ "${FORCE:-0}" = "1" ] || [ "$OLD_SHA" = "none" ]; then
   CHANGED="ALL"
 elif [ "$OLD_SHA" = "$NEW_SHA" ]; then
-  if aidream_stale; then
+  if ! hosted_release_complete; then
+    log "deployed SHA is current but required live aliases are missing or stale — self-heal queued"
+    SELF_HEAL=1
+    CHANGED=""
+  elif aidream_stale; then
     # This repo is unchanged but the AIDREAM repo moved — fall through with an
     # empty change set so ONLY the aidream image branch fires below.
     CHANGED=""
@@ -134,7 +207,8 @@ elif [ "$OLD_SHA" = "$NEW_SHA" ]; then
     exit 0
   fi
 else
-  CHANGED="$(git diff --name-only "$OLD_SHA" "$NEW_SHA" 2>/dev/null || echo ALL)"
+  CHANGED="$(git diff --name-only "$OLD_SHA" "$NEW_SHA")" \
+    || fail "cannot compute the validated release change set"
 fi
 changed() { [ "$CHANGED" = "ALL" ] || grep -q "$1" <<<"$CHANGED"; }
 
@@ -142,7 +216,9 @@ changed() { [ "$CHANGED" = "ALL" ] || grep -q "$1" <<<"$CHANGED"; }
 ORCH_CHANGED=0
 ORCH_CANDIDATE="matrx-orchestrator:sha-$NEW_SHA"
 if [ "$OLD_SHA" != "$NEW_SHA" ] || [ "${FORCE:-0}" = 1 ] \
-    || ! docker image inspect "$ORCH_IMAGE" >/dev/null 2>&1; then
+    || ! image_label_matches "$ORCH_IMAGE" com.aimatrx.source.sha "$NEW_SHA" \
+    || { [ "$SELF_HEAL" = 1 ] && [ "$IMAGE_STATE_PRESENT" = 1 ] \
+         && ! image_state_matches "$ORCH_IMAGE"; }; then
   ORCH_CHANGED=1
   log "building immutable orchestrator candidate $ORCH_CANDIDATE"
   docker build \
@@ -191,22 +267,36 @@ build_candidate() {
   CANDIDATE_TAGS+=("$candidate_tag")
 }
 
-# rebuild if sandbox-image/ changed OR the image is absent (self-heal)
-need_img()       { [ "$SBX_CHANGED"   = 1 ] || ! docker image inspect "$1" >/dev/null 2>&1; }
+# Rebuild if sandbox-image/ changed or a required live alias is absent/stale.
+need_img() {
+  [ "$SBX_CHANGED" = 1 ] \
+    || ! image_version_compatible "$1" \
+    || { [ "$SELF_HEAL" = 1 ] && [ "$IMAGE_STATE_PRESENT" = 1 ] \
+         && ! image_state_matches "$1"; }
+}
 
-# local rebuilds when sandbox-image/ OR sandbox-local/ changes (or the image is missing)
-need_local_img() { [ "$SBX_CHANGED"   = 1 ] || [ "$LOCAL_CHANGED" = 1 ] || ! docker image inspect "$1" >/dev/null 2>&1; }
+# Local also inherits core, so a core self-heal invalidates its base even when
+# the existing local alias happens to carry the expected version label.
+need_local_img() {
+  [ "$SBX_CHANGED" = 1 ] || [ "$LOCAL_CHANGED" = 1 ] \
+    || [ "${CORE_REBUILT:-0}" = 1 ] \
+    || ! image_version_compatible "$1" \
+    || { [ "$SELF_HEAL" = 1 ] && [ "$IMAGE_STATE_PRESENT" = 1 ] \
+         && ! image_state_matches "$1"; }
+}
 
 cd "$REPO_DIR/sandbox-image"
 # Stamp the zero-drift version (commit SHA) so /etc/sandbox-image-version +
 # /drift report the build that produced the image, matching the EC2 job.
 # aidream builds FROM matrx-sandbox:core, so it inherits this version file.
 CORE_BUILD_VERSION=core
+CORE_REBUILT=0
 if need_img matrx-sandbox:core; then
   CORE_CANDIDATE="matrx-sandbox:core-$NEW_SHA"
   build_candidate matrx-sandbox:core "$CORE_CANDIDATE" \
     docker build --build-arg MATRX_IMAGE_VERSION="$NEW_SHA" -t "$CORE_CANDIDATE" .
   CORE_BUILD_VERSION="core-$NEW_SHA"
+  CORE_REBUILT=1
 else
   log "core present + unchanged — skip"
 fi
@@ -220,7 +310,7 @@ fi
 # aidream is REQUIRED + ~5GB (builds ON TOP of :core, freshly rebuilt above if needed).
 # Export MATRX_IMAGE_VERSION so build-aidream.sh forwards it as a build-arg and
 # the aidream layer's /etc/sandbox-image-version matches the deploy SHA.
-if need_img matrx-sandbox:aidream || aidream_stale; then
+if [ "$CORE_REBUILT" = 1 ] || need_img matrx-sandbox:aidream || aidream_stale; then
   AIDREAM_SOURCE_SHA=$(git -C "$AIDREAM_SRC_DIR" ls-remote origin refs/heads/main 2>/dev/null | cut -f1)
   [[ "$AIDREAM_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
     || fail "cannot resolve immutable aidream source SHA"
@@ -380,6 +470,21 @@ done < <(docker image ls --format '{{.Repository}}:{{.Tag}}')
 # Record the deployed SHA only now — every step above succeeded. This is what
 # the next run diffs against (see the state-file comment at the top).
 mkdir -p "$(dirname "$STATE_FILE")" || fail_release "could not create deploy state directory"
+IMAGE_STATE_TMP="${IMAGE_STATE_FILE}.tmp.$$"
+: > "$IMAGE_STATE_TMP" || fail_release "could not stage hosted image state"
+for live in \
+  "$ORCH_IMAGE" \
+  matrx-sandbox:core \
+  matrx-sandbox:slim \
+  matrx-sandbox:aidream \
+  matrx-sandbox:local; do
+  image_id=$(docker image inspect "$live" --format '{{.Id}}' 2>/dev/null) \
+    || fail_release "required live image vanished before state commit: $live"
+  printf '%s\t%s\n' "$live" "$image_id" >> "$IMAGE_STATE_TMP" \
+    || fail_release "could not stage hosted image state for $live"
+done
+mv -f "$IMAGE_STATE_TMP" "$IMAGE_STATE_FILE" \
+  || fail_release "could not atomically record hosted image state"
 STATE_TMP="${STATE_FILE}.tmp.$$"
 printf '%s\n' "$NEW_SHA" > "$STATE_TMP" \
   && mv -f "$STATE_TMP" "$STATE_FILE" \

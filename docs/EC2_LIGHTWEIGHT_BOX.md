@@ -236,8 +236,9 @@ Backend, in dependency order:
    list.
 4. **EC2 image delivery** — ✅ DONE.
    [.github/workflows/deploy.yml](../.github/workflows/deploy.yml) now builds +
-   pushes `$ECR_REPO:slim` alongside `:core`, and the SSM deploy step pulls it
-   and tags it `matrx-sandbox:slim` on the host so the template override
+   pushes the immutable `$ECR_REPO:slim-$GITHUB_SHA` candidate, and the SSM
+   deploy pulls that exact tested revision and tags it `matrx-sandbox:slim`
+   locally on the frozen host so the template override
    resolves there. (AMI bake is still optional for the warm pool — step 5.)
 5. **(If warm pool)** — a small controller that keeps N instances up with the
    slim image resident; the orchestrator places `tier:ec2, template:slim`

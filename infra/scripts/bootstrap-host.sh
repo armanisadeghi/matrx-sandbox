@@ -52,7 +52,9 @@ systemctl restart docker
 
 # ─── Pull the sandbox base image ─────────────────────────────────────────────
 # In production, pull from ECR
-# docker pull <account>.dkr.ecr.<region>.amazonaws.com/matrx-sandbox:latest
+# Pull an immutable, approved release SHA (the deploy workflow never publishes
+# mutable ECR aliases):
+# docker pull <account>.dkr.ecr.<region>.amazonaws.com/matrx-sandbox:<40-char-sha>
 
 echo "=== Bootstrap Complete ==="
 echo "Finished at $(date -u)"
