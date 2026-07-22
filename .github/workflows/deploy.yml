@@ -19,6 +19,12 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
+        with:
+          # The release-hardening tests `git archive` pinned LEGACY commits
+          # (LEGACY_EC2_SOURCE_SHAS) — a shallow checkout lacks them, which
+          # failed every run since the promotion redesign landed and kept
+          # deploy/hosted from ever being created (2026-07-22).
+          fetch-depth: 0
       - uses: actions/setup-python@a26af69be951a213d495a4c3e4e4022e16d87065 # v5
         with:
           python-version: "3.11"

@@ -16,7 +16,14 @@ mkdir -p "$LOCK_DIR"
 exec flock "$LOCK_DIR/.deploy-hosted.lock" bash -c '
   set -euo pipefail
   cd "'"$REPO_DIR"'"
-  git fetch origin refs/heads/deploy/hosted --quiet
+  if ! git fetch origin refs/heads/deploy/hosted --quiet 2>/dev/null; then
+    # No approved release exists yet (the promotion gate has not passed since
+    # the deploy/hosted redesign, or the ref was removed). HOLD politely —
+    # fataling here spammed the journal every 2 minutes and looked like a
+    # poller crash when it was actually the gate upstream doing its job.
+    echo "[pull-deploy-runner] deploy/hosted not found on origin — no approved release yet; holding."
+    exit 0
+  fi
   TARGET=$(git rev-parse FETCH_HEAD)
   case "$TARGET" in
     [0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f][0-9a-f]) ;;
