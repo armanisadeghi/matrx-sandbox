@@ -123,7 +123,7 @@ List the files for the user. Backend: `SELECT id, file_path, file_size, mime_typ
 
 ### `GET /api/cloud-files/get?path=<path>`
 
-Stream a single file's bytes. Backend: query `cld_files`, fetch the latest version's `storage_uri`, stream from cloud_sync's S3/Supabase backend.
+Stream a single file's bytes. Backend: query `cld_files`, fetch the latest version's `storage_uri`, stream from cloud_sync's S3 backend.
 
 **Response:** binary content; `Content-Type` from `cld_files.mime_type`; `Content-Length` from `file_size`. 404 if not found, 403 on RLS-equivalent failures.
 

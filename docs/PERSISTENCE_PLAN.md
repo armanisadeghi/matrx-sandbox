@@ -605,7 +605,7 @@ A thorough audit on 2026-04-26 found **production-grade file-persistence infrast
 
 ### `matrx-utils.cloud_sync` (in aidream)
 
-Path: `/srv/projects/aidream/packages/matrx-utils/matrx_utils/file_handling/cloud_sync/`. Multi-backend (S3 / Supabase / server FS) file sync engine with **versioning, permissions, share links, group ACLs**, async + sync APIs, and a complete Postgres schema (`cld_files`, `cld_folders`, `cld_file_versions`, `cld_file_permissions`, `cld_share_links`, `cld_user_groups`). Used by aidream production.
+Path: `/srv/projects/aidream/packages/matrx-utils/matrx_utils/file_handling/cloud_sync/`. S3 / server-filesystem sync engine with **versioning, permissions, share links, group ACLs**, async + sync APIs, and a complete Postgres schema (`cld_files`, `cld_folders`, `cld_file_versions`, `cld_file_permissions`, `cld_share_links`, `cld_user_groups`). Used by aidream production.
 
 **Sandbox integration opportunity:** instead of the orchestrator's bespoke `hot-sync.sh` + `cold-mount.sh`, the in-container `matrx_agent.persistence` module could call `cloud_sync.managed_write_async` for individual files at checkpoint time — gaining versioning, audit trail, share links for free. **Phase 6.**
 
