@@ -375,10 +375,14 @@ async def test_list_session_cap_is_admitted_before_constructor_offload(
         )
         for _ in range(api_main.MAX_FS_LIST_SESSIONS)
     ]
-    deadline = asyncio.get_running_loop().time() + 1.0
+    # Watchdog only — the test's semantics don't depend on HOW FAST the
+    # executor threads start, just that admission happens while the gate is
+    # still closed. 1.0s lost to CI thread-scheduling jitter by 1.6µs on
+    # 2026-07-22 and blocked a release; be generous.
+    deadline = asyncio.get_running_loop().time() + 10.0
     while started < api_main.MAX_FS_LIST_SESSIONS:
-        assert asyncio.get_running_loop().time() < deadline
-        await asyncio.sleep(0)
+        assert asyncio.get_running_loop().time() < deadline, "constructor offload threads never started"
+        await asyncio.sleep(0.001)
     await asyncio.sleep(0.02)
 
     assert started == api_main.MAX_FS_LIST_SESSIONS
