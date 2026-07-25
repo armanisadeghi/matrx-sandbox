@@ -60,6 +60,58 @@ async def test_create_sandbox_generates_unique_id(mock_docker):
 
 
 @pytest.mark.asyncio
+async def test_create_sandbox_fetches_vault_with_orchestrator_user_agent(
+    mock_docker,
+    monkeypatch,
+):
+    from orchestrator import sandbox_manager
+    from orchestrator.config import settings
+
+    container = MagicMock()
+    container.id = "abc123"
+    container.status = "running"
+    container.exec_run.return_value = (0, b"")
+    mock_docker.containers.run.return_value = container
+    mock_docker.containers.get.return_value = container
+
+    captured_headers: dict[str, str] = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"env": {"YOUTUBE_DATA_API_KEY": "test-key"}}
+
+    class FakeAsyncClient:
+        def __init__(self, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return None
+
+        async def get(self, url, *, headers):
+            captured_headers.update(headers)
+            return FakeResponse()
+
+    monkeypatch.setattr(settings, "aidream_url", "https://server.example.com")
+    monkeypatch.setattr(settings, "aidream_service_token", "bridge-token")
+    monkeypatch.setattr("httpx.AsyncClient", FakeAsyncClient)
+
+    sandbox = await sandbox_manager.create_sandbox(user_id="test-user")
+
+    assert captured_headers["User-Agent"] == "matrx-sandbox-orchestrator"
+    assert sandbox.config["secrets_injection"]["status_code"] == 200
+    assert sandbox.config["secrets_injection"]["fetched_count"] == 1
+    run_env = mock_docker.containers.run.call_args.kwargs["environment"]
+    assert run_env["YOUTUBE_DATA_API_KEY"] == "test-key"
+
+
+@pytest.mark.asyncio
 async def test_list_sandboxes_filters_by_user(clean_sandbox_state):
     """list_sandboxes should filter by user_id when provided."""
     from orchestrator import sandbox_manager

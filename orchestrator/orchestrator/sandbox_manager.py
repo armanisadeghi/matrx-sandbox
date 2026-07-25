@@ -500,6 +500,7 @@ async def create_sandbox(
                             "Authorization": f"Bearer {resolved_aidream_token}",
                             "X-Matrx-User-Id": str(user_id),
                             "Accept": "application/json",
+                            "User-Agent": "matrx-sandbox-orchestrator",
                         },
                     )
                 diag["status_code"] = resp.status_code

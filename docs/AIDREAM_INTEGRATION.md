@@ -281,11 +281,17 @@ Then redeploy AI Dream. The bridge endpoints `GET /api/cloud-files/list|get|quot
 In `/srv/apps/sandbox-orchestrator/.env` on this dev server, plus the EC2 orchestrator's env (via SSM or the GitHub Actions deploy):
 
 ```
-MATRX_AIDREAM_URL=https://api.aidream.ai            # adjust to actual host
+MATRX_AIDREAM_URL=https://server.app.matrxserver.com
 MATRX_AIDREAM_SERVICE_TOKEN=<same value as step 1>
 ```
 
 Then on this server: `cd /srv/apps/sandbox-orchestrator && docker compose restart`. EC2: trigger `deploy.yml` or `aws ssm send-command` with the same env update.
+
+The orchestrator's server-to-server vault request sends
+`User-Agent: matrx-sandbox-orchestrator`. Keep that explicit header: Cloudflare
+challenges the default `python-httpx` user agent from AWS before the request can
+reach AI Dream, which otherwise produces a misleading HTTP 403 and boots the
+sandbox without its vaulted environment.
 
 ### 4. (Phase 6b) AWS creds for hosted-tier S3 sync — separate concern
 
