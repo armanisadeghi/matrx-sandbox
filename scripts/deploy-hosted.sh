@@ -218,16 +218,47 @@ changed() { [ "$CHANGED" = "ALL" ] || grep -q "$1" <<<"$CHANGED"; }
 # ── Build orchestrator candidate (no live tags change yet) ──────────────────
 ORCH_CHANGED=0
 ORCH_CANDIDATE="matrx-orchestrator:sha-$NEW_SHA"
+BUILD_STATUS_DIR="${IMAGE_BUILD_STATUS_DIR:-/srv/apps/image-build-status}"
+mkdir -p "$BUILD_STATUS_DIR" 2>/dev/null || true
+BUILD_MARKERS=()
+
+mark_build_pending() {
+  local variant="$1"
+  local marker="$BUILD_STATUS_DIR/${variant}.json"
+  printf '{"variant":"%s","started_at":"%s","source":"deploy-hosted"}\n' \
+    "$variant" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$marker" 2>/dev/null || true
+  BUILD_MARKERS+=("$marker")
+}
+
+clear_build_marker() {
+  local variant="$1"
+  rm -f "$BUILD_STATUS_DIR/${variant}.json" 2>/dev/null || true
+}
+
+clear_all_build_markers() {
+  local marker
+  for marker in "${BUILD_MARKERS[@]}"; do
+    rm -f "$marker" 2>/dev/null || true
+  done
+}
+
+# A marker covers the complete build -> promotion window, not merely the
+# docker build subprocess. Otherwise Fleet Health reports a candidate awaiting
+# atomic promotion as a permanent missing-image incident. Any failure clears
+# every marker so a dead deploy never looks alive for the 30-minute UI TTL.
+trap 'status=$?; clear_all_build_markers; exit $status' EXIT INT TERM
+
 if [ "$OLD_SHA" != "$NEW_SHA" ] || [ "${FORCE:-0}" = 1 ] \
     || ! image_label_matches "$ORCH_IMAGE" com.aimatrx.source.sha "$NEW_SHA" \
     || { [ "$SELF_HEAL" = 1 ] && [ "$IMAGE_STATE_PRESENT" = 1 ] \
          && ! image_state_matches "$ORCH_IMAGE"; }; then
   ORCH_CHANGED=1
   log "building immutable orchestrator candidate $ORCH_CANDIDATE"
+  mark_build_pending orchestrator
   docker build \
     --build-arg MATRX_SOURCE_SHA="$NEW_SHA" \
     -t "$ORCH_CANDIDATE" "$REPO_DIR/orchestrator" \
-    || fail "orchestrator candidate build failed — live deployment untouched"
+    || { clear_build_marker orchestrator; fail "orchestrator candidate build failed — live deployment untouched"; }
   baked_source=$(docker image inspect "$ORCH_CANDIDATE" \
     --format '{{index .Config.Labels "com.aimatrx.source.sha"}}')
   [ "$baked_source" = "$NEW_SHA" ] \
@@ -245,8 +276,6 @@ fi
 # MARKER is written while each image builds so
 # the Manager's Fleet Health shows "rebuilding…" instead of a false "missing"
 # critical (same dir the Manager's own UI rebuilds use).
-BUILD_STATUS_DIR="${IMAGE_BUILD_STATUS_DIR:-/srv/apps/image-build-status}"
-mkdir -p "$BUILD_STATUS_DIR" 2>/dev/null || true
 SBX_CHANGED=0;   changed '^sandbox-image/' && SBX_CHANGED=1
 LOCAL_CHANGED=0; changed '^sandbox-local/' && LOCAL_CHANGED=1
 LIVE_TAGS=()
@@ -255,12 +284,9 @@ CANDIDATE_TAGS=()
 build_candidate() {
   local live_tag="$1" candidate_tag="$2"; shift 2
   local variant="${live_tag##*:}"
-  local marker="$BUILD_STATUS_DIR/${variant}.json"
   log "building immutable candidate $candidate_tag"
-  printf '{"variant":"%s","started_at":"%s","source":"deploy-hosted"}\n' \
-    "$variant" "$(date -u +%Y-%m-%dT%H:%M:%SZ)" > "$marker" 2>/dev/null || true
-  "$@" || { rm -f "$marker"; fail "$candidate_tag build failed — live release untouched"; }
-  rm -f "$marker" 2>/dev/null || true
+  mark_build_pending "$variant"
+  "$@" || { clear_build_marker "$variant"; fail "$candidate_tag build failed — live release untouched"; }
   local baked
   baked=$(docker image inspect "$candidate_tag" \
     --format '{{index .Config.Labels "com.aimatrx.sandbox.version"}}')
@@ -383,7 +409,7 @@ fail_release() { PROMOTION_ACTIVE=0; rollback_release; fail "$*"; }
 PROMOTED_TAGS=()
 PROMOTION_ACTIVE=1
 ORCH_STOPPED=0
-trap 'status=$?; trap - EXIT INT TERM; if [ "${PROMOTION_ACTIVE:-0}" = 1 ]; then PROMOTION_ACTIVE=0; rollback_release; fi; exit $status' EXIT INT TERM
+trap 'status=$?; trap - EXIT INT TERM; if [ "${PROMOTION_ACTIVE:-0}" = 1 ]; then PROMOTION_ACTIVE=0; rollback_release; fi; clear_all_build_markers; exit $status' EXIT INT TERM
 if [ "$ORCH_CHANGED" = 1 ] || [ "${#LIVE_TAGS[@]}" -gt 0 ]; then
   # Prevent the old orchestrator from spawning a box between individual tag
   # promotions. The service resumes only after the complete tag set is live.
@@ -401,6 +427,7 @@ for index in "${!LIVE_TAGS[@]}"; do
   fi
   docker tag "$candidate" "$live" || fail_release "could not promote $candidate"
   PROMOTED_TAGS+=("$live")
+  clear_build_marker "${live##*:}"
 done
 
 if [ "$ORCH_CHANGED" = 1 ]; then
@@ -411,6 +438,7 @@ if [ "$ORCH_CHANGED" = 1 ]; then
   fi
   docker tag "$ORCH_CANDIDATE" "$ORCH_IMAGE" \
     || fail_release "could not promote $ORCH_CANDIDATE"
+  clear_build_marker orchestrator
 fi
 
 if [ "$ORCH_STOPPED" = 1 ]; then
@@ -496,5 +524,6 @@ printf '%s\n' "$NEW_SHA" > "$STATE_TMP" \
   || fail_release "could not atomically record deployed SHA"
 PROMOTION_ACTIVE=0
 ORCH_STOPPED=0
+clear_all_build_markers
 trap - EXIT INT TERM
 log "hosted-tier deploy complete at $NEW_SHA"

@@ -65,6 +65,11 @@ docker ps --filter label=matrx.sandbox_id --format "table {{.Names}}\t{{.Status}
 
 **Automatic on push to `main`** — the deploy poller rebuilds every changed image variant, records the exact successful live image IDs beside the deployed SHA, and self-heals missing or unexpectedly retagged aliases before any no-op exit. It recreates the starter pool when its image changes. The commands below are a manual fallback for local iteration only:
 
+Fleet Health build markers remain active from the start of each candidate build
+through atomic live-tag promotion. A built candidate waiting for another image
+is therefore shown as **rebuilding**, not as a permanent missing-image outage;
+failed deploys clear their markers immediately.
+
 ```bash
 # Rebuild the core image
 cd /srv/projects/matrx-sandbox/sandbox-image && docker build -t matrx-sandbox:core .
