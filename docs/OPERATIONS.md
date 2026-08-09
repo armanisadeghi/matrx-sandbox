@@ -74,6 +74,10 @@ The poller also rebuilds any live sandbox image older than 14 days, even when
 its source path has not changed. That matches Fleet Health's freshness limit,
 so an age warning self-heals instead of remaining permanently actionable.
 
+Aidream candidates are staged from the immutable source SHA resolved before
+the build starts. A newer Aidream push may queue a later rebuild, but it cannot
+change or invalidate the source underneath an active long-running build.
+
 Both CI and Deploy test checkouts fetch full Git history because the release
 hardening suite archives the exact legacy EC2 source SHAs. A shallow checkout
 cannot validate that recovery path and will fail before the sandbox SDK suite.

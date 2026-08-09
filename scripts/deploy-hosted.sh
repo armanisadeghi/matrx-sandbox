@@ -370,7 +370,8 @@ if [ "$CORE_REBUILT" = 1 ] || need_img matrx-sandbox:aidream || aidream_stale; t
   AIDREAM_CANDIDATE="matrx-sandbox:aidream-$NEW_SHA-${AIDREAM_SOURCE_SHA:0:12}"
   build_candidate matrx-sandbox:aidream "$AIDREAM_CANDIDATE" \
     env MATRX_IMAGE_VERSION="$NEW_SHA" MATRX_CORE_VERSION="$CORE_BUILD_VERSION" \
-      bash build-aidream.sh --tag "$AIDREAM_CANDIDATE"
+      bash build-aidream.sh --tag "$AIDREAM_CANDIDATE" \
+        --source-sha "$AIDREAM_SOURCE_SHA"
   baked_aidream=$(docker image inspect "$AIDREAM_CANDIDATE" \
     --format '{{index .Config.Labels "com.aimatrx.aidream.sha"}}')
   [ "$baked_aidream" = "$AIDREAM_SOURCE_SHA" ] \

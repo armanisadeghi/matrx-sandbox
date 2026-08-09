@@ -12,6 +12,7 @@ RELEASE_GUARD = REPO_ROOT / "scripts" / "lib" / "release-guard.sh"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 HOSTED_DEPLOY = REPO_ROOT / "scripts" / "deploy-hosted.sh"
+AIDREAM_BUILDER = REPO_ROOT / "sandbox-image" / "build-aidream.sh"
 LEGACY_EC2_SOURCE_SHAS = (
     "30ed118b431b72e8f73f1b199fd9398d78361ed5",
     "f229d4b9347a66b3e8e8d8235f122d31dc336436",
@@ -264,6 +265,15 @@ def test_hosted_deploy_self_heals_images_at_fleet_freshness_limit():
     assert '|| image_too_old "$1"' in script
     for image in ("core", "slim", "aidream", "local"):
         assert f"&& ! image_too_old matrx-sandbox:{image}" in script
+
+
+def test_hosted_deploy_pins_aidream_source_before_long_build():
+    deploy = HOSTED_DEPLOY.read_text(encoding="utf-8")
+    builder = AIDREAM_BUILDER.read_text(encoding="utf-8")
+
+    assert '--source-sha "$AIDREAM_SOURCE_SHA"' in deploy
+    assert '--source-sha) SOURCE_SHA="$2"' in builder
+    assert 'archive --format=tar "$SOURCE_REF"' in builder
 
 
 def test_workflows_pin_uv_version_on_the_uv_action_only():
