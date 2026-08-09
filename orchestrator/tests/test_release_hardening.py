@@ -11,6 +11,7 @@ REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_GUARD = REPO_ROOT / "scripts" / "lib" / "release-guard.sh"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
+HOSTED_DEPLOY = REPO_ROOT / "scripts" / "deploy-hosted.sh"
 LEGACY_EC2_SOURCE_SHAS = (
     "30ed118b431b72e8f73f1b199fd9398d78361ed5",
     "f229d4b9347a66b3e8e8d8235f122d31dc336436",
@@ -254,6 +255,15 @@ def test_ci_test_checkout_includes_legacy_release_history():
     test_job = workflow[workflow.index("  test:") : workflow.index("\n  build-sandbox:")]
 
     assert "fetch-depth: 0" in test_job
+
+
+def test_hosted_deploy_self_heals_images_at_fleet_freshness_limit():
+    script = HOSTED_DEPLOY.read_text(encoding="utf-8")
+
+    assert 'MAX_IMAGE_AGE_SECONDS="${MAX_IMAGE_AGE_SECONDS:-1209600}"' in script
+    assert '|| image_too_old "$1"' in script
+    for image in ("core", "slim", "aidream", "local"):
+        assert f"&& ! image_too_old matrx-sandbox:{image}" in script
 
 
 def test_workflows_pin_uv_version_on_the_uv_action_only():

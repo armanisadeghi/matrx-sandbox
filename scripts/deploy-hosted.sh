@@ -34,6 +34,7 @@ REPO_DIR="${MATRX_SANDBOX_DIR:-/srv/projects/matrx-sandbox}"
 ORCH_COMPOSE_DIR="${ORCH_COMPOSE_DIR:-/srv/apps/sandbox-orchestrator}"
 ORCH_HEALTH_URL="${ORCH_HEALTH_URL:-https://orchestrator.dev.codematrx.com/health}"
 ORCH_IMAGE="matrx-orchestrator:latest"
+MAX_IMAGE_AGE_SECONDS="${MAX_IMAGE_AGE_SECONDS:-1209600}" # 14 days; matches Fleet Health
 
 log()  { echo "[deploy-hosted] $*"; }
 fail() { echo "[deploy-hosted] ERROR: $*" >&2; exit 1; }
@@ -178,17 +179,38 @@ image_state_matches() {
   [ "$actual" = "$expected" ]
 }
 
+image_too_old() {
+  local image="$1" created created_epoch now age
+  docker image inspect "$image" >/dev/null 2>&1 || return 0
+  created=$(docker image inspect "$image" --format '{{.Created}}' 2>/dev/null) || return 1
+  created_epoch=$(date -u -d "$created" +%s 2>/dev/null) || {
+    log "WARNING: cannot parse creation time for $image; freshness is unknown"
+    return 1
+  }
+  now=$(date -u +%s)
+  age=$((now - created_epoch))
+  if [ "$age" -ge "$MAX_IMAGE_AGE_SECONDS" ]; then
+    log "$image is ${age}s old (limit ${MAX_IMAGE_AGE_SECONDS}s) — freshness rebuild queued"
+    return 0
+  fi
+  return 1
+}
+
 hosted_release_complete() {
   image_label_matches "$ORCH_IMAGE" com.aimatrx.source.sha "$NEW_SHA" \
     && image_state_matches "$ORCH_IMAGE" \
     && image_version_compatible matrx-sandbox:core \
     && image_state_matches matrx-sandbox:core \
+    && ! image_too_old matrx-sandbox:core \
     && image_version_compatible matrx-sandbox:slim \
     && image_state_matches matrx-sandbox:slim \
+    && ! image_too_old matrx-sandbox:slim \
     && image_version_compatible matrx-sandbox:aidream \
     && image_state_matches matrx-sandbox:aidream \
+    && ! image_too_old matrx-sandbox:aidream \
     && image_version_compatible matrx-sandbox:local \
-    && image_state_matches matrx-sandbox:local
+    && image_state_matches matrx-sandbox:local \
+    && ! image_too_old matrx-sandbox:local
 }
 
 SELF_HEAL=0
@@ -300,6 +322,7 @@ build_candidate() {
 need_img() {
   [ "$SBX_CHANGED" = 1 ] \
     || ! image_version_compatible "$1" \
+    || image_too_old "$1" \
     || { [ "$SELF_HEAL" = 1 ] && [ "$IMAGE_STATE_PRESENT" = 1 ] \
          && ! image_state_matches "$1"; }
 }
@@ -310,6 +333,7 @@ need_local_img() {
   [ "$SBX_CHANGED" = 1 ] || [ "$LOCAL_CHANGED" = 1 ] \
     || [ "${CORE_REBUILT:-0}" = 1 ] \
     || ! image_version_compatible "$1" \
+    || image_too_old "$1" \
     || { [ "$SELF_HEAL" = 1 ] && [ "$IMAGE_STATE_PRESENT" = 1 ] \
          && ! image_state_matches "$1"; }
 }

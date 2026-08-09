@@ -70,6 +70,10 @@ through atomic live-tag promotion. A built candidate waiting for another image
 is therefore shown as **rebuilding**, not as a permanent missing-image outage;
 failed deploys clear their markers immediately.
 
+The poller also rebuilds any live sandbox image older than 14 days, even when
+its source path has not changed. That matches Fleet Health's freshness limit,
+so an age warning self-heals instead of remaining permanently actionable.
+
 Both CI and Deploy test checkouts fetch full Git history because the release
 hardening suite archives the exact legacy EC2 source SHAs. A shallow checkout
 cannot validate that recovery path and will fail before the sandbox SDK suite.
