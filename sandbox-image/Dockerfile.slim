@@ -3,11 +3,6 @@ FROM ubuntu:22.04
 LABEL maintainer="AI Matrx <team@aimatrx.com>"
 LABEL description="Lightweight ephemeral coding sandbox — clone, run tools, push a branch"
 
-# ─── Image version stamp (zero-drift system) — see Dockerfile for rationale ──
-ARG MATRX_IMAGE_VERSION=dev
-ENV MATRX_IMAGE_VERSION=${MATRX_IMAGE_VERSION}
-LABEL com.aimatrx.sandbox.version="${MATRX_IMAGE_VERSION}"
-
 # ─── Why this image exists ───────────────────────────────────────────────────
 # This is the "lightweight coding box" (see docs/EC2_LIGHTWEIGHT_BOX.md). Its
 # persistence model is GIT, not a volume and not S3: the agent clones a repo,
@@ -166,6 +161,12 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 
 # Image-variant marker (read by SDK/scripts to set SANDBOX_MODE accurately)
 RUN echo "slim" > /etc/sandbox-image-tag
+
+# Keep the per-release stamp below the stable dependency and source layers so
+# a new commit SHA does not force a complete coding-toolchain rebuild.
+ARG MATRX_IMAGE_VERSION=dev
+ENV MATRX_IMAGE_VERSION=${MATRX_IMAGE_VERSION}
+LABEL com.aimatrx.sandbox.version="${MATRX_IMAGE_VERSION}"
 RUN echo "${MATRX_IMAGE_VERSION}" > /etc/sandbox-image-version
 
 ENTRYPOINT ["tini", "--"]

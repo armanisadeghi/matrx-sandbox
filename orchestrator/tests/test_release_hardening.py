@@ -13,6 +13,8 @@ DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 HOSTED_DEPLOY = REPO_ROOT / "scripts" / "deploy-hosted.sh"
 AIDREAM_BUILDER = REPO_ROOT / "sandbox-image" / "build-aidream.sh"
+CORE_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile"
+SLIM_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile.slim"
 LEGACY_EC2_SOURCE_SHAS = (
     "30ed118b431b72e8f73f1b199fd9398d78361ed5",
     "f229d4b9347a66b3e8e8d8235f122d31dc336436",
@@ -263,6 +265,14 @@ def test_hosted_fast_path_allows_one_serialized_recovery_ahead_of_it():
     hosted_job = workflow[workflow.index("  deploy-hosted:") :]
 
     assert "command_timeout: 60m" in hosted_job
+
+
+def test_image_version_stamp_does_not_invalidate_dependency_cache():
+    core = CORE_DOCKERFILE.read_text(encoding="utf-8")
+    slim = SLIM_DOCKERFILE.read_text(encoding="utf-8")
+
+    assert core.index("ARG MATRX_IMAGE_VERSION") > core.index("COPY sdk/")
+    assert slim.index("ARG MATRX_IMAGE_VERSION") > slim.index("COPY sdk/")
 
 
 def test_hosted_deploy_self_heals_images_at_fleet_freshness_limit():

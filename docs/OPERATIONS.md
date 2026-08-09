@@ -79,6 +79,10 @@ The poller also rebuilds any live sandbox image older than 14 days, even when
 its source path has not changed. That matches Fleet Health's freshness limit,
 so an age warning self-heals instead of remaining permanently actionable.
 
+The per-release `MATRX_IMAGE_VERSION` stamp is applied after stable dependency
+and source layers in both sandbox Dockerfiles. A new commit SHA therefore does
+not invalidate the expensive apt, Playwright, Node, and Python package cache.
+
 Aidream candidates are staged from the immutable source SHA resolved before
 the build starts. A newer Aidream push may queue a later rebuild, but it cannot
 change or invalidate the source underneath an active long-running build.
