@@ -10,6 +10,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parents[2]
 RELEASE_GUARD = REPO_ROOT / "scripts" / "lib" / "release-guard.sh"
 DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
+CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 LEGACY_EC2_SOURCE_SHAS = (
     "30ed118b431b72e8f73f1b199fd9398d78361ed5",
     "f229d4b9347a66b3e8e8d8235f122d31dc336436",
@@ -246,6 +247,13 @@ def test_workflow_uses_sha_as_single_ecr_release_pointer():
     assert 'docker push $ECR_REPO:slim-${{ github.sha }}' in workflow
     assert not re.search(r"docker push .*:(?:latest|slim)[\"']?\s*$", workflow, re.MULTILINE)
     assert "Promote verified ECR aliases" not in workflow
+
+
+def test_ci_test_checkout_includes_legacy_release_history():
+    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
+    test_job = workflow[workflow.index("  test:") : workflow.index("\n  build-sandbox:")]
+
+    assert "fetch-depth: 0" in test_job
 
 
 def test_workflows_pin_uv_version_on_the_uv_action_only():
