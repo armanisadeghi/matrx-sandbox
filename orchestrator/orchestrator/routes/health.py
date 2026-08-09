@@ -19,6 +19,7 @@ from fastapi import APIRouter
 from orchestrator import sandbox_manager
 from orchestrator.config import settings
 from orchestrator.models import HealthResponse, SystemInfoResponse
+from orchestrator.store import PostgresSandboxStore
 
 router = APIRouter(tags=["health"])
 
@@ -30,10 +31,13 @@ async def health_check():
     """Health check for the orchestrator service."""
     sandboxes = await sandbox_manager.list_sandboxes()
     active = [s for s in sandboxes if s.status in ("ready", "running", "starting")]
+    backend = "postgres" if isinstance(sandbox_manager._get_store(), PostgresSandboxStore) else "memory"
     return HealthResponse(
         status="healthy",
         active_sandboxes=len(active),
         uptime_seconds=round(time.time() - _start_time, 1),
+        store_backend=backend,
+        durable_storage=backend == "postgres",
     )
 
 

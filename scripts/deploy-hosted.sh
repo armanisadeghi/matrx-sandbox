@@ -68,6 +68,10 @@ run_db_migrations() {
     || fail "required orchestrator env file is unreadable: $ORCH_COMPOSE_DIR/.env"
   grep -q '^MATRX_DATABASE_URL=.' "$ORCH_COMPOSE_DIR/.env" \
     || fail "MATRX_DATABASE_URL is not resolved; refusing to skip required migrations"
+  # Pre-flight for the store guard in orchestrator/config.py: the new container
+  # refuses to boot unless this is 'postgres'. Catch it before the swap.
+  grep -q '^MATRX_SANDBOX_STORE=postgres[[:space:]]*$' "$ORCH_COMPOSE_DIR/.env" \
+    || fail "MATRX_SANDBOX_STORE must be 'postgres' in $ORCH_COMPOSE_DIR/.env (in-memory loses every sandbox row on restart)"
   if ! docker run --rm --env-file "$ORCH_COMPOSE_DIR/.env" "$image" \
         python -m orchestrator.migrate_runner; then
     fail "DB migrations failed — aborting before recreating orchestrator"

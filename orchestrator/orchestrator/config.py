@@ -44,9 +44,28 @@ class Settings(BaseSettings):
     max_command_length: int = 10000
     command_timeout_seconds: int = 300
 
-    # Sandbox store persistence
-    sandbox_store: str = "memory"   # env var: MATRX_SANDBOX_STORE (memory or postgres)
+    # ── Sandbox store persistence — NO DEFAULT, ON PURPOSE ──────────────────
+    # This used to default to "memory". A host that never set (or misspelled)
+    # MATRX_SANDBOX_STORE booted happily on an in-memory store: every
+    # sandbox_instances row vanished on restart, the only signal was a
+    # logger.info, and nobody found out until they went looking for a sandbox
+    # that no longer existed. Same failure class as the second-database
+    # incident — healthy-looking service, real data loss.
+    #
+    # There is now no value you can arrive at by omission. Unset or
+    # unrecognized => the orchestrator REFUSES TO START (see
+    # ``resolve_sandbox_store``). "memory" is an explicit local-dev/test
+    # opt-in and is rejected outright on any deployed host.
+    sandbox_store: str = ""         # env var: MATRX_SANDBOX_STORE (memory | postgres)
     database_url: str = ""          # env var: MATRX_DATABASE_URL
+
+    # ── Host identity (the two declared axes, same names as aidream) ────────
+    # MATRX_STAGE = production | development | local   (test auto-detected)
+    # MATRX_ROLE  = app_server | worker | sandbox | sandbox_host
+    # Read here only to decide how strict a config guard should be. An unknown
+    # or missing stage is treated as a DEPLOYED host — guards fail CLOSED.
+    stage: str = ""                 # env var: MATRX_STAGE
+    role: str = ""                  # env var: MATRX_ROLE
 
     # Tiering — which tier this orchestrator hosts.
     # Used to reject creates that ask for the wrong tier and to surface the
@@ -271,6 +290,74 @@ class Settings(BaseSettings):
         if v.upper() not in valid:
             raise ValueError(f"log_level must be one of {valid}")
         return v.upper()
+
+    # ── Host posture + the store guard ──────────────────────────────────────
+
+    @property
+    def is_test_run(self) -> bool:
+        """True inside pytest (the one place a store may be picked implicitly)."""
+        return bool(os.environ.get("PYTEST_CURRENT_TEST"))
+
+    @property
+    def is_deployed_host(self) -> bool:
+        """True unless this is provably a developer's local machine.
+
+        Fails CLOSED: an unset/unknown MATRX_STAGE counts as deployed, because
+        the host that forgets to declare its stage is exactly the host that
+        forgets to declare its store.
+        """
+        if self.is_test_run:
+            return False
+        return self.stage.strip().lower() != "local"
+
+    def resolve_sandbox_store(self) -> str:
+        """Return "postgres" or "memory", or RAISE naming the fix.
+
+        The whole point of this function: there is no path to an in-memory
+        store that a deployed host can reach by omission or by a typo.
+        """
+        raw = (self.sandbox_store or "").strip().lower()
+
+        if not raw:
+            if self.is_test_run:
+                return "memory"
+            raise RuntimeError(
+                "MATRX_SANDBOX_STORE is not set — refusing to start.\n"
+                "  Accepted values: postgres | memory\n"
+                "  Set MATRX_SANDBOX_STORE=postgres (plus MATRX_DATABASE_URL) on any\n"
+                "  deployed orchestrator (ec2 or hosted tier). Every sandbox row lives\n"
+                "  there; an in-memory store loses all of them on restart.\n"
+                "  For local development only: MATRX_SANDBOX_STORE=memory together with\n"
+                "  MATRX_STAGE=local."
+            )
+
+        if raw not in ("postgres", "memory"):
+            raise RuntimeError(
+                f"MATRX_SANDBOX_STORE={self.sandbox_store!r} is not a recognized store "
+                "— refusing to start.\n"
+                "  Accepted values: postgres | memory\n"
+                "  A misspelling must never silently degrade to in-memory storage."
+            )
+
+        if raw == "memory" and self.is_deployed_host:
+            raise RuntimeError(
+                "MATRX_SANDBOX_STORE=memory is refused on a deployed host "
+                "— refusing to start.\n"
+                f"  MATRX_STAGE={self.stage or '(unset)'} "
+                f"MATRX_HOST_TIER={self.host_tier or '(unset)'}\n"
+                "  An in-memory store loses EVERY sandbox_instances row on restart.\n"
+                "  Set MATRX_SANDBOX_STORE=postgres and MATRX_DATABASE_URL.\n"
+                "  If this really is a developer machine, declare it: MATRX_STAGE=local."
+            )
+
+        if raw == "postgres" and not self.database_url:
+            raise RuntimeError(
+                "MATRX_DATABASE_URL is not set but MATRX_SANDBOX_STORE=postgres "
+                "— refusing to start.\n"
+                "  Set MATRX_DATABASE_URL to the platform Postgres connection string."
+            )
+
+        return raw
 
     # ── Effective AI Dream credentials (with passthrough-file fallback) ──────
     # The hosted tier already mounts /srv/projects/aidream/.env via

@@ -754,16 +754,32 @@ def _row_to_sandbox(row) -> SandboxResponse:
 
 
 def create_store() -> SandboxStore:
-    """Factory function to create the appropriate store based on config."""
+    """Create the configured store, or RAISE.
+
+    There is no default and no fallback: ``resolve_sandbox_store`` raises with
+    the variable name and the fix when MATRX_SANDBOX_STORE is unset, misspelled,
+    or asks for ``memory`` on a deployed host. The in-memory store is real
+    storage-shaped code with no durability, so when it IS legitimately chosen it
+    announces itself in a banner nobody can mistake for a healthy boot.
+    """
     from orchestrator.config import settings
 
-    if settings.sandbox_store == "postgres":
-        if not settings.database_url:
-            raise RuntimeError(
-                "MATRX_DATABASE_URL must be set when MATRX_SANDBOX_STORE=postgres"
-            )
-        logger.info("Using Postgres sandbox store")
+    kind = settings.resolve_sandbox_store()
+
+    if kind == "postgres":
+        logger.info("Sandbox store: POSTGRES (durable)")
         return PostgresSandboxStore(settings.database_url)
-    else:
-        logger.info("Using in-memory sandbox store (state lost on restart)")
-        return InMemorySandboxStore()
+
+    banner = (
+        "\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+        "!!  SANDBOX STORE = IN-MEMORY — NOTHING IS PERSISTED               !!\n"
+        "!!  Every sandbox row is LOST on restart. This is a development    !!\n"
+        "!!  store, explicitly selected by MATRX_SANDBOX_STORE=memory with  !!\n"
+        f"!!  MATRX_STAGE={settings.stage or '(unset/test)'}\n"
+        "!!  If you are looking at a deployed host, this is a DEFECT:       !!\n"
+        "!!  set MATRX_SANDBOX_STORE=postgres + MATRX_DATABASE_URL.         !!\n"
+        "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+    )
+    logger.warning(banner)
+    return InMemorySandboxStore()

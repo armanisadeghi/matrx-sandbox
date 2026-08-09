@@ -27,15 +27,93 @@ setup_logging()
 _logger = logging.getLogger(__name__)
 
 
+def _degraded_config_warnings() -> list[str]:
+    """Config values whose ABSENCE quietly buys a worse orchestrator.
+
+    Same defect shape as the old MATRX_SANDBOX_STORE default: nothing crashes,
+    a capability just isn't there. These stay non-fatal (unlike the store, none
+    of them destroys data that already exists) but they are never silent.
+    """
+    if not settings.is_deployed_host:
+        return []
+
+    out: list[str] = []
+
+    if not settings.host_tier:
+        out.append(
+            "MATRX_HOST_TIER is unset — this orchestrator's reconcile/reaper sweeps "
+            "are not tier-scoped and new rows carry no tier. Set it to 'ec2' or 'hosted'."
+        )
+    if not settings.s3_bucket:
+        out.append(
+            "MATRX_S3_BUCKET is unset — sandboxes get no hot/cold S3 prefixes, so "
+            "nothing under /home/agent or /data/cold is backed up off the host."
+        )
+    if settings.host_tier == "hosted" and not (
+        settings.aws_access_key_id and settings.aws_secret_access_key
+    ):
+        out.append(
+            "MATRX_AWS_ACCESS_KEY_ID / MATRX_AWS_SECRET_ACCESS_KEY unset on the hosted "
+            "tier — spawned sandboxes run hot-sync/cold-mount in LOCAL-ONLY mode: user "
+            "files live only in the per-user Docker volume and are lost with it."
+        )
+    if not settings.resolve_aidream_service_token():
+        out.append(
+            "MATRX_AIDREAM_SERVICE_TOKEN unresolved (and not readable from "
+            f"{settings.aidream_passthrough_env_file}) — sandboxes start with no AI Dream "
+            "integration and cloud-files sync is skipped."
+        )
+    if not settings.access_token_secret:
+        out.append(
+            "MATRX_ACCESS_TOKEN_SECRET is unset — /access-tokens, /agent-binding and "
+            "/proxy/* return 503, so browser-direct access to sandboxes is dead."
+        )
+
+    return out
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — startup and shutdown hooks."""
+    # Store FIRST — before any block that swallows exceptions (the reconcile
+    # blocks below catch broadly). A misconfigured MATRX_SANDBOX_STORE is a
+    # refusal to start, not a warning: create_store() raises naming the
+    # variable, the accepted values and the fix. Resolving it here means the
+    # process dies at boot instead of at the first request.
+    from orchestrator.sandbox_manager import _get_store
+    from orchestrator.store import PostgresSandboxStore
+
+    _store = _get_store()
+    _logger.info(
+        "Sandbox store resolved: %s (durable=%s)",
+        settings.resolve_sandbox_store(),
+        isinstance(_store, PostgresSandboxStore),
+    )
+
     # Warn if running without API key authentication
     if not settings.api_key:
-        _logger.warning(
-            "MATRX_API_KEY is not set — API is running WITHOUT authentication. "
-            "Set MATRX_API_KEY for production use."
-        )
+        if settings.is_deployed_host:
+            _logger.warning(
+                "\n"
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!\n"
+                "!!  MATRX_API_KEY IS NOT SET ON A DEPLOYED HOST                 !!\n"
+                "!!  Every orchestrator route is UNAUTHENTICATED — anyone who    !!\n"
+                "!!  can reach this port can create, exec in, and destroy        !!\n"
+                "!!  sandboxes. Set MATRX_API_KEY now.                           !!\n"
+                "!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!"
+            )
+        else:
+            _logger.warning(
+                "MATRX_API_KEY is not set — API is running WITHOUT authentication. "
+                "Set MATRX_API_KEY for production use."
+            )
+
+    # Every other config value whose ABSENCE silently degrades a deployed host
+    # into a lesser mode. None of these can crash the orchestrator (an
+    # already-running deployment must not be bricked by a missing optional
+    # value), but none of them may whisper either — same rule as the store.
+    for line in _degraded_config_warnings():
+        _logger.warning("DEGRADED CONFIG: %s", line)
 
     # Startup: validate S3 bucket is accessible (C8)
     try:

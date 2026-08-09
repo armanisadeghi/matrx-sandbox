@@ -190,6 +190,12 @@ class HealthResponse(BaseModel):
     status: str
     active_sandboxes: int
     uptime_seconds: float
+    # Which store backs sandbox_instances, and whether it survives a restart.
+    # Surfaced so an in-memory orchestrator is visible to operators/monitors
+    # without reading logs — an in-memory store on a deployed host means every
+    # sandbox row disappears on the next restart.
+    store_backend: str = "unknown"
+    durable_storage: bool = False
 
 
 class SystemInfoResponse(BaseModel):

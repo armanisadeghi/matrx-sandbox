@@ -65,8 +65,14 @@ resolve_setting() {
 
 DB_URL=$(resolve_setting MATRX_DATABASE_URL)
 API_KEY=$(resolve_setting MATRX_API_KEY)
+STORE=$(resolve_setting MATRX_SANDBOX_STORE)
 [ -n "$DB_URL" ] || fail "MATRX_DATABASE_URL is unresolved; migrations may not be skipped"
 [ -n "$API_KEY" ] || fail "MATRX_API_KEY is unresolved; production metadata must stay authenticated"
+# Pre-flight for the store guard in orchestrator/config.py: the new container
+# would refuse to boot on anything but 'postgres' here. Catch it BEFORE the
+# swap instead of after.
+[ "$STORE" = "postgres" ] \
+  || fail "MATRX_SANDBOX_STORE is '${STORE:-unset}'; a deployed orchestrator must set it to 'postgres' (in-memory loses every sandbox row on restart)"
 
 log "pulling immutable image candidates"
 docker pull "$ECR_REPO:$TARGET_SHA"
