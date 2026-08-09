@@ -21,6 +21,11 @@ Operational runbook for the two sandbox tiers. For architecture (storage tiers, 
 
 Both orchestrators advertise their tier via `GET /` and `GET /api-surface`. A `POST /sandboxes` request whose `tier` doesn't match the orchestrator's `MATRX_HOST_TIER` is rejected with HTTP 400 — there is no cross-tier proxying. Frontends route by reading the sandbox row's `tier` column.
 
+The best-effort hosted GitHub job waits up to 60 minutes because it uses the
+same serialized host lock as the poller. This covers one already-running image
+recovery plus the new release; the poller remains authoritative if inbound SSH
+fails or that window is exhausted.
+
 ---
 
 ## Hosted-tier ops (this server)

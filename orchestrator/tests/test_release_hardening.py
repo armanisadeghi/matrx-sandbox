@@ -258,6 +258,13 @@ def test_ci_test_checkout_includes_legacy_release_history():
     assert "fetch-depth: 0" in test_job
 
 
+def test_hosted_fast_path_allows_one_serialized_recovery_ahead_of_it():
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    hosted_job = workflow[workflow.index("  deploy-hosted:") :]
+
+    assert "command_timeout: 60m" in hosted_job
+
+
 def test_hosted_deploy_self_heals_images_at_fleet_freshness_limit():
     script = HOSTED_DEPLOY.read_text(encoding="utf-8")
 

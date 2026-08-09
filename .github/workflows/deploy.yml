@@ -288,7 +288,11 @@ jobs:
           key: ${{ secrets.DEPLOY_SSH_KEY }}
           port: ${{ secrets.DEPLOY_PORT || 22 }}
           timeout: 60s
-          command_timeout: 30m
+          # This fast path shares the host's serialized deploy lock with the
+          # authoritative poller. A recovery build can legitimately occupy
+          # most of 30 minutes before this command gets the lock, so allow one
+          # complete queued build instead of reporting a false failed job.
+          command_timeout: 60m
           script: |
             set -e
             # Serialize with the host poller BEFORE touching the checkout —
