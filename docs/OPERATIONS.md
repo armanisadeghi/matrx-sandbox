@@ -21,10 +21,11 @@ Operational runbook for the two sandbox tiers. For architecture (storage tiers, 
 
 Both orchestrators advertise their tier via `GET /` and `GET /api-surface`. A `POST /sandboxes` request whose `tier` doesn't match the orchestrator's `MATRX_HOST_TIER` is rejected with HTTP 400 — there is no cross-tier proxying. Frontends route by reading the sandbox row's `tier` column.
 
-The best-effort hosted GitHub job waits up to 60 minutes because it uses the
-same serialized host lock as the poller. This covers one already-running image
-recovery plus the new release; the poller remains authoritative if inbound SSH
-fails or that window is exhausted.
+The best-effort hosted GitHub job waits up to 120 minutes because it uses the
+same serialized host lock as the poller. The authoritative systemd service has
+a three-hour budget, covering both lock wait and a cold core/slim/aidream build.
+Successful releases refresh the runner and both systemd units, so the live
+timeout policy cannot silently remain pinned to an obsolete checkout.
 
 ---
 

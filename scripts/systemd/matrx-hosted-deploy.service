@@ -24,7 +24,8 @@ Environment=HOME=/root
 # The runner is installed to /usr/local/bin (NOT run from the checkout) so the
 # git reset it performs can never rewrite the executing script mid-run.
 ExecStart=/usr/local/bin/matrx-hosted-deploy-runner
-# Image builds can take a while (aidream ~5GB); don't let systemd kill a
-# legitimate deploy. The flock in the script prevents pile-ups regardless.
-TimeoutStartSec=45min
+# A cold core + slim + aidream rebuild can exceed an hour on this host, and the
+# service may first wait behind the GitHub SSH fast path's serialized lock.
+# Budget for both phases; the flock still prevents overlapping deploys.
+TimeoutStartSec=3h
 Nice=5

@@ -15,6 +15,9 @@ HOSTED_DEPLOY = REPO_ROOT / "scripts" / "deploy-hosted.sh"
 AIDREAM_BUILDER = REPO_ROOT / "sandbox-image" / "build-aidream.sh"
 CORE_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile"
 SLIM_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile.slim"
+HOSTED_DEPLOY_SERVICE = (
+    REPO_ROOT / "scripts" / "systemd" / "matrx-hosted-deploy.service"
+)
 LEGACY_EC2_SOURCE_SHAS = (
     "30ed118b431b72e8f73f1b199fd9398d78361ed5",
     "f229d4b9347a66b3e8e8d8235f122d31dc336436",
@@ -264,7 +267,16 @@ def test_hosted_fast_path_allows_one_serialized_recovery_ahead_of_it():
     workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
     hosted_job = workflow[workflow.index("  deploy-hosted:") :]
 
-    assert "command_timeout: 60m" in hosted_job
+    assert "command_timeout: 120m" in hosted_job
+
+
+def test_authoritative_poller_allows_a_queued_cold_build():
+    unit = HOSTED_DEPLOY_SERVICE.read_text(encoding="utf-8")
+    deploy = HOSTED_DEPLOY.read_text(encoding="utf-8")
+
+    assert "TimeoutStartSec=3h" in unit
+    assert "matrx-hosted-deploy.service" in deploy
+    assert "systemctl daemon-reload" in deploy
 
 
 def test_image_version_stamp_does_not_invalidate_dependency_cache():

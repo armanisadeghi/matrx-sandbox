@@ -499,11 +499,22 @@ done
 [ "$verified" = 1 ] || fail_release "exact source/API/filesystem contract verification failed"
 log "release contract verified at $NEW_SHA ✓"
 
-# Refresh the out-of-checkout poller only after this release is healthy. The
-# next timer tick will therefore continue following the CI-approved ref.
+# Refresh the out-of-checkout poller and its timeout policy only after this
+# release is healthy. Installing only the runner previously left the live
+# systemd unit pinned to a 45-minute timeout that killed valid cold builds.
 install -m 0755 "$REPO_DIR/scripts/systemd/pull-deploy-runner.sh" \
   /usr/local/bin/matrx-hosted-deploy-runner \
   || fail_release "could not install approved-ref poller"
+install -m 0644 "$REPO_DIR/scripts/systemd/matrx-hosted-deploy.service" \
+  /etc/systemd/system/matrx-hosted-deploy.service \
+  || fail_release "could not install hosted deploy service"
+install -m 0644 "$REPO_DIR/scripts/systemd/matrx-hosted-deploy.timer" \
+  /etc/systemd/system/matrx-hosted-deploy.timer \
+  || fail_release "could not install hosted deploy timer"
+systemctl daemon-reload \
+  || fail_release "could not reload hosted deploy systemd units"
+systemctl enable --now matrx-hosted-deploy.timer \
+  || fail_release "could not enable hosted deploy timer"
 
 # ── GC: keep frequent image rebuilds from eating the disk ────────────────────
 # The aidream variant rebuilds on every aidream push (several times/day), each
