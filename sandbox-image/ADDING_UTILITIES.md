@@ -2,6 +2,17 @@
 
 This guide shows you exactly where to add different types of utilities that will be available in every sandbox container.
 
+## Managed Claude runtime prerequisites
+
+The existing `matrx-sandbox:aidream` image owns the two official Linux
+prerequisites for Claude Code's Bash sandbox: `bubblewrap` (`bwrap`) and
+`socat`. `Dockerfile.aidream` fails its build if either executable is missing,
+and `build-aidream.sh` verifies both again by starting the finished image. The
+aidream managed-runtime capability probe also performs a live `bwrap` mount-
+namespace smoke test and refuses execution if isolation is unavailable. Do not
+move these tools into another image or service: managed Claude runs inside the
+existing aidream variant.
+
 ## Quick Reference
 
 | Type | Location | Available in Container At |

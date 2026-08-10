@@ -54,7 +54,17 @@ RUN apt-get update \
     libmagic1 \
     libpq-dev \
     tesseract-ocr \
+    bubblewrap \
+    socat \
     && rm -rf /var/lib/apt/lists/*
+
+# Claude Code's official Linux Bash sandbox requires both executables. Keep
+# this in the existing aidream image and fail the build loudly if a base-image
+# or distro change makes either package unavailable.
+RUN command -v bwrap >/dev/null \
+    && command -v socat >/dev/null \
+    && bwrap --version \
+    && socat -V 2>&1 | head -1
 
 # ─── uv installer + uv-managed Python 3.13 ─────────────────────────────────
 # uv installs its own Python — avoids the deadsnakes-PPA + python3-apt

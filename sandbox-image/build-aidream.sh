@@ -130,6 +130,10 @@ docker build \
     -t "$TAG" \
     .
 
+echo "[build-aidream] verifying Claude Linux sandbox prerequisites in $TAG"
+docker run --rm --entrypoint /bin/sh "$TAG" -c \
+    'command -v bwrap >/dev/null && command -v socat >/dev/null && bwrap --version >/dev/null && socat -V >/dev/null 2>&1'
+
 echo "[build-aidream] cleaning up staged source"
 rm -rf "$STAGE_DIR" "$LOCAL_SCRIPTS_STAGE"
 
