@@ -5,6 +5,7 @@ from __future__ import annotations
 import hmac
 import logging
 from datetime import datetime, timezone
+from typing import Any
 
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
@@ -1574,9 +1575,11 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
 
     # 1. Container inspect
     container_info: dict[str, object] = {"present": False}
+    docker_container: Any | None = None
     try:
         client = sandbox_manager._get_docker_client()
         container = await asyncio.to_thread(client.containers.get, sandbox_id)
+        docker_container = container
         await asyncio.to_thread(container.reload)
         attrs = container.attrs
         state = attrs.get("State", {})
@@ -1608,6 +1611,31 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
     matrx_agent: dict[str, object] = {"checked": False, "reason": "no container ip"}
     aidream_health: dict[str, object] = {"checked": False, "reason": "not aidream template"}
     aidream_ready: dict[str, object] = {"checked": False, "reason": "not aidream template"}
+    aidream_source: dict[str, object] = {"checked": False, "reason": "not aidream template"}
+
+    if is_aidream and docker_container is not None:
+        try:
+            source_code, source_output = await asyncio.to_thread(
+                lambda: docker_container.exec_run(
+                    [
+                        "/opt/sandbox/scripts/aidream-helpers.sh",
+                        "verify-release",
+                    ],
+                    stdout=True,
+                    stderr=True,
+                    user="agent",
+                )
+            )
+            source_text = (
+                source_output.decode(errors="replace") if source_output else ""
+            ).strip()
+            aidream_source = {
+                "checked": True,
+                "ok": source_code == 0,
+                "detail": source_text,
+            }
+        except Exception as exc:
+            aidream_source = {"checked": True, "ok": False, "error": str(exc)}
 
     if container_ip:
         # 2. matrx_agent (always present — fs/git/exec daemon)
@@ -1625,7 +1653,14 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
     overall_ok = bool(
         container_info.get("running")
         and matrx_agent.get("ok")
-        and (not is_aidream or (aidream_health.get("ok") and aidream_ready.get("ok")))
+        and (
+            not is_aidream
+            or (
+                aidream_source.get("ok")
+                and aidream_health.get("ok")
+                and aidream_ready.get("ok")
+            )
+        )
     )
 
     # Secrets-vault injection diagnostic — stamped by create_sandbox at
@@ -1667,6 +1702,7 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
             "matrx_agent_8000": matrx_agent,
             "aidream_health_8001": aidream_health,
             "aidream_ready_8001": aidream_ready,
+            "aidream_source_exact": aidream_source,
         },
         "secrets_injection": secrets_injection,
     }

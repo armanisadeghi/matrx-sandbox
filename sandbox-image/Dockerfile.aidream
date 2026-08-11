@@ -36,7 +36,9 @@ LABEL com.aimatrx.sandbox.version="${MATRX_IMAGE_VERSION}"
 # layers on top of :local. Read by /home/agent/.sandbox_env on every boot.
 USER root
 RUN echo "aidream" > /etc/sandbox-image-tag \
-    && echo "${MATRX_IMAGE_VERSION}" > /etc/sandbox-image-version
+    && echo "${MATRX_IMAGE_VERSION}" > /etc/sandbox-image-version \
+    && echo "${AIDREAM_GIT_SHA}" > /etc/aidream-image-sha \
+    && chmod 0444 /etc/aidream-image-sha
 
 # ─── System deps for aidream (mirroring aidream/Dockerfile) ────────────────
 # Skipping software-properties-common / deadsnakes PPA — it's brittle on
@@ -54,7 +56,17 @@ RUN apt-get update \
     libmagic1 \
     libpq-dev \
     tesseract-ocr \
+    bubblewrap \
+    socat \
     && rm -rf /var/lib/apt/lists/*
+
+# Claude Code's official Linux Bash sandbox requires both executables. Keep
+# this in the existing aidream image and fail the build loudly if a base-image
+# or distro change makes either package unavailable.
+RUN command -v bwrap >/dev/null \
+    && command -v socat >/dev/null \
+    && bwrap --version \
+    && socat -V 2>&1 | head -1
 
 # ─── uv installer + uv-managed Python 3.13 ─────────────────────────────────
 # uv installs its own Python — avoids the deadsnakes-PPA + python3-apt

@@ -65,8 +65,8 @@ else
         || echo "[build-aidream] WARN: git fetch failed — baking last-known origin/main"
     SOURCE_REF="origin/main"
 fi
-GIT_SHA=$(git -C "$AIDREAM_SRC" rev-parse --short "$SOURCE_REF" 2>/dev/null || echo "unknown")
 AIDREAM_FULL_SHA=$(git -C "$AIDREAM_SRC" rev-parse "$SOURCE_REF" 2>/dev/null || echo "unknown")
+GIT_SHA=${AIDREAM_FULL_SHA:0:9}
 STAGE_DIR="./aidream-src"
 LOCAL_SCRIPTS_STAGE="./scripts-local"
 
@@ -97,22 +97,24 @@ git -C "$AIDREAM_SRC" archive --format=tar "$SOURCE_REF" | tar -x -C "$STAGE_DIR
 rm -rf "$STAGE_DIR/dashboard" "$STAGE_DIR/workflow-studio" "$STAGE_DIR/knowledgebase" \
        "$STAGE_DIR/.cursor" "$STAGE_DIR/.claude" "$STAGE_DIR/.agent" "$STAGE_DIR/.arman" "$STAGE_DIR/.treasure-maps"
 
-# We DO want a .git dir for `mtx aidream update` to work — but we want
-# the small one (refs + remotes only), not the full history. Use a
-# git clone --depth=1 trick: re-init in the staged dir as a shallow
-# clone of the source.
-echo "[build-aidream] adding shallow .git so 'mtx aidream update' works"
+# Keep the real immutable source commit as HEAD. A synthetic staging commit
+# makes runtime/source certification impossible even when every file matches.
+echo "[build-aidream] adding exact source commit for runtime certification"
 (
     cd "$STAGE_DIR"
     if [ -d "$AIDREAM_SRC/.git" ]; then
-        # Shallow-init from the source repo's remotes.
         git init -q
         git remote add origin "$(git -C "$AIDREAM_SRC" remote get-url origin 2>/dev/null || echo '')"
-        # Pretend the current state is HEAD so `git pull` later does the right thing.
-        git add -A 2>/dev/null
-        git -c user.email=build@matrx -c user.name=build commit -q -m "bake: aidream@$GIT_SHA" 2>/dev/null || true
+        git fetch -q --depth=1 "$AIDREAM_SRC" "$AIDREAM_FULL_SHA"
+        git reset -q --mixed FETCH_HEAD
+        git branch -M main
+        test "$(git rev-parse HEAD)" = "$AIDREAM_FULL_SHA"
+        git diff --quiet
     fi
-) || echo "[build-aidream] WARN: .git seeding failed; mtx aidream update may not work until first reset"
+) || {
+    echo "[build-aidream] exact source commit staging failed" >&2
+    exit 1
+}
 
 STAGED_SIZE=$(du -sh "$STAGE_DIR" | cut -f1)
 echo "[build-aidream] staged $STAGED_SIZE"
@@ -124,11 +126,26 @@ echo "[build-aidream] docker build → $TAG (this is the slow step — uv sync t
 docker build \
     --label "com.aimatrx.aidream.sha=$AIDREAM_FULL_SHA" \
     -f Dockerfile.aidream \
-    --build-arg AIDREAM_GIT_SHA="$GIT_SHA" \
+    --build-arg AIDREAM_GIT_SHA="$AIDREAM_FULL_SHA" \
     --build-arg MATRX_IMAGE_VERSION="${MATRX_IMAGE_VERSION:-dev}" \
     --build-arg CORE_VERSION="${MATRX_CORE_VERSION:-core}" \
     -t "$TAG" \
     .
+
+IMAGE_AIDREAM_SHA=$(docker image inspect "$TAG" --format '{{ index .Config.Labels "com.aimatrx.aidream.sha" }}')
+[ "$IMAGE_AIDREAM_SHA" = "$AIDREAM_FULL_SHA" ] || {
+    echo "[build-aidream] image aidream SHA label mismatch: $IMAGE_AIDREAM_SHA != $AIDREAM_FULL_SHA" >&2
+    exit 1
+}
+
+echo "[build-aidream] verifying Claude Linux sandbox prerequisites in $TAG"
+docker run --rm --entrypoint /bin/sh "$TAG" -c \
+    'test "$(cat /etc/aidream-image-sha)" = "$(git -C /opt/aidream-template rev-parse HEAD)" \
+    && command -v bwrap >/dev/null && command -v socat >/dev/null \
+    && bwrap --version >/dev/null && socat -V >/dev/null 2>&1 \
+    && runtime_dir=$(mktemp -d) \
+    && cp -a /opt/aidream-template/. "$runtime_dir/" \
+    && AIDREAM_WORK_DIR="$runtime_dir" /opt/sandbox/scripts/aidream-helpers.sh verify-release'
 
 echo "[build-aidream] cleaning up staged source"
 rm -rf "$STAGE_DIR" "$LOCAL_SCRIPTS_STAGE"

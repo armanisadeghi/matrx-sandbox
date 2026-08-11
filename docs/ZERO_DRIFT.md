@@ -19,6 +19,13 @@ Every image carries a version baked at build time (`MATRX_IMAGE_VERSION`), expos
 - a **LABEL** `com.aimatrx.sandbox.version` (inspectable without running),
 - a file **`/etc/sandbox-image-version`** (the box reads it to self-verify on a migration boot).
 
+The `aidream` variant additionally carries the exact 40-character aidream source
+commit in `com.aimatrx.aidream.sha` and root-owned
+`/etc/aidream-image-sha`. Its persistent working copy must match that commit and
+have no tracked modifications before managed autostart or diagnostics can call
+it release-ready. This separate source gate matters because `/home/agent` data
+survives image migration.
+
 **Always build through [`sandbox-image/build.sh`](../sandbox-image/build.sh)** — it stamps the version (git short-sha + `-dirty` if the tree is dirty + UTC timestamp). A bare `docker build` leaves the version as `"dev"`, which the drift report flags as unversioned.
 
 ```bash
