@@ -110,31 +110,26 @@ echo "[build-aidream] adding exact source commit for runtime certification"
 stage_exact_commit() {
     cd "$STAGE_DIR" || return 1
     [ -d "$AIDREAM_SRC/.git" ] || return 0
-    local step
-    for step in \
-        "git init -q" \
-        "git remote add origin $(git -C "$AIDREAM_SRC" remote get-url origin 2>/dev/null || echo '')" \
-        "git fetch -q --depth=1 $AIDREAM_SRC $AIDREAM_FULL_SHA" \
-        "git reset -q --mixed FETCH_HEAD" \
-        "git branch -M main"
-    do
-        eval "$step" || { echo "[build-aidream] staging step failed: $step" >&2; return 1; }
-    done
-    local head
-    head=$(git rev-parse HEAD)
-    [ "$head" = "$AIDREAM_FULL_SHA" ] || {
-        echo "[build-aidream] staged HEAD $head != source $AIDREAM_FULL_SHA" >&2
-        return 1
-    }
+    step() { echo "[build-aidream] staging step failed: $*" >&2; return 1; }
+    git init -q || step git init
+    git remote add origin \
+        "$(git -C "$AIDREAM_SRC" remote get-url origin 2>/dev/null || echo '')" \
+        || step git remote add origin
+    git fetch -q --depth=1 "$AIDREAM_SRC" "$AIDREAM_FULL_SHA" \
+        || step git fetch "$AIDREAM_FULL_SHA"
+    git reset -q --mixed FETCH_HEAD || step git reset FETCH_HEAD
+    git branch -M main || step git branch -M main
+    test "$(git rev-parse HEAD)" = "$AIDREAM_FULL_SHA" \
+        || step "HEAD $(git rev-parse HEAD) != source $AIDREAM_FULL_SHA"
     # Loud, not silent: name the files that broke exactness. A `git diff
-    # --quiet` that only says "failed" cost a full day of blind retries.
-    git diff --quiet && return 0
+    # --quiet` that only reported "failed" cost a full day of blind retries.
+    if git diff --quiet; then return 0; fi
     echo "[build-aidream] staged tree differs from $AIDREAM_FULL_SHA — first 20 paths:" >&2
     git diff --name-status | head -20 >&2
     echo "[build-aidream] (nothing may delete or modify tracked files in $STAGE_DIR)" >&2
     return 1
 }
-( stage_exact_commit ) || {
+( set -e; stage_exact_commit ) || {
     echo "[build-aidream] exact source commit staging failed" >&2
     exit 1
 }
