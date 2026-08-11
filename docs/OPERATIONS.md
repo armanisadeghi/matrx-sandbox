@@ -335,6 +335,13 @@ Root cause (legacy): pre-v0.2.0 deploy.yml only built/pushed Docker images and c
 
 Recovery: re-run `deploy.yml` for `main`. Do not hand-copy files or install an editable package into the live directory; that bypasses the locked candidate, migration gate, rollback capture, and exact contract assertion in `scripts/deploy-ec2.sh`. If the workflow itself is broken, repair and re-run the pipeline while the last-known-good service remains live.
 
+**Second root cause, found 2026‑08‑11 — the release could not boot, and said it did.** Two bugs stacked, and together they pinned EC2 on `f229d4b` for weeks while every deploy record read green:
+
+- **Never let anything in the release depend on the candidate path.** `uv sync` builds the venv in `orchestrator-candidate-<sha>/`, and promotion **moves** that directory to `/home/ec2-user/orchestrator`. uv pins console-script shebangs to the absolute build path, so `.venv/bin/uvicorn` is unrunnable the instant it goes live — `systemd[1]: Failed to execute .../.venv/bin/uvicorn: No such file or directory`, status `203/EXEC`, crashloop, contract assertion times out, rollback. The systemd drop-in therefore execs **`.venv/bin/python -m uvicorn`** (that `python` is a symlink to `/usr/bin/python3.11` and survives the move), and the script refuses to promote a candidate that cannot run it. If you add any other entry point, re-check it against a *moved* venv, not the built one.
+- **A rolled-back release must exit non-zero.** `rollback()` starts with `trap - ERR` + `set +e`; returning from it resumed the script after the failing statement with `-e` disabled, so it ran the success epilogue and logged `release … is healthy and exact` with exit 0. GitHub showed a successful deploy over a live old revision. `rollback()` now exits 1. Related trap: **`exit` does not fire the ERR trap** — a failure path that calls `fail()` after the rollback trap is installed will skip the rollback and leave the broken release live. Call `rollback` directly there.
+
+The contract assertion also dumps `systemctl status`, the unit journal, and the last `/api-surface` payload before rolling back. It used to be a bare `|| false`, which is why the boot failure was invisible in the workflow log.
+
 ### Tier env var
 
 The orchestrator reports `tier: null` unless `MATRX_HOST_TIER=ec2` is set. Drop-in:
