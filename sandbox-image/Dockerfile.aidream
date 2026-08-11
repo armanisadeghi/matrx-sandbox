@@ -36,7 +36,9 @@ LABEL com.aimatrx.sandbox.version="${MATRX_IMAGE_VERSION}"
 # layers on top of :local. Read by /home/agent/.sandbox_env on every boot.
 USER root
 RUN echo "aidream" > /etc/sandbox-image-tag \
-    && echo "${MATRX_IMAGE_VERSION}" > /etc/sandbox-image-version
+    && echo "${MATRX_IMAGE_VERSION}" > /etc/sandbox-image-version \
+    && echo "${AIDREAM_GIT_SHA}" > /etc/aidream-image-sha \
+    && chmod 0444 /etc/aidream-image-sha
 
 # ─── System deps for aidream (mirroring aidream/Dockerfile) ────────────────
 # Skipping software-properties-common / deadsnakes PPA — it's brittle on

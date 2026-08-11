@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 import re
 import subprocess
 from pathlib import Path
@@ -13,6 +14,9 @@ DEPLOY_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "deploy.yml"
 CI_WORKFLOW = REPO_ROOT / ".github" / "workflows" / "ci.yml"
 HOSTED_DEPLOY = REPO_ROOT / "scripts" / "deploy-hosted.sh"
 AIDREAM_BUILDER = REPO_ROOT / "sandbox-image" / "build-aidream.sh"
+AIDREAM_HELPER = REPO_ROOT / "sandbox-image" / "scripts" / "aidream-helpers.sh"
+AIDREAM_ENTRYPOINT = REPO_ROOT / "sandbox-image" / "scripts" / "entrypoint-aidream.sh"
+SANDBOX_ROUTES = REPO_ROOT / "orchestrator" / "orchestrator" / "routes" / "sandboxes.py"
 CORE_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile"
 SLIM_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile.slim"
 HOSTED_DEPLOY_SERVICE = (
@@ -303,6 +307,71 @@ def test_hosted_deploy_pins_aidream_source_before_long_build():
     assert '--source-sha "$AIDREAM_SOURCE_SHA"' in deploy
     assert '--source-sha) SOURCE_SHA="$2"' in builder
     assert 'archive --format=tar "$SOURCE_REF"' in builder
+
+
+def test_aidream_builder_and_autostart_require_exact_full_source_sha():
+    builder = AIDREAM_BUILDER.read_text(encoding="utf-8")
+    entrypoint = AIDREAM_ENTRYPOINT.read_text(encoding="utf-8")
+    routes = SANDBOX_ROUTES.read_text(encoding="utf-8")
+
+    assert '--build-arg AIDREAM_GIT_SHA="$AIDREAM_FULL_SHA"' in builder
+    assert 'git fetch -q --depth=1 "$AIDREAM_SRC" "$AIDREAM_FULL_SHA"' in builder
+    assert 'test "$(git rev-parse HEAD)" = "$AIDREAM_FULL_SHA"' in builder
+    assert 'IMAGE_AIDREAM_SHA=$(docker image inspect' in builder
+    assert "--require-image-source" in entrypoint
+    assert '"verify-release"' in routes
+    assert '"aidream_source_exact": aidream_source' in routes
+    assert 'aidream_source.get("ok")' in routes
+
+
+def test_aidream_release_source_verifier_rejects_dirty_and_wrong_sha(tmp_path: Path):
+    workdir = tmp_path / "aidream"
+    workdir.mkdir()
+    _git(workdir, "init", "-b", "main")
+    _git(workdir, "config", "user.email", "release-test@example.com")
+    _git(workdir, "config", "user.name", "Release Test")
+    tracked = workdir / "release.txt"
+    tracked.write_text("exact\n", encoding="utf-8")
+    _git(workdir, "add", "release.txt")
+    _git(workdir, "commit", "-m", "exact source")
+    exact_sha = _git(workdir, "rev-parse", "HEAD")
+    sha_file = tmp_path / "aidream-image-sha"
+    sha_file.write_text(f"{exact_sha}\n", encoding="utf-8")
+    env = {
+        **os.environ,
+        "AIDREAM_WORK_DIR": str(workdir),
+        "AIDREAM_IMAGE_SHA_FILE": str(sha_file),
+    }
+
+    exact = subprocess.run(
+        [str(AIDREAM_HELPER), "verify-release"],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert exact.returncode == 0, exact.stderr
+    assert f"source_state=exact expected={exact_sha} actual={exact_sha}" in exact.stdout
+
+    tracked.write_text("modified\n", encoding="utf-8")
+    dirty = subprocess.run(
+        [str(AIDREAM_HELPER), "verify-release"],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert dirty.returncode != 0
+    assert "source_state=modified" in dirty.stderr
+
+    _git(workdir, "restore", "release.txt")
+    sha_file.write_text(f"{'0' * 40}\n", encoding="utf-8")
+    mismatch = subprocess.run(
+        [str(AIDREAM_HELPER), "verify-release"],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert mismatch.returncode != 0
+    assert "source_state=sha-mismatch" in mismatch.stderr
 
 
 def test_workflows_pin_uv_version_on_the_uv_action_only():

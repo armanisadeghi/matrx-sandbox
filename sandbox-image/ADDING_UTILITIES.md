@@ -13,6 +13,15 @@ namespace smoke test and refuses execution if isolation is unavailable. Do not
 move these tools into another image or service: managed Claude runs inside the
 existing aidream variant.
 
+Release builds also pin the exact full aidream commit in the image label and
+root-owned `/etc/aidream-image-sha`. The staged checkout keeps that real commit
+as `HEAD` (never a synthetic build commit). Managed autostart calls
+`mtx aidream serve --require-image-source`, which fails closed unless the
+persistent working copy is clean and exactly matches the baked SHA. Operator
+diagnostics expose the same check as `aidream_source_exact`; a stale or modified
+working copy can still be edited and served manually, but cannot be certified as
+the managed release runtime.
+
 ## Quick Reference
 
 | Type | Location | Available in Container At |

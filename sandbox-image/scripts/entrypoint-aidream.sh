@@ -68,7 +68,8 @@ fi
 log "auto-starting aidream FastAPI on :8001 in the background"
 (
     sleep 8
-    sudo -u agent -E -H bash -lc '/usr/local/bin/mtx aidream serve --port 8001' \
+    sudo -u agent -E -H bash -lc \
+        '/usr/local/bin/mtx aidream serve --port 8001 --require-image-source' \
         > /var/log/sandbox/aidream-autostart.log 2>&1 || true
 ) &
 disown || true
