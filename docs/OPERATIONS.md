@@ -88,6 +88,18 @@ Aidream candidates are staged from the immutable source SHA resolved before
 the build starts. A newer Aidream push may queue a later rebuild, but it cannot
 change or invalidate the source underneath an active long-running build.
 
+**The aidream variant's source tree is byte-exact and nothing may prune it.**
+The image certifies its own runtime source: `/etc/aidream-image-sha` must equal
+`git -C /opt/aidream-template rev-parse HEAD` with a clean `git status`
+(`mtx aidream verify-release`, asserted during the build and before managed
+autostart). So neither `build-aidream.sh` nor `Dockerfile.aidream` may delete or
+edit a tracked file — `git archive` already stages tracked files only. Deleting
+"heavy" tracked dirs (`knowledgebase/`, `.claude/`, `tmp/`, …) to save ~6 MB of
+a multi-GB image is what wedged the hosted deploy poller for 20 h on
+2026-08-11: every 2-min run died at `[build-aidream] exact source commit
+staging failed`, so `matrx-sandbox:aidream` went missing and the release stalled
+at the previous SHA. Both failure messages now list the offending paths.
+
 Both CI and Deploy test checkouts fetch full Git history because the release
 hardening suite archives the exact legacy EC2 source SHAs. A shallow checkout
 cannot validate that recovery path and will fail before the sandbox SDK suite.
@@ -312,6 +324,8 @@ Recovery via Session Manager (no SSH needed):
 5. Re-trigger: `gh workflow run deploy.yml --repo armanisadeghi/matrx-sandbox` (run from anywhere with `gh` auth).
 
 The deploy pipeline prunes dangling images before each pull and removes pulled candidate aliases after a verified release. If disk pressure persists, investigate the SSM output and ECR/Docker retention instead of deleting live or rollback tags.
+
+Since 2026‑08‑11 `scripts/deploy-ec2.sh` also **reclaims leaked per‑SHA candidates** (`<ecr>:<sha>`, `:slim-<sha>`, `-orchestrator:<sha>` from earlier releases) before pulling, deletes them on the failure path too, and **refuses to start** with `[deploy-ec2] ERROR: only N MiB free …` plus `df`/`docker system df` output when under 10 GiB. That replaced the old failure mode: a failed release leaked ~4 GB of tags, and the next deploys died mid‑pull with the unreadable `register layer` error — which is exactly how EC2 fell three releases behind on 2026‑08‑09 and 2026‑08‑11. A disk‑full deploy now names the disk in the first error line.
 
 ### 2. Orchestrator code on EC2 is stale even though deploy "succeeded"
 

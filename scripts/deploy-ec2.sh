@@ -74,7 +74,42 @@ STORE=$(resolve_setting MATRX_SANDBOX_STORE)
 [ "$STORE" = "postgres" ] \
   || fail "MATRX_SANDBOX_STORE is '${STORE:-unset}'; a deployed orchestrator must set it to 'postgres' (in-memory loses every sandbox row on restart)"
 
+# Immutable per-SHA tags are deleted at the end of a SUCCESSFUL release, so a
+# failed one leaks ~4 GB of them. A few bad releases fill the 50 GB root volume
+# and every later deploy dies inside `docker pull` with the useless "failed to
+# register layer: no space left on device" (2026-08-09 and 2026-08-11 both died
+# this way, leaving EC2 three releases behind). Reclaim leaked candidates
+# first, then refuse to start — loudly, naming the disk — rather than dying
+# halfway through a pull.
+cleanup_candidate_images() {
+  docker image rm \
+    "$ECR_REPO:$TARGET_SHA" \
+    "$ECR_REPO:slim-$TARGET_SHA" \
+    "$ECR_REPO-orchestrator:$TARGET_SHA" >/dev/null 2>&1 || true
+}
+
+log "reclaiming disk from previous releases"
+docker images --format '{{.Repository}}:{{.Tag}}' \
+  | grep -E "^${ECR_REPO}(-orchestrator)?:(slim-)?[0-9a-f]{40}$" \
+  | grep -v ":\(slim-\)\?$TARGET_SHA\$" \
+  | while read -r leaked; do
+      log "removing leaked release candidate $leaked"
+      docker image rm "$leaked" >/dev/null 2>&1 || true
+    done
+docker image prune -f >/dev/null 2>&1 || true
+docker builder prune -f >/dev/null 2>&1 || true
+
+REQUIRED_FREE_KB=$((10 * 1024 * 1024))   # 10 GiB — the three pulls land ~5 GiB
+FREE_KB=$(df -Pk /var/lib/docker | awk 'NR==2 {print $4}')
+if [ "${FREE_KB:-0}" -lt "$REQUIRED_FREE_KB" ]; then
+  df -h /var/lib/docker >&2
+  docker system df >&2 || true
+  fail "only $((FREE_KB / 1024)) MiB free on the Docker filesystem, need $((REQUIRED_FREE_KB / 1024)) MiB — release $TARGET_SHA not attempted; free space on the EC2 box and re-run the Deploy workflow"
+fi
+log "disk ok: $((FREE_KB / 1024)) MiB free"
+
 log "pulling immutable image candidates"
+trap 'cleanup_candidate_images' ERR INT TERM
 docker pull "$ECR_REPO:$TARGET_SHA"
 docker pull "$ECR_REPO:slim-$TARGET_SHA"
 docker pull "$ECR_REPO-orchestrator:$TARGET_SHA"
@@ -134,6 +169,9 @@ rollback() {
     fi
   fi
   systemctl start "$UNIT" || true
+  # Never leave the per-SHA candidates behind: a failed release that keeps
+  # them is what filled the root volume and blocked the next three deploys.
+  cleanup_candidate_images
 }
 trap 'rollback' ERR INT TERM
 
