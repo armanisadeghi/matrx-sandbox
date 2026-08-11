@@ -4,8 +4,9 @@
 # Why this script exists:
 #   docker COPY only sees the build context, so we have to stage aidream's
 #   source into the sandbox-image/ directory under aidream-src/. This script
-#   does that with rsync + the targeted .dockerignore.aidream, captures the
-#   git SHA, runs the build, and cleans up.
+#   does that with `git archive` at the exact release commit (tracked files
+#   only), seeds a .git whose HEAD IS that commit so the image can certify its
+#   own runtime source, runs the build, and cleans up.
 #
 # Usage:
 #   ./build-aidream.sh [/path/to/aidream]      # default: /srv/projects/aidream
@@ -93,25 +94,47 @@ mkdir -p "$STAGE_DIR"
 # Untracked junk (__pycache__, node_modules, .venv, .env) never ships because
 # archive only emits tracked files.
 git -C "$AIDREAM_SRC" archive --format=tar "$SOURCE_REF" | tar -x -C "$STAGE_DIR"
-# Tracked-but-heavy dirs the sandbox variant doesn't need:
-rm -rf "$STAGE_DIR/dashboard" "$STAGE_DIR/workflow-studio" "$STAGE_DIR/knowledgebase" \
-       "$STAGE_DIR/.cursor" "$STAGE_DIR/.claude" "$STAGE_DIR/.agent" "$STAGE_DIR/.arman" "$STAGE_DIR/.treasure-maps"
+
+# DO NOT delete tracked paths from the staged tree (this used to strip
+# knowledgebase/, .claude/, .arman/, tmp/, … to save ~6 MB of a multi-GB
+# image). Since 76ea81c the image certifies its runtime source: the staged
+# tree must be a byte-exact checkout of $AIDREAM_FULL_SHA, so any deleted
+# tracked file makes `git status` dirty forever — which is exactly what
+# wedged the hosted deploy poller for 20 h on 2026-08-11 (every run failed at
+# "exact source commit staging failed"). Exactness beats 6 MB. `git archive`
+# emits tracked files only, so there is no untracked junk to prune either.
 
 # Keep the real immutable source commit as HEAD. A synthetic staging commit
 # makes runtime/source certification impossible even when every file matches.
 echo "[build-aidream] adding exact source commit for runtime certification"
-(
-    cd "$STAGE_DIR"
-    if [ -d "$AIDREAM_SRC/.git" ]; then
-        git init -q
-        git remote add origin "$(git -C "$AIDREAM_SRC" remote get-url origin 2>/dev/null || echo '')"
-        git fetch -q --depth=1 "$AIDREAM_SRC" "$AIDREAM_FULL_SHA"
-        git reset -q --mixed FETCH_HEAD
-        git branch -M main
-        test "$(git rev-parse HEAD)" = "$AIDREAM_FULL_SHA"
-        git diff --quiet
-    fi
-) || {
+stage_exact_commit() {
+    cd "$STAGE_DIR" || return 1
+    [ -d "$AIDREAM_SRC/.git" ] || return 0
+    local step
+    for step in \
+        "git init -q" \
+        "git remote add origin $(git -C "$AIDREAM_SRC" remote get-url origin 2>/dev/null || echo '')" \
+        "git fetch -q --depth=1 $AIDREAM_SRC $AIDREAM_FULL_SHA" \
+        "git reset -q --mixed FETCH_HEAD" \
+        "git branch -M main"
+    do
+        eval "$step" || { echo "[build-aidream] staging step failed: $step" >&2; return 1; }
+    done
+    local head
+    head=$(git rev-parse HEAD)
+    [ "$head" = "$AIDREAM_FULL_SHA" ] || {
+        echo "[build-aidream] staged HEAD $head != source $AIDREAM_FULL_SHA" >&2
+        return 1
+    }
+    # Loud, not silent: name the files that broke exactness. A `git diff
+    # --quiet` that only says "failed" cost a full day of blind retries.
+    git diff --quiet && return 0
+    echo "[build-aidream] staged tree differs from $AIDREAM_FULL_SHA — first 20 paths:" >&2
+    git diff --name-status | head -20 >&2
+    echo "[build-aidream] (nothing may delete or modify tracked files in $STAGE_DIR)" >&2
+    return 1
+}
+( stage_exact_commit ) || {
     echo "[build-aidream] exact source commit staging failed" >&2
     exit 1
 }

@@ -94,20 +94,17 @@ RUN mkdir -p "$AIDREAM_TEMPLATE_DIR"
 # is harmless. Once seeded, `python -c "import matrx_ai"` just works.
 ENV PATH="/home/agent/aidream/.venv/bin:${PATH}"
 
-# Copy aidream source. .dockerignore-equivalent omissions (dashboard, studio,
-# .git, knowledgebase, tmp, etc.) are listed in sandbox-image/.dockerignore.aidream
-# which docker buildx can pick up via --file. We can't reference an alternate
-# .dockerignore from this Dockerfile alone, so we copy then prune.
+# Copy aidream source. build-aidream.sh stages ./aidream-src/ with `git
+# archive` at the exact release commit, plus a real .git whose HEAD is that
+# commit — tracked files only, so there is no junk to prune.
+#
+# NOTHING may delete or edit a tracked file here. The image certifies its own
+# runtime source (`mtx aidream verify-release` requires HEAD == the baked SHA
+# AND a clean `git status`), so pruning even a few MB of tracked paths makes
+# every sandbox permanently "modified" and fails the build's own verification
+# step. This is why the old `rm -rf dashboard workflow-studio knowledgebase
+# tmp .claude …` RUN is gone: exactness beats 6 MB.
 COPY --chown=agent:agent ./aidream-src/ ${AIDREAM_TEMPLATE_DIR}/
-
-# Drop the things the sandbox doesn't need (Vite frontends, node_modules if any
-# leaked through, OS junk). Saves ~3 MB but mostly improves clarity.
-RUN cd "$AIDREAM_TEMPLATE_DIR" \
-    && rm -rf dashboard workflow-studio knowledgebase tmp .DS_Store \
-    .agent .arman .claude .cursor .treasure-maps \
-    && find . -name "__pycache__" -type d -prune -exec rm -rf {} + \
-    && find . -name "*.pyc" -delete \
-    && find . -name ".DS_Store" -delete
 
 # Pre-resolve a venv at /opt/aidream-template/.venv using uv. This is the
 # expensive step (~3-6 GB of wheels). We do it ONCE at image build time so

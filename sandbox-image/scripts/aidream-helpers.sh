@@ -66,7 +66,11 @@ verify_release_source() {
         return 1
     fi
     if [ -n "$dirty" ]; then
+        # Name the offending paths. A bare "modified" sent a full day of
+        # hosted deploys into blind retries on 2026-08-11 — the image build was
+        # deleting tracked dirs from the very tree it then certified.
         echo "source_state=modified expected=$expected actual=$actual" >&2
+        echo "$dirty" | head -20 >&2
         return 1
     fi
     echo "source_state=exact expected=$expected actual=$actual"
