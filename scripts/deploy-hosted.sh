@@ -36,8 +36,24 @@ ORCH_HEALTH_URL="${ORCH_HEALTH_URL:-https://orchestrator.dev.codematrx.com/healt
 ORCH_IMAGE="matrx-orchestrator:latest"
 MAX_IMAGE_AGE_SECONDS="${MAX_IMAGE_AGE_SECONDS:-1209600}" # 14 days; matches Fleet Health
 
+# Why a failure file: Fleet Health could see the poller was stuck but not WHY,
+# so its only advice was "ssh in and read journalctl". A 20 h wedge on
+# 2026-08-11 went undiagnosed that way. Every fail() now records the reason
+# beside the deploy state, where the Manager reads it into the dashboard; a
+# successful release clears it.
+FAILURE_FILE="${DEPLOY_FAILURE_FILE:-/srv/apps/deploy-state/matrx-sandbox.last-failure.json}"
+json_escape() { printf '%s' "$1" | sed 's/\\/\\\\/g; s/"/\\"/g; s/\t/ /g'; }
+record_failure() {
+  mkdir -p "$(dirname "$FAILURE_FILE")" 2>/dev/null || true
+  printf '{"sha":"%s","at":"%s","reason":"%s"}\n' \
+    "$(json_escape "${TARGET_SHA:-unknown}")" \
+    "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+    "$(json_escape "$1")" > "$FAILURE_FILE" 2>/dev/null || true
+}
+clear_failure() { rm -f "$FAILURE_FILE" 2>/dev/null || true; }
+
 log()  { echo "[deploy-hosted] $*"; }
-fail() { echo "[deploy-hosted] ERROR: $*" >&2; exit 1; }
+fail() { echo "[deploy-hosted] ERROR: $*" >&2; record_failure "$*"; exit 1; }
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/release-guard.sh
 source "$SCRIPT_DIR/lib/release-guard.sh" \
@@ -565,5 +581,6 @@ printf '%s\n' "$NEW_SHA" > "$STATE_TMP" \
 PROMOTION_ACTIVE=0
 ORCH_STOPPED=0
 clear_all_build_markers
+clear_failure
 trap - EXIT INT TERM
 log "hosted-tier deploy complete at $NEW_SHA"
