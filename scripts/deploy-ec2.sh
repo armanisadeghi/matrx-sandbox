@@ -89,24 +89,35 @@ cleanup_candidate_images() {
 }
 
 log "reclaiming disk from previous releases"
-docker images --format '{{.Repository}}:{{.Tag}}' \
+# `|| true` matters: under `set -o pipefail` a grep that matches nothing — the
+# normal, healthy case where no candidates leaked — fails the pipeline and
+# would abort the release before it starts. Nothing to reclaim is success.
+LEAKED=$(docker images --format '{{.Repository}}:{{.Tag}}' \
   | grep -E "^${ECR_REPO}(-orchestrator)?:(slim-)?[0-9a-f]{40}$" \
-  | grep -v ":\(slim-\)\?$TARGET_SHA\$" \
-  | while read -r leaked; do
-      log "removing leaked release candidate $leaked"
-      docker image rm "$leaked" >/dev/null 2>&1 || true
-    done
+  | grep -v ":\(slim-\)\?$TARGET_SHA\$" || true)
+for leaked in $LEAKED; do
+  log "removing leaked release candidate $leaked"
+  docker image rm "$leaked" >/dev/null 2>&1 || true
+done
 docker image prune -f >/dev/null 2>&1 || true
 docker builder prune -f >/dev/null 2>&1 || true
 
 REQUIRED_FREE_KB=$((10 * 1024 * 1024))   # 10 GiB — the three pulls land ~5 GiB
-FREE_KB=$(df -Pk /var/lib/docker | awk 'NR==2 {print $4}')
-if [ "${FREE_KB:-0}" -lt "$REQUIRED_FREE_KB" ]; then
-  df -h /var/lib/docker >&2
+# Ask Docker where its data actually lives, and never let the guard itself be
+# the thing that fails a release: an unreadable path falls back to /.
+DOCKER_ROOT=$(docker info --format '{{.DockerRootDir}}' 2>/dev/null || echo /var/lib/docker)
+[ -d "$DOCKER_ROOT" ] || DOCKER_ROOT=/
+FREE_KB=$(df -Pk "$DOCKER_ROOT" 2>/dev/null | awk 'NR==2 {print $4}')
+if [ -n "${FREE_KB:-}" ] && [ "$FREE_KB" -lt "$REQUIRED_FREE_KB" ]; then
+  df -h "$DOCKER_ROOT" >&2
   docker system df >&2 || true
   fail "only $((FREE_KB / 1024)) MiB free on the Docker filesystem, need $((REQUIRED_FREE_KB / 1024)) MiB — release $TARGET_SHA not attempted; free space on the EC2 box and re-run the Deploy workflow"
 fi
-log "disk ok: $((FREE_KB / 1024)) MiB free"
+if [ -n "${FREE_KB:-}" ]; then
+  log "disk ok: $((FREE_KB / 1024)) MiB free on $DOCKER_ROOT"
+else
+  log "WARNING: could not read free space for $DOCKER_ROOT — proceeding unguarded"
+fi
 
 log "pulling immutable image candidates"
 trap 'cleanup_candidate_images' ERR INT TERM
