@@ -143,6 +143,13 @@ chown -R ec2-user:ec2-user "$CANDIDATE_DIR"
 sudo -u ec2-user /usr/bin/python3.11 -m pip install --user --quiet "uv==$UV_VERSION"
 sudo -u ec2-user env PATH="/home/ec2-user/.local/bin:$PATH" \
   uv sync --directory "$CANDIDATE_DIR" --locked --no-dev --python /usr/bin/python3.11
+# The venv is built at $CANDIDATE_DIR and then MOVED to $LIVE_DIR, so anything
+# that hardcodes the build path breaks on arrival. Prove the one entry point
+# the unit actually uses survives that move; console scripts do not (their
+# shebang is the absolute candidate path), which is why the drop-in below
+# execs `python -m uvicorn` instead of `.venv/bin/uvicorn`.
+sudo -u ec2-user "$CANDIDATE_DIR/.venv/bin/python" -m uvicorn --version >/dev/null \
+  || fail "candidate venv cannot run 'python -m uvicorn' — refusing to promote a release that cannot boot"
 
 log "applying required migrations before promotion"
 validate_release_authority
@@ -183,6 +190,14 @@ rollback() {
   # Never leave the per-SHA candidates behind: a failed release that keeps
   # them is what filled the root volume and blocked the next three deploys.
   cleanup_candidate_images
+  # EXIT, do not return. This handler starts with `trap - ERR` + `set +e`, so
+  # returning resumed the script right after the failing statement with -e
+  # disabled: it walked into the success epilogue, deleted the failed-release
+  # directory, logged "release … is healthy and exact" and exited 0. A
+  # rolled-back release was reported to GitHub as a SUCCESSFUL deploy while
+  # EC2 kept serving the old revision — observed on b7d131e, 2026-08-11.
+  log "release $TARGET_SHA FAILED and was rolled back"
+  exit 1
 }
 trap 'rollback' ERR INT TERM
 
@@ -221,11 +236,22 @@ if [ -r "$RELEASE_DROPIN" ]; then
   cp -a "$RELEASE_DROPIN" "$DROPIN_BACKUP"
 fi
 DROPIN_CHANGED=1
+# `python -m uvicorn`, NOT `.venv/bin/uvicorn`. uv writes console scripts with
+# a shebang pointing at the absolute path the venv was BUILT at
+# (/home/ec2-user/orchestrator-candidate-<sha>/.venv/bin/python), and this
+# release moves that directory to /home/ec2-user/orchestrator — so the script
+# is unrunnable the moment it goes live: systemd reports 203/EXEC "Failed to
+# execute .../.venv/bin/uvicorn: No such file or directory" and crashloops,
+# the contract assertion below times out, and the release rolls back. That is
+# what pinned EC2 on f229d4b (a pre-atomic-deploy revision) for weeks.
+# `.venv/bin/python` is a symlink to /usr/bin/python3.11, so it survives the
+# move and resolves the venv from its own pyvenv.cfg. Verified on the box:
+# after mv, the console script exits 127 while `python -m uvicorn` runs.
 cat > "$RELEASE_DROPIN" <<'EOF'
 [Service]
 WorkingDirectory=/home/ec2-user/orchestrator
 ExecStart=
-ExecStart=/home/ec2-user/orchestrator/.venv/bin/uvicorn orchestrator.main:app --host 0.0.0.0 --port 8000 --workers 1
+ExecStart=/home/ec2-user/orchestrator/.venv/bin/python -m uvicorn orchestrator.main:app --host 0.0.0.0 --port 8000 --workers 1
 EOF
 systemctl daemon-reload
 systemctl start "$UNIT"
@@ -248,7 +274,23 @@ PY
   then verified=1; break; fi
   sleep 2
 done
-[ "$verified" = 1 ] || false
+if [ "$verified" != 1 ]; then
+  # Say WHY before rolling back. This used to be a bare `|| false`, so a
+  # release that never booted produced no diagnosis at all — the SSM log
+  # jumped straight from "asserting contract" to "rolling back", and the
+  # actual cause (systemd 203/EXEC on a relocated venv) was only visible in
+  # the box's journal, which nobody reads when the workflow says success.
+  echo "[deploy-ec2] contract assertion FAILED for $TARGET_SHA after 60s" >&2
+  systemctl status "$UNIT" --no-pager -l 2>&1 | head -20 >&2
+  journalctl -u "$UNIT" -n 30 --no-pager 2>&1 | tail -30 >&2
+  echo "[deploy-ec2] last /api-surface payload: ${payload:-<no response>}" | head -c 2000 >&2
+  echo >&2
+  echo "[deploy-ec2] ERROR: release $TARGET_SHA did not come up healthy and exact" >&2
+  # Call rollback directly — do NOT use fail() here. `exit` does not fire the
+  # ERR trap, so fail() would leave the broken release LIVE and un-rolled-back.
+  # rollback() restores the previous release and exits non-zero itself.
+  rollback
+fi
 
 trap - ERR INT TERM
 rm -rf "$FAILED_DIR" "$DROPIN_BACKUP"
