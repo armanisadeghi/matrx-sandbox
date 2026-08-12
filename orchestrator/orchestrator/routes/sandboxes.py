@@ -1624,6 +1624,7 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
                     stdout=True,
                     stderr=True,
                     user="agent",
+                    environment={"AIDREAM_WORK_DIR": "/opt/aidream-template"},
                 )
             )
             source_text = (

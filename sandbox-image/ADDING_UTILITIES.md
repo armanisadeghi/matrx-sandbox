@@ -17,10 +17,26 @@ Release builds also pin the exact full aidream commit in the image label and
 root-owned `/etc/aidream-image-sha`. The staged checkout keeps that real commit
 as `HEAD` (never a synthetic build commit). Managed autostart calls
 `mtx aidream serve --require-image-source`, which fails closed unless the
-persistent working copy is clean and exactly matches the baked SHA. Operator
-diagnostics expose the same check as `aidream_source_exact`; a stale or modified
-working copy can still be edited and served manually, but cannot be certified as
-the managed release runtime.
+immutable `/opt/aidream-template` checkout is clean and exactly matches the
+baked SHA. Managed autostart always serves that certified template. The durable
+`/home/agent/aidream` checkout remains the user's editable worktree and is never
+reset or deleted to start the API; it can be older, newer, or dirty without
+changing the managed server revision. `mtx aidream` commands still target the
+editable checkout by default. Operator diagnostics run `aidream_source_exact`
+against the immutable template, matching the process they health-check on
+port 8001 rather than producing false drift from the user's worktree. The
+hosted aidream container uses a Docker-enforced read-only root filesystem and
+drops `SYS_ADMIN` plus `/dev/fuse`; sudo inside the sandbox cannot remount,
+bind-shadow, or write the template/venv. EC2 does not autostart this managed
+API. Managed autostart
+first proves the mount is read-only, then executes the root-owned helper with
+an inert ephemeral home, fixed source/stamp paths, `/dev/null` global Git
+config, and a fixed privileged-mode Bash that ignores exported functions and
+profiles. Injection-sensitive shell, Python,
+Git, loader, venv, and uv variables are removed before dispatch, and managed
+serve uses the template venv's Python in isolated mode. Exact verification
+rejects untracked tampering. Only the user home and explicit runtime tmpfs/log
+paths remain writable.
 
 ## Quick Reference
 

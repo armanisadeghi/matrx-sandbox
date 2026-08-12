@@ -19,6 +19,7 @@ import docker
 from docker.errors import DockerException, NotFound, APIError
 
 from orchestrator.config import settings
+from orchestrator.runtime_isolation import container_runtime_isolation
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.storage_layout import (
     StorageLocation,
@@ -619,15 +620,12 @@ async def create_sandbox(
             detach=True,
             environment=env,
             volumes=volumes or None,
+            **container_runtime_isolation(template, location.tier),
             # Resource constraints
             cpu_period=100000,
             cpu_quota=int(cpu_limit * 100000),
             mem_limit=memory_limit,
             # FUSE requires SYS_ADMIN capability and /dev/fuse access
-            cap_add=["SYS_ADMIN"],
-            devices=["/dev/fuse"],
-            # No capability drops — the container IS the security boundary
-            cap_drop=[],
             # Expose SSH (port 22) on a dynamic host port
             ports={"22/tcp": None},
             # Networking

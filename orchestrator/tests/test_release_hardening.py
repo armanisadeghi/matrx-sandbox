@@ -16,6 +16,7 @@ HOSTED_DEPLOY = REPO_ROOT / "scripts" / "deploy-hosted.sh"
 AIDREAM_BUILDER = REPO_ROOT / "sandbox-image" / "build-aidream.sh"
 AIDREAM_HELPER = REPO_ROOT / "sandbox-image" / "scripts" / "aidream-helpers.sh"
 AIDREAM_ENTRYPOINT = REPO_ROOT / "sandbox-image" / "scripts" / "entrypoint-aidream.sh"
+AIDREAM_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile.aidream"
 SANDBOX_ROUTES = REPO_ROOT / "orchestrator" / "orchestrator" / "routes" / "sandboxes.py"
 CORE_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile"
 SLIM_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile.slim"
@@ -320,8 +321,119 @@ def test_aidream_builder_and_autostart_require_exact_full_source_sha():
     assert 'IMAGE_AIDREAM_SHA=$(docker image inspect' in builder
     assert "--require-image-source" in entrypoint
     assert '"verify-release"' in routes
+    assert 'environment={"AIDREAM_WORK_DIR": "/opt/aidream-template"}' in routes
     assert '"aidream_source_exact": aidream_source' in routes
     assert 'aidream_source.get("ok")' in routes
+
+
+def test_aidream_autostart_uses_immutable_template_without_resetting_user_work():
+    entrypoint = AIDREAM_ENTRYPOINT.read_text(encoding="utf-8")
+    dockerfile = AIDREAM_DOCKERFILE.read_text(encoding="utf-8")
+    autostart = entrypoint[entrypoint.index('log "auto-starting aidream') :]
+
+    assert 'AIDREAM_WORK_DIR="$TEMPLATE_DIR"' in autostart
+    assert "/bin/bash --noprofile --norc -p" in autostart
+    assert "/opt/sandbox/scripts/aidream-helpers.sh serve" in autostart
+    assert "bash -lc" not in autostart
+    assert "bash -c" not in autostart
+    assert "-u BASH_ENV -u ENV" in autostart
+    assert "-u PYTHONHOME -u PYTHONPATH -u PYTHONSTARTUP" in autostart
+    assert "-u LD_PRELOAD -u LD_LIBRARY_PATH" in autostart
+    assert "-u GIT_CONFIG_SYSTEM -u GIT_CONFIG_NOSYSTEM" in autostart
+    assert "-u VIRTUAL_ENV -u UV_PROJECT_ENVIRONMENT -u UV_PYTHON" in autostart
+    assert 'PATH="$TEMPLATE_DIR/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' in autostart
+    assert 'AIDREAM_TEMPLATE_DIR="$TEMPLATE_DIR"' in autostart
+    assert "AIDREAM_IMAGE_SHA_FILE=/etc/aidream-image-sha" in autostart
+    assert "HOME=/run/aidream-managed-home" in autostart
+    assert "GIT_CONFIG_GLOBAL=/dev/null" in autostart
+    assert "PYTHONNOUSERSITE=1" in autostart
+    assert "PYTHONDONTWRITEBYTECODE=1" in autostart
+    assert "template_mount_is_read_only" in entrypoint
+    assert '[[ ",$options," == *,ro,* ]]' in entrypoint
+    assert "refusing managed aidream autostart" in entrypoint
+    assert 'export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' in entrypoint
+    assert '/usr/bin/findmnt -n -o OPTIONS -T "$TEMPLATE_DIR"' in entrypoint
+    assert "/usr/bin/sudo -u agent -E -H /usr/bin/env" in entrypoint
+    assert "/bin/sleep 8" in entrypoint
+    assert '[ "${MATRX_TIER:-}" = "hosted" ]' in entrypoint
+    assert "Claude managed runtime is hosted-only" in entrypoint
+    assert "--require-image-source" in autostart
+    assert 'rm -rf "$WORK_DIR"' not in entrypoint
+    assert 'found existing $WORK_DIR — preserving user state' in entrypoint
+    assert "COPY --chown=root:root ./aidream-src/" in dockerfile
+    assert 'chown -R root:root "${AIDREAM_TEMPLATE_DIR}"' in dockerfile
+    assert 'chmod -R a-w "${AIDREAM_TEMPLATE_DIR}"' in dockerfile
+    assert 'git config --system --add safe.directory "${AIDREAM_TEMPLATE_DIR}"' in dockerfile
+    assert "mkdir -p /var/log/aidream" in dockerfile
+    assert "chown agent:agent /var/log/aidream" in dockerfile
+
+
+def test_aidream_build_proves_agent_cannot_mutate_certified_runtime():
+    builder = AIDREAM_BUILDER.read_text(encoding="utf-8")
+
+    assert "docker run --rm --read-only" in builder
+    assert "findmnt -n -o OPTIONS -T /opt/aidream-template" in builder
+    assert "test ! -w /opt/aidream-template" in builder
+    assert "test ! -w /opt/aidream-template/pyproject.toml" in builder
+    assert "test ! -w /opt/aidream-template/.venv" in builder
+    assert "sudo -u agent sudo touch /opt/aidream-template/.sudo-write-probe" in builder
+    assert "sudo -u agent sudo touch /opt/aidream-template/.venv/.sudo-write-probe" in builder
+    assert "sudo /bin/mount -o remount,rw /" in builder
+    assert "sudo /bin/mount --bind /home/agent/aidream /opt/aidream-template" in builder
+    assert "AIDREAM_WORK_DIR=/opt/aidream-template" in builder
+    assert "aidream-helpers.sh verify-release" in builder
+    assert "touch /var/log/aidream/.agent-log-probe" in builder
+    assert "sitecustomize.py" in builder
+    assert "fsmonitor = !touch /tmp/gitconfig-ran" in builder
+    assert "test ! -e /tmp/sitecustomize-ran" in builder
+    assert "test ! -e /tmp/gitconfig-ran" in builder
+    assert "for shim in findmnt sudo env sleep bash" in builder
+    assert 'compgen -G "/tmp/shim-*-ran"' in builder
+
+
+def test_aidream_autostart_cannot_source_malicious_agent_profiles():
+    entrypoint = AIDREAM_ENTRYPOINT.read_text(encoding="utf-8")
+    autostart = entrypoint[entrypoint.index('log "auto-starting aidream') :]
+
+    # A malicious ~/.bash_profile, ~/.profile, ~/.bashrc, or BASH_ENV cannot
+    # execute because managed autostart invokes the root-owned command
+    # directly rather than starting any shell, and strips shell hooks before
+    # dispatch. The explicit PATH also cannot be replaced by a user profile.
+    assert "bash -l" not in autostart
+    assert "bash -c" not in autostart
+    assert ".bash_profile" not in autostart
+    assert ".bashrc" not in autostart
+    assert "/bin/bash --noprofile --norc -p" in autostart
+    assert "/opt/sandbox/scripts/aidream-helpers.sh serve" in autostart
+    assert "-u BASH_ENV -u ENV" in autostart
+    assert 'PATH="$TEMPLATE_DIR/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"' in autostart
+
+
+def test_managed_aidream_uses_fixed_venv_without_uv_mutation():
+    helper = AIDREAM_HELPER.read_text(encoding="utf-8")
+
+    assert 'if [ "$require_image_source" -eq 1 ]' in helper
+    assert 'nohup "$WORK_DIR/.venv/bin/python" -I run.py' in helper
+    assert "PYTHONDONTWRITEBYTECODE=1" in helper
+
+
+def test_exact_release_verifier_rejects_untracked_tampering():
+    helper = AIDREAM_HELPER.read_text(encoding="utf-8")
+
+    assert "status --porcelain --untracked-files=all" in helper
+
+
+def test_every_aidream_container_path_uses_shared_isolation_and_readiness():
+    manager = (REPO_ROOT / "orchestrator/orchestrator/sandbox_manager.py").read_text()
+    migrate = (REPO_ROOT / "orchestrator/orchestrator/migrate.py").read_text()
+    pool = (REPO_ROOT / "orchestrator/orchestrator/pool.py").read_text()
+
+    assert "**container_runtime_isolation(template, location.tier)" in manager
+    assert migrate.count("run_kwargs.update(container_runtime_isolation(template, tier))") == 2
+    assert '_wait_container_ready(new, verify_timeout, template)' in migrate
+    assert "http://127.0.0.1:8001/api/health/ready" in migrate
+    assert "aidream-helpers.sh verify-release" in migrate
+    assert "if not warm_pool_supports_template(template)" in pool
 
 
 def test_aidream_release_source_verifier_rejects_dirty_and_wrong_sha(tmp_path: Path):
@@ -363,6 +475,19 @@ def test_aidream_release_source_verifier_rejects_dirty_and_wrong_sha(tmp_path: P
     assert "source_state=modified" in dirty.stderr
 
     _git(workdir, "restore", "release.txt")
+    untracked = workdir / "sitecustomize.py"
+    untracked.write_text("raise RuntimeError('tampered')\n", encoding="utf-8")
+    untracked_result = subprocess.run(
+        [str(AIDREAM_HELPER), "verify-release"],
+        env=env,
+        text=True,
+        capture_output=True,
+    )
+    assert untracked_result.returncode != 0
+    assert "source_state=modified" in untracked_result.stderr
+    assert "sitecustomize.py" in untracked_result.stderr
+
+    untracked.unlink()
     sha_file.write_text(f"{'0' * 40}\n", encoding="utf-8")
     mismatch = subprocess.run(
         [str(AIDREAM_HELPER), "verify-release"],
