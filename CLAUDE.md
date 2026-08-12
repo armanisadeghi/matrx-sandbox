@@ -22,6 +22,7 @@ Already deeply documented. Read the right doc for the question:
 | **Day-to-day operations** (deploy, recovery, monitoring, key rotation) | **[docs/OPERATIONS.md](docs/OPERATIONS.md)** |
 | **User data persistence** (what's saved, where, session-report, auto-stash) | **[docs/PERSISTENCE_PLAN.md](docs/PERSISTENCE_PLAN.md)** |
 | **AI Dream ↔ Sandbox integration** (cloud-files bridge, `mtx` CLI, service-token auth) | **[docs/AIDREAM_INTEGRATION.md](docs/AIDREAM_INTEGRATION.md)** |
+| **AI Work Hub provider runtime product plan** (conversations, launch, requests, skills, associations, automation) | **[/Users/armanisadeghi/code/common-docs/projects/ai-work-hub/PLAN.md](/Users/armanisadeghi/code/common-docs/projects/ai-work-hub/PLAN.md)** |
 | **Zero-drift migration** (version stamping, drift detection, the safe image swap, auto-migrate) | **[docs/ZERO_DRIFT.md](docs/ZERO_DRIFT.md)** |
 | **Live infra dashboard** (recommended first stop) | **`/administration/sandbox-infra`** in matrx-frontend |
 
