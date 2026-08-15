@@ -232,6 +232,10 @@ WS /sandboxes/{id}/pty?cols=120&rows=30
 ```
 
 - Bidirectional. Client sends raw bytes; server emits raw PTY bytes.
+- Text WebSocket frames are terminal input unless they are a recognized JSON
+  control object (`resize` or `signal`). JSON scalar keystrokes such as `2`
+  remain ordinary input; clients may therefore send xterm `onData` strings
+  verbatim without escaping them.
 - Control frames as JSON text: `{ "type": "resize", "cols": 100, "rows": 40 }`, `{ "type": "signal", "name": "SIGINT" }`.
 - Survives a brief disconnect (grace period). vim, nano, htop, REPLs, `git commit` all work.
 

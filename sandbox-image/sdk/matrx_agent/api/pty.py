@@ -15,6 +15,30 @@ from matrx_agent.api import _auth
 
 router = APIRouter()
 
+
+def _write_client_text(fd: int, pid: int, text: str) -> None:
+    """Apply a PTY control frame or write ordinary terminal input verbatim.
+
+    Keystrokes arrive one character at a time.  Some perfectly ordinary input
+    (notably a digit such as ``2``) is also valid JSON, so successful JSON
+    parsing alone cannot distinguish a control frame from terminal input.
+    """
+    try:
+        message = json.loads(text)
+    except json.JSONDecodeError:
+        message = None
+
+    if isinstance(message, dict) and message.get("type") == "resize":
+        set_winsize(fd, message.get("rows", 30), message.get("cols", 120))
+        return
+    if isinstance(message, dict) and message.get("type") == "signal":
+        sig_name = message.get("name")
+        if isinstance(sig_name, str) and hasattr(signal, sig_name):
+            os.kill(pid, getattr(signal, sig_name))
+        return
+
+    os.write(fd, text.encode())
+
 def set_winsize(fd, row, col, xpix=0, ypix=0):
     winsize = struct.pack("HHHH", row, col, xpix, ypix)
     fcntl.ioctl(fd, termios.TIOCSWINSZ, winsize)
@@ -72,20 +96,12 @@ async def pty_endpoint(websocket: WebSocket, cols: int = 120, rows: int = 30):
             try:
                 while True:
                     message = await websocket.receive()
-                    if "text" in message:
-                        try:
-                            msg = json.loads(message["text"])
-                            if msg.get("type") == "resize":
-                                set_winsize(fd, msg.get("rows", 30), msg.get("cols", 120))
-                            elif msg.get("type") == "signal":
-                                sig_name = msg.get("name")
-                                if hasattr(signal, sig_name):
-                                    os.kill(pid, getattr(signal, sig_name))
-                        except json.JSONDecodeError:
-                            # If it's not JSON, maybe it's raw text?
-                            os.write(fd, message["text"].encode())
-                    elif "bytes" in message:
-                        os.write(fd, message["bytes"])
+                    text = message.get("text")
+                    data = message.get("bytes")
+                    if text is not None:
+                        _write_client_text(fd, pid, text)
+                    elif data is not None:
+                        os.write(fd, data)
             except WebSocketDisconnect:
                 pass
             except Exception:
