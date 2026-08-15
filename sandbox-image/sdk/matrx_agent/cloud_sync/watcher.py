@@ -383,7 +383,11 @@ class CloudFilesWatcher:
 
         if not degraded:
             try:
-                self._seed_hashes()
+                # Hashing a persistent cloud-files tree can take minutes and
+                # performs blocking disk reads. Never run that work on the
+                # FastAPI event loop: it would stall PTY handshakes and every
+                # filesystem/exec route in the sandbox daemon.
+                await asyncio.to_thread(self._seed_hashes)
             except Exception as e:  # noqa: BLE001
                 _logger.warning("cloud-files: seed walk failed (continuing): %s", e)
             # Reconcile against cld_files: files in the persistent volume but
@@ -717,7 +721,10 @@ class CloudFilesWatcher:
 
                 # Pre-send hash short-circuit (A5: don't even hit the bridge if
                 # local content matches what we last uploaded).
-                new_hash = self._sha256(local)
+                # Files may be as large as the 1 GiB sync cap. Hashing them on
+                # the event loop makes unrelated PTY/WebSocket traffic appear
+                # to connect and then die under load.
+                new_hash = await asyncio.to_thread(self._sha256, local)
                 if self._last_hash.get(rel) == new_hash:
                     self._event_arrivals.pop(rel, None)
                     self._safe_mark_done(event_id)
@@ -928,7 +935,7 @@ class CloudFilesWatcher:
             if (
                 local.exists()
                 and not local.is_symlink()
-                and self._sha256(local) == new_hash
+                and await asyncio.to_thread(self._sha256, local) == new_hash
             ):
                 self._last_hash[rel] = new_hash
                 self._remember_apply(rel, new_hash)

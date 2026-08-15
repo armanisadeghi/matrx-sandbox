@@ -236,6 +236,9 @@ WS /sandboxes/{id}/pty?cols=120&rows=30
   control object (`resize` or `signal`). JSON scalar keystrokes such as `2`
   remain ordinary input; clients may therefore send xterm `onData` strings
   verbatim without escaping them.
+- Cloud-files startup scans and per-file SHA-256 work run off the daemon event
+  loop. Large persistent volumes therefore cannot starve PTY handshakes or
+  unrelated filesystem/exec requests while synchronization catches up.
 - Control frames as JSON text: `{ "type": "resize", "cols": 100, "rows": 40 }`, `{ "type": "signal", "name": "SIGINT" }`.
 - Survives a brief disconnect (grace period). vim, nano, htop, REPLs, `git commit` all work.
 
