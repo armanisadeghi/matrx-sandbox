@@ -24,6 +24,7 @@ Already deeply documented. Read the right doc for the question:
 | **AI Dream ↔ Sandbox integration** (cloud-files bridge, `mtx` CLI, service-token auth) | **[docs/AIDREAM_INTEGRATION.md](docs/AIDREAM_INTEGRATION.md)** |
 | **Cloud-files replica implementation** (watcher, replay, system-path boundary, retries) | **[sandbox-image/sdk/matrx_agent/cloud_sync/FEATURE.md](sandbox-image/sdk/matrx_agent/cloud_sync/FEATURE.md)** |
 | **AI Work Hub provider runtime product plan** (conversations, launch, requests, skills, associations, automation) | **[/Users/armanisadeghi/code/common-docs/projects/ai-work-hub/PLAN.md](/Users/armanisadeghi/code/common-docs/projects/ai-work-hub/PLAN.md)** |
+| **Persistent Cloud Browser plan** (per-user Chromium profile workers, lifecycle isolation, WebRTC takeover, encrypted checkpoints) | **[/Users/armanisadeghi/code/common-docs/projects/persistent-cloud-browser/PLAN.md](/Users/armanisadeghi/code/common-docs/projects/persistent-cloud-browser/PLAN.md)** |
 | **Zero-drift migration** (version stamping, drift detection, the safe image swap, auto-migrate) | **[docs/ZERO_DRIFT.md](docs/ZERO_DRIFT.md)** |
 | **Live infra dashboard** (recommended first stop) | **`/administration/sandbox-infra`** in matrx-frontend |
 
