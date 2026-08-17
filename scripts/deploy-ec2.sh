@@ -66,6 +66,8 @@ resolve_setting() {
 DB_URL=$(resolve_setting MATRX_DATABASE_URL)
 API_KEY=$(resolve_setting MATRX_API_KEY)
 STORE=$(resolve_setting MATRX_SANDBOX_STORE)
+AIDREAM_URL=$(resolve_setting MATRX_AIDREAM_URL)
+EXPECTED_AIDREAM_URL="http://172.31.83.75:8000"
 [ -n "$DB_URL" ] || fail "MATRX_DATABASE_URL is unresolved; migrations may not be skipped"
 [ -n "$API_KEY" ] || fail "MATRX_API_KEY is unresolved; production metadata must stay authenticated"
 # Pre-flight for the store guard in orchestrator/config.py: the new container
@@ -73,6 +75,11 @@ STORE=$(resolve_setting MATRX_SANDBOX_STORE)
 # swap instead of after.
 [ "$STORE" = "postgres" ] \
   || fail "MATRX_SANDBOX_STORE is '${STORE:-unset}'; a deployed orchestrator must set it to 'postgres' (in-memory loses every sandbox row on restart)"
+# EC2-origin sandbox traffic must stay on the co-located sandbox_host replica.
+# Falling back to the public Coolify app_server defeats the two-runtime topology
+# and makes an internal dependency depend on public DNS.
+[ "$AIDREAM_URL" = "$EXPECTED_AIDREAM_URL" ] \
+  || fail "MATRX_AIDREAM_URL is '${AIDREAM_URL:-unset}'; EC2 must use $EXPECTED_AIDREAM_URL, never the public app_server"
 
 # Immutable per-SHA tags are deleted at the end of a SUCCESSFUL release, so a
 # failed one leaks ~4 GB of them. A few bad releases fill the 50 GB root volume
@@ -289,6 +296,16 @@ if [ "$verified" != 1 ]; then
   # Call rollback directly — do NOT use fail() here. `exit` does not fire the
   # ERR trap, so fail() would leave the broken release LIVE and un-rolled-back.
   # rollback() restores the previous release and exits non-zero itself.
+  rollback
+fi
+
+LIVE_AIDREAM_URL=$(resolve_setting MATRX_AIDREAM_URL)
+if [ "$LIVE_AIDREAM_URL" != "$EXPECTED_AIDREAM_URL" ]; then
+  echo "[deploy-ec2] ERROR: live EC2 orchestrator route changed during promotion: '${LIVE_AIDREAM_URL:-unset}'" >&2
+  rollback
+fi
+if ! curl -fsS --max-time 15 "$LIVE_AIDREAM_URL/health/version" >/dev/null; then
+  echo "[deploy-ec2] ERROR: live EC2 orchestrator cannot reach its AWS-local AI Dream replica" >&2
   rollback
 fi
 

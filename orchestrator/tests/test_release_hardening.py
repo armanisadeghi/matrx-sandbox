@@ -424,6 +424,24 @@ def test_deploy_scripts_revalidate_immutable_approval_not_moving_main():
         assert "release_guard_fetch_current_main" not in script
 
 
+def test_ec2_release_requires_the_private_aidream_replica_before_and_after_swap():
+    script = (REPO_ROOT / "scripts" / "deploy-ec2.sh").read_text(encoding="utf-8")
+    expected = 'EXPECTED_AIDREAM_URL="http://172.31.83.75:8000"'
+    preflight = '[ "$AIDREAM_URL" = "$EXPECTED_AIDREAM_URL" ]'
+    promotion = script.index('log "promoting candidates"')
+    live_gate = '[ "$LIVE_AIDREAM_URL" != "$EXPECTED_AIDREAM_URL" ]'
+
+    assert expected in script
+    assert script.index(preflight) < promotion
+    assert script.index(live_gate) > promotion
+    assert '"$LIVE_AIDREAM_URL/health/version"' in script
+    assert "never the public app_server" in script
+    live_gate_at = script.index(live_gate)
+    post_swap = script[live_gate_at : script.index("trap - ERR INT TERM", live_gate_at)]
+    assert post_swap.count("rollback") == 2
+    assert "|| fail" not in post_swap
+
+
 def test_hosted_noop_requires_every_live_release_alias():
     script = (REPO_ROOT / "scripts" / "deploy-hosted.sh").read_text(encoding="utf-8")
     start = script.index("hosted_release_complete()")

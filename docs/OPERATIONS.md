@@ -243,12 +243,22 @@ For the deploy pipeline to work, the repo needs:
 
 Sandboxes can act on behalf of users against AI Dream's cloud_files (`cld_files`) backend, surfacing each user's uploaded files at `/home/agent/cloud-files/` for native shell-tool access by agents.
 
-**Wiring it up** — set in `/srv/apps/sandbox-orchestrator/.env`:
+**Wiring it up** — the URL depends on the tier. The hosted tier uses the
+public Coolify `app_server`; the EC2 tier must use the private EC2
+`sandbox_host` replica:
 ```
-MATRX_AIDREAM_URL=https://api.aidream.example.com
+# Hosted: https://server.app.matrxserver.com
+# EC2:    http://172.31.83.75:8000
+MATRX_AIDREAM_URL=<the tier's endpoint above>
 MATRX_AIDREAM_SERVICE_TOKEN=<shared with AI Dream's AIDREAM_SANDBOX_SERVICE_TOKEN>
 ```
 Then `cd /srv/apps/sandbox-orchestrator && docker compose restart`. New sandboxes will auto-sync at startup.
+
+On EC2 the setting lives in the `matrx-orchestrator` systemd environment. The
+release script fails before pulling images unless it equals
+`http://172.31.83.75:8000`, checks it again after promotion, and performs a
+real `/health/version` canary over that private route. Never point an EC2
+orchestrator or the sandboxes it creates at `server.app.matrxserver.com`.
 
 **Verifying it from the orchestrator:**
 ```bash
