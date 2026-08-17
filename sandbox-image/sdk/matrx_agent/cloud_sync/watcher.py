@@ -35,6 +35,7 @@ from watchdog.observers import Observer
 
 from matrx_agent.cloud_sync.client import AsyncBridgeClient, BridgeConfig
 from matrx_agent.cloud_sync.downstream import RemoteChange, make_subscriber
+from matrx_agent.cloud_sync.paths import is_system_path
 from matrx_agent.cloud_sync.queue import (
     DEFAULT_PATH as DEFAULT_QUEUE_PATH,
 )
@@ -82,6 +83,13 @@ CLOUD_FILES_TMP_SUFFIX = ".cloud-files.tmp"
 
 def _is_ignored_scratch(path: str) -> bool:
     return path.endswith(CLOUD_FILES_TMP_SUFFIX)
+
+
+def _is_retryable_bridge_error(error: Exception) -> bool:
+    if not isinstance(error, httpx.HTTPStatusError):
+        return True
+    status_code = error.response.status_code
+    return status_code in {408, 425, 429} or status_code >= 500
 
 
 class _Handler(FileSystemEventHandler):
@@ -451,6 +459,9 @@ class CloudFilesWatcher:
         """Schedule replay events with zero debounce (already aged)."""
         assert self._loop is not None
         for evt in events:
+            if is_system_path(evt.rel_path):
+                self._safe_mark_done(evt.event_id)
+                continue
             handle = self._loop.call_later(
                 0.0,
                 (
@@ -480,6 +491,8 @@ class CloudFilesWatcher:
                 if rel is None:
                     continue
                 if self._is_dotpath(rel):
+                    continue
+                if is_system_path(rel):
                     continue
                 if _is_ignored_scratch(rel):
                     continue
@@ -581,6 +594,8 @@ class CloudFilesWatcher:
                     continue
                 if self._is_dotpath(rel):
                     continue
+                if is_system_path(rel):
+                    continue
                 if _is_ignored_scratch(rel):
                     continue
 
@@ -657,6 +672,10 @@ class CloudFilesWatcher:
     # ─── Flush handlers ──────────────────────────────────────────────────────
 
     async def _flush_upsert(self, rel: str, event_id: str) -> None:
+        if is_system_path(rel):
+            self._event_arrivals.pop(rel, None)
+            self._safe_mark_done(event_id)
+            return
         # Remove from pending so a new event can schedule a replacement.
         prev = self._pending.pop(rel, None)
         # If a different event_id is now pending for this path, the newer one
@@ -753,6 +772,8 @@ class CloudFilesWatcher:
                         return
                     except Exception as e:  # noqa: BLE001
                         last_err = e
+                        if not _is_retryable_bridge_error(e):
+                            break
                 _logger.warning(
                     "cloud-files: PUT %s failed after retries: %s",
                     rel,
@@ -768,6 +789,10 @@ class CloudFilesWatcher:
                 self._safe_mark_done(event_id)
 
     async def _flush_delete(self, rel: str, event_id: str) -> None:
+        if is_system_path(rel):
+            self._event_arrivals.pop(rel, None)
+            self._safe_mark_done(event_id)
+            return
         prev = self._pending.pop(rel, None)
         if prev is not None and prev[1] != event_id:
             self._pending[rel] = prev
@@ -818,6 +843,8 @@ class CloudFilesWatcher:
                         return
                     except Exception as e:  # noqa: BLE001
                         last_err = e
+                        if not _is_retryable_bridge_error(e):
+                            break
                 _logger.warning(
                     "cloud-files: DELETE %s failed after retries: %s",
                     rel,
@@ -878,7 +905,7 @@ class CloudFilesWatcher:
         """
         self._remote_received += 1
         rel = change.rel_path or ""
-        if not rel or self._is_dotpath(rel):
+        if not rel or self._is_dotpath(rel) or is_system_path(rel):
             return
 
         # Path safety: refuse anything that resolves outside cloud_root.

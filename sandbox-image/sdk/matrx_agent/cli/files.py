@@ -25,13 +25,16 @@ from pathlib import Path
 from typing import Any
 
 from matrx_agent.cloud_sync.client import BridgeConfig, report_missing
+from matrx_agent.cloud_sync.paths import is_system_path
 
 # Lazy http import — falls back to urllib if requests/httpx not in the image
 try:
     import httpx as _http  # type: ignore
+
     _USING = "httpx"
 except ImportError:  # pragma: no cover
     import urllib.request as _http  # type: ignore
+
     _USING = "urllib"
 
 
@@ -57,6 +60,7 @@ def _http_json(method: str, url: str, headers: dict[str, str], **kwargs) -> Any:
     else:  # urllib fallback
         import urllib.parse
         import urllib.error
+
         data = kwargs.get("json")
         body = json.dumps(data).encode() if data is not None else None
         if body:
@@ -67,7 +71,10 @@ def _http_json(method: str, url: str, headers: dict[str, str], **kwargs) -> Any:
                 payload = resp.read()
                 return json.loads(payload) if payload else None
         except urllib.error.HTTPError as e:
-            print(f"AI Dream {method} {url} → HTTP {e.code}: {e.read()[:200]!r}", file=sys.stderr)
+            print(
+                f"AI Dream {method} {url} → HTTP {e.code}: {e.read()[:200]!r}",
+                file=sys.stderr,
+            )
             raise
 
 
@@ -87,6 +94,7 @@ def cmd_ls(cfg: BridgeConfig) -> int:
 
     # Accept either a flat list of files or a {files: [...]} envelope.
     rows = listing if isinstance(listing, list) else listing.get("files") or []
+    rows = [row for row in rows if not is_system_path(str(row.get("file_path") or ""))]
     width = max((len(str(r.get("file_size", "?"))) for r in rows), default=4)
     for r in rows:
         size = str(r.get("file_size", "?"))
@@ -96,6 +104,12 @@ def cmd_ls(cfg: BridgeConfig) -> int:
 
 
 def cmd_cat(cfg: BridgeConfig, path: str) -> int:
+    if is_system_path(path):
+        print(
+            "system-managed paths are not part of the sandbox cloud-files mount",
+            file=sys.stderr,
+        )
+        return 2
     if _USING == "httpx":
         with _http.Client(timeout=60.0) as client:
             r = client.get(
@@ -110,7 +124,9 @@ def cmd_cat(cfg: BridgeConfig, path: str) -> int:
             sys.stdout.buffer.write(r.content)
         return 0
     else:
-        import urllib.parse, urllib.error
+        import urllib.error
+        import urllib.parse
+
         url = f"{cfg.url}/api/cloud-files/get?{urllib.parse.urlencode({'path': path})}"
         req = _http.Request(url, headers=_headers(cfg))
         try:
@@ -128,6 +144,9 @@ def cmd_put(cfg: BridgeConfig, local_path: str, remote_path: str | None) -> int:
         print(f"not a file: {local_path}", file=sys.stderr)
         return 1
     remote_path = remote_path or p.name
+    if is_system_path(remote_path):
+        print("system-managed paths are not writable from a sandbox", file=sys.stderr)
+        return 2
 
     if _USING != "httpx":
         print(
@@ -149,12 +168,22 @@ def cmd_put(cfg: BridgeConfig, local_path: str, remote_path: str | None) -> int:
         if not r.is_success:
             print(f"put failed: HTTP {r.status_code}: {r.text[:200]}", file=sys.stderr)
             return 1
-        result = r.json() if r.headers.get("content-type", "").startswith("application/json") else None
-        print(f"uploaded → {remote_path}" + (f"  (id={result['id']})" if result and "id" in result else ""))
+        result = (
+            r.json()
+            if r.headers.get("content-type", "").startswith("application/json")
+            else None
+        )
+        print(
+            f"uploaded → {remote_path}"
+            + (f"  (id={result['id']})" if result and "id" in result else "")
+        )
     return 0
 
 
 def cmd_rm(cfg: BridgeConfig, path: str) -> int:
+    if is_system_path(path):
+        print("system-managed paths are not removable from a sandbox", file=sys.stderr)
+        return 2
     try:
         _http_json(
             "DELETE",
@@ -193,6 +222,8 @@ def cmd_sync_down(cfg: BridgeConfig, dest: str, max_bytes: int) -> int:
         path = r.get("file_path") or r.get("name")
         if not path:
             continue
+        if is_system_path(str(path)):
+            continue
         # Path-traversal guard: a malicious or buggy server could return
         # ``file_path = "../../etc/passwd"`` and we'd write outside dest_dir.
         # Resolve and assert the target stays under dest_dir.
@@ -224,6 +255,7 @@ def cmd_sync_down(cfg: BridgeConfig, dest: str, max_bytes: int) -> int:
                     local.write_bytes(rr.content)
             else:
                 import urllib.parse
+
                 url = f"{cfg.url}/api/cloud-files/get?{urllib.parse.urlencode({'path': path})}"
                 req = _http.Request(url, headers=_headers(cfg))
                 with _http.urlopen(req, timeout=120) as resp:
@@ -254,11 +286,16 @@ def cmd_sync_up(cfg: BridgeConfig, src: str) -> int:
             if not p.is_file():
                 continue
             rel = str(p.relative_to(src_dir))
+            if is_system_path(rel):
+                skipped += 1
+                continue
             try:
                 with p.open("rb") as fh:
                     r = client.put(
                         f"{cfg.url}/api/cloud-files/put",
-                        headers={k: v for k, v in _headers(cfg).items() if k != "Accept"},
+                        headers={
+                            k: v for k, v in _headers(cfg).items() if k != "Accept"
+                        },
                         files={"file": (p.name, fh)},
                         data={"file_path": rel},
                     )
@@ -335,6 +372,7 @@ def _run_local_only(
             NotSupportedError,
             select_bridge_client,
         )
+
         cfg = _Cfg.from_env()
         if cfg is None:
             report_missing()
