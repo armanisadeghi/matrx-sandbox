@@ -19,6 +19,10 @@ Operational runbook for the two sandbox tiers. For architecture (storage tiers, 
 | Deploy mechanism | Push to `main` → GHA → ECR build → SSM → restart on EC2 | Push to `main` → `matrx-hosted-deploy.timer` (2-min host poller) runs `scripts/deploy-hosted.sh` (migrations + health-gate + rollback). GHA SSH is best-effort only. |
 | API key | `MATRX_API_KEY` on EC2 | `MATRX_API_KEY` in `/srv/apps/sandbox-orchestrator/.env` (also recorded in `/srv/.credentials`) |
 
+The hosted orchestrator contract gate allows up to three minutes for cold-boot
+reconciliation before rollback. The previous one-minute gate repeatedly rolled
+back healthy candidates on a fleet of roughly 160 live containers.
+
 Both orchestrators advertise their tier via `GET /` and `GET /api-surface`. A `POST /sandboxes` request whose `tier` doesn't match the orchestrator's `MATRX_HOST_TIER` is rejected with HTTP 400 — there is no cross-tier proxying. Frontends route by reading the sandbox row's `tier` column.
 
 The best-effort hosted GitHub job waits up to 120 minutes because it uses the

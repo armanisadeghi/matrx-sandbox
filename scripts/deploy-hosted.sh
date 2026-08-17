@@ -497,11 +497,14 @@ if [ -n "${LOCAL_CANDIDATE:-}" ] && [ -f "$REPO_DIR/sandbox-local/docker-compose
     || fail_release "starter pool recreate failed"
 fi
 
-log "waiting for orchestrator release contract (up to 60s)…"
+# A cold boot reconciles every hosted sandbox before startup completes. With
+# ~160 live containers that regularly takes longer than one minute. Match the
+# fleet-health restart allowance and give the exact contract three minutes.
+log "waiting for orchestrator release contract (up to 180s)…"
 ORCH_API_KEY=$(grep '^MATRX_API_KEY=' "$ORCH_COMPOSE_DIR/.env" | head -1 | cut -d= -f2-)
 [ -n "$ORCH_API_KEY" ] || fail_release "MATRX_API_KEY is not resolved for post-deploy verification"
 verified=0
-for _ in $(seq 1 30); do
+for _ in $(seq 1 90); do
   if payload=$(curl -fsS --max-time 5 -H "X-API-Key: $ORCH_API_KEY" \
       "${ORCH_HEALTH_URL%/health}/api-surface" 2>/dev/null) \
       && RELEASE_PAYLOAD="$payload" EXPECTED_SHA="$NEW_SHA" python3 - <<'PY'
