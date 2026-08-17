@@ -104,7 +104,7 @@ ENV PATH="/home/agent/aidream/.venv/bin:${PATH}"
 # every sandbox permanently "modified" and fails the build's own verification
 # step. This is why the old `rm -rf dashboard workflow-studio knowledgebase
 # tmp .claude …` RUN is gone: exactness beats 6 MB.
-COPY --chown=agent:agent ./aidream-src/ ${AIDREAM_TEMPLATE_DIR}/
+COPY --chown=root:root ./aidream-src/ ${AIDREAM_TEMPLATE_DIR}/
 
 # Pre-resolve a venv at /opt/aidream-template/.venv using uv. This is the
 # expensive step (~3-6 GB of wheels). We do it ONCE at image build time so
@@ -118,10 +118,18 @@ ENV UV_PROJECT_ENVIRONMENT=${AIDREAM_TEMPLATE_DIR}/.venv
 # Make uv's Python install discoverable by non-root users (agent). Without
 # this, `uv run` works as root in the build but fails as agent at runtime.
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
+# aidream's platform logger writes to /var/log/aidream during import. The
+# immutable managed server runs as agent, so create that directory at image
+# time rather than requiring a privileged runtime repair.
 RUN uv sync --frozen --no-dev \
     && du -sh .venv \
-    && chown -R agent:agent "${AIDREAM_TEMPLATE_DIR}" \
-    && chmod -R a+rX "${UV_PYTHON_INSTALL_DIR}"
+    && git config --system --add safe.directory "${AIDREAM_TEMPLATE_DIR}" \
+    && chown -R root:root "${AIDREAM_TEMPLATE_DIR}" \
+    && chmod -R a-w "${AIDREAM_TEMPLATE_DIR}" \
+    && chmod -R a+rX "${AIDREAM_TEMPLATE_DIR}" \
+    && chmod -R a+rX "${UV_PYTHON_INSTALL_DIR}" \
+    && mkdir -p /var/log/aidream \
+    && chown agent:agent /var/log/aidream
 
 # ─── Helper scripts: mtx aidream {update,reset,serve,version} ──────────────
 # Lives at /opt/sandbox/scripts/aidream-helpers.sh — sourced by the mtx

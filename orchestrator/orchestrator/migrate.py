@@ -27,6 +27,7 @@ import time
 from docker.errors import APIError, NotFound
 
 from orchestrator.config import settings
+from orchestrator.runtime_isolation import container_runtime_isolation
 from orchestrator.versioning import current_image
 
 logger = logging.getLogger(__name__)
@@ -42,14 +43,24 @@ def _binds_to_volumes(host_config: dict) -> dict:
     return out
 
 
-async def _wait_container_ready(container, timeout: int) -> bool:
+async def _wait_container_ready(container, timeout: int, template: str | None = None) -> bool:
     elapsed, interval = 0, 2
     while elapsed < timeout:
         try:
             await asyncio.to_thread(container.reload)
             if container.status == "exited":
                 return False
-            code, _ = await asyncio.to_thread(container.exec_run, "test -f /tmp/.sandbox_ready")
+            readiness = "test -f /tmp/.sandbox_ready"
+            if template == "aidream":
+                readiness += (
+                    " && curl -fsS http://127.0.0.1:8001/api/health/ready >/dev/null"
+                    " && AIDREAM_WORK_DIR=/opt/aidream-template"
+                    " AIDREAM_IMAGE_SHA_FILE=/etc/aidream-image-sha"
+                    " GIT_CONFIG_GLOBAL=/dev/null"
+                    " /bin/bash --noprofile --norc -p"
+                    " /opt/sandbox/scripts/aidream-helpers.sh verify-release >/dev/null"
+                )
+            code, _ = await asyncio.to_thread(container.exec_run, readiness)
             if code == 0:
                 return True
         except (NotFound, APIError) as exc:
@@ -209,13 +220,14 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
             "migrate %s: %s -> %s (template=%s)",
             sandbox_id, (old_image_id or "?")[:19], target, template,
         )
+        tier = labels.get("matrx.tier")
         run_kwargs: dict = dict(
             image=target, name=tmp_name, detach=True, environment=env,
             volumes=volumes or None, network=settings.docker_network,
-            cap_add=["SYS_ADMIN"], devices=["/dev/fuse"], cap_drop=[],
             ports={"22/tcp": None}, extra_hosts={"host.docker.internal": "host-gateway"},
             labels=labels, restart_policy={"Name": "no", "MaximumRetryCount": 0},
         )
+        run_kwargs.update(container_runtime_isolation(template, tier))
         if host.get("NanoCpus"):
             run_kwargs["nano_cpus"] = host["NanoCpus"]
         if host.get("Memory"):
@@ -227,7 +239,7 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
             logger.error("migrate %s: new container create failed: %s", sandbox_id, exc)
             return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"create failed: {exc}"}
 
-        ready = await _wait_container_ready(new, verify_timeout)
+        ready = await _wait_container_ready(new, verify_timeout, template)
         new_ver = (await _container_version(new)) if ready else None
         # Skip strict version equality when the current image is itself
         # unversioned (built before the stamp) — fall back to readiness + image id.
@@ -372,10 +384,12 @@ async def _migrate_s3_ordered(
         run_kwargs: dict = dict(
             image=target, name=tmp_name, detach=True, environment=env_fresh,
             volumes=volumes or None, network=settings.docker_network,
-            cap_add=["SYS_ADMIN"], devices=["/dev/fuse"], cap_drop=[],
             ports={"22/tcp": None}, extra_hosts={"host.docker.internal": "host-gateway"},
             labels=labels, restart_policy={"Name": "no", "MaximumRetryCount": 0},
         )
+        template = labels.get("matrx.template")
+        tier = labels.get("matrx.tier")
+        run_kwargs.update(container_runtime_isolation(template, tier))
         if host.get("NanoCpus"):
             run_kwargs["nano_cpus"] = host["NanoCpus"]
         if host.get("Memory"):
@@ -387,7 +401,7 @@ async def _migrate_s3_ordered(
             await _restart_container(old)
             return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"create failed: {exc}"}
 
-        ready = await _wait_container_ready(new, verify_timeout)
+        ready = await _wait_container_ready(new, verify_timeout, template)
         new_ver = (await _container_version(new)) if ready else None
         version_ok = cur.version is None or new_ver == cur.version
         if not ready or not version_ok:

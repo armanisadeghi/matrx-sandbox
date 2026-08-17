@@ -37,6 +37,7 @@ from datetime import datetime, timedelta, timezone
 
 from orchestrator.config import settings
 from orchestrator.models import SandboxResponse, SandboxStatus
+from orchestrator.runtime_isolation import warm_pool_supports_template
 
 logger = logging.getLogger(__name__)
 
@@ -150,6 +151,13 @@ def _warm_run_container(template: str):
     user, NO DB row, NO per-user volume (slim is git-persistence; a warm box
     has no owner to mount for).
     """
+    if not warm_pool_supports_template(template):
+        logger.error(
+            "Pool: refusing to pre-warm template=%s; managed aidream requires an owner volume and runtime env",
+            template,
+        )
+        return None
+
     from orchestrator.sandbox_manager import _get_docker_client
     from orchestrator.routes.templates import resolve_template_image
 

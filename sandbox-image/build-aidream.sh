@@ -165,6 +165,43 @@ docker run --rm --entrypoint /bin/sh "$TAG" -c \
     && cp -a /opt/aidream-template/. "$runtime_dir/" \
     && AIDREAM_WORK_DIR="$runtime_dir" /opt/sandbox/scripts/aidream-helpers.sh verify-release'
 
+echo "[build-aidream] verifying immutable managed source as the runtime user"
+docker run --rm --read-only \
+    --tmpfs /home/agent:rw,nosuid,nodev,mode=0700,uid=1000,gid=1000 \
+    --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
+    --tmpfs /run:rw,nosuid,nodev,mode=1777 \
+    --tmpfs /var/log/aidream:rw,nosuid,nodev,mode=0775,uid=1000,gid=1000 \
+    --entrypoint /bin/sh "$TAG" -c \
+    'set -eu \
+    && mkdir -p /home/agent/.local/lib/python3.13/site-packages /run/aidream-managed-home \
+    && printf "%s\n" "open(\"/tmp/sitecustomize-ran\", \"w\").write(\"bad\")" > /home/agent/.local/lib/python3.13/site-packages/sitecustomize.py \
+    && printf "%s\n" "[core]" "  fsmonitor = !touch /tmp/gitconfig-ran #" > /home/agent/.gitconfig \
+    && mkdir -p /home/agent/aidream/.venv/bin \
+    && for shim in findmnt sudo env sleep bash; do printf "%s\n" "#!/bin/sh" "touch /tmp/shim-$shim-ran" "exit 99" > "/home/agent/aidream/.venv/bin/$shim"; chmod +x "/home/agent/aidream/.venv/bin/$shim"; done \
+    && chown -R agent:agent /home/agent \
+    && chmod 0555 /run/aidream-managed-home \
+    && findmnt -n -o OPTIONS -T /opt/aidream-template | grep -Eq "(^|,)ro(,|$)" \
+    && test ! -w /opt/aidream-template \
+    && test ! -w /opt/aidream-template/pyproject.toml \
+    && test ! -w /opt/aidream-template/.venv \
+    && ! sudo -u agent sudo touch /opt/aidream-template/.sudo-write-probe 2>/dev/null \
+    && ! sudo -u agent sudo touch /opt/aidream-template/.venv/.sudo-write-probe 2>/dev/null \
+    && ! sudo -u agent sudo /bin/mount -o remount,rw / 2>/dev/null \
+    && ! sudo -u agent sudo /bin/mount --bind /home/agent/aidream /opt/aidream-template 2>/dev/null \
+    && sudo -u agent env -i \
+        PATH=/opt/aidream-template/.venv/bin:/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin \
+        HOME=/run/aidream-managed-home GIT_CONFIG_GLOBAL=/dev/null \
+        AIDREAM_WORK_DIR=/opt/aidream-template AIDREAM_IMAGE_SHA_FILE=/etc/aidream-image-sha \
+        PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+        /bin/bash --noprofile --norc -p /opt/sandbox/scripts/aidream-helpers.sh verify-release \
+    && sudo -u agent env -i HOME=/run/aidream-managed-home PYTHONNOUSERSITE=1 \
+        /opt/aidream-template/.venv/bin/python -I -c "import sys; assert sys.flags.isolated and sys.flags.no_user_site" \
+    && test ! -e /tmp/sitecustomize-ran \
+    && test ! -e /tmp/gitconfig-ran \
+    && ! compgen -G "/tmp/shim-*-ran" >/dev/null \
+    && sudo -u agent touch /var/log/aidream/.agent-log-probe \
+    && rm /var/log/aidream/.agent-log-probe'
+
 echo "[build-aidream] cleaning up staged source"
 rm -rf "$STAGE_DIR" "$LOCAL_SCRIPTS_STAGE"
 

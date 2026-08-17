@@ -100,6 +100,31 @@ a multi-GB image is what wedged the hosted deploy poller for 20 h on
 staging failed`, so `matrx-sandbox:aidream` went missing and the release stalled
 at the previous SHA. Both failure messages now list the offending paths.
 
+Managed autostart executes `/opt/aidream-template`, not the durable
+`/home/agent/aidream` worktree. The template is the immutable server release;
+the home checkout belongs to the user and may contain intentional commits or
+local edits. Never reset or delete that worktree to repair server drift. Rebuild
+and promote an exact image instead. The image creates `/var/log/aidream` for the
+non-root server at build time, so a fresh container needs no privileged startup
+repair. Hosted aidream containers run with Docker's read-only root filesystem
+and drop `SYS_ADMIN` plus `/dev/fuse`; EC2 aidream development boxes keep their
+existing writable/FUSE behavior and do not autostart the managed Claude API.
+Only the durable hosted user home and explicit runtime tmpfs paths remain
+writable. The host-enforced mount boundary stays read-only even through the
+interactive agent's passwordless sudo: remount and bind-shadow attacks lack the
+required capability. Autostart refuses to run until `findmnt` proves the
+template resides on a read-only mount. It executes the fixed root-owned helper
+with an inert ephemeral `HOME`, fixed `PATH` and source/stamp paths, `/dev/null`
+global Git config, and a fixed privileged-mode Bash that ignores exported
+functions and profiles. Shell, Python, Git, dynamic-loader, venv,
+and uv injection variables are removed before dispatch. Managed serve invokes
+the template venv's Python with isolated mode (`-I`). The image build proves
+sudo cannot write source or venv, malicious user `sitecustomize.py` and Git
+`core.fsmonitor` hooks do not execute, exact-source verification includes
+untracked files, persistent-venv command shims cannot replace launch binaries,
+and the separate runtime log directory remains writable. Aidream warm pooling
+is prohibited because a pre-owner box cannot preserve this policy and volume.
+
 Both CI and Deploy test checkouts fetch full Git history because the release
 hardening suite archives the exact legacy EC2 source SHAs. A shallow checkout
 cannot validate that recovery path and will fail before the sandbox SDK suite.

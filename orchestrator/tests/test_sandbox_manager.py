@@ -112,6 +112,61 @@ async def test_create_sandbox_fetches_vault_with_orchestrator_user_agent(
 
 
 @pytest.mark.asyncio
+async def test_aidream_container_rootfs_is_read_only_with_explicit_runtime_tmpfs(
+    mock_docker,
+):
+    container = MagicMock()
+    container.id = "abc123"
+    container.status = "running"
+    container.exec_run.return_value = (0, b"")
+    mock_docker.containers.run.return_value = container
+    mock_docker.containers.get.return_value = container
+
+    from orchestrator import sandbox_manager
+
+    await sandbox_manager.create_sandbox(
+        user_id="00000000-0000-4000-8000-000000000001",
+        template="aidream",
+        tier="hosted",
+    )
+
+    kwargs = mock_docker.containers.run.call_args.kwargs
+    assert kwargs["read_only"] is True
+    assert kwargs["cap_add"] == []
+    assert kwargs["devices"] == []
+    assert kwargs["tmpfs"] == {
+        "/tmp": "rw,nosuid,nodev,mode=1777",
+        "/var/tmp": "rw,nosuid,nodev,mode=1777",
+        "/run": "rw,nosuid,nodev,mode=1777",
+        "/var/log/sandbox": "rw,nosuid,nodev,mode=0775,uid=1000,gid=1000",
+        "/var/log/aidream": "rw,nosuid,nodev,mode=0775,uid=1000,gid=1000",
+        "/data/cold": "rw,nosuid,nodev,mode=0775,uid=1000,gid=1000",
+    }
+
+
+def test_runtime_isolation_is_one_shared_policy_for_every_constructor():
+    from orchestrator.runtime_isolation import container_runtime_isolation
+
+    aidream = container_runtime_isolation("aidream", "hosted")
+    assert aidream["read_only"] is True
+    assert "/run" in aidream["tmpfs"]
+    assert aidream["cap_add"] == []
+    assert aidream["devices"] == []
+    assert container_runtime_isolation("aidream", "ec2")["read_only"] is False
+    assert container_runtime_isolation("aidream", "ec2")["cap_add"] == ["SYS_ADMIN"]
+
+
+def test_aidream_warm_pool_is_structurally_prohibited(monkeypatch):
+    from orchestrator import pool
+
+    get_client = MagicMock(side_effect=AssertionError("Docker must not be called"))
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", get_client)
+
+    assert pool._warm_run_container("aidream") is None
+    get_client.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_list_sandboxes_filters_by_user(clean_sandbox_state):
     """list_sandboxes should filter by user_id when provided."""
     from orchestrator import sandbox_manager

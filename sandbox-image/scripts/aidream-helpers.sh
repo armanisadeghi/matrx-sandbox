@@ -56,7 +56,7 @@ verify_release_source() {
     local expected actual dirty
     expected=$(cat "$IMAGE_SHA_FILE" 2>/dev/null || true)
     actual=$(git -C "$WORK_DIR" rev-parse HEAD 2>/dev/null || true)
-    dirty=$(git -C "$WORK_DIR" status --porcelain --untracked-files=no 2>/dev/null || true)
+    dirty=$(git -C "$WORK_DIR" status --porcelain --untracked-files=all 2>/dev/null || true)
     if ! [[ "$expected" =~ ^[0-9a-f]{40}$ ]]; then
         echo "source_state=invalid-image-sha expected=$expected" >&2
         return 1
@@ -140,7 +140,15 @@ cmd_serve() {
     # ensure $port is free (8001 is free by convention; matrx_agent has 8000)
     # so the bind is deterministic — required for the orchestrator's path
     # routing in /proxy/{path:path} to know where to send /ai/* and /api/*.
-    PORT="$port" nohup uv run python run.py >"$LOG_FILE" 2>&1 &
+    if [ "$require_image_source" -eq 1 ]; then
+        # The managed image already contains a fully resolved venv. Execute
+        # its fixed interpreter directly so startup cannot mutate the
+        # root-owned template or redirect uv through user-controlled config.
+        PORT="$port" PYTHONDONTWRITEBYTECODE=1 \
+            nohup "$WORK_DIR/.venv/bin/python" -I run.py >"$LOG_FILE" 2>&1 &
+    else
+        PORT="$port" nohup uv run python run.py >"$LOG_FILE" 2>&1 &
+    fi
     echo $! > "$PID_FILE"
     sleep 2
     if kill -0 "$(cat "$PID_FILE")" 2>/dev/null; then
