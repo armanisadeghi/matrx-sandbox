@@ -388,7 +388,7 @@ def test_aidream_build_proves_agent_cannot_mutate_certified_runtime():
     assert "test ! -e /tmp/sitecustomize-ran" in builder
     assert "test ! -e /tmp/gitconfig-ran" in builder
     assert "for shim in findmnt sudo env sleep bash" in builder
-    assert 'compgen -G "/tmp/shim-*-ran"' in builder
+    assert "find /tmp -maxdepth 1 -name 'shim-*-ran'" in builder
 
 
 def test_aidream_autostart_cannot_source_malicious_agent_profiles():
