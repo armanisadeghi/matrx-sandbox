@@ -45,25 +45,53 @@ cd "$(dirname "$0")"  # cd into sandbox-image/
 
 # Bake origin/main, NOT the local working tree. /srv/projects/aidream is a
 # reference clone with no auto-pull — building from its HEAD shipped images
-# 100+ commits stale (2026-07-09). Fetch is best-effort: offline builds bake
-# the last-fetched origin/main rather than failing. Release callers pass an
-# already-resolved full SHA so a moving main branch cannot change the staged
-# source during a long build.
+# 100+ commits stale (2026-07-09). The Manager carries GITHUB_PAT but its
+# non-interactive Git checkout has no credential helper, so retry through a
+# short-lived askpass helper before refusing to build stale source. Release
+# callers pass an already-resolved full SHA so a moving main branch cannot
+# change the staged source during a long build.
+fetch_with_manager_identity() {
+    local -a fetch_args=("$@")
+    if git -C "$AIDREAM_SRC" fetch "${fetch_args[@]}" --quiet; then
+        return 0
+    fi
+    [[ -n "${GITHUB_PAT:-}" ]] || return 1
+
+    local askpass_dir askpass
+    askpass_dir="$(mktemp -d)"
+    askpass="$askpass_dir/askpass.sh"
+    printf '%s\n' \
+        '#!/usr/bin/env bash' \
+        'case "$1" in' \
+        '  *Username*) printf "%s\\n" "x-access-token" ;;' \
+        '  *) printf "%s\\n" "$GITHUB_PAT" ;;' \
+        'esac' > "$askpass"
+    chmod 700 "$askpass"
+    local status=0
+    GIT_ASKPASS="$askpass" GIT_TERMINAL_PROMPT=0 \
+        git -C "$AIDREAM_SRC" fetch "${fetch_args[@]}" --quiet || status=$?
+    rm -rf "$askpass_dir"
+    return "$status"
+}
+
 if [ -n "$SOURCE_SHA" ]; then
     [[ "$SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] || {
         echo "[build-aidream] invalid --source-sha: $SOURCE_SHA" >&2
         exit 1
     }
     git -C "$AIDREAM_SRC" cat-file -e "$SOURCE_SHA^{commit}" 2>/dev/null \
-        || git -C "$AIDREAM_SRC" fetch origin "$SOURCE_SHA" --quiet \
+        || fetch_with_manager_identity origin "$SOURCE_SHA" \
         || {
             echo "[build-aidream] immutable source SHA is unavailable: $SOURCE_SHA" >&2
             exit 1
         }
     SOURCE_REF="$SOURCE_SHA"
 else
-    git -C "$AIDREAM_SRC" fetch origin main --quiet \
-        || echo "[build-aidream] WARN: git fetch failed — baking last-known origin/main"
+    fetch_with_manager_identity origin main \
+        || {
+            echo "[build-aidream] current origin/main is unavailable; refusing to bake stale source" >&2
+            exit 1
+        }
     SOURCE_REF="origin/main"
 fi
 AIDREAM_FULL_SHA=$(git -C "$AIDREAM_SRC" rev-parse "$SOURCE_REF" 2>/dev/null || echo "unknown")
