@@ -26,10 +26,23 @@ router = APIRouter(tags=["health"])
 _start_time = time.time()
 
 
+def _sandboxes_for_this_host(sandboxes):
+    """Limit shared-ledger rows to the tier served by this orchestrator."""
+    host_tier = settings.host_tier
+    if not host_tier:
+        return sandboxes
+    return [
+        sandbox
+        for sandbox in sandboxes
+        if getattr(getattr(sandbox, "tier", None), "value", getattr(sandbox, "tier", None))
+        == host_tier
+    ]
+
+
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check for the orchestrator service."""
-    sandboxes = await sandbox_manager.list_sandboxes()
+    sandboxes = _sandboxes_for_this_host(await sandbox_manager.list_sandboxes())
     active = [s for s in sandboxes if s.status in ("ready", "running", "starting")]
     backend = "postgres" if isinstance(sandbox_manager._get_store(), PostgresSandboxStore) else "memory"
     return HealthResponse(
@@ -107,7 +120,10 @@ async def system_info():
 
     counts = await asyncio.to_thread(_docker_container_counts)
 
-    sandboxes = await sandbox_manager.list_sandboxes()
+    # Both orchestrators share one ledger. Reporting the global row count here
+    # made each host look badly drifted even when its own containers and rows
+    # matched, so scope operational counts to this host's configured tier.
+    sandboxes = _sandboxes_for_this_host(await sandbox_manager.list_sandboxes())
     active = sum(1 for s in sandboxes if s.status in ("ready", "running", "starting"))
 
     return SystemInfoResponse(
