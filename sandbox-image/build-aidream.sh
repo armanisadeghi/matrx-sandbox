@@ -226,7 +226,7 @@ docker run --rm --read-only \
         /opt/aidream-template/.venv/bin/python -I -c "import sys; assert sys.flags.isolated and sys.flags.no_user_site" \
     && test ! -e /tmp/sitecustomize-ran \
     && test ! -e /tmp/gitconfig-ran \
-    && ! compgen -G "/tmp/shim-*-ran" >/dev/null \
+    && test -z "$(find /tmp -maxdepth 1 -name 'shim-*-ran' -print -quit)" \
     && sudo -u agent touch /var/log/aidream/.agent-log-probe \
     && rm /var/log/aidream/.agent-log-probe'
 
