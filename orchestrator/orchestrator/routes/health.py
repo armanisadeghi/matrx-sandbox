@@ -44,7 +44,9 @@ async def health_check():
     """Health check for the orchestrator service."""
     sandboxes = _sandboxes_for_this_host(await sandbox_manager.list_sandboxes())
     active = [s for s in sandboxes if s.status in ("ready", "running", "starting")]
-    backend = "postgres" if isinstance(sandbox_manager._get_store(), PostgresSandboxStore) else "memory"
+    backend = (
+        "postgres" if isinstance(sandbox_manager._get_store(), PostgresSandboxStore) else "memory"
+    )
     return HealthResponse(
         status="healthy",
         active_sandboxes=len(active),
@@ -80,7 +82,7 @@ def _read_loadavg() -> tuple[float, float, float] | None:
         return None
 
 
-def _docker_container_counts() -> dict[str, int]:
+def _docker_container_counts(active_sandbox_ids: set[str]) -> dict[str, int]:
     """Best-effort counts of containers managed by this orchestrator.
 
     Uses the same Docker client the orchestrator uses for spawning sandboxes;
@@ -88,7 +90,16 @@ def _docker_container_counts() -> dict[str, int]:
     """
     try:
         client = sandbox_manager._get_docker_client()
-        all_containers = client.containers.list(all=True, filters={"label": "matrx.sandbox_id"})
+        candidates = client.containers.list(all=True, filters={"label": "matrx.sandbox_id"})
+        all_containers = []
+        for container in candidates:
+            labels = (container.attrs.get("Config", {}) or {}).get("Labels", {}) or {}
+            sandbox_id = labels.get("matrx.sandbox_id")
+            is_unclaimed_warm = (
+                labels.get("matrx.warm_pool") == "1" and sandbox_id not in active_sandbox_ids
+            )
+            if not is_unclaimed_warm:
+                all_containers.append(container)
         running = [c for c in all_containers if c.status == "running"]
         return {"sandbox_total": len(all_containers), "sandbox_running": len(running)}
     except Exception:
@@ -118,13 +129,15 @@ async def system_info():
     load = _read_loadavg()
     cpu_count = os.cpu_count() or 0
 
-    counts = await asyncio.to_thread(_docker_container_counts)
-
     # Both orchestrators share one ledger. Reporting the global row count here
     # made each host look badly drifted even when its own containers and rows
     # matched, so scope operational counts to this host's configured tier.
     sandboxes = _sandboxes_for_this_host(await sandbox_manager.list_sandboxes())
     active = sum(1 for s in sandboxes if s.status in ("ready", "running", "starting"))
+    active_ids = {
+        str(s.sandbox_id) for s in sandboxes if s.status in ("ready", "running", "starting")
+    }
+    counts = await asyncio.to_thread(_docker_container_counts, active_ids)
 
     return SystemInfoResponse(
         tier=settings.host_tier or None,

@@ -2,14 +2,14 @@
 
 from __future__ import annotations
 
-from datetime import datetime, timezone
-from unittest.mock import AsyncMock, patch
+from types import SimpleNamespace
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 from httpx import ASGITransport, AsyncClient
 
 from orchestrator.main import app
-from orchestrator.models import SandboxResponse, SandboxStatus
+from orchestrator.routes.health import _docker_container_counts
 
 
 @pytest.fixture
@@ -109,6 +109,28 @@ async def test_get_health_returns_healthy(mock_health_sandbox_manager):
     assert "uptime_seconds" in data
 
 
+def test_system_counts_exclude_only_unclaimed_warm_pool_containers():
+    def container(sandbox_id: str, *, warm: bool, status: str = "running"):
+        labels = {"matrx.sandbox_id": sandbox_id}
+        if warm:
+            labels["matrx.warm_pool"] = "1"
+        return SimpleNamespace(status=status, attrs={"Config": {"Labels": labels}})
+
+    docker = MagicMock()
+    docker.containers.list.return_value = [
+        container("sbx-normal", warm=False),
+        container("sbx-warm-unclaimed", warm=True),
+        container("sbx-warm-claimed", warm=True),
+    ]
+
+    with patch(
+        "orchestrator.routes.health.sandbox_manager._get_docker_client", return_value=docker
+    ):
+        counts = _docker_container_counts({"sbx-normal", "sbx-warm-claimed"})
+
+    assert counts == {"sandbox_total": 2, "sandbox_running": 2}
+
+
 # ─── API Key Authentication Tests ─────────────────────────────────────────────
 
 TEST_API_KEY = "test-secret-key-for-auth-tests"
@@ -126,9 +148,7 @@ def mock_api_key():
 
 
 @pytest.mark.asyncio
-async def test_request_without_key_returns_401(
-    mock_sandbox_manager, mock_api_key
-):
+async def test_request_without_key_returns_401(mock_sandbox_manager, mock_api_key):
     """Request to authenticated endpoint without API key should return 401."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -139,9 +159,7 @@ async def test_request_without_key_returns_401(
 
 
 @pytest.mark.asyncio
-async def test_request_with_wrong_key_returns_403(
-    mock_sandbox_manager, mock_api_key
-):
+async def test_request_with_wrong_key_returns_403(mock_sandbox_manager, mock_api_key):
     """Request with an incorrect API key should return 403."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -155,9 +173,7 @@ async def test_request_with_wrong_key_returns_403(
 
 
 @pytest.mark.asyncio
-async def test_request_with_correct_key_returns_200(
-    mock_sandbox_manager, mock_api_key
-):
+async def test_request_with_correct_key_returns_200(mock_sandbox_manager, mock_api_key):
     """Request with the correct API key should succeed."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -170,9 +186,7 @@ async def test_request_with_correct_key_returns_200(
 
 
 @pytest.mark.asyncio
-async def test_request_with_bearer_token_returns_200(
-    mock_sandbox_manager, mock_api_key
-):
+async def test_request_with_bearer_token_returns_200(mock_sandbox_manager, mock_api_key):
     """Request with correct key via Authorization: Bearer should succeed."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
@@ -185,9 +199,7 @@ async def test_request_with_bearer_token_returns_200(
 
 
 @pytest.mark.asyncio
-async def test_health_without_key_returns_200(
-    mock_health_sandbox_manager, mock_api_key
-):
+async def test_health_without_key_returns_200(mock_health_sandbox_manager, mock_api_key):
     """/health should be exempt from API key auth even when key is configured."""
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:

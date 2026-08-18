@@ -332,7 +332,7 @@ All other endpoints require `X-API-Key: <key>` (or `Authorization: Bearer <key>`
   // CPU
   "cpu_count": 4,
   "load_1m": 0.42, "load_5m": 0.31, "load_15m": 0.27,
-  // Sandbox counts — both views, so operators can spot drift
+  // Claimed sandbox counts — unclaimed warm-pool capacity is excluded
   "sandboxes_in_db": 12,
   "sandboxes_active": 4,
   "sandbox_containers_total": 4,
@@ -340,7 +340,7 @@ All other endpoints require `X-API-Key: <key>` (or `Authorization: Bearer <key>`
 }
 ```
 
-Powers the **Sandbox Infrastructure** admin panel in matrx-frontend (`/administration/sandbox-infra`). When `sandboxes_active != sandbox_containers_running`, the orchestrator's view of the world has drifted from Docker's — investigate (usually the orchestrator restarted but the store didn't reconcile).
+Powers the **Sandbox Infrastructure** admin panel in matrx-frontend (`/administration/sandbox-infra`). Unclaimed warm-pool containers have no database row and are deliberately excluded from both Docker counts; a claimed warm container remains included even though Docker retains its immutable `matrx.warm_pool=1` label. When `sandboxes_active != sandbox_containers_running`, the orchestrator's claimed-sandbox view has genuinely drifted from Docker — investigate (usually the orchestrator restarted but the store didn't reconcile).
 
 ---
 
