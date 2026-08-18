@@ -144,11 +144,31 @@ validate_release_authority
 # LOUD on lookup failure: a silent empty remote hid a broken git credential
 # setup (unit missing HOME) for a day while the check reported "current".
 AIDREAM_SRC_DIR="${AIDREAM_SRC_DIR:-/srv/projects/aidream}"
+resolve_aidream_source_sha() {
+  local remote local_ref
+  remote=$(git -C "$AIDREAM_SRC_DIR" ls-remote origin refs/heads/main 2>/dev/null | cut -f1)
+  if [[ "$remote" =~ ^[0-9a-f]{40}$ ]]; then
+    printf '%s\n' "$remote"
+    return 0
+  fi
+
+  # The hosted fast path may run over SSH without the Manager's GitHub
+  # credential environment. Do not let that unrelated auth boundary strand a
+  # coherent orchestrator release: use the last manager-fetched tracking ref,
+  # then let fleet freshness queue the next aidream rebuild if it moved again.
+  local_ref=$(git -C "$AIDREAM_SRC_DIR" rev-parse refs/remotes/origin/main 2>/dev/null || true)
+  if [[ "$local_ref" =~ ^[0-9a-f]{40}$ ]]; then
+    log "WARNING: aidream remote lookup unavailable; using manager-fetched origin/main ${local_ref:0:9}" >&2
+    printf '%s\n' "$local_ref"
+    return 0
+  fi
+  return 1
+}
 aidream_stale() {
   docker image inspect matrx-sandbox:aidream >/dev/null 2>&1 || return 0   # missing → need_img covers it anyway
   local baked remote
   baked=$(docker image inspect matrx-sandbox:aidream --format '{{index .Config.Labels "com.aimatrx.aidream.sha"}}' 2>/dev/null)
-  remote=$(git -C "$AIDREAM_SRC_DIR" ls-remote origin refs/heads/main 2>/dev/null | cut -f1)
+  remote=$(resolve_aidream_source_sha || true)
   if [ -z "$remote" ]; then
     log "WARNING: aidream freshness UNKNOWN — ls-remote returned nothing (git auth/HOME broken?). Skipping rebuild rather than churning."
     return 1
@@ -384,7 +404,7 @@ fi
 # Export MATRX_IMAGE_VERSION so build-aidream.sh forwards it as a build-arg and
 # the aidream layer's /etc/sandbox-image-version matches the deploy SHA.
 if [ "$CORE_REBUILT" = 1 ] || need_img matrx-sandbox:aidream || aidream_stale; then
-  AIDREAM_SOURCE_SHA=$(git -C "$AIDREAM_SRC_DIR" ls-remote origin refs/heads/main 2>/dev/null | cut -f1)
+  AIDREAM_SOURCE_SHA=$(resolve_aidream_source_sha || true)
   [[ "$AIDREAM_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
     || fail "cannot resolve immutable aidream source SHA"
   AIDREAM_CANDIDATE="matrx-sandbox:aidream-$NEW_SHA-${AIDREAM_SOURCE_SHA:0:12}"
