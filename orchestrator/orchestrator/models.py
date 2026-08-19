@@ -33,6 +33,10 @@ class ResourcesSpec(BaseModel):
 
 class CreateSandboxRequest(BaseModel):
     user_id: str = Field(..., description="Supabase auth user UUID")
+    organization_id: str | None = Field(
+        default=None,
+        description="Active organization whose permitted shared secrets are injected",
+    )
     config: dict = Field(default_factory=dict, description="Optional sandbox config overrides")
     template: str | None = Field(default=None, description="Template id (e.g. 'bare', 'node-22', 'python-3.13')")
     template_version: str | None = Field(default=None, description="Optional template version pin")
@@ -60,6 +64,17 @@ class CreateSandboxRequest(BaseModel):
             UUID(v)
         except (ValueError, AttributeError):
             raise ValueError("user_id must be a valid UUID")
+        return v
+
+    @field_validator("organization_id")
+    @classmethod
+    def validate_organization_id(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        try:
+            UUID(v)
+        except (ValueError, AttributeError):
+            raise ValueError("organization_id must be a valid UUID")
         return v
 
 

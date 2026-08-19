@@ -94,7 +94,7 @@ async def test_create_sandbox_fetches_vault_with_orchestrator_user_agent(
         async def __aexit__(self, exc_type, exc, tb):
             return None
 
-        async def get(self, url, *, headers):
+        async def get(self, url, *, headers, **kwargs):
             captured_headers.update(headers)
             return FakeResponse()
 
@@ -109,6 +109,59 @@ async def test_create_sandbox_fetches_vault_with_orchestrator_user_agent(
     assert sandbox.config["secrets_injection"]["fetched_count"] == 1
     run_env = mock_docker.containers.run.call_args.kwargs["environment"]
     assert run_env["YOUTUBE_DATA_API_KEY"] == "test-key"
+
+
+@pytest.mark.asyncio
+async def test_create_sandbox_scopes_vault_fetch_to_organization(mock_docker, monkeypatch):
+    """Shared secrets travel only over the service-token hop with org scope."""
+    from orchestrator import sandbox_manager
+    from orchestrator.config import settings
+
+    container = MagicMock()
+    container.id = "org-container"
+    container.status = "running"
+    container.exec_run.return_value = (0, b"")
+    mock_docker.containers.run.return_value = container
+    mock_docker.containers.get.return_value = container
+    captured: dict = {}
+
+    class FakeResponse:
+        status_code = 200
+        text = ""
+
+        @staticmethod
+        def json():
+            return {"env": {"ORG_SHARED_KEY": "test-only"}}
+
+    class FakeAsyncClient:
+        def __init__(self, *args, **kwargs):
+            pass
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+        async def get(self, url, **kwargs):
+            captured.update(url=url, **kwargs)
+            return FakeResponse()
+
+    monkeypatch.setattr("httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr(settings, "aidream_url", "https://aidream.test")
+    monkeypatch.setattr(settings, "aidream_service_token", "service-token")
+
+    organization_id = "884d1ce8-7b49-4fba-a2f3-0f7dd7c83d4f"
+    sandbox = await sandbox_manager.create_sandbox(
+        user_id="test-user", organization_id=organization_id
+    )
+
+    assert captured["params"] == {"organization_id": organization_id}
+    assert captured["headers"]["X-Matrx-User-Id"] == "test-user"
+    assert sandbox.config["organization_id"] == organization_id
+    docker_env = mock_docker.containers.run.call_args.kwargs["environment"]
+    assert docker_env["ORGANIZATION_ID"] == organization_id
+    assert docker_env["ORG_SHARED_KEY"] == "test-only"
 
 
 @pytest.mark.asyncio

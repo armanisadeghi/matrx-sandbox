@@ -263,6 +263,7 @@ async def close_store() -> None:
 
 async def create_sandbox(
     user_id: str,
+    organization_id: str | None = None,
     config: dict | None = None,
     template: str | None = None,
     template_version: str | None = None,
@@ -281,6 +282,8 @@ async def create_sandbox(
     store = _get_store()
     sandbox_id = f"sbx-{uuid.uuid4().hex[:12]}"
     config = config or {}
+    if organization_id:
+        config["organization_id"] = organization_id
     resources = resources or {}
 
     sandbox = SandboxResponse(
@@ -336,6 +339,8 @@ async def create_sandbox(
             "MATRX_HOT_PREFIX": location.s3_hot_prefix or "",
             "MATRX_COLD_PREFIX": location.s3_cold_prefix or "",
         }
+        if organization_id:
+            env["ORGANIZATION_ID"] = organization_id
         if template:
             env["SANDBOX_TEMPLATE"] = template
         if template_version:
@@ -460,6 +465,7 @@ async def create_sandbox(
             "aidream_service_token_set": bool(resolved_aidream_token),
             "aidream_url_used": resolved_aidream_url or None,
             "user_id_set": bool(user_id),
+            "organization_id_set": bool(organization_id),
         }
         if not user_id:
             diag["skipped_reason"] = "user_id is empty on the create request"
@@ -497,6 +503,9 @@ async def create_sandbox(
                 async with httpx.AsyncClient(timeout=10.0) as hx:
                     resp = await hx.get(
                         f"{resolved_aidream_url.rstrip('/')}/api/user-secrets/internal/sandbox-env-for-user",
+                        params={"organization_id": organization_id}
+                        if organization_id
+                        else None,
                         headers={
                             "Authorization": f"Bearer {resolved_aidream_token}",
                             "X-Matrx-User-Id": str(user_id),
@@ -515,8 +524,8 @@ async def create_sandbox(
                                 secrets_env[k] = v
                     diag["fetched_count"] = len(secrets_env)
                     logger.info(
-                        "user-secrets: injected %d secret(s) for user=%s",
-                        len(secrets_env), user_id,
+                        "user-secrets: injected %d secret(s) for user=%s org=%s",
+                        len(secrets_env), user_id, organization_id,
                     )
                 else:
                     body_text = (resp.text or "")[:300]

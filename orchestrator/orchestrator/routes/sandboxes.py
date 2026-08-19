@@ -91,6 +91,7 @@ async def create_sandbox(req: CreateSandboxRequest):
     await storage.ensure_user_storage(req.user_id)
     sandbox = await sandbox_manager.create_sandbox(
         user_id=req.user_id,
+        organization_id=req.organization_id,
         config=req.config,
         template=req.template,
         template_version=req.template_version,
@@ -134,11 +135,16 @@ async def claim_sandbox(req: CreateSandboxRequest):
     # is in the container env from boot.
     config_env = (req.config or {}).get("env") if isinstance(req.config, dict) else None
     has_inject_env = isinstance(config_env, dict) and len(config_env) > 0
-    if has_inject_env:
+    # An organization-scoped create may resolve shared Vault entries inside
+    # create_sandbox(). A running warm container cannot accept those values,
+    # so org-scoped requests must cold-create even when config.env is empty.
+    if has_inject_env or req.organization_id:
         logger.info(
-            "Skipping warm pool for user %s — config.env has %d keys "
-            "to inject (warm boxes can't accept new env post-boot)",
-            req.user_id, len(config_env),
+            "Skipping warm pool for user %s — scoped/caller env must be "
+            "injected at boot (organization_id=%s, config_env_keys=%d)",
+            req.user_id,
+            req.organization_id,
+            len(config_env) if isinstance(config_env, dict) else 0,
         )
         return await create_sandbox(req)
 
@@ -330,6 +336,7 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     labels = old.labels
     ttl_seconds = old.ttl_seconds
     config = dict(old.config or {})
+    organization_id = config.get("organization_id")
     resources = config.get("resources") if isinstance(config.get("resources"), dict) else None
 
     logger.info(
@@ -353,6 +360,7 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     try:
         new_sandbox = await sandbox_manager.create_sandbox(
             user_id=user_id,
+            organization_id=organization_id if isinstance(organization_id, str) else None,
             config=config,
             template=template,
             template_version=template_version,
@@ -426,6 +434,7 @@ async def resume_sandbox(sandbox_id: str):
     labels = old.labels
     ttl_seconds = old.ttl_seconds
     config = dict(old.config or {})
+    organization_id = config.get("organization_id")
     resources = config.get("resources") if isinstance(config.get("resources"), dict) else None
 
     logger.info(
@@ -437,6 +446,7 @@ async def resume_sandbox(sandbox_id: str):
         await storage.ensure_user_storage(user_id)
         new_sandbox = await sandbox_manager.create_sandbox(
             user_id=user_id,
+            organization_id=organization_id if isinstance(organization_id, str) else None,
             config=config,
             template=template,
             template_version=template_version,
@@ -780,7 +790,7 @@ async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
         activity.session_closed(sandbox_id)
         try:
             await websocket.close()
-        except:
+        except Exception:
             pass
 
 
@@ -1039,7 +1049,7 @@ async def proxy_pty(sandbox_id: str, websocket: WebSocket):
         activity.session_closed(sandbox_id)
         try:
             await websocket.close()
-        except:
+        except Exception:
             pass
 
 @router.api_route("/{sandbox_id}/search/{path:path}", methods=["GET", "POST"])
