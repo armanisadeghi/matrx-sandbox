@@ -1,408 +1,213 @@
-"""Browser tools — Playwright-backed headless Chromium automation.
-
-All tools operate on a persistent browser session managed by ToolSession.browser.
-The browser is launched lazily on first use and persists across calls so navigation
-state, cookies, and localStorage carry over.
-"""
+"""Browser tools routed exclusively through the canonical Browser Manager."""
 
 from __future__ import annotations
 
-import base64
-import logging
-import re
+import json
+from typing import Any
 
 from matrx_tools.session import ToolSession
 from matrx_tools.types import ImageData, ToolResult, ToolResultType
 
-logger = logging.getLogger(__name__)
 
-SNAPSHOT_MAX_LENGTH = 50_000
-DEFAULT_TIMEOUT_MS = 30_000
+def _error(message: str) -> ToolResult:
+    return ToolResult(type=ToolResultType.ERROR, output=message)
 
 
-# ── BrowserNavigate ────────────────────────────────────────────────────────────
+def _result_payload(response: dict[str, Any]) -> dict[str, Any]:
+    result = response.get("result")
+    return result if isinstance(result, dict) else {}
+
+
+async def _command(session: ToolSession, command: dict[str, Any]) -> tuple[dict[str, Any], dict[str, Any]]:
+    response = await session.browser_client().command(command)
+    return response, _result_payload(response)
 
 
 async def tool_browser_navigate(
-    session: ToolSession,
-    url: str,
-    wait_until: str = "domcontentloaded",
+    session: ToolSession, url: str, wait_until: str = "domcontentloaded"
 ) -> ToolResult:
     try:
-        page = await session.browser.ensure_browser()
-        response = await page.goto(url, wait_until=wait_until, timeout=DEFAULT_TIMEOUT_MS)
-        status = response.status if response else "unknown"
-        title = await page.title()
-        return ToolResult(
-            output=f"Navigated to {page.url}\nStatus: {status}\nTitle: {title}",
+        response, result = await _command(
+            session,
+            {
+                "command": "navigate", "url": url, "wait_until": wait_until,
+                "timeout_ms": 30_000, "extract_text": False,
+            },
         )
-    except Exception as e:
-        return ToolResult(type=ToolResultType.ERROR, output=f"Navigation failed: {e}")
+        return ToolResult(
+            output=(f"Navigated to {result.get('url') or url}\n"
+                    f"Status: {result.get('http_status', 'unknown')}\n"
+                    f"Title: {result.get('title') or ''}"),
+            metadata={"run_id": response.get("run_id"), "page_id": response.get("active_page_id")},
+        )
+    except Exception as exc:
+        return _error(f"Navigation failed: {exc}")
 
 
-# ── BrowserSnapshot ────────────────────────────────────────────────────────────
-
-
-async def tool_browser_snapshot(
-    session: ToolSession,
-    selector: str | None = None,
-) -> ToolResult:
+async def tool_browser_snapshot(session: ToolSession, selector: str | None = None) -> ToolResult:
     try:
-        page = await session.browser.ensure_browser()
-        title = await page.title()
-
         if selector:
-            element = await page.query_selector(selector)
-            if not element:
-                return ToolResult(
-                    type=ToolResultType.ERROR,
-                    output=f"Element not found: {selector}",
-                )
-            snapshot = await element.evaluate("el => el.outerHTML")
+            response, result = await _command(
+                session, {"command": "get_element", "selector": selector, "include_html": True}
+            )
+            if not result.get("found"):
+                return _error(f"Element not found: {selector}")
+            content = result.get("outer_html") or result.get("text") or ""
         else:
-            snapshot = await page.evaluate("""() => {
-                function getAccessibilityTree(element, depth = 0, maxDepth = 8) {
-                    if (depth > maxDepth) return '';
-                    const indent = '  '.repeat(depth);
-                    let result = '';
-                    const role = element.getAttribute('role') ||
-                                 element.tagName.toLowerCase();
-                    const name = element.getAttribute('aria-label') ||
-                                 element.getAttribute('alt') ||
-                                 element.getAttribute('title') ||
-                                 element.getAttribute('placeholder') || '';
-                    const text = element.childNodes.length === 1 &&
-                                 element.childNodes[0].nodeType === 3
-                                 ? element.childNodes[0].textContent.trim() : '';
-                    const value = element.value || '';
-                    const href = element.getAttribute('href') || '';
-                    const type = element.getAttribute('type') || '';
-
-                    let label = role;
-                    if (name) label += ` "${name}"`;
-                    if (text && text.length < 200) label += ` "${text}"`;
-                    if (value) label += ` value="${value}"`;
-                    if (href) label += ` href="${href}"`;
-                    if (type) label += ` type="${type}"`;
-                    if (element.disabled) label += ' [disabled]';
-                    if (element.getAttribute('aria-expanded'))
-                        label += ` expanded=${element.getAttribute('aria-expanded')}`;
-
-                    const skip = ['script', 'style', 'noscript', 'svg', 'path'];
-                    if (skip.includes(element.tagName.toLowerCase())) return '';
-
-                    result += indent + label + '\\n';
-
-                    for (const child of element.children) {
-                        result += getAccessibilityTree(child, depth + 1, maxDepth);
-                    }
-                    return result;
-                }
-                return getAccessibilityTree(document.body);
-            }""")
-
-        if len(snapshot) > SNAPSHOT_MAX_LENGTH:
-            snapshot = snapshot[:SNAPSHOT_MAX_LENGTH] + "\n... [truncated]"
-
+            response, result = await _command(
+                session, {"command": "get_text", "selector": "body", "cap": 50_000}
+            )
+            content = result.get("text") or ""
+        url = result.get("url") or session.browser_client().current_url or ""
         return ToolResult(
-            output=f"Page: {page.url}\nTitle: {title}\n\n{snapshot}",
+            output=f"Page: {url}\n\n{content}",
+            metadata={"run_id": response.get("run_id"), "page_id": response.get("active_page_id")},
         )
-    except Exception as e:
-        return ToolResult(type=ToolResultType.ERROR, output=f"Snapshot failed: {e}")
-
-
-# ── BrowserScreenshot ──────────────────────────────────────────────────────────
+    except Exception as exc:
+        return _error(f"Snapshot failed: {exc}")
 
 
 async def tool_browser_screenshot(
-    session: ToolSession,
-    full_page: bool = False,
-    selector: str | None = None,
+    session: ToolSession, full_page: bool = False, selector: str | None = None
 ) -> ToolResult:
+    if full_page or selector:
+        return _error("The canonical sandbox screenshot currently captures the active viewport only.")
     try:
-        page = await session.browser.ensure_browser()
-
-        if selector:
-            element = await page.query_selector(selector)
-            if not element:
-                return ToolResult(
-                    type=ToolResultType.ERROR,
-                    output=f"Element not found: {selector}",
-                )
-            raw = await element.screenshot(type="png")
-        else:
-            raw = await page.screenshot(type="png", full_page=full_page)
-
-        encoded = base64.b64encode(raw).decode("ascii")
-        size_kb = len(raw) / 1024
-        title = await page.title()
-
+        response = await session.browser_client().capture()
+        artifact = response.get("artifact")
+        if not isinstance(artifact, dict) or not artifact.get("image_base64"):
+            return _error("Screenshot failed: Browser Manager returned no image.")
+        size_kb = float(artifact.get("byte_count") or 0) / 1024
         return ToolResult(
-            output=f"Screenshot of {page.url} ({size_kb:.1f} KB)\nTitle: {title}",
-            image=ImageData(media_type="image/png", base64_data=encoded),
+            output=f"Screenshot of {session.browser_client().current_url or ''} ({size_kb:.1f} KB)",
+            image=ImageData(
+                media_type=str(artifact.get("media_type") or "image/png"),
+                base64_data=str(artifact["image_base64"]),
+            ),
+            metadata={"run_id": response.get("run_id")},
         )
-    except Exception as e:
-        return ToolResult(type=ToolResultType.ERROR, output=f"Screenshot failed: {e}")
-
-
-# ── BrowserClick ───────────────────────────────────────────────────────────────
+    except Exception as exc:
+        return _error(f"Screenshot failed: {exc}")
 
 
 async def tool_browser_click(
-    session: ToolSession,
-    selector: str | None = None,
-    text: str | None = None,
-    position: dict | None = None,
-    button: str = "left",
-    click_count: int = 1,
+    session: ToolSession, selector: str | None = None, text: str | None = None,
+    position: dict | None = None, button: str = "left", click_count: int = 1,
 ) -> ToolResult:
+    if position is not None or button != "left" or click_count != 1:
+        return _error("Position, alternate-button, and multi-click actions are not in the canonical worker contract.")
+    target = selector or (f"text={text}" if text else None)
+    if not target:
+        return _error("Provide 'selector' or 'text' to identify what to click.")
     try:
-        page = await session.browser.ensure_browser()
-
-        if text:
-            locator = page.get_by_text(text, exact=False).first
-            await locator.click(button=button, click_count=click_count, timeout=DEFAULT_TIMEOUT_MS)
-            return ToolResult(output=f"Clicked text: '{text}'")
-        elif selector:
-            kwargs: dict = {"button": button, "click_count": click_count, "timeout": DEFAULT_TIMEOUT_MS}
-            if position:
-                kwargs["position"] = position
-            await page.click(selector, **kwargs)
-            return ToolResult(output=f"Clicked: {selector}")
-        elif position:
-            await page.mouse.click(position.get("x", 0), position.get("y", 0), button=button, click_count=click_count)
-            return ToolResult(output=f"Clicked at position ({position.get('x')}, {position.get('y')})")
-        else:
-            return ToolResult(
-                type=ToolResultType.ERROR,
-                output="Provide 'selector', 'text', or 'position' to identify what to click.",
-            )
-    except Exception as e:
-        return ToolResult(type=ToolResultType.ERROR, output=f"Click failed: {e}")
-
-
-# ── BrowserType ────────────────────────────────────────────────────────────────
+        await _command(session, {
+            "command": "click", "selector": target, "wait_after_ms": 0, "timeout_ms": 10_000,
+        })
+        return ToolResult(output=f"Clicked: {target}")
+    except Exception as exc:
+        return _error(f"Click failed: {exc}")
 
 
 async def tool_browser_type(
-    session: ToolSession,
-    text: str,
-    selector: str | None = None,
-    press_enter: bool = False,
-    clear_first: bool = False,
+    session: ToolSession, text: str, selector: str | None = None,
+    press_enter: bool = False, clear_first: bool = False,
 ) -> ToolResult:
+    if not selector:
+        return _error("A selector is required by the canonical browser worker for typed text.")
     try:
-        page = await session.browser.ensure_browser()
-
-        if selector:
-            if clear_first:
-                await page.fill(selector, "", timeout=DEFAULT_TIMEOUT_MS)
-            await page.type(selector, text, timeout=DEFAULT_TIMEOUT_MS)
-            desc = f"Typed into {selector}"
-        else:
-            await page.keyboard.type(text)
-            desc = "Typed text (no selector — typed to focused element)"
-
-        if press_enter:
-            await page.keyboard.press("Enter")
-            desc += " + pressed Enter"
-
-        return ToolResult(output=desc)
-    except Exception as e:
-        return ToolResult(type=ToolResultType.ERROR, output=f"Type failed: {e}")
+        await _command(session, {
+            "command": "type_text", "selector": selector, "text": text,
+            "clear_first": clear_first, "press_enter": press_enter, "timeout_ms": 10_000,
+        })
+        return ToolResult(output=f"Typed into {selector}" + (" + pressed Enter" if press_enter else ""))
+    except Exception as exc:
+        return _error(f"Type failed: {exc}")
 
 
-# ── BrowserPressKey ────────────────────────────────────────────────────────────
-
-
-async def tool_browser_press_key(
-    session: ToolSession,
-    key: str,
-) -> ToolResult:
-    try:
-        page = await session.browser.ensure_browser()
-        await page.keyboard.press(key)
-        return ToolResult(output=f"Pressed key: {key}")
-    except Exception as e:
-        return ToolResult(type=ToolResultType.ERROR, output=f"Key press failed: {e}")
-
-
-# ── BrowserScroll ──────────────────────────────────────────────────────────────
+async def tool_browser_press_key(session: ToolSession, key: str) -> ToolResult:
+    del session, key
+    return _error("Free-form key presses are not in the canonical browser worker contract.")
 
 
 async def tool_browser_scroll(
-    session: ToolSession,
-    direction: str = "down",
-    amount: int = 3,
+    session: ToolSession, direction: str = "down", amount: int = 3,
     selector: str | None = None,
 ) -> ToolResult:
+    if direction not in {"up", "down"}:
+        return _error("The canonical browser worker supports vertical scrolling only.")
     try:
-        page = await session.browser.ensure_browser()
-
-        delta_map = {
-            "down": (0, amount * 100),
-            "up": (0, -(amount * 100)),
-            "right": (amount * 100, 0),
-            "left": (-(amount * 100), 0),
-        }
-        dx, dy = delta_map.get(direction, (0, amount * 100))
-
-        if selector:
-            element = await page.query_selector(selector)
-            if element:
-                await element.scroll_into_view_if_needed()
-                box = await element.bounding_box()
-                if box:
-                    await page.mouse.wheel(dx, dy)
-        else:
-            await page.mouse.wheel(dx, dy)
-
+        await _command(session, {
+            "command": "scroll", "direction": direction, "pixels": amount * 100,
+            "selector": selector,
+        })
         return ToolResult(output=f"Scrolled {direction} by {amount} units")
-    except Exception as e:
-        return ToolResult(type=ToolResultType.ERROR, output=f"Scroll failed: {e}")
+    except Exception as exc:
+        return _error(f"Scroll failed: {exc}")
 
 
-# ── BrowserEvaluate ────────────────────────────────────────────────────────────
-
-
-async def tool_browser_evaluate(
-    session: ToolSession,
-    javascript: str,
-) -> ToolResult:
+async def tool_browser_evaluate(session: ToolSession, javascript: str) -> ToolResult:
     try:
-        page = await session.browser.ensure_browser()
-        result = await page.evaluate(javascript)
-        output = str(result) if result is not None else "(no return value)"
-        if len(output) > SNAPSHOT_MAX_LENGTH:
-            output = output[:SNAPSHOT_MAX_LENGTH] + "\n... [truncated]"
-        return ToolResult(output=output)
-    except Exception as e:
-        return ToolResult(type=ToolResultType.ERROR, output=f"JavaScript evaluation failed: {e}")
-
-
-# ── BrowserWaitFor ─────────────────────────────────────────────────────────────
+        _, result = await _command(session, {"command": "eval_js", "expression": javascript})
+        return ToolResult(output=json.dumps(result.get("value"), ensure_ascii=False, default=str))
+    except Exception as exc:
+        return _error(f"JavaScript evaluation failed: {exc}")
 
 
 async def tool_browser_wait_for(
-    session: ToolSession,
-    text: str | None = None,
-    selector: str | None = None,
-    timeout: int = 30000,
+    session: ToolSession, text: str | None = None, selector: str | None = None,
+    timeout: int = 30_000,
 ) -> ToolResult:
+    if not text and not selector:
+        return _error("Provide 'text' or 'selector' to wait for.")
     try:
-        page = await session.browser.ensure_browser()
-
-        if text:
-            await page.wait_for_selector(f"text={text}", timeout=timeout)
-            return ToolResult(output=f"Text appeared: '{text}'")
-        elif selector:
-            await page.wait_for_selector(selector, timeout=timeout)
-            return ToolResult(output=f"Element appeared: {selector}")
-        else:
-            return ToolResult(
-                type=ToolResultType.ERROR,
-                output="Provide 'text' or 'selector' to wait for.",
-            )
-    except Exception as e:
-        return ToolResult(type=ToolResultType.ERROR, output=f"Wait failed: {e}")
+        await _command(session, {
+            "command": "wait_for", "selector": selector, "text": text,
+            "state": "visible", "timeout_ms": timeout,
+        })
+        return ToolResult(output=f"Wait completed for: {selector or text}")
+    except Exception as exc:
+        return _error(f"Wait failed: {exc}")
 
 
-# ── BrowserBack ────────────────────────────────────────────────────────────────
-
-
-async def tool_browser_back(
-    session: ToolSession,
-) -> ToolResult:
+async def tool_browser_back(session: ToolSession) -> ToolResult:
     try:
-        page = await session.browser.ensure_browser()
-        await page.go_back(timeout=DEFAULT_TIMEOUT_MS)
-        title = await page.title()
-        return ToolResult(output=f"Navigated back to {page.url}\nTitle: {title}")
-    except Exception as e:
-        return ToolResult(type=ToolResultType.ERROR, output=f"Back navigation failed: {e}")
-
-
-# ── BrowserTabs ────────────────────────────────────────────────────────────────
+        await _command(session, {"command": "eval_js", "expression": "history.back()"})
+        return ToolResult(output="Requested browser back navigation.")
+    except Exception as exc:
+        return _error(f"Back navigation failed: {exc}")
 
 
 async def tool_browser_tabs(
-    session: ToolSession,
-    action: str = "list",
-    page_id: str | None = None,
+    session: ToolSession, action: str = "list", page_id: str | None = None,
     url: str | None = None,
 ) -> ToolResult:
+    del page_id, url
+    if action != "list":
+        return _error("Tab mutation is not yet exposed by the canonical Browser Manager bridge.")
     try:
-        if action == "list":
-            tabs = session.browser.list_tabs()
-            if not tabs:
-                return ToolResult(output="No browser tabs open.")
-            lines = []
-            for t in tabs:
-                marker = " (active)" if t["active"] else ""
-                lines.append(f"  {t['page_id']}: {t['url']}{marker}")
-            return ToolResult(output=f"Open tabs ({len(tabs)}):\n" + "\n".join(lines))
-
-        elif action == "new":
-            pid, page = await session.browser.new_tab()
-            if url:
-                await page.goto(url, wait_until="domcontentloaded", timeout=DEFAULT_TIMEOUT_MS)
-            return ToolResult(output=f"Created new tab {pid}" + (f" at {url}" if url else ""))
-
-        elif action == "switch":
-            if not page_id:
-                return ToolResult(type=ToolResultType.ERROR, output="page_id required for 'switch' action")
-            page = await session.browser.switch_tab(page_id)
-            if page is None:
-                return ToolResult(type=ToolResultType.ERROR, output=f"Tab not found: {page_id}")
-            return ToolResult(output=f"Switched to tab {page_id}: {page.url}")
-
-        elif action == "close":
-            if not page_id:
-                return ToolResult(type=ToolResultType.ERROR, output="page_id required for 'close' action")
-            closed = await session.browser.close_tab(page_id)
-            if not closed:
-                return ToolResult(type=ToolResultType.ERROR, output=f"Tab not found: {page_id}")
-            return ToolResult(output=f"Closed tab {page_id}")
-
-        else:
-            return ToolResult(
-                type=ToolResultType.ERROR,
-                output=f"Unknown action: {action}. Use 'list', 'new', 'switch', or 'close'.",
-            )
-    except Exception as e:
-        return ToolResult(type=ToolResultType.ERROR, output=f"Tab operation failed: {e}")
+        client = session.browser_client()
+        await client.ensure_run()
+        if client.active_page_id is None:
+            return ToolResult(output="No active browser page has been observed yet.")
+        return ToolResult(
+            output=f"Open tabs (known active page):\n  {client.active_page_id}: {client.current_url or ''} (active)",
+            metadata={"run_id": client.run_id},
+        )
+    except Exception as exc:
+        return _error(f"Tab operation failed: {exc}")
 
 
-# ── BrowserConsole ─────────────────────────────────────────────────────────────
+async def tool_browser_console(session: ToolSession, pattern: str | None = None) -> ToolResult:
+    del session, pattern
+    return _error("Console collection is not exposed by the canonical Browser Manager contract.")
 
 
-async def tool_browser_console(
-    session: ToolSession,
-    pattern: str | None = None,
-) -> ToolResult:
-    messages = session.browser.pop_console_messages()
-    if pattern:
-        try:
-            regex = re.compile(pattern)
-            messages = [m for m in messages if regex.search(m.get("text", ""))]
-        except re.error as e:
-            return ToolResult(type=ToolResultType.ERROR, output=f"Invalid pattern: {e}")
-
-    if not messages:
-        return ToolResult(output="No console messages.")
-
-    lines = [f"[{m.get('type', '?')}] {m.get('text', '')}" for m in messages]
-    return ToolResult(output=f"Console messages ({len(lines)}):\n" + "\n".join(lines))
-
-
-# ── BrowserClose ───────────────────────────────────────────────────────────────
-
-
-async def tool_browser_close(
-    session: ToolSession,
-) -> ToolResult:
-    if not session.browser.is_running:
+async def tool_browser_close(session: ToolSession) -> ToolResult:
+    client = session.browser_client()
+    if not client.is_running:
         return ToolResult(output="Browser is not running.")
-
-    await session.browser.close()
-    return ToolResult(output="Browser closed.")
+    try:
+        await client.close()
+        return ToolResult(output="Browser closed.")
+    except Exception as exc:
+        return _error(f"Browser close failed: {exc}")

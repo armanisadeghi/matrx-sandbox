@@ -6,6 +6,24 @@
 
 This doc is the contract. Both ends now match. The only remaining step is provisioning the shared service token + AWS creds (see Configuration checklist below).
 
+## Canonical browser calls from a sandbox
+
+`matrx_tools` no longer starts its own disposable Playwright/Chromium process.
+Its existing browser tool names now use the Browser Manager owned by AI Dream,
+over the same approved-server authentication described below:
+
+```text
+matrx_tools -> /browser-manager/internal/sandbox/* -> Browser Manager -> canonical worker
+```
+
+The orchestrator must explicitly inject `MATRX_BROWSER_PROFILE_ID` and
+`MATRX_BROWSER_EXECUTION_TARGET` in addition to the existing AI Dream URL,
+service token, `USER_ID`, and `SANDBOX_ID`. Missing browser identity fails closed;
+there is no local-browser fallback. `browser_fleet` is usable once the central
+worker is healthy. The `sandbox` value is deliberately refused by AI Dream until
+G2 provides durable per-sandbox placement, isolation proof, and measured capacity;
+it cannot silently fall through to the singleton central worker.
+
 ---
 
 ## The user-facing pitch
