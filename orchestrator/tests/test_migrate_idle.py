@@ -6,6 +6,7 @@ from datetime import datetime, timedelta, timezone
 
 from orchestrator.config import settings
 from orchestrator.migrate import _has_recent_heartbeat
+from orchestrator.migrate import _refresh_platform_environment
 
 
 class _Row:
@@ -35,6 +36,43 @@ def test_naive_heartbeat_treated_as_utc():
     # A naive timestamp must not raise; treat it as UTC.
     hb = datetime.utcnow() - timedelta(seconds=5)
     assert _has_recent_heartbeat(_Row(hb)) is True
+
+
+def test_platform_environment_refresh_preserves_user_values(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.sandbox_manager._resolve_passthrough_keys",
+        lambda: ["SUPABASE_MATRIX_HOST", "SUPABASE_MATRIX_PASSWORD"],
+    )
+    monkeypatch.setenv("SUPABASE_MATRIX_HOST", "east.example")
+    monkeypatch.setenv("SUPABASE_MATRIX_PASSWORD", "new-secret")
+
+    refreshed, changed = _refresh_platform_environment([
+        "SUPABASE_MATRIX_HOST=west.example",
+        "SUPABASE_MATRIX_PASSWORD=old-secret",
+        "USER_CHOSEN_VALUE=keep-me",
+    ])
+
+    assert "USER_CHOSEN_VALUE=keep-me" in refreshed
+    assert "SUPABASE_MATRIX_HOST=east.example" in refreshed
+    assert "SUPABASE_MATRIX_PASSWORD=new-secret" in refreshed
+    assert "SUPABASE_MATRIX_HOST=west.example" not in refreshed
+    assert changed == 2
+
+
+def test_platform_environment_refresh_removes_retired_platform_key(monkeypatch):
+    monkeypatch.setattr(
+        "orchestrator.sandbox_manager._resolve_passthrough_keys",
+        lambda: ["RETIRED_PLATFORM_KEY"],
+    )
+    monkeypatch.delenv("RETIRED_PLATFORM_KEY", raising=False)
+
+    refreshed, changed = _refresh_platform_environment([
+        "RETIRED_PLATFORM_KEY=stale",
+        "USER_CHOSEN_VALUE=keep-me",
+    ])
+
+    assert refreshed == ["USER_CHOSEN_VALUE=keep-me"]
+    assert changed == 1
 
 
 # ── Widened idle gate (2026-07-09): open sessions + recent tool activity ──────

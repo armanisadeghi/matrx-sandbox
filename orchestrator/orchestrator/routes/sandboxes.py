@@ -579,6 +579,31 @@ async def migrate_sandbox_route(sandbox_id: str, target_image: str | None = None
     raise HTTPException(status_code=502, detail=result)
 
 
+@router.post("/{sandbox_id}/refresh-platform-env")
+async def refresh_sandbox_platform_env(sandbox_id: str):
+    """Recreate an idle hosted sandbox with current platform configuration.
+
+    The existing sandbox id and persistent ``/home/agent`` volume are retained.
+    A replacement must pass readiness checks before cutover, and the old
+    container is restored on failure.  The idle gate protects active tool calls,
+    terminals, file watches, recent activity, and recent heartbeats.
+    """
+    from orchestrator.migrate import migrate_sandbox
+
+    store = sandbox_manager._get_store()
+    result = await migrate_sandbox(
+        sandbox_id,
+        store=store,
+        require_idle=True,
+        refresh_platform_env=True,
+    )
+    if result["status"] in ("migrated", "already_current", "busy_deferred"):
+        return result
+    if result["status"] == "not_found":
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    raise HTTPException(status_code=502, detail=result)
+
+
 @router.post("/{sandbox_id}/heartbeat", response_model=HeartbeatResponse)
 async def sandbox_heartbeat(sandbox_id: str):
     """Record a heartbeat from a sandbox."""

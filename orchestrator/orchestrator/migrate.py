@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 
 from docker.errors import APIError, NotFound
@@ -31,6 +32,43 @@ from orchestrator.runtime_isolation import container_runtime_isolation
 from orchestrator.versioning import current_image
 
 logger = logging.getLogger(__name__)
+
+
+def _refresh_platform_environment(existing: list[str]) -> tuple[list[str], int]:
+    """Replace orchestrator-owned passthrough values without touching user env.
+
+    Docker container environments are immutable.  When the platform database
+    or another shared service moves, already-running sandboxes therefore keep
+    the old values until they are recreated.  The passthrough name registry is
+    the boundary between platform-owned configuration and per-sandbox/user
+    configuration: remove those names from the old environment, then append
+    the values currently loaded by the orchestrator.
+
+    Values and key names are deliberately absent from the return metadata so a
+    migration response or log cannot disclose secrets.
+    """
+    from orchestrator.sandbox_manager import _resolve_passthrough_keys
+
+    platform_keys = set(_resolve_passthrough_keys())
+    old_values: dict[str, str] = {}
+    preserved: list[str] = []
+    for item in existing:
+        key, separator, value = item.partition("=")
+        if separator and key in platform_keys:
+            old_values[key] = value
+        else:
+            preserved.append(item)
+
+    current_values = {
+        key: value for key in sorted(platform_keys)
+        if (value := os.environ.get(key))
+    }
+    changed = sum(
+        1 for key in platform_keys
+        if old_values.get(key) != current_values.get(key)
+    )
+    preserved.extend(f"{key}={value}" for key, value in current_values.items())
+    return preserved, changed
 
 
 def _binds_to_volumes(host_config: dict) -> dict:
@@ -105,7 +143,8 @@ def _has_recent_heartbeat(sbx) -> bool:
 
 
 async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = None,
-                          verify_timeout: int = 90, require_idle: bool = False) -> dict:
+                          verify_timeout: int = 90, require_idle: bool = False,
+                          refresh_platform_env: bool = False) -> dict:
     """Migrate one box to the current image (or an explicit target_image).
     Returns a status dict; never raises.
 
@@ -150,9 +189,6 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     target = target_image or cur.tag
     old_image_id = (old.attrs or {}).get("Image")
 
-    if not target_image and cur.image_id and old_image_id == cur.image_id:
-        return {"status": "already_current", "sandbox_id": sandbox_id, "version": cur.version}
-
     cfg = old.attrs.get("Config") or {}
     host = old.attrs.get("HostConfig") or {}
     # Copy the old env EXCEPT MATRX_IMAGE_VERSION — the new image must report its
@@ -162,6 +198,20 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         e for e in (cfg.get("Env") or [])
         if not e.startswith("MATRX_IMAGE_VERSION=") and not e.startswith("SANDBOX_MIGRATION=")
     ]
+    platform_env_changes = 0
+    if refresh_platform_env:
+        env, platform_env_changes = _refresh_platform_environment(env)
+
+    if (
+        not target_image
+        and cur.image_id
+        and old_image_id == cur.image_id
+        and platform_env_changes == 0
+    ):
+        return {
+            "status": "already_current", "sandbox_id": sandbox_id,
+            "version": cur.version, "platform_env_changed": 0,
+        }
     # Tell the new container's entrypoint it's a MIGRATION boot, not a fresh
     # spawn: the data is already on the volume we're re-mounting, so it skips the
     # (up to 60s) cloud_files down-sync — the biggest chunk of migration time.
@@ -312,6 +362,7 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     return {
         "status": "migrated", "sandbox_id": sandbox_id,
         "to_version": cur.version or new_ver, "to_image": target,
+        "platform_env_changed": platform_env_changes,
     }
 
 
