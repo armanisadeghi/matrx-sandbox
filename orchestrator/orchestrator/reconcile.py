@@ -216,16 +216,27 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
                 user_id=user_id,
                 status=status,
                 container_id=container.id,
-                created_at=_parse_created_at(labels.get("matrx.created_at")),
-                hot_path="/home/agent",
-                cold_path="/data/cold",
-                config={},
-                ttl_seconds=7200,  # default; on next heartbeat/extend the truth wins
+                # Docker proves runtime state, not user-authored metadata.
+                # Preserve every metadata field already recorded in Postgres;
+                # replacing config with {} here erased config for the entire
+                # live fleet on every orchestrator restart.
+                created_at=(
+                    existing_row.created_at if existing_row is not None
+                    else _parse_created_at(labels.get("matrx.created_at"))
+                ),
+                hot_path=(existing_row.hot_path if existing_row is not None else "/home/agent"),
+                cold_path=(existing_row.cold_path if existing_row is not None else "/data/cold"),
+                config=(existing_row.config if existing_row is not None else {}),
+                ttl_seconds=(existing_row.ttl_seconds if existing_row is not None else 7200),
                 tier=tier,
                 template=labels.get("matrx.template"),
                 template_version=labels.get("matrx.template_version"),
+                labels=(existing_row.labels if existing_row is not None else None),
                 ssh_port=_ssh_host_port(attrs),
-                persistence_volume=_persistence_volume_from_mounts(attrs),
+                persistence_volume=(
+                    _persistence_volume_from_mounts(attrs)
+                    or (existing_row.persistence_volume if existing_row is not None else None)
+                ),
             )
 
             await store.save(sandbox)
