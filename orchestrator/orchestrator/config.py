@@ -72,6 +72,19 @@ class Settings(BaseSettings):
     # tier in /api-surface and SandboxResponse rows.
     host_tier: str = ""             # env var: MATRX_HOST_TIER ("ec2" or "hosted")
 
+    # Internal development worker.  Empty means the capability is disabled.
+    # The caller supplies only a safe workspace key; host paths never cross the
+    # API boundary.  Access is restricted to the exact user ids declared here.
+    internal_development_workspace_root: str = ""
+    internal_development_user_ids: str = ""
+
+    def internal_development_users(self) -> set[str]:
+        return {
+            value.strip()
+            for value in self.internal_development_user_ids.split(",")
+            if value.strip()
+        }
+
     # ── Warm pool ───────────────────────────────────────────────────────────
     # Keep N pre-booted, unclaimed sandboxes ready so "launch from a chat
     # window" is a fast CLAIM (adopt an already-running box) instead of a cold

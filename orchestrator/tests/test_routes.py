@@ -54,6 +54,59 @@ async def test_post_sandboxes_invalid_user_id(mock_sandbox_manager, mock_storage
 
 
 @pytest.mark.asyncio
+async def test_internal_development_template_requires_allowlisted_ec2_host(
+    mock_sandbox_manager,
+    mock_storage,
+    monkeypatch,
+):
+    from orchestrator.config import settings
+
+    user_id = "00000000-0000-4000-8000-000000000001"
+    monkeypatch.setattr(settings, "host_tier", "ec2")
+    monkeypatch.setattr(settings, "internal_development_workspace_root", "/workspace")
+    monkeypatch.setattr(settings, "internal_development_user_ids", "somebody-else")
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/sandboxes",
+            json={"user_id": user_id, "template": "development", "tier": "ec2"},
+        )
+
+    assert response.status_code == 403
+    mock_sandbox_manager.create_sandbox.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_internal_development_template_rejects_unsafe_workspace_key(
+    mock_sandbox_manager,
+    mock_storage,
+    monkeypatch,
+):
+    from orchestrator.config import settings
+
+    user_id = "00000000-0000-4000-8000-000000000001"
+    monkeypatch.setattr(settings, "host_tier", "ec2")
+    monkeypatch.setattr(settings, "internal_development_workspace_root", "/workspace")
+    monkeypatch.setattr(settings, "internal_development_user_ids", user_id)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/sandboxes",
+            json={
+                "user_id": user_id,
+                "template": "development",
+                "tier": "ec2",
+                "config": {"workspace_key": "../escape"},
+            },
+        )
+
+    assert response.status_code == 422
+    mock_sandbox_manager.create_sandbox.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_get_sandboxes_returns_empty_list(mock_sandbox_manager):
     """GET /sandboxes should return an empty list when no sandboxes exist."""
     transport = ASGITransport(app=app)

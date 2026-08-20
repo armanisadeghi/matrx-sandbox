@@ -5,6 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 _AIDREAM_TEMPLATE = "aidream"
+_OWNER_BOUND_TEMPLATES = {_AIDREAM_TEMPLATE, "development"}
 _AIDREAM_TMPFS = {
     "/tmp": "rw,nosuid,nodev,mode=1777",
     "/var/tmp": "rw,nosuid,nodev,mode=1777",
@@ -41,9 +42,9 @@ def container_runtime_isolation(template: str | None, tier: str | None) -> dict[
 
 
 def warm_pool_supports_template(template: str | None) -> bool:
-    """Heavy aidream boxes require owner env/volume and cannot be pre-warmed."""
+    """Owner-bound boxes require env/storage and cannot be pre-warmed."""
 
-    return template != _AIDREAM_TEMPLATE
+    return template not in _OWNER_BOUND_TEMPLATES
 
 
 __all__ = ["container_runtime_isolation", "warm_pool_supports_template"]

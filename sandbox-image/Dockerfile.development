@@ -1,0 +1,31 @@
+ARG BASE_IMAGE=matrx-sandbox:slim
+FROM ${BASE_IMAGE}
+
+LABEL maintainer="AI Matrx <team@aimatrx.com>"
+LABEL description="Internal AI Matrx development worker — persistent workspace, current repo toolchains"
+
+USER root
+
+# The normal slim image stays small for customer sandboxes.  This internal-only
+# derivative adds exactly what the AI Matrx repositories and their canonical
+# release scripts require.  uv owns Python 3.13 on demand, so the image does not
+# need a second system Python installation.
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs gh git-lfs \
+    && rm -rf /var/lib/apt/lists/* \
+    && npm install -g npm@11 pnpm@10.15.0 \
+    && git lfs install --system \
+    && curl -LsSf https://astral.sh/uv/0.10.8/install.sh \
+        | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && node --version \
+    && pnpm --version \
+    && uv --version \
+    && gh --version
+
+RUN echo "development" > /etc/sandbox-image-tag
+
+ARG MATRX_IMAGE_VERSION=dev
+ENV MATRX_IMAGE_VERSION=${MATRX_IMAGE_VERSION}
+LABEL com.aimatrx.sandbox.version="${MATRX_IMAGE_VERSION}"
+RUN echo "${MATRX_IMAGE_VERSION}" > /etc/sandbox-image-version
+

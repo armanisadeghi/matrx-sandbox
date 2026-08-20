@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from pathlib import Path
 import shlex
 import uuid
 from datetime import datetime, timezone
@@ -323,6 +324,21 @@ async def create_sandbox(
                 "Hosted-tier sandbox %s: mounting user volume %s -> /home/agent",
                 sandbox_id, volume_name,
             )
+        elif template == "development":
+            workspace_root = Path(settings.internal_development_workspace_root).resolve()
+            workspace_key = str(config.get("workspace_key") or "primary")
+            workspace_path = (workspace_root / workspace_key).resolve()
+            if workspace_path.parent != workspace_root:
+                raise RuntimeError("internal development workspace escapes configured root")
+            workspace_path.mkdir(mode=0o700, parents=True, exist_ok=True)
+            os.chown(workspace_path, 1000, 1000)
+            volumes[str(workspace_path)] = {"bind": "/home/agent", "mode": "rw"}
+            sandbox.persistence_volume = f"host:{workspace_key}"
+            logger.info(
+                "Internal development sandbox %s: mounting workspace %s -> /home/agent",
+                sandbox_id,
+                workspace_key,
+            )
 
         env = {
             "SANDBOX_ID": sandbox_id,
@@ -600,6 +616,18 @@ async def create_sandbox(
         for k, v in secrets_env.items():
             env[k] = v
 
+        if template == "development":
+            github_token_keys = (
+                "GITHUB_TOKEN",
+                "GH_TOKEN",
+                "GITHUB_PAT",
+                "MATRX_GITHUB_TOKEN",
+            )
+            if not any(env.get(key) for key in github_token_keys):
+                raise RuntimeError(
+                    "internal development sandbox requires a vaulted GitHub token"
+                )
+
         # Resource overrides — fall back to settings defaults
         cpu_limit = resources.get("cpu") or settings.container_cpu_limit
         memory_limit = resources.get("memory_mb")
@@ -654,7 +682,10 @@ async def create_sandbox(
                 **({"matrx.template_version": template_version} if template_version else {}),
                 **{f"matrx.label.{k}": v for k, v in (labels or {}).items()},
             },
-            restart_policy={"Name": "no", "MaximumRetryCount": 0},
+            restart_policy={
+                "Name": "unless-stopped" if template == "development" else "no",
+                "MaximumRetryCount": 0,
+            },
         ))  # type: ignore[call-overload]
 
         sandbox.container_id = container.id

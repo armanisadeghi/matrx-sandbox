@@ -163,6 +163,25 @@ jobs:
           test "$(docker image inspect "$ECR_REPO:slim-${{ github.sha }}" \
             --format '{{index .Config.Labels "com.aimatrx.sandbox.version"}}')" = "${{ github.sha }}"
 
+      - name: Build and push internal development sandbox image
+        run: |
+          # Internal-only derivative of slim with the current AI Matrx repo
+          # toolchains. It is exposed only on the allowlisted EC2 host.
+          ECR_REPO=${{ secrets.ECR_REPO_URI }}
+          ECR_NAME=${ECR_REPO#*/}
+          if aws ecr describe-images --repository-name "$ECR_NAME" \
+              --image-ids imageTag=development-${{ github.sha }} >/dev/null 2>&1; then
+            docker pull "$ECR_REPO:development-${{ github.sha }}"
+          else
+            docker build -f sandbox-image/Dockerfile.development \
+              --build-arg BASE_IMAGE="$ECR_REPO:slim-${{ github.sha }}" \
+              --build-arg MATRX_IMAGE_VERSION=${{ github.sha }} \
+              -t "$ECR_REPO:development-${{ github.sha }}" sandbox-image/
+            docker push "$ECR_REPO:development-${{ github.sha }}"
+          fi
+          test "$(docker image inspect "$ECR_REPO:development-${{ github.sha }}" \
+            --format '{{index .Config.Labels "com.aimatrx.sandbox.version"}}')" = "${{ github.sha }}"
+
       - name: Build and push orchestrator image
         run: |
           ECR_REPO=${{ secrets.ECR_REPO_URI }}-orchestrator

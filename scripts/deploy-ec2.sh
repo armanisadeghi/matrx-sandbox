@@ -92,6 +92,7 @@ cleanup_candidate_images() {
   docker image rm \
     "$ECR_REPO:$TARGET_SHA" \
     "$ECR_REPO:slim-$TARGET_SHA" \
+    "$ECR_REPO:development-$TARGET_SHA" \
     "$ECR_REPO-orchestrator:$TARGET_SHA" >/dev/null 2>&1 || true
 }
 
@@ -100,8 +101,8 @@ log "reclaiming disk from previous releases"
 # normal, healthy case where no candidates leaked — fails the pipeline and
 # would abort the release before it starts. Nothing to reclaim is success.
 LEAKED=$(docker images --format '{{.Repository}}:{{.Tag}}' \
-  | grep -E "^${ECR_REPO}(-orchestrator)?:(slim-)?[0-9a-f]{40}$" \
-  | grep -v ":\(slim-\)\?$TARGET_SHA\$" || true)
+  | grep -E "^${ECR_REPO}(-orchestrator)?:(slim-|development-)?[0-9a-f]{40}$" \
+  | grep -v ":\(slim-\|development-\)\?$TARGET_SHA\$" || true)
 for leaked in $LEAKED; do
   log "removing leaked release candidate $leaked"
   docker image rm "$leaked" >/dev/null 2>&1 || true
@@ -130,8 +131,12 @@ log "pulling immutable image candidates"
 trap 'cleanup_candidate_images' ERR INT TERM
 docker pull "$ECR_REPO:$TARGET_SHA"
 docker pull "$ECR_REPO:slim-$TARGET_SHA"
+docker pull "$ECR_REPO:development-$TARGET_SHA"
 docker pull "$ECR_REPO-orchestrator:$TARGET_SHA"
-for image in "$ECR_REPO:$TARGET_SHA" "$ECR_REPO:slim-$TARGET_SHA"; do
+for image in \
+  "$ECR_REPO:$TARGET_SHA" \
+  "$ECR_REPO:slim-$TARGET_SHA" \
+  "$ECR_REPO:development-$TARGET_SHA"; do
   baked=$(docker image inspect "$image" \
     --format '{{index .Config.Labels "com.aimatrx.sandbox.version"}}')
   [ "$baked" = "$TARGET_SHA" ] || fail "$image embeds unexpected version $baked"
@@ -192,6 +197,11 @@ rollback() {
     else
       docker image rm matrx-sandbox:slim >/dev/null 2>&1 || true
     fi
+    if [ "$DEVELOPMENT_HAD_LIVE" = 1 ]; then
+      docker tag matrx-sandbox:development-rollback matrx-sandbox:development
+    else
+      docker image rm matrx-sandbox:development >/dev/null 2>&1 || true
+    fi
   fi
   systemctl start "$UNIT" || true
   # Never leave the per-SHA candidates behind: a failed release that keeps
@@ -213,6 +223,7 @@ log "promoting candidates"
 systemctl stop "$UNIT"
 CORE_HAD_LIVE=0
 SLIM_HAD_LIVE=0
+DEVELOPMENT_HAD_LIVE=0
 if docker image inspect matrx-sandbox:latest >/dev/null 2>&1; then
   CORE_HAD_LIVE=1
   docker tag matrx-sandbox:latest matrx-sandbox:rollback
@@ -225,9 +236,16 @@ if docker image inspect matrx-sandbox:slim >/dev/null 2>&1; then
 else
   docker image rm matrx-sandbox:slim-rollback >/dev/null 2>&1 || true
 fi
+if docker image inspect matrx-sandbox:development >/dev/null 2>&1; then
+  DEVELOPMENT_HAD_LIVE=1
+  docker tag matrx-sandbox:development matrx-sandbox:development-rollback
+else
+  docker image rm matrx-sandbox:development-rollback >/dev/null 2>&1 || true
+fi
 IMAGES_PROMOTED=1
 docker tag "$ECR_REPO:$TARGET_SHA" matrx-sandbox:latest
 docker tag "$ECR_REPO:slim-$TARGET_SHA" matrx-sandbox:slim
+docker tag "$ECR_REPO:development-$TARGET_SHA" matrx-sandbox:development
 
 rm -rf "$ROLLBACK_DIR"
 LIVE_MOVED=0
@@ -314,5 +332,6 @@ rm -rf "$FAILED_DIR" "$DROPIN_BACKUP"
 docker image rm \
   "$ECR_REPO:$TARGET_SHA" \
   "$ECR_REPO:slim-$TARGET_SHA" \
+  "$ECR_REPO:development-$TARGET_SHA" \
   "$ECR_REPO-orchestrator:$TARGET_SHA" >/dev/null 2>&1 || true
 log "release $TARGET_SHA is healthy and exact"

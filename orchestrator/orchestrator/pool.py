@@ -153,7 +153,7 @@ def _warm_run_container(template: str):
     """
     if not warm_pool_supports_template(template):
         logger.error(
-            "Pool: refusing to pre-warm template=%s; managed aidream requires an owner volume and runtime env",
+            "Pool: refusing to pre-warm template=%s; owner-bound templates require runtime env and storage",
             template,
         )
         return None

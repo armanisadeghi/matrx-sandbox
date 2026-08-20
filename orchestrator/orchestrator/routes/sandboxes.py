@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import logging
+import re
 from datetime import datetime, timezone
 from typing import Any
 
@@ -36,6 +37,7 @@ from orchestrator.models import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(prefix="/sandboxes", tags=["sandboxes"])
+_WORKSPACE_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
 
 
 def _with_agent(headers: dict, sandbox_id: str) -> dict:
@@ -87,6 +89,26 @@ async def create_sandbox(req: CreateSandboxRequest):
                 "the hosted tier, or choose a non-aidream template for EC2."
             ),
         )
+
+    if req.template == "development":
+        if effective_tier != "ec2":
+            raise HTTPException(
+                status_code=400,
+                detail="The internal development template is hosted on the AWS EC2 tier.",
+            )
+        if not settings.internal_development_workspace_root:
+            raise HTTPException(
+                status_code=503,
+                detail="Internal development workspace storage is not configured on this host.",
+            )
+        if req.user_id not in settings.internal_development_users():
+            raise HTTPException(status_code=403, detail="Internal development template is restricted.")
+        workspace_key = (req.config or {}).get("workspace_key", "primary")
+        if not isinstance(workspace_key, str) or not _WORKSPACE_KEY_RE.fullmatch(workspace_key):
+            raise HTTPException(
+                status_code=422,
+                detail="workspace_key must be 1-63 lowercase letters, numbers, hyphens, or underscores.",
+            )
 
     await storage.ensure_user_storage(req.user_id)
     sandbox = await sandbox_manager.create_sandbox(

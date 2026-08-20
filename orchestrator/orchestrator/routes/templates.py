@@ -31,6 +31,7 @@ _TEMPLATE_IMAGE_OVERRIDES: dict[str, str] = {
     # Lightweight coding box — clone, run tools, push a branch. Git-as-
     # persistence, no S3/FUSE/Chromium. See docs/EC2_LIGHTWEIGHT_BOX.md.
     "slim": "matrx-sandbox:slim",
+    "development": "matrx-sandbox:development",
 }
 
 
@@ -51,7 +52,7 @@ def _builtin_templates() -> list[TemplateInfo]:
     tier = settings.host_tier or None
     def _img(tpl: str) -> str:
         return _TEMPLATE_IMAGE_OVERRIDES.get(tpl, default_image)
-    return [
+    templates = [
         TemplateInfo(
             id="bare",
             version="1",
@@ -106,6 +107,22 @@ def _builtin_templates() -> list[TemplateInfo]:
             languages=["python", "node", "bash"],
         ),
     ]
+    if tier == "ec2" and settings.internal_development_workspace_root:
+        templates.append(
+            TemplateInfo(
+                id="development",
+                version="1",
+                description=(
+                    "Internal AI Matrx development worker — persistent encrypted "
+                    "host workspace, Node 22 + pnpm, uv/Python 3.13, git + gh. "
+                    "Restricted to configured internal identities."
+                ),
+                image=_img("development"),
+                tier=tier,
+                languages=["python", "node", "typescript", "bash"],
+            )
+        )
+    return templates
 
 
 @router.get("", response_model=TemplateListResponse)

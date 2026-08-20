@@ -219,6 +219,83 @@ def test_aidream_warm_pool_is_structurally_prohibited(monkeypatch):
     get_client.assert_not_called()
 
 
+def test_development_warm_pool_is_structurally_prohibited(monkeypatch):
+    from orchestrator import pool
+
+    get_client = MagicMock(side_effect=AssertionError("Docker must not be called"))
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", get_client)
+
+    assert pool._warm_run_container("development") is None
+    get_client.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_development_sandbox_mounts_workspace_and_restarts(
+    mock_docker,
+    monkeypatch,
+    tmp_path,
+):
+    from orchestrator import sandbox_manager
+    from orchestrator.config import settings
+
+    container = MagicMock()
+    container.id = "development-container"
+    container.status = "running"
+    container.exec_run.return_value = (0, b"")
+    mock_docker.containers.run.return_value = container
+    mock_docker.containers.get.return_value = container
+
+    monkeypatch.setattr(settings, "internal_development_workspace_root", str(tmp_path))
+    monkeypatch.setattr(settings, "aidream_url", "")
+    monkeypatch.setattr(settings, "aidream_service_token", "")
+    monkeypatch.setattr("os.chown", MagicMock())
+
+    sandbox = await sandbox_manager.create_sandbox(
+        user_id="00000000-0000-4000-8000-000000000001",
+        template="development",
+        tier="ec2",
+        config={"workspace_key": "primary", "env": {"GH_TOKEN": "test-token"}},
+    )
+
+    kwargs = mock_docker.containers.run.call_args.kwargs
+    assert kwargs["volumes"] == {
+        str(tmp_path / "primary"): {"bind": "/home/agent", "mode": "rw"}
+    }
+    assert kwargs["restart_policy"] == {
+        "Name": "unless-stopped",
+        "MaximumRetryCount": 0,
+    }
+    assert sandbox.persistence_volume == "host:primary"
+
+
+@pytest.mark.asyncio
+async def test_development_sandbox_refuses_to_boot_without_github_auth(
+    mock_docker,
+    monkeypatch,
+    tmp_path,
+):
+    from orchestrator import sandbox_manager
+    from orchestrator.config import settings
+
+    monkeypatch.setattr(settings, "internal_development_workspace_root", str(tmp_path))
+    monkeypatch.setattr(settings, "aidream_url", "")
+    monkeypatch.setattr(settings, "aidream_service_token", "")
+    monkeypatch.setattr("os.chown", MagicMock())
+
+    with pytest.raises(
+        RuntimeError,
+        match="requires a vaulted GitHub token",
+    ):
+        await sandbox_manager.create_sandbox(
+            user_id="00000000-0000-4000-8000-000000000001",
+            template="development",
+            tier="ec2",
+            config={"workspace_key": "primary"},
+        )
+
+    mock_docker.containers.run.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_list_sandboxes_filters_by_user(clean_sandbox_state):
     """list_sandboxes should filter by user_id when provided."""
