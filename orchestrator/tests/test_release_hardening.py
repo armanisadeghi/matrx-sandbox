@@ -551,7 +551,7 @@ def test_deploy_scripts_revalidate_immutable_approval_not_moving_main():
 
 def test_ec2_release_requires_the_private_aidream_replica_before_and_after_swap():
     script = (REPO_ROOT / "scripts" / "deploy-ec2.sh").read_text(encoding="utf-8")
-    expected = 'EXPECTED_AIDREAM_URL="http://172.31.83.75:8000"'
+    expected = 'EXPECTED_AIDREAM_URL="http://aidream.internal.matrxserver.com"'
     preflight = '[ "$AIDREAM_URL" = "$EXPECTED_AIDREAM_URL" ]'
     promotion = script.index('log "promoting candidates"')
     live_gate = '[ "$LIVE_AIDREAM_URL" != "$EXPECTED_AIDREAM_URL" ]'

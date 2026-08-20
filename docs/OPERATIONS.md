@@ -272,12 +272,12 @@ For the deploy pipeline to work, the repo needs:
 
 Sandboxes can act on behalf of users against AI Dream's cloud_files (`cld_files`) backend, surfacing each user's uploaded files at `/home/agent/cloud-files/` for native shell-tool access by agents.
 
-**Wiring it up** — the URL depends on the tier. The hosted tier uses the
-public Coolify `app_server`; the EC2 tier must use the private EC2
-`sandbox_host` replica:
+**Wiring it up** — the URL depends on the tier. The hosted tier uses the public
+ECS endpoint; the EC2 tier uses the private Route 53 name for the same ECS
+service so calls stay inside AWS:
 ```
 # Hosted: https://server.app.matrxserver.com
-# EC2:    http://172.31.83.75:8000
+# EC2:    http://aidream.internal.matrxserver.com
 MATRX_AIDREAM_URL=<the tier's endpoint above>
 MATRX_AIDREAM_SERVICE_TOKEN=<shared with AI Dream's AIDREAM_SANDBOX_SERVICE_TOKEN>
 ```
@@ -285,7 +285,7 @@ Then `cd /srv/apps/sandbox-orchestrator && docker compose restart`. New sandboxe
 
 On EC2 the setting lives in the `matrx-orchestrator` systemd environment. The
 release script fails before pulling images unless it equals
-`http://172.31.83.75:8000`, checks it again after promotion, and performs a
+`http://aidream.internal.matrxserver.com`, checks it again after promotion, and performs a
 real `/health/version` canary over that private route. Never point an EC2
 orchestrator or the sandboxes it creates at `server.app.matrxserver.com`.
 
@@ -475,7 +475,7 @@ This makes the orchestrator keep 2 pre-booted, unclaimed `slim` boxes ready so `
 
 ### 2. `user_memory` migration applied to Supabase
 
-Migration [`migrations/004_user_memory.sql`](../orchestrator/migrations/004_user_memory.sql) (in the repo) was **applied to the live Matrx Main Supabase project** (`txzxabzwovsujtloxrus`) on 2026-05-23. The file replicates it; it has also already been run. New table `user_memory` — additive, nothing existing modified. Backs the per-user cross-project memory (see [MEMORY_API.md](MEMORY_API.md)).
+Migration [`migrations/004_user_memory.sql`](../orchestrator/migrations/004_user_memory.sql) is present in the live Matrx Main East Supabase project (`brsgrqvjdzwihsvnfqkf`). The former West project (`txzxabzwovsujtloxrus`) is rollback-only and must not receive sandbox writes or scheduled work. New table `user_memory` is additive and backs the per-user cross-project memory (see [MEMORY_API.md](MEMORY_API.md)).
 
 ### 3. `matrx-sandbox:slim` image build
 
