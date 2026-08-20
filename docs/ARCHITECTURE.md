@@ -1,5 +1,7 @@
 # AI Matrx Ephemeral Sandbox Architecture
 
+Cross-repo work order: `/Users/armanisadeghi/code/common-docs/projects/production-reliability-closeout/SANDBOX_FLEET_WORK_ORDER.md` — read it before changing fleet reconciliation, heartbeat/activity, TTL, reaping, drift reporting, or container cleanup.
+
 ## Overview
 
 On-demand, isolated Unix sandboxes for AI agent execution. Each sandbox is a
