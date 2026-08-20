@@ -120,6 +120,32 @@ async def test_get_sandboxes_returns_empty_list(mock_sandbox_manager):
 
 
 @pytest.mark.asyncio
+async def test_internal_development_template_is_visible_only_to_allowlisted_user(
+    monkeypatch,
+):
+    from orchestrator.config import settings
+
+    user_id = "00000000-0000-4000-8000-000000000001"
+    monkeypatch.setattr(settings, "host_tier", "ec2")
+    monkeypatch.setattr(settings, "internal_development_workspace_root", "/workspace")
+    monkeypatch.setattr(settings, "internal_development_user_ids", user_id)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        public_response = await client.get("/templates")
+        internal_response = await client.get(f"/templates?user_id={user_id}")
+
+    assert public_response.status_code == 200
+    assert internal_response.status_code == 200
+    assert "development" not in {
+        item["id"] for item in public_response.json()["templates"]
+    }
+    assert "development" in {
+        item["id"] for item in internal_response.json()["templates"]
+    }
+
+
+@pytest.mark.asyncio
 async def test_get_sandbox_unknown_id_returns_404(mock_sandbox_manager):
     """GET /sandboxes/{id} with an unknown ID should return 404."""
     mock_sandbox_manager.get_sandbox.return_value = None

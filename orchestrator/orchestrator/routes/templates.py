@@ -47,7 +47,7 @@ def resolve_template_image(template: str | None) -> str | None:
     return _TEMPLATE_IMAGE_OVERRIDES.get(template)
 
 
-def _builtin_templates() -> list[TemplateInfo]:
+def _builtin_templates(user_id: str | None = None) -> list[TemplateInfo]:
     default_image = settings.sandbox_image
     tier = settings.host_tier or None
     def _img(tpl: str) -> str:
@@ -107,7 +107,11 @@ def _builtin_templates() -> list[TemplateInfo]:
             languages=["python", "node", "bash"],
         ),
     ]
-    if tier == "ec2" and settings.internal_development_workspace_root:
+    if (
+        tier == "ec2"
+        and settings.internal_development_workspace_root
+        and user_id in settings.internal_development_users()
+    ):
         templates.append(
             TemplateInfo(
                 id="development",
@@ -126,6 +130,6 @@ def _builtin_templates() -> list[TemplateInfo]:
 
 
 @router.get("", response_model=TemplateListResponse)
-async def list_templates() -> TemplateListResponse:
+async def list_templates(user_id: str | None = None) -> TemplateListResponse:
     """List sandbox templates available on this orchestrator."""
-    return TemplateListResponse(templates=_builtin_templates())
+    return TemplateListResponse(templates=_builtin_templates(user_id=user_id))
