@@ -19,14 +19,22 @@ def clean_sandbox_state():
     the old _sandboxes dict (which no longer exists).
     """
     from orchestrator import sandbox_manager
+    from orchestrator.config import settings
 
     store = InMemorySandboxStore()
+    original_host_tier = settings.host_tier
+    # Unit creates explicitly emulate the EC2 orchestrator; production code no
+    # longer invents this identity when MATRX_HOST_TIER is absent.
+    settings.host_tier = "ec2"
     sandbox_manager._store = store
     sandbox_manager._docker_client = None
     sandbox_manager._sandbox_cwd.clear()
-    yield store
-    sandbox_manager._store = None
-    sandbox_manager._docker_client = None
+    try:
+        yield store
+    finally:
+        settings.host_tier = original_host_tier
+        sandbox_manager._store = None
+        sandbox_manager._docker_client = None
     sandbox_manager._sandbox_cwd.clear()
 
 
