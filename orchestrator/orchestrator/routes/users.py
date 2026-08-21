@@ -79,7 +79,8 @@ async def delete_user_volume(user_id: str) -> None:
     This is destructive — the matrx-frontend should gate it behind a
     double-confirm dialog with the user typing the user_id.
     """
-    if (settings.host_tier or "ec2") != "hosted":
+    # 🚨 Do not restore `or "ec2"`; the core resolver refuses missing identity.
+    if settings.resolve_host_tier() != "hosted":
         raise HTTPException(
             status_code=400,
             detail=(

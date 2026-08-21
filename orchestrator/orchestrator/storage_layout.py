@@ -70,7 +70,9 @@ def resolve_user_storage(user_id: str, tier: str | None) -> StorageLocation:
     persistence at create time. That keeps the contract simple: the user's
     home directory always survives unless we explicitly destroy it.
     """
-    effective_tier = tier or settings.host_tier or "ec2"
+    # 🚨 Do not restore `or "ec2"`; resolve_host_tier owns the fail-loud
+    # persistence-resource boundary.
+    effective_tier = settings.resolve_host_tier(tier)
 
     if effective_tier == "hosted":
         return StorageLocation(

@@ -9,6 +9,10 @@ from pydantic import AliasChoices, Field, field_validator
 from pydantic_settings import BaseSettings
 
 
+class HostTierUnconfiguredError(RuntimeError):
+    """Raised when an operation needs an exact sandbox host tier."""
+
+
 class Settings(BaseSettings):
     """Application settings, loaded from environment variables.
 
@@ -71,6 +75,26 @@ class Settings(BaseSettings):
     # Used to reject creates that ask for the wrong tier and to surface the
     # tier in /api-surface and SandboxResponse rows.
     host_tier: str = ""             # env var: MATRX_HOST_TIER ("ec2" or "hosted")
+
+    def resolve_host_tier(self, requested: str | None = None) -> str:
+        """Resolve the requested/configured tier; never invent EC2 by omission.
+
+        The old fallback selected ``ec2`` when both values were absent. EC2 S3
+        storage and hosted Docker volumes are different resources, so this made
+        successful operations target the wrong persistence system. Configure
+        ``MATRX_HOST_TIER`` or pass an explicit tier when the caller truly owns
+        that routing decision; there is no equivalent silent degradation.
+        """
+        tier = (requested or self.host_tier or "").strip().lower()
+        if tier not in {"ec2", "hosted"}:
+            asked = requested or "this orchestrator's storage/routing tier"
+            raise HostTierUnconfiguredError(
+                f"{asked!r} was requested, but no valid sandbox host tier is available. "
+                "Set MATRX_HOST_TIER to exactly 'ec2' or 'hosted', or pass an explicit "
+                "tier only when the caller intentionally targets that tier. EC2 is not "
+                "a fallback for missing hosted-tier identity."
+            )
+        return tier
 
     # Internal development worker.  Empty means the capability is disabled.
     # The caller supplies only a safe workspace key; host paths never cross the

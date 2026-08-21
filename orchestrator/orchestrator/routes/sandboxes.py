@@ -73,7 +73,8 @@ async def create_sandbox(req: CreateSandboxRequest):
             ),
         )
 
-    effective_tier = req.tier or settings.host_tier
+    # 🚨 Do not restore an EC2 default; the core resolver owns tier identity.
+    effective_tier = settings.resolve_host_tier(req.tier)
 
     # The aidream template is a 5 GB image baked + venv-resolved only on the
     # hosted tier (this server). EC2's ECR repo doesn't carry it, so an
@@ -1374,7 +1375,8 @@ async def issue_access_token(sandbox_id: str, body: AccessTokenRequest) -> Acces
             secret=settings.access_token_secret,
             sandbox_id=sandbox_id,
             scopes=body.scopes,
-            tier=settings.host_tier or (sandbox.tier.value if sandbox.tier else "ec2"),
+            # 🚨 Do not restore `or "ec2"`; missing tier must fail at the resolver.
+            tier=settings.resolve_host_tier(sandbox.tier.value if sandbox.tier else None),
             ttl_seconds=ttl,
             actor=body.actor,
             single_use=body.single_use,
@@ -1444,7 +1446,8 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
             secret=settings.access_token_secret,
             sandbox_id=sandbox_id,
             scopes=scopes,
-            tier=settings.host_tier or (sandbox.tier.value if sandbox.tier else "ec2"),
+            # 🚨 Do not restore `or "ec2"`; missing tier must fail at the resolver.
+            tier=settings.resolve_host_tier(sandbox.tier.value if sandbox.tier else None),
             ttl_seconds=ttl,
             # Server-to-server binding (co-located AI Dream): allow a full
             # session, not the 15-min browser ceiling, so a long agent run
