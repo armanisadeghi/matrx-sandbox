@@ -134,6 +134,25 @@ it as a transient daemon read rather than a real mass-death).
 
 Row state surfaced on every `SandboxResponse`: `status`, `created_at`,
 `updated_at`, `last_heartbeat_at`, `stopped_at`, `stop_reason`, `expires_at`.
+`sandbox_id` is the immutable routing identity; nullable `name` is the
+owner-editable display label and survives reconcile, resume, reset, and image
+migration.
+
+### Internal development connection lifecycle
+
+The allowlisted EC2 `development` template is a permanent worker, not an
+ephemeral user box. Its `/home/agent` is a host-mounted EBS workspace. Before
+an AI-scoped token or `/agent-binding` is issued, `connection_hooks.py`:
+
+1. retries an idle-gated image migration if a deployment left the worker
+   drifted;
+2. runs `scripts/sync-internal-development-repos.sh` under `flock`;
+3. fast-forwards only clean `main` branches that are ancestors of
+   `origin/main`.
+
+Dirty, detached, non-main, and diverged repositories are reported and left
+untouched. Hook warnings never block access. A 30-second in-process cache
+coalesces duplicate binding/token calls from the same UI connection.
 
 ## Container Image Contents
 
@@ -180,6 +199,8 @@ Sandbox metadata is persisted in Supabase Postgres (`sandbox_instances` table):
    d. Deploys to EC2 via **AWS SSM** (Systems Manager) — no SSH needed
    e. SSM command: pulls images from ECR, tags them, restarts systemd service
    f. Health check loop (30 attempts, 2s interval) confirms orchestrator is healthy
+   g. Calls `POST /migrate-all`; idle permanent development workers atomically
+      swap to the approved image while retaining the mounted workspace
 
 ### Why SSM Instead of SSH
 - EC2 security group restricts SSH to a single home IP

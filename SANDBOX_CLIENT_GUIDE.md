@@ -56,6 +56,7 @@ A `POST /sandboxes` whose `tier` field doesn't match the orchestrator's `MATRX_H
 POST /sandboxes
 {
   "user_id": "<uuid>",                 // required
+  "name": "Research worker",           // optional display name, 1-100 chars
   "tier": "ec2" | "hosted",            // optional; must match orchestrator tier when set
   "template": "bare" | "node-22" | "python-3.13",   // optional; see /templates
   "template_version": "1",             // optional
@@ -75,6 +76,7 @@ Returns a `SandboxResponse`:
 {
   "sandbox_id": "sbx-abc123…",
   "user_id": "...",
+  "name": "Research worker",           // nullable; fall back to sandbox_id
   "status": "ready" | "starting" | ...,
   "container_id": "...",
   "created_at": "2026-04-26T…",
@@ -136,6 +138,18 @@ Agents inside the sandbox can end their own session:
 POST /sandboxes/{id}/complete    { "result": {...} }   # success → graceful shutdown
 POST /sandboxes/{id}/error       { "error": "...", "details": {...} }   # failure → graceful shutdown
 ```
+
+### Development-worker SessionStart hook
+
+For the internal-only `development` template, an AI-scoped
+`POST /sandboxes/{id}/access-tokens` or `POST /sandboxes/{id}/agent-binding`
+runs the connection preparation hook before returning credentials. The
+response includes `connection_hooks` with the image-refresh result and the
+repository-sync summary. The hook fetches the canonical repositories and only
+fast-forwards clean `main` branches; it never resets, cleans, stashes, changes
+branches, or force-pushes. A dirty/diverged repository produces
+`completed_with_warnings` and remains untouched. Ordinary user templates
+return `connection_hooks: null` and run no internal hook.
 
 ---
 

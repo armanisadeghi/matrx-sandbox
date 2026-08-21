@@ -327,6 +327,28 @@ if ! curl -fsS --max-time 15 "$LIVE_AIDREAM_URL/health/version" >/dev/null; then
   rollback
 fi
 
+# A successful release must also move persistent internal development workers
+# onto the approved image. Their /home/agent is a host-mounted EBS workspace,
+# so the zero-drift swap preserves repository data byte-for-byte. Ordinary EC2
+# sandboxes remain safely unsupported/deferred by migrate-all's storage and
+# activity gates. This is deploy-triggered, not a polling schedule.
+log "migrating idle persistent development workers to the approved image"
+if MIGRATION_RESULT=$(curl -fsS --max-time 240 -X POST \
+    -H "X-API-Key: $API_KEY" \
+    http://localhost:8000/migrate-all); then
+  MIGRATION_RESULT="$MIGRATION_RESULT" /usr/bin/python3.11 - <<'PY' || true
+import json
+import os
+
+result = json.loads(os.environ["MIGRATION_RESULT"])
+if result.get("failed"):
+    print("[deploy-ec2] WARNING: sandbox image migration failures:", result["failed"])
+print("[deploy-ec2] migration result:", json.dumps(result, sort_keys=True))
+PY
+else
+  log "WARNING: post-release migration trigger failed; development workers retry on their next AI connection"
+fi
+
 trap - ERR INT TERM
 rm -rf "$FAILED_DIR" "$DROPIN_BACKUP"
 docker image rm \

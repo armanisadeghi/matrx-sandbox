@@ -214,6 +214,10 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
             sandbox = SandboxResponse(
                 sandbox_id=sandbox_id,
                 user_id=user_id,
+                name=(
+                    existing_row.name if existing_row is not None
+                    else labels.get("matrx.name")
+                ),
                 status=status,
                 container_id=container.id,
                 # Docker proves runtime state, not user-authored metadata.

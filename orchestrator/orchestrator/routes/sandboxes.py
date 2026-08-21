@@ -113,6 +113,7 @@ async def create_sandbox(req: CreateSandboxRequest):
     await storage.ensure_user_storage(req.user_id)
     sandbox = await sandbox_manager.create_sandbox(
         user_id=req.user_id,
+        name=req.name,
         organization_id=req.organization_id,
         config=req.config,
         template=req.template,
@@ -176,6 +177,9 @@ async def claim_sandbox(req: CreateSandboxRequest):
         ttl_seconds=req.ttl_seconds,
     )
     if claimed is not None:
+        if req.name:
+            claimed.name = req.name
+            await sandbox_manager._get_store().save(claimed)
         logger.info("Claimed warm sandbox %s for user %s", claimed.sandbox_id, req.user_id)
         return claimed
 
@@ -352,6 +356,7 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     # Snapshot creation params before destroy so we don't depend on the
     # store keeping the row alive (some implementations purge on destroy).
     user_id = old.user_id
+    name = old.name
     tier = getattr(old.tier, "value", old.tier) if old.tier else None
     template = old.template
     template_version = old.template_version
@@ -382,6 +387,7 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     try:
         new_sandbox = await sandbox_manager.create_sandbox(
             user_id=user_id,
+            name=name,
             organization_id=organization_id if isinstance(organization_id, str) else None,
             config=config,
             template=template,
@@ -450,6 +456,7 @@ async def resume_sandbox(sandbox_id: str):
     # Snapshot the original shape so the resumed sandbox is the same kind of
     # box, just on the latest image. The per-user volume restores the data.
     user_id = old.user_id
+    name = old.name
     tier = getattr(old.tier, "value", old.tier) if old.tier else None
     template = old.template
     template_version = old.template_version
@@ -468,6 +475,7 @@ async def resume_sandbox(sandbox_id: str):
         await storage.ensure_user_storage(user_id)
         new_sandbox = await sandbox_manager.create_sandbox(
             user_id=user_id,
+            name=name,
             organization_id=organization_id if isinstance(organization_id, str) else None,
             config=config,
             template=template,
@@ -1355,6 +1363,10 @@ async def issue_access_token(sandbox_id: str, body: AccessTokenRequest) -> Acces
             detail="access tokens not configured (set MATRX_ACCESS_TOKEN_SECRET on the orchestrator)",
         )
 
+    connection_hooks = (
+        await _prepare_connection(sandbox) if "ai" in body.scopes else None
+    )
+
     ttl = body.ttl_seconds or sandbox_token.DEFAULT_TTL_SECONDS
 
     try:
@@ -1385,6 +1397,7 @@ async def issue_access_token(sandbox_id: str, body: AccessTokenRequest) -> Acces
         ws_base=ws_base,
         tier=payload["tier"],
         sandbox_id=sandbox_id,
+        connection_hooks=connection_hooks,
     )
 
 
@@ -1409,6 +1422,7 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
     if not settings.access_token_secret:
         raise HTTPException(status_code=503, detail="access tokens not configured (set MATRX_ACCESS_TOKEN_SECRET)")
+    connection_hooks = await _prepare_connection(sandbox)
     # Prefer the internal/in-VPC address so the co-located AI Dream's tool
     # calls stay on the private LAN (same-AZ = free + sub-ms). On EC2 this is
     # auto-detected from instance metadata — no operator config needed. Falls
@@ -1446,7 +1460,21 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
         "access_token": token,
         "root_path": sandbox.hot_path or "/home/agent",
         "expires_at": datetime.fromtimestamp(payload["exp"], tz=timezone.utc).isoformat(),
+        "connection_hooks": connection_hooks,
     }
+
+
+async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
+    """Run internal SessionStart hooks before development-worker tool access.
+
+    Failures stay visible in the report and logs, but never overwrite work or
+    prevent token issuance. Ordinary user sandboxes do not run this path.
+    """
+    if sandbox.template != "development":
+        return None
+    from orchestrator.connection_hooks import prepare_development_connection
+
+    return await prepare_development_connection(sandbox)
 
 
 @router.api_route(

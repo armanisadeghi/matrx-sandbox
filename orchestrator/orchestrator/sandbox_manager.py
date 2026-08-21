@@ -264,6 +264,7 @@ async def close_store() -> None:
 
 async def create_sandbox(
     user_id: str,
+    name: str | None = None,
     organization_id: str | None = None,
     config: dict | None = None,
     template: str | None = None,
@@ -290,6 +291,7 @@ async def create_sandbox(
     sandbox = SandboxResponse(
         sandbox_id=sandbox_id,
         user_id=user_id,
+        name=name,
         status=SandboxStatus.CREATING,
         created_at=datetime.now(timezone.utc),
         config=config,
@@ -672,6 +674,7 @@ async def create_sandbox(
             labels={
                 "matrx.sandbox_id": sandbox_id,
                 "matrx.user_id": user_id,
+                **({"matrx.name": name} if name else {}),
                 "matrx.created_at": sandbox.created_at.isoformat(),
                 # Labels carry the *minimum* state needed for boot-time
                 # reconcile to rebuild a SandboxResponse without help from

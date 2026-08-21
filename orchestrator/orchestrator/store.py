@@ -350,11 +350,12 @@ class PostgresSandboxStore(SandboxStore):
             await conn.execute(
                 """
                 INSERT INTO sandbox_instances
-                    (user_id, sandbox_id, status, container_id, created_at, hot_path, cold_path,
+                    (user_id, sandbox_id, name, status, container_id, created_at, hot_path, cold_path,
                      config, ttl_seconds, tier, template, template_version, labels,
                      persistence_volume)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8::jsonb, $9, $10, $11, $12, $13::jsonb, $14)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14::jsonb, $15)
                 ON CONFLICT (sandbox_id) DO UPDATE SET
+                    name = COALESCE(EXCLUDED.name, sandbox_instances.name),
                     status = EXCLUDED.status,
                     container_id = EXCLUDED.container_id,
                     config = EXCLUDED.config,
@@ -379,6 +380,7 @@ class PostgresSandboxStore(SandboxStore):
                 """,
                 UUID(sandbox.user_id),
                 sandbox.sandbox_id,
+                sandbox.name,
                 sandbox.status.value,
                 sandbox.container_id,
                 sandbox.created_at,
@@ -733,6 +735,7 @@ def _row_to_sandbox(row) -> SandboxResponse:
     return SandboxResponse(
         sandbox_id=row["sandbox_id"],
         user_id=str(row["user_id"]),
+        name=_maybe("name"),
         status=SandboxStatus(row["status"]),
         container_id=row["container_id"],
         created_at=row["created_at"],

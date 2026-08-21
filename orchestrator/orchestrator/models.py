@@ -33,6 +33,12 @@ class ResourcesSpec(BaseModel):
 
 class CreateSandboxRequest(BaseModel):
     user_id: str = Field(..., description="Supabase auth user UUID")
+    name: str | None = Field(
+        default=None,
+        min_length=1,
+        max_length=100,
+        description="Optional user-visible sandbox name; sandbox_id remains the routing identity.",
+    )
     organization_id: str | None = Field(
         default=None,
         description="Active organization whose permitted shared secrets are injected",
@@ -77,10 +83,24 @@ class CreateSandboxRequest(BaseModel):
             raise ValueError("organization_id must be a valid UUID")
         return v
 
+    @field_validator("name")
+    @classmethod
+    def normalize_name(cls, v: str | None) -> str | None:
+        if v is None:
+            return None
+        value = v.strip()
+        if not value:
+            raise ValueError("name must contain at least one non-whitespace character")
+        return value
+
 
 class SandboxResponse(BaseModel):
     sandbox_id: str
     user_id: str
+    name: str | None = Field(
+        default=None,
+        description="User-visible name; clients fall back to sandbox_id when null.",
+    )
     status: SandboxStatus
     container_id: str | None = None
     created_at: datetime
@@ -313,6 +333,10 @@ class AccessTokenResponse(BaseModel):
     ws_base: str = Field(description="WSS base URL the browser uses for PTY / file watcher.")
     tier: str = Field(description="ec2 | hosted — echoed for client-side sanity checking.")
     sandbox_id: str
+    connection_hooks: dict | None = Field(
+        default=None,
+        description="Internal SessionStart hook report; null for ordinary user sandboxes.",
+    )
 
 
 class ExtendRequest(BaseModel):
