@@ -155,7 +155,19 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
                 content={"detail": "Missing API key. Provide X-API-Key header or Authorization: Bearer <key>."},
             )
 
-        # Constant-time comparison to prevent timing attacks
+        # Constant-time comparison to prevent timing attacks.
+        #
+        # 🚨 Debugging a 403 here? This means a key WAS presented and does not
+        # match THIS host's MATRX_API_KEY. Every orchestrator host (EC2, hosted)
+        # generates its OWN master key — there is no shared key across tiers
+        # (docs/OPERATIONS.md secrets table). The usual cause is a consumer
+        # sending the OTHER tier's key: the frontend holds them as
+        # MATRX_ORCHESTRATOR_API_KEY (EC2) / MATRX_HOSTED_ORCHESTRATOR_API_KEY
+        # (hosted); aidream as SANDBOX_EC2_ORCHESTRATOR_API_KEY /
+        # SANDBOX_ORCHESTRATOR_API_KEY. This 403 says NOTHING about the sandbox
+        # in the path — the box is usually alive and healthy (2026-08-21
+        # incident: this response was misread as a dead sandbox and a live user
+        # session was hard-failed). Fix key parity; do not touch the sandbox.
         if not hmac.compare_digest(provided_key, settings.api_key):
             logger.warning(
                 "Invalid API key for %s from %s",

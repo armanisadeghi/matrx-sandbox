@@ -194,7 +194,11 @@ NEW_KEY=$(openssl rand -hex 32)
 
 # Edit /srv/apps/sandbox-orchestrator/.env — replace MATRX_API_KEY=…
 # Edit /srv/.credentials — update SANDBOX_ORCHESTRATOR_HOSTED_API_KEY=…
-# Tell the frontend team — they need to update MATRX_HOSTED_ORCHESTRATOR_API_KEY in Vercel.
+# Update BOTH consumers or their server-side sandbox arming breaks with 403 'Invalid API key':
+#   - frontend: MATRX_HOSTED_ORCHESTRATOR_API_KEY in Vercel
+#   - aidream:  SANDBOX_ORCHESTRATOR_API_KEY on the ECS task definition
+# (Rotating the EC2 tier instead? Same rule: frontend MATRX_ORCHESTRATOR_API_KEY
+#  + aidream SANDBOX_EC2_ORCHESTRATOR_API_KEY. Keys are PER HOST, never shared.)
 
 cd /srv/apps/sandbox-orchestrator && docker compose restart
 ```
@@ -261,9 +265,9 @@ For the deploy pipeline to work, the repo needs:
 
 | Tier | Secret | Where stored | Used by |
 |---|---|---|---|
-| EC2 orchestrator | `MATRX_API_KEY` | EC2 systemd unit env / secrets manager | Frontend `MATRX_ORCHESTRATOR_API_KEY` |
+| EC2 orchestrator | `MATRX_API_KEY` | EC2 systemd unit env / secrets manager | Frontend `MATRX_ORCHESTRATOR_API_KEY` (Vercel) **and** aidream `SANDBOX_EC2_ORCHESTRATOR_API_KEY` (ECS task env) |
 | EC2 orchestrator | `MATRX_DATABASE_URL` (Supabase) | EC2 systemd env | EC2 only |
-| Hosted orchestrator | `MATRX_API_KEY` | `/srv/apps/sandbox-orchestrator/.env` (chmod 600) + `/srv/.credentials` as `SANDBOX_ORCHESTRATOR_HOSTED_API_KEY` | Frontend `MATRX_HOSTED_ORCHESTRATOR_API_KEY` |
+| Hosted orchestrator | `MATRX_API_KEY` | `/srv/apps/sandbox-orchestrator/.env` (chmod 600) + `/srv/.credentials` as `SANDBOX_ORCHESTRATOR_HOSTED_API_KEY` | Frontend `MATRX_HOSTED_ORCHESTRATOR_API_KEY` (Vercel) **and** aidream `SANDBOX_ORCHESTRATOR_API_KEY` (ECS task env) |
 | GHA pipeline | AWS keys + EC2 ID | GitHub repo Secrets | `.github/workflows/deploy.yml` |
 
 ---
