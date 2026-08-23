@@ -31,6 +31,7 @@ async def expired_store(monkeypatch):
     await store.save(SandboxResponse(
         sandbox_id=SBX,
         user_id="00000000-0000-0000-0000-000000000001",
+        organization_id="22222222-2222-4222-8222-222222222222",
         status=SandboxStatus.EXPIRED,
         created_at=datetime.now(timezone.utc),
     ))

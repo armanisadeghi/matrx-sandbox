@@ -264,8 +264,8 @@ async def close_store() -> None:
 
 async def create_sandbox(
     user_id: str,
+    organization_id: str,
     name: str | None = None,
-    organization_id: str | None = None,
     config: dict | None = None,
     template: str | None = None,
     template_version: str | None = None,
@@ -284,13 +284,18 @@ async def create_sandbox(
     store = _get_store()
     sandbox_id = f"sbx-{uuid.uuid4().hex[:12]}"
     config = config or {}
-    if organization_id:
-        config["organization_id"] = organization_id
+    config_organization_id = config.get("organization_id")
+    if config_organization_id is not None and config_organization_id != organization_id:
+        raise ValueError(
+            "config.organization_id must match the explicit organization_id"
+        )
+    config["organization_id"] = organization_id
     resources = resources or {}
 
     sandbox = SandboxResponse(
         sandbox_id=sandbox_id,
         user_id=user_id,
+        organization_id=organization_id,
         name=name,
         status=SandboxStatus.CREATING,
         created_at=datetime.now(timezone.utc),
@@ -357,8 +362,7 @@ async def create_sandbox(
             "MATRX_HOT_PREFIX": location.s3_hot_prefix or "",
             "MATRX_COLD_PREFIX": location.s3_cold_prefix or "",
         }
-        if organization_id:
-            env["ORGANIZATION_ID"] = organization_id
+        env["ORGANIZATION_ID"] = organization_id
         if template:
             env["SANDBOX_TEMPLATE"] = template
         if template_version:
@@ -521,9 +525,7 @@ async def create_sandbox(
                 async with httpx.AsyncClient(timeout=10.0) as hx:
                     resp = await hx.get(
                         f"{resolved_aidream_url.rstrip('/')}/api/user-secrets/internal/sandbox-env-for-user",
-                        params={"organization_id": organization_id}
-                        if organization_id
-                        else None,
+                        params={"organization_id": organization_id},
                         headers={
                             "Authorization": f"Bearer {resolved_aidream_token}",
                             "X-Matrx-User-Id": str(user_id),
@@ -674,6 +676,7 @@ async def create_sandbox(
             labels={
                 "matrx.sandbox_id": sandbox_id,
                 "matrx.user_id": user_id,
+                "matrx.organization_id": organization_id,
                 **({"matrx.name": name} if name else {}),
                 "matrx.created_at": sandbox.created_at.isoformat(),
                 # Labels carry the *minimum* state needed for boot-time

@@ -74,7 +74,10 @@ class TestSandboxLifecycle:
     def test_create_sandbox(self, check_docker, check_orchestrator, http_client):
         resp = http_client.post(
             "/sandboxes",
-            json={"user_id": "integration-test-user"},
+            json={
+                "user_id": "integration-test-user",
+                "organization_id": "22222222-2222-4222-8222-222222222222",
+            },
         )
         assert resp.status_code == 201
         data = resp.json()
@@ -97,7 +100,10 @@ class TestSandboxLifecycle:
         # Create
         resp = http_client.post(
             "/sandboxes",
-            json={"user_id": "integration-lifecycle"},
+            json={
+                "user_id": "integration-lifecycle",
+                "organization_id": "22222222-2222-4222-8222-222222222222",
+            },
         )
         assert resp.status_code == 201
         sandbox_id = resp.json()["sandbox_id"]
@@ -165,7 +171,10 @@ class TestS3Storage:
     ):
         resp = http_client.post(
             "/sandboxes",
-            json={"user_id": "s3-test-user"},
+            json={
+                "user_id": "s3-test-user",
+                "organization_id": "22222222-2222-4222-8222-222222222222",
+            },
         )
         assert resp.status_code == 201
         sandbox_id = resp.json()["sandbox_id"]

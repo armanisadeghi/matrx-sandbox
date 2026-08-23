@@ -17,6 +17,16 @@ from orchestrator.models import SandboxResponse, SandboxStatus
 logger = logging.getLogger(__name__)
 
 
+def _explicit_organization_id(sandbox: SandboxResponse) -> UUID:
+    """Validate organization identity before either store accepts a write."""
+    try:
+        return UUID(sandbox.organization_id)
+    except (ValueError, TypeError, AttributeError) as exc:
+        raise ValueError(
+            "sandbox persistence requires an explicit organization_id"
+        ) from exc
+
+
 class SandboxStore(ABC):
     """Abstract base class for sandbox persistence."""
 
@@ -157,6 +167,7 @@ class InMemorySandboxStore(SandboxStore):
         self._memory: dict[str, dict[str, tuple[str, datetime]]] = {}
 
     async def save(self, sandbox: SandboxResponse) -> None:
+        _explicit_organization_id(sandbox)
         self._sandboxes[sandbox.sandbox_id] = sandbox
 
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
@@ -342,6 +353,7 @@ class PostgresSandboxStore(SandboxStore):
             return await fn(*args, **kwargs)
 
     async def save(self, sandbox: SandboxResponse) -> None:
+        organization_id = _explicit_organization_id(sandbox)
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             # ``persistence_volume`` is added in migration 003 and is nullable
@@ -350,11 +362,12 @@ class PostgresSandboxStore(SandboxStore):
             await conn.execute(
                 """
                 INSERT INTO sandbox_instances
-                    (user_id, sandbox_id, name, status, container_id, created_at, hot_path, cold_path,
+                    (user_id, organization_id, sandbox_id, name, status, container_id, created_at, hot_path, cold_path,
                      config, ttl_seconds, tier, template, template_version, labels,
                      persistence_volume)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14::jsonb, $15)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15::jsonb, $16)
                 ON CONFLICT (sandbox_id) DO UPDATE SET
+                    organization_id = EXCLUDED.organization_id,
                     name = COALESCE(EXCLUDED.name, sandbox_instances.name),
                     status = EXCLUDED.status,
                     container_id = EXCLUDED.container_id,
@@ -379,6 +392,7 @@ class PostgresSandboxStore(SandboxStore):
                     updated_at = NOW()
                 """,
                 UUID(sandbox.user_id),
+                organization_id,
                 sandbox.sandbox_id,
                 sandbox.name,
                 sandbox.status.value,
@@ -735,6 +749,7 @@ def _row_to_sandbox(row) -> SandboxResponse:
     return SandboxResponse(
         sandbox_id=row["sandbox_id"],
         user_id=str(row["user_id"]),
+        organization_id=str(row["organization_id"]),
         name=_maybe("name"),
         status=SandboxStatus(row["status"]),
         container_id=row["container_id"],

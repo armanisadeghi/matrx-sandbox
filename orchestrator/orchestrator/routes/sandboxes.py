@@ -174,6 +174,7 @@ async def claim_sandbox(req: CreateSandboxRequest):
 
     claimed = await pool.claim_warm(
         user_id=req.user_id,
+        organization_id=req.organization_id,
         template=template,
         ttl_seconds=req.ttl_seconds,
     )
@@ -364,7 +365,7 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     labels = old.labels
     ttl_seconds = old.ttl_seconds
     config = dict(old.config or {})
-    organization_id = config.get("organization_id")
+    organization_id = old.organization_id
     resources = config.get("resources") if isinstance(config.get("resources"), dict) else None
 
     logger.info(
@@ -389,7 +390,7 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
         new_sandbox = await sandbox_manager.create_sandbox(
             user_id=user_id,
             name=name,
-            organization_id=organization_id if isinstance(organization_id, str) else None,
+            organization_id=organization_id,
             config=config,
             template=template,
             template_version=template_version,
@@ -464,7 +465,7 @@ async def resume_sandbox(sandbox_id: str):
     labels = old.labels
     ttl_seconds = old.ttl_seconds
     config = dict(old.config or {})
-    organization_id = config.get("organization_id")
+    organization_id = old.organization_id
     resources = config.get("resources") if isinstance(config.get("resources"), dict) else None
 
     logger.info(
@@ -477,7 +478,7 @@ async def resume_sandbox(sandbox_id: str):
         new_sandbox = await sandbox_manager.create_sandbox(
             user_id=user_id,
             name=name,
-            organization_id=organization_id if isinstance(organization_id, str) else None,
+            organization_id=organization_id,
             config=config,
             template=template,
             template_version=template_version,

@@ -132,11 +132,14 @@ ever touches its own tier's rows. A safety valve refuses the "mark stopped"
 pass if Docker reports **zero** live containers while live rows exist (treating
 it as a transient daemon read rather than a real mass-death).
 
-Row state surfaced on every `SandboxResponse`: `status`, `created_at`,
+Row state surfaced on every `SandboxResponse`: `organization_id`, `status`, `created_at`,
 `updated_at`, `last_heartbeat_at`, `stopped_at`, `stop_reason`, `expires_at`.
 `sandbox_id` is the immutable routing identity; nullable `name` is the
 owner-editable display label and survives reconcile, resume, reset, and image
-migration.
+migration. `organization_id` is required at create time, written explicitly to
+Postgres, and preserved through every lifecycle reconstruction. A container
+without either a durable row or `matrx.organization_id` label is refused by
+boot reconciliation before persistence.
 
 ### Internal development connection lifecycle
 

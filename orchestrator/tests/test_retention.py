@@ -16,6 +16,7 @@ def _mk(sandbox_id: str, status=SandboxStatus.READY, stopped_days_ago: int | Non
     sb = SandboxResponse(
         sandbox_id=sandbox_id,
         user_id="00000000-0000-0000-0000-000000000001",
+        organization_id="22222222-2222-4222-8222-222222222222",
         status=status,
         created_at=datetime.now(timezone.utc) - timedelta(days=30),
     )

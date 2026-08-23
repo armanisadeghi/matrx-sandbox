@@ -15,10 +15,12 @@ from orchestrator.reconcile import reconcile_from_docker
 async def test_existing_row_metadata_survives_docker_reconcile(monkeypatch):
     sandbox_id = "sbx-preserve-meta"
     user_id = "11111111-1111-4111-8111-111111111111"
+    organization_id = "22222222-2222-4222-8222-222222222222"
     created_at = datetime(2025, 1, 2, tzinfo=timezone.utc)
     existing = SandboxResponse(
         sandbox_id=sandbox_id,
         user_id=user_id,
+        organization_id=organization_id,
         status=SandboxStatus.RUNNING,
         container_id="old-container",
         created_at=created_at,
@@ -74,6 +76,7 @@ async def test_existing_row_metadata_survives_docker_reconcile(monkeypatch):
     assert summary["reconciled"] == 1
     assert store.saved is not None
     assert store.saved.container_id == "new-container"
+    assert store.saved.organization_id == organization_id
     assert store.saved.template_version == "current-version"
     assert store.saved.created_at == created_at
     assert store.saved.hot_path == "/custom/hot"

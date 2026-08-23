@@ -11,6 +11,8 @@ from httpx import ASGITransport, AsyncClient
 from orchestrator.main import app
 from orchestrator.routes.health import _docker_container_counts
 
+ORG_ID = "22222222-2222-4222-8222-222222222222"
+
 
 @pytest.fixture
 def mock_sandbox_manager():
@@ -48,9 +50,29 @@ async def test_post_sandboxes_invalid_user_id(mock_sandbox_manager, mock_storage
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
             "/sandboxes",
-            json={"user_id": "invalid user id with spaces!!"},
+            json={
+                "user_id": "invalid user id with spaces!!",
+                "organization_id": ORG_ID,
+            },
         )
     assert response.status_code == 422
+
+
+@pytest.mark.asyncio
+async def test_post_sandboxes_requires_organization_before_manager(
+    mock_sandbox_manager, mock_storage
+):
+    """A missing organization is rejected at the API boundary before any write path."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/sandboxes",
+            json={"user_id": "00000000-0000-4000-8000-000000000001"},
+        )
+
+    assert response.status_code == 422
+    mock_storage.ensure_user_storage.assert_not_awaited()
+    mock_sandbox_manager.create_sandbox.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -70,7 +92,12 @@ async def test_internal_development_template_requires_allowlisted_ec2_host(
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.post(
             "/sandboxes",
-            json={"user_id": user_id, "template": "development", "tier": "ec2"},
+            json={
+                "user_id": user_id,
+                "organization_id": ORG_ID,
+                "template": "development",
+                "tier": "ec2",
+            },
         )
 
     assert response.status_code == 403
@@ -96,6 +123,7 @@ async def test_internal_development_template_rejects_unsafe_workspace_key(
             "/sandboxes",
             json={
                 "user_id": user_id,
+                "organization_id": ORG_ID,
                 "template": "development",
                 "tier": "ec2",
                 "config": {"workspace_key": "../escape"},

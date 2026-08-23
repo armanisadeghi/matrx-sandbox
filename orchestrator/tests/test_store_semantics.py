@@ -16,11 +16,14 @@ import pytest
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.store import InMemorySandboxStore
 
+ORG_ID = "22222222-2222-4222-8222-222222222222"
+
 
 def _mk(sandbox_id: str = "sbx-test00000001", user_id: str | None = None) -> SandboxResponse:
     return SandboxResponse(
         sandbox_id=sandbox_id,
         user_id=user_id or "00000000-0000-0000-0000-000000000001",
+        organization_id=ORG_ID,
         status=SandboxStatus.READY,
         created_at=datetime.now(timezone.utc),
     )
@@ -64,7 +67,6 @@ async def test_mark_stopped_unknown_returns_false():
 async def test_concurrent_claim_does_not_double_assign_warm_box(monkeypatch):
     """Two simultaneous claim_warm calls must never adopt the same container."""
     from orchestrator import pool
-    from orchestrator.config import settings
 
     store = InMemorySandboxStore()
     monkeypatch.setattr(pool, "_pool_enabled", lambda: True)
@@ -102,8 +104,12 @@ async def test_concurrent_claim_does_not_double_assign_warm_box(monkeypatch):
     monkeypatch.setattr(pool, "_replenish_async", lambda: asyncio.sleep(0))
 
     results = await asyncio.gather(
-        pool.claim_warm("00000000-0000-0000-0000-0000000000aa", template="slim"),
-        pool.claim_warm("00000000-0000-0000-0000-0000000000bb", template="slim"),
+        pool.claim_warm(
+            "00000000-0000-0000-0000-0000000000aa", ORG_ID, template="slim"
+        ),
+        pool.claim_warm(
+            "00000000-0000-0000-0000-0000000000bb", ORG_ID, template="slim"
+        ),
     )
 
     claimed_ids = sorted(r.sandbox_id for r in results if r is not None)

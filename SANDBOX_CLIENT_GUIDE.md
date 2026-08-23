@@ -56,6 +56,7 @@ A `POST /sandboxes` whose `tier` field doesn't match the orchestrator's `MATRX_H
 POST /sandboxes
 {
   "user_id": "<uuid>",                 // required
+  "organization_id": "<uuid>",         // required; initiating organization, never inferred
   "name": "Research worker",           // optional display name, 1-100 chars
   "tier": "ec2" | "hosted",            // optional; must match orchestrator tier when set
   "template": "bare" | "node-22" | "python-3.13",   // optional; see /templates
@@ -76,6 +77,7 @@ Returns a `SandboxResponse`:
 {
   "sandbox_id": "sbx-abc123…",
   "user_id": "...",
+  "organization_id": "...",            // durable identity; preserved by reset/resume
   "name": "Research worker",           // nullable; fall back to sandbox_id
   "status": "ready" | "starting" | ...,
   "container_id": "...",
@@ -92,6 +94,11 @@ Returns a `SandboxResponse`:
   "labels": { ... }
 }
 ```
+
+Requests without `organization_id` fail with HTTP 422 before storage or
+container creation. Clients must supply the organization carried by the
+initiating request; the orchestrator never selects a personal, active, or
+system organization.
 
 ### Read / list
 

@@ -37,6 +37,7 @@ async def live_sandbox(monkeypatch):
     sandbox = SandboxResponse(
         sandbox_id=SBX,
         user_id="00000000-0000-0000-0000-000000000001",
+        organization_id="22222222-2222-4222-8222-222222222222",
         status=SandboxStatus.RUNNING,
         created_at=datetime.now(timezone.utc),
     )

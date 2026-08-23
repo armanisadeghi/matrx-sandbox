@@ -259,6 +259,7 @@ async def ensure_warm_pool() -> dict:
 
 async def claim_warm(
     user_id: str,
+    organization_id: str,
     template: str | None = None,
     ttl_seconds: int | None = None,
 ) -> SandboxResponse | None:
@@ -269,7 +270,7 @@ async def claim_warm(
     if not _pool_enabled():
         return None
 
-    from orchestrator.sandbox_manager import _get_store, _get_docker_client, _proxy_url_for
+    from orchestrator.sandbox_manager import _get_store, _proxy_url_for
 
     store = _get_store()
 
@@ -300,12 +301,13 @@ async def claim_warm(
         sandbox = SandboxResponse(
             sandbox_id=sandbox_id,
             user_id=user_id,
+            organization_id=organization_id,
             status=SandboxStatus.READY,
             container_id=container.id,
             created_at=datetime.now(timezone.utc),
             hot_path="/home/agent",
             cold_path="/data/cold",
-            config={"warm_claimed": True},
+            config={"warm_claimed": True, "organization_id": organization_id},
             ttl_seconds=ttl_seconds or settings.max_session_duration_seconds,
             tier=settings.host_tier or None,
             template=template,

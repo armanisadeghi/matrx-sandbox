@@ -182,6 +182,20 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
             if existing_row is not None:
                 user_id = existing_row.user_id
 
+            organization_id = (
+                existing_row.organization_id
+                if existing_row is not None
+                else labels.get("matrx.organization_id")
+            )
+            if not organization_id:
+                summary["failed"] += 1
+                logger.error(
+                    "Reconcile refused org-less sandbox %s before persistence: "
+                    "no existing row and no matrx.organization_id label",
+                    sandbox_id,
+                )
+                continue
+
             # ── Respect the recorded end-of-life — never resurrect it ──
             # If the DB row was soft-deleted OR already moved to a terminal
             # status (stopped/expired/failed — a user/admin/reaper destroy),
@@ -214,6 +228,7 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
             sandbox = SandboxResponse(
                 sandbox_id=sandbox_id,
                 user_id=user_id,
+                organization_id=organization_id,
                 name=(
                     existing_row.name if existing_row is not None
                     else labels.get("matrx.name")

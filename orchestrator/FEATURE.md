@@ -8,6 +8,13 @@ resolver for operations that select between them.
 explicit tier only when the caller intentionally targets it. EC2 is not an
 equivalent fallback for an unknown hosted-tier identity.
 
+**Every sandbox has explicit organization identity.** `CreateSandboxRequest`,
+`SandboxResponse`, container labels, and `SandboxStore.save` require the
+initiating `organization_id`; reset, resume, and reconcile preserve that field.
+Postgres never receives an org-less sandbox write. Read the emergency contract:
+[`no-db-assigned-org/PLAN.md`](../../common-docs/projects/no-db-assigned-org/PLAN.md).
+
 ## Change log
 
+- 2026-08-23 — Required explicit organization identity through create, lifecycle, reconcile, and persistence.
 - 2026-08-21 — Removed implicit EC2 selection from storage and token routing.

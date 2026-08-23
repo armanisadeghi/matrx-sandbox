@@ -10,6 +10,8 @@ import pytest
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.store import InMemorySandboxStore
 
+ORG_ID = "22222222-2222-4222-8222-222222222222"
+
 
 @pytest.fixture(autouse=True)
 def clean_sandbox_state():
@@ -59,7 +61,9 @@ async def test_create_sandbox_generates_unique_id(mock_docker):
 
     from orchestrator import sandbox_manager
 
-    sandbox = await sandbox_manager.create_sandbox(user_id="test-user")
+    sandbox = await sandbox_manager.create_sandbox(
+        user_id="test-user", organization_id=ORG_ID
+    )
 
     assert sandbox.sandbox_id.startswith("sbx-")
     assert sandbox.user_id == "test-user"
@@ -110,7 +114,9 @@ async def test_create_sandbox_fetches_vault_with_orchestrator_user_agent(
     monkeypatch.setattr(settings, "aidream_service_token", "bridge-token")
     monkeypatch.setattr("httpx.AsyncClient", FakeAsyncClient)
 
-    sandbox = await sandbox_manager.create_sandbox(user_id="test-user")
+    sandbox = await sandbox_manager.create_sandbox(
+        user_id="test-user", organization_id=ORG_ID
+    )
 
     assert captured_headers["User-Agent"] == "matrx-sandbox-orchestrator"
     assert sandbox.config["secrets_injection"]["status_code"] == 200
@@ -187,6 +193,7 @@ async def test_aidream_container_rootfs_is_read_only_with_explicit_runtime_tmpfs
 
     await sandbox_manager.create_sandbox(
         user_id="00000000-0000-4000-8000-000000000001",
+        organization_id=ORG_ID,
         template="aidream",
         tier="hosted",
     )
@@ -260,6 +267,7 @@ async def test_development_sandbox_mounts_workspace_and_restarts(
 
     sandbox = await sandbox_manager.create_sandbox(
         user_id="00000000-0000-4000-8000-000000000001",
+        organization_id=ORG_ID,
         template="development",
         tier="ec2",
         config={"workspace_key": "primary", "env": {"GH_TOKEN": "test-token"}},
@@ -296,6 +304,7 @@ async def test_development_sandbox_refuses_to_boot_without_github_auth(
     ):
         await sandbox_manager.create_sandbox(
             user_id="00000000-0000-4000-8000-000000000001",
+            organization_id=ORG_ID,
             template="development",
             tier="ec2",
             config={"workspace_key": "primary"},
@@ -313,11 +322,11 @@ async def test_list_sandboxes_filters_by_user(clean_sandbox_state):
 
     # Seed some test data through the store
     await store.save(SandboxResponse(
-        sandbox_id="sbx-1", user_id="alice", status=SandboxStatus.READY,
+        sandbox_id="sbx-1", user_id="alice", organization_id=ORG_ID, status=SandboxStatus.READY,
         created_at=datetime.now(timezone.utc),
     ))
     await store.save(SandboxResponse(
-        sandbox_id="sbx-2", user_id="bob", status=SandboxStatus.READY,
+        sandbox_id="sbx-2", user_id="bob", organization_id=ORG_ID, status=SandboxStatus.READY,
         created_at=datetime.now(timezone.utc),
     ))
 
@@ -345,7 +354,7 @@ async def test_heartbeat_returns_true_for_known_sandbox(clean_sandbox_state):
 
     store = clean_sandbox_state
     await store.save(SandboxResponse(
-        sandbox_id="sbx-known", user_id="alice", status=SandboxStatus.READY,
+        sandbox_id="sbx-known", user_id="alice", organization_id=ORG_ID, status=SandboxStatus.READY,
         created_at=datetime.now(timezone.utc),
     ))
 
@@ -360,7 +369,7 @@ async def test_exec_in_sandbox_not_running(mock_docker, clean_sandbox_state):
 
     store = clean_sandbox_state
     await store.save(SandboxResponse(
-        sandbox_id="sbx-stopped", user_id="alice", status=SandboxStatus.READY,
+        sandbox_id="sbx-stopped", user_id="alice", organization_id=ORG_ID, status=SandboxStatus.READY,
         container_id="container-stopped",
         created_at=datetime.now(timezone.utc),
     ))
@@ -381,7 +390,7 @@ async def test_exec_in_sandbox_command_too_long(mock_docker, clean_sandbox_state
 
     store = clean_sandbox_state
     await store.save(SandboxResponse(
-        sandbox_id="sbx-long", user_id="alice", status=SandboxStatus.READY,
+        sandbox_id="sbx-long", user_id="alice", organization_id=ORG_ID, status=SandboxStatus.READY,
         container_id="container-long",
         created_at=datetime.now(timezone.utc),
     ))
@@ -399,7 +408,7 @@ async def test_destroy_sandbox_marks_stopped(mock_docker, clean_sandbox_state):
 
     store = clean_sandbox_state
     await store.save(SandboxResponse(
-        sandbox_id="sbx-destroy", user_id="alice", status=SandboxStatus.READY,
+        sandbox_id="sbx-destroy", user_id="alice", organization_id=ORG_ID, status=SandboxStatus.READY,
         container_id="container-destroy",
         created_at=datetime.now(timezone.utc),
     ))
@@ -440,7 +449,7 @@ async def test_get_sandbox_returns_sandbox(clean_sandbox_state):
 
     store = clean_sandbox_state
     expected = SandboxResponse(
-        sandbox_id="sbx-found", user_id="bob", status=SandboxStatus.READY,
+        sandbox_id="sbx-found", user_id="bob", organization_id=ORG_ID, status=SandboxStatus.READY,
         created_at=datetime.now(timezone.utc),
     )
     await store.save(expected)
@@ -458,7 +467,7 @@ async def test_exec_in_sandbox_tracks_cwd(mock_docker, clean_sandbox_state):
 
     store = clean_sandbox_state
     await store.save(SandboxResponse(
-        sandbox_id="sbx-cwd", user_id="alice", status=SandboxStatus.READY,
+        sandbox_id="sbx-cwd", user_id="alice", organization_id=ORG_ID, status=SandboxStatus.READY,
         container_id="container-cwd",
         created_at=datetime.now(timezone.utc),
     ))

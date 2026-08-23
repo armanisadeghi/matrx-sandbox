@@ -33,15 +33,15 @@ class ResourcesSpec(BaseModel):
 
 class CreateSandboxRequest(BaseModel):
     user_id: str = Field(..., description="Supabase auth user UUID")
+    organization_id: str = Field(
+        ...,
+        description="Organization carried by the initiating sandbox request",
+    )
     name: str | None = Field(
         default=None,
         min_length=1,
         max_length=100,
         description="Optional user-visible sandbox name; sandbox_id remains the routing identity.",
-    )
-    organization_id: str | None = Field(
-        default=None,
-        description="Active organization whose permitted shared secrets are injected",
     )
     config: dict = Field(default_factory=dict, description="Optional sandbox config overrides")
     template: str | None = Field(default=None, description="Template id (e.g. 'bare', 'node-22', 'python-3.13')")
@@ -74,9 +74,7 @@ class CreateSandboxRequest(BaseModel):
 
     @field_validator("organization_id")
     @classmethod
-    def validate_organization_id(cls, v: str | None) -> str | None:
-        if v is None:
-            return None
+    def validate_organization_id(cls, v: str) -> str:
         try:
             UUID(v)
         except (ValueError, AttributeError):
@@ -97,6 +95,10 @@ class CreateSandboxRequest(BaseModel):
 class SandboxResponse(BaseModel):
     sandbox_id: str
     user_id: str
+    organization_id: str = Field(
+        ...,
+        description="Organization explicitly supplied by the initiating request",
+    )
     name: str | None = Field(
         default=None,
         description="User-visible name; clients fall back to sandbox_id when null.",
@@ -151,6 +153,15 @@ class SandboxResponse(BaseModel):
             "orchestrator's MATRX_PUBLIC_URL is unset."
         ),
     )
+
+    @field_validator("organization_id")
+    @classmethod
+    def validate_organization_id(cls, v: str) -> str:
+        try:
+            UUID(v)
+        except (ValueError, AttributeError):
+            raise ValueError("organization_id must be a valid UUID")
+        return v
 
 
 class SandboxListResponse(BaseModel):

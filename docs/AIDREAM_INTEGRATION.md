@@ -108,7 +108,7 @@ That's the full story. Everything below is plumbing for that one user need.
 
 ### Organization vault injection
 
-Sandbox creation also uses this service-token boundary for secret injection. The frontend sends the active `organization_id` with `POST /sandboxes`; the orchestrator calls:
+Sandbox creation also uses this service-token boundary for secret injection. Every caller must send the initiating `organization_id` with `POST /sandboxes`; requests without it fail before container creation or persistence. The orchestrator calls:
 
 ```http
 GET /api/user-secrets/internal/sandbox-env-for-user?organization_id=<org_uuid>
@@ -118,7 +118,7 @@ X-Matrx-User-Id: <user_uuid>
 
 AI Dream revalidates that the user is an active member and may use each shared value, resolves organization entries, then overlays personal entries with the same key. Plaintext returns only to the orchestrator and is injected at container boot. The user-JWT `/api/user-secrets/sandbox-env` route remains personal-only, so it cannot be called as an organization-secret reveal endpoint.
 
-The orchestrator records `organization_id` in sandbox config so reset/resume preserve scope. Organization-scoped claims skip the warm pool because a running container cannot accept new environment variables.
+The orchestrator records `organization_id` as a required persistent model field, in sandbox config, and on the container label so reset, resume, and reconcile preserve it. It never selects a personal, active, or system organization. Organization-scoped claims skip the warm pool because a running container cannot accept new environment variables.
 
 ---
 
