@@ -13,6 +13,7 @@
 - **Limits are knobs, and agents set them.** Every limit/quota/ceiling/gate is a per-feature admin-adjustable knob with an agent-chosen starting value — never a hardcoded constant, a TBD placeholder, or an absent control. Canonical: [limits-are-knobs-agents-set-them.md](/Users/armanisadeghi/code/common-docs/policies/limits-are-knobs-agents-set-them.md).
 - **We don't do legacy.** A replaced system is migrated, repointed, and DELETED — never frozen, never run beside its replacement, never a keep-or-kill question. Canonical: [no-legacy.md](/Users/armanisadeghi/code/common-docs/policies/no-legacy.md).
 - **One database, addressed only by URL** (`https://db.matrxserver.com`, never by project ref) — this repo's known exception to the connection-variable rule is below in Working Here.
+- **Every sandbox write carries an explicit `organization_id`.** The create request, persisted model, and Postgres payload must refuse absence; the database never assigns it. Emergency work order: [no-db-assigned-org PLAN](/Users/armanisadeghi/code/common-docs/projects/no-db-assigned-org/PLAN.md).
 
 ## Where the detail lives
 
