@@ -24,6 +24,7 @@
 | HTTP API surface for clients (orchestrator endpoints + in-container fs/pty/git/processes/ports daemon) | [SANDBOX_CLIENT_GUIDE.md](SANDBOX_CLIENT_GUIDE.md) — cross-check before relying on an endpoint; not all of it may be implemented |
 | User data persistence (what's saved, where, session-report, auto-stash) | [docs/PERSISTENCE_PLAN.md](docs/PERSISTENCE_PLAN.md) |
 | AI Dream ↔ Sandbox integration (cloud-files bridge, `mtx` CLI, service-token auth) | [docs/AIDREAM_INTEGRATION.md](docs/AIDREAM_INTEGRATION.md) |
+| Files: the sandbox still rides aidream's `/cloud-files/*` bridge and is NOT cut over to the file service | `/Users/armanisadeghi/code/common-docs/systems/media/file-service/STATE.md` — read it before touching file traffic in ANY repo |
 | Cloud-files replica implementation (watcher, replay, system-path boundary, retries) | [sandbox-image/sdk/matrx_agent/cloud_sync/FEATURE.md](sandbox-image/sdk/matrx_agent/cloud_sync/FEATURE.md) |
 | Zero-drift migration (version stamping, drift detection, safe image swap, auto-migrate) | [docs/ZERO_DRIFT.md](docs/ZERO_DRIFT.md) |
 | Adding tools/SDKs to the sandbox image | [sandbox-image/ADDING_UTILITIES.md](sandbox-image/ADDING_UTILITIES.md) |
