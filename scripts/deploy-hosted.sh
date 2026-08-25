@@ -88,6 +88,8 @@ run_db_migrations() {
   # refuses to boot unless this is 'postgres'. Catch it before the swap.
   grep -q '^MATRX_SANDBOX_STORE=postgres[[:space:]]*$' "$ORCH_COMPOSE_DIR/.env" \
     || fail "MATRX_SANDBOX_STORE must be 'postgres' in $ORCH_COMPOSE_DIR/.env (in-memory loses every sandbox row on restart)"
+  grep -q '^MATRX_HOST_TIER=hosted[[:space:]]*$' "$ORCH_COMPOSE_DIR/.env" \
+    || fail "MATRX_HOST_TIER must be 'hosted' in $ORCH_COMPOSE_DIR/.env (token issuance and lifecycle routing require exact tier identity)"
   if ! docker run --rm --env-file "$ORCH_COMPOSE_DIR/.env" "$image" \
         python -m orchestrator.migrate_runner; then
     fail "DB migrations failed — aborting before recreating orchestrator"

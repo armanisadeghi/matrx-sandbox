@@ -29,3 +29,13 @@ def test_source_guard_bans_ec2_fallbacks() -> None:
     source = "\n".join(path.read_text() for path in root.rglob("*.py"))
     assert 'host_tier or "ec2"' not in source
     assert 'else "ec2"' not in source
+
+
+def test_deploys_refuse_missing_or_wrong_host_tier() -> None:
+    repo = Path(__file__).resolve().parents[2]
+    ec2_deploy = (repo / "scripts" / "deploy-ec2.sh").read_text()
+    hosted_deploy = (repo / "scripts" / "deploy-hosted.sh").read_text()
+
+    assert 'HOST_TIER=$(resolve_setting MATRX_HOST_TIER)' in ec2_deploy
+    assert '[ "$HOST_TIER" = "ec2" ]' in ec2_deploy
+    assert "^MATRX_HOST_TIER=hosted" in hosted_deploy

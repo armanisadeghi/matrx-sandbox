@@ -16,6 +16,7 @@ Postgres never receives an org-less sandbox write. Read the emergency contract:
 
 ## Change log
 
+- 2026-08-25 — Made both deployment paths refuse a missing or wrong `MATRX_HOST_TIER` before swapping the orchestrator. Token issuance and lifecycle routing require exact tier identity; a bad deployment now stops with the actionable variable name instead of surfacing as an opaque token-mint HTTP 500.
 - 2026-08-25 — Made Postgres pool recovery generation-safe and non-blocking: one lock now serializes pool publication, failed pools are detached before graceful close, and retirement has a five-second hard bound with forced termination. This prevents a leaked/closing asyncpg connection from wedging `/health`, removing the only Traefik backend, and turning every sandbox token mint into a misleading plain 404.
 - 2026-08-23 — Required explicit organization identity through create, lifecycle, reconcile, and persistence.
 - 2026-08-21 — Removed implicit EC2 selection from storage and token routing.

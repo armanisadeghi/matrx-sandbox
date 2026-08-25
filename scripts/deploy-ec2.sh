@@ -66,6 +66,7 @@ resolve_setting() {
 DB_URL=$(resolve_setting MATRX_DATABASE_URL)
 API_KEY=$(resolve_setting MATRX_API_KEY)
 STORE=$(resolve_setting MATRX_SANDBOX_STORE)
+HOST_TIER=$(resolve_setting MATRX_HOST_TIER)
 AIDREAM_URL=$(resolve_setting MATRX_AIDREAM_URL)
 EXPECTED_AIDREAM_URL="http://aidream.internal.matrxserver.com"
 [ -n "$DB_URL" ] || fail "MATRX_DATABASE_URL is unresolved; migrations may not be skipped"
@@ -75,6 +76,11 @@ EXPECTED_AIDREAM_URL="http://aidream.internal.matrxserver.com"
 # swap instead of after.
 [ "$STORE" = "postgres" ] \
   || fail "MATRX_SANDBOX_STORE is '${STORE:-unset}'; a deployed orchestrator must set it to 'postgres' (in-memory loses every sandbox row on restart)"
+# Token issuance, lifecycle reconciliation, and persistence layout all require
+# an exact tier. Catch a missing/wrong value before the container swap instead
+# of letting /access-tokens fail as an opaque HTTP 500 later.
+[ "$HOST_TIER" = "ec2" ] \
+  || fail "MATRX_HOST_TIER is '${HOST_TIER:-unset}'; the EC2 orchestrator must set it to 'ec2'"
 # EC2-origin sandbox traffic must stay on the co-located sandbox_host replica.
 # Falling back to the public Coolify app_server defeats the two-runtime topology
 # and makes an internal dependency depend on public DNS.
