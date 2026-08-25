@@ -284,8 +284,11 @@ class PostgresSandboxStore(SandboxStore):
     """
 
     def __init__(self, database_url: str) -> None:
+        import asyncio
+
         self._database_url = database_url
         self._pool = None
+        self._pool_lock = asyncio.Lock()
 
     async def _get_pool(self):
         """Lazy-initialize the connection pool.
@@ -298,31 +301,64 @@ class PostgresSandboxStore(SandboxStore):
         healthcheck failures before this fix.
         """
         if self._pool is None:
-            import asyncpg
-            from urllib.parse import urlparse, unquote
-
-            parsed = urlparse(self._database_url)
-            self._pool = await asyncpg.create_pool(
-                host=parsed.hostname,
-                port=parsed.port or 5432,
-                user=unquote(parsed.username or ""),
-                password=unquote(parsed.password or ""),
-                database=parsed.path.lstrip("/") or "postgres",
-                min_size=2,
-                max_size=10,
-                # Disable prepared statements for Supabase transaction pooler compatibility
-                statement_cache_size=0,
-                # Recycle connections aggressively — Supabase pooler closes
-                # them faster than we'd ever want to reuse one. 20s is
-                # comfortably under the typical pooler idle-kill window.
-                max_inactive_connection_lifetime=20.0,
-                # Quick noop on every acquire so the caller never gets a
-                # dead-on-arrival connection. asyncpg automatically
-                # discards + replaces a connection whose setup raises.
-                setup=lambda conn: conn.execute("SELECT 1"),
-            )
-            logger.info("Postgres connection pool created (idle_lifetime=20s, setup-probed)")
+            async with self._pool_lock:
+                if self._pool is not None:
+                    return self._pool
+                self._pool = await self._create_pool()
         return self._pool
+
+    async def _create_pool(self):
+        """Create one pool; callers serialize publication with ``_pool_lock``."""
+        import asyncpg
+        from urllib.parse import urlparse, unquote
+
+        parsed = urlparse(self._database_url)
+        pool = await asyncpg.create_pool(
+            host=parsed.hostname,
+            port=parsed.port or 5432,
+            user=unquote(parsed.username or ""),
+            password=unquote(parsed.password or ""),
+            database=parsed.path.lstrip("/") or "postgres",
+            min_size=2,
+            max_size=10,
+            # Disable prepared statements for Supabase transaction pooler compatibility
+            statement_cache_size=0,
+            # Recycle connections aggressively — Supabase pooler closes
+            # them faster than we'd ever want to reuse one. 20s is
+            # comfortably under the typical pooler idle-kill window.
+            max_inactive_connection_lifetime=20.0,
+            # Quick noop on every acquire so the caller never gets a
+            # dead-on-arrival connection. asyncpg automatically
+            # discards + replaces a connection whose setup raises.
+            setup=lambda conn: conn.execute("SELECT 1"),
+        )
+        logger.info("Postgres connection pool created (idle_lifetime=20s, setup-probed)")
+        return pool
+
+    async def _discard_pool(self, failed_pool) -> None:
+        """Detach a failed pool immediately, then close it with a hard bound.
+
+        ``Pool.close()`` waits for every checked-out connection.  Awaiting it
+        before clearing ``self._pool`` can wedge every request behind a dead
+        pool indefinitely (asyncpg only warns after 60 seconds).  Publish the
+        empty slot first so the next attempt can create a healthy pool, and
+        terminate the retired pool if graceful close cannot finish promptly.
+        """
+        import asyncio
+
+        async with self._pool_lock:
+            if self._pool is not failed_pool:
+                return
+            self._pool = None
+
+        try:
+            await asyncio.wait_for(failed_pool.close(), timeout=5.0)
+        except TimeoutError:
+            logger.warning("Timed out closing failed Postgres pool; terminating it")
+            failed_pool.terminate()
+        except Exception:
+            logger.warning("Failed Postgres pool close raised; terminating it", exc_info=True)
+            failed_pool.terminate()
 
     async def _execute_with_retry(self, fn, *args, **kwargs):
         """Run a connection-using function with one automatic retry on the
@@ -335,6 +371,7 @@ class PostgresSandboxStore(SandboxStore):
         exception propagate — the route layer surfaces it to the caller.
         """
         import asyncpg
+        attempted_pool = await self._get_pool()
         try:
             return await fn(*args, **kwargs)
         except (
@@ -344,12 +381,9 @@ class PostgresSandboxStore(SandboxStore):
             BrokenPipeError,
         ) as exc:
             logger.warning("Postgres connection lost (%s); rebuilding pool and retrying once", exc)
-            try:
-                if self._pool is not None:
-                    await self._pool.close()
-            except Exception:
-                pass
-            self._pool = None
+            # Retire only the generation this attempt actually used. Another
+            # concurrent failure may already have published a healthy pool.
+            await self._discard_pool(attempted_pool)
             return await fn(*args, **kwargs)
 
     async def save(self, sandbox: SandboxResponse) -> None:
