@@ -1282,7 +1282,7 @@ def _authenticate_proxy_request(
     tells the proxy whether to drop the inbound ``Authorization`` from the
     forwarded headers. False for cases (1), (2), (4); True only for (3).
 
-    A request with NO recognised auth (no master, no scoped, no bearer)
+    A request with NO recognized auth (no master, no scoped, no bearer)
     is rejected with 401 to keep the proxy from being an open relay.
     """
     # 1. Master key
