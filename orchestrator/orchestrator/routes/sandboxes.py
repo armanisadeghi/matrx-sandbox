@@ -1478,7 +1478,22 @@ async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
         return None
     from orchestrator.connection_hooks import prepare_development_connection
 
-    return await prepare_development_connection(sandbox)
+    try:
+        return await prepare_development_connection(sandbox)
+    except Exception:
+        # Connection preparation is best-effort metadata attached to the mint
+        # response. It must never turn a valid token request into a 500: the
+        # caller can still use the sandbox, and the next bind will retry the
+        # hook. Keep the failure loud and return a bounded status object rather
+        # than leaking exception detail across the API boundary.
+        logging.getLogger(__name__).exception(
+            "Development connection hook failed for sandbox %s; issuing the token without hooks",
+            sandbox.sandbox_id,
+        )
+        return {
+            "status": "failed",
+            "summary": "Development connection preparation failed; it will retry on the next binding.",
+        }
 
 
 @router.api_route(

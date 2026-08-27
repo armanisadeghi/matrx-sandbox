@@ -9,6 +9,7 @@ import pytest
 
 from orchestrator import connection_hooks
 from orchestrator.models import SandboxResponse, SandboxStatus
+from orchestrator.routes import sandboxes
 
 
 def _sandbox() -> SandboxResponse:
@@ -83,3 +84,30 @@ async def test_connection_hook_coalesces_duplicate_binding_calls(monkeypatch):
     assert first["cached"] is False
     assert second["cached"] is True
     execute.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_prepare_connection_isolates_hook_failure_from_token_mint(
+    monkeypatch, caplog
+):
+    hook = AsyncMock(side_effect=RuntimeError("sync transport unavailable"))
+    monkeypatch.setattr(connection_hooks, "prepare_development_connection", hook)
+
+    result = await sandboxes._prepare_connection(_sandbox())
+
+    assert result == {
+        "status": "failed",
+        "summary": "Development connection preparation failed; it will retry on the next binding.",
+    }
+    assert "issuing the token without hooks" in caplog.text
+    assert "sync transport unavailable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_prepare_connection_skips_hooks_for_ordinary_sandbox(monkeypatch):
+    hook = AsyncMock()
+    monkeypatch.setattr(connection_hooks, "prepare_development_connection", hook)
+    ordinary = _sandbox().model_copy(update={"template": "default"})
+
+    assert await sandboxes._prepare_connection(ordinary) is None
+    hook.assert_not_awaited()

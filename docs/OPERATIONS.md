@@ -439,6 +439,7 @@ gh workflow run deploy.yml --repo armanisadeghi/matrx-sandbox
 | EC2 `/` shows old version after deploy "succeeded" | Pre‑v0.2.0 deploy never updated on-disk code (it only restarted with the same files). Use the manual recovery in "Recovering EC2" above; it should self-heal on the next deploy. |
 | `POST /sandboxes` succeeds on EC2 but fs/git/pty proxies 502 | In-container daemon not running | EC2: SSM into the host, check `docker exec <sbx> ss -tlnp \| grep 8000`. If missing, the sandbox image is stale — rebuild and redeploy. |
 | Hosted `/exec` works but `/fs/list` 502s | Spawned sandbox is on the wrong network — orchestrator can't reach `<container_ip>:8000` | Confirm `MATRX_DOCKER_NETWORK=proxy` in the orchestrator .env, and that the sandbox image inherits this via the orchestrator's `network=` argument |
+| Development sandbox token mint returns 500/502 while connection preparation is failing | The pre-token SessionStart hook failed | Current orchestrators log the hook exception, return `connection_hooks.status=failed`, and still issue the scoped token; redeploy if the endpoint still fails closed. The next binding retries preparation. |
 | `/extend` returns 200 but `expires_at` doesn't change | Pre-v0.2.0 orchestrator (stub still in place) | Redeploy with the latest image |
 | Traefik 404 on `orchestrator.dev.codematrx.com` | DNS not resolving or Traefik labels missing | `dig orchestrator.dev.codematrx.com` (must point at `77.37.62.64`); `docker inspect matrx-orchestrator \| grep traefik` |
 
