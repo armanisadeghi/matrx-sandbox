@@ -147,3 +147,10 @@ async def test_prepare_connection_returns_only_json_safe_bounded_diagnostics(mon
             "version": "abc123",
         },
     }
+
+
+def test_persisted_sandbox_tier_is_a_plain_string():
+    sandbox = _sandbox().model_copy(update={"tier": "hosted"})
+
+    assert sandbox.tier == "hosted"
+    assert sandboxes.settings.resolve_host_tier(sandbox.tier) == "hosted"

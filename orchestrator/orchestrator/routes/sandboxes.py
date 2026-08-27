@@ -1377,7 +1377,9 @@ async def issue_access_token(sandbox_id: str, body: AccessTokenRequest) -> Acces
             sandbox_id=sandbox_id,
             scopes=body.scopes,
             # 🚨 Do not restore `or "ec2"`; missing tier must fail at the resolver.
-            tier=settings.resolve_host_tier(sandbox.tier.value if sandbox.tier else None),
+            # SandboxTier is a Literal, so Pydantic stores the persisted value
+            # as a plain string (not an Enum with a ``.value`` attribute).
+            tier=settings.resolve_host_tier(sandbox.tier),
             ttl_seconds=ttl,
             actor=body.actor,
             single_use=body.single_use,
@@ -1448,7 +1450,7 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
             sandbox_id=sandbox_id,
             scopes=scopes,
             # 🚨 Do not restore `or "ec2"`; missing tier must fail at the resolver.
-            tier=settings.resolve_host_tier(sandbox.tier.value if sandbox.tier else None),
+            tier=settings.resolve_host_tier(sandbox.tier),
             ttl_seconds=ttl,
             # Server-to-server binding (co-located AI Dream): allow a full
             # session, not the 15-min browser ceiling, so a long agent run
