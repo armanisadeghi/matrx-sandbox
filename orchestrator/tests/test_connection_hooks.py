@@ -111,3 +111,39 @@ async def test_prepare_connection_skips_hooks_for_ordinary_sandbox(monkeypatch):
 
     assert await sandboxes._prepare_connection(ordinary) is None
     hook.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_prepare_connection_returns_only_json_safe_bounded_diagnostics(monkeypatch):
+    hook = AsyncMock(
+        return_value={
+            "hook": "session_start.repo_sync",
+            "status": "ok",
+            "exit_code": 0,
+            "summary": "sync complete",
+            "cached": False,
+            "image_refresh": {
+                "status": "already_current",
+                "sandbox_id": "sbx-development",
+                "version": "abc123",
+                "internal_client": object(),
+            },
+            "internal_client": object(),
+        }
+    )
+    monkeypatch.setattr(connection_hooks, "prepare_development_connection", hook)
+
+    result = await sandboxes._prepare_connection(_sandbox())
+
+    assert result == {
+        "hook": "session_start.repo_sync",
+        "status": "ok",
+        "exit_code": 0,
+        "summary": "sync complete",
+        "cached": False,
+        "image_refresh": {
+            "status": "already_current",
+            "sandbox_id": "sbx-development",
+            "version": "abc123",
+        },
+    }

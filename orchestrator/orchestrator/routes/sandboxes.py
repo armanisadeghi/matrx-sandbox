@@ -1479,7 +1479,42 @@ async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
     from orchestrator.connection_hooks import prepare_development_connection
 
     try:
-        return await prepare_development_connection(sandbox)
+        report = await prepare_development_connection(sandbox)
+        # This hook runs before a security-critical token response.  Never
+        # allow a Docker/client-specific value in its diagnostic report to
+        # reach FastAPI's response serializer and turn a successfully minted
+        # token into a late 500.  Keep the public report deliberately small
+        # and JSON-primitive-only; the full failure remains in server logs.
+        image_refresh = report.get("image_refresh")
+        safe_image_refresh = None
+        if isinstance(image_refresh, dict):
+            safe_image_refresh = {
+                key: value
+                for key, value in image_refresh.items()
+                if key
+                in {
+                    "status",
+                    "sandbox_id",
+                    "reason",
+                    "version",
+                    "to_version",
+                    "to_image",
+                    "platform_env_changed",
+                }
+                and isinstance(value, (str, int, float, bool, type(None)))
+            }
+        return {
+            "hook": str(report.get("hook", "session_start.repo_sync")),
+            "status": str(report.get("status", "unknown")),
+            "exit_code": (
+                report.get("exit_code")
+                if isinstance(report.get("exit_code"), int)
+                else None
+            ),
+            "summary": str(report.get("summary", ""))[-12000:],
+            "image_refresh": safe_image_refresh,
+            "cached": report.get("cached") is True,
+        }
     except Exception:
         # Connection preparation is best-effort metadata attached to the mint
         # response. It must never turn a valid token request into a 500: the
