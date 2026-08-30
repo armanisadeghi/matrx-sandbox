@@ -34,7 +34,16 @@ def _write_client_text(fd: int, pid: int, text: str) -> None:
     if isinstance(message, dict) and message.get("type") == "signal":
         sig_name = message.get("name")
         if isinstance(sig_name, str) and hasattr(signal, sig_name):
-            os.kill(pid, getattr(signal, sig_name))
+            sig = getattr(signal, sig_name)
+            try:
+                foreground_pgid = os.tcgetpgrp(fd)
+                os.killpg(foreground_pgid, sig)
+            except OSError:
+                # If the foreground job exited between tcgetpgrp() and
+                # killpg(), still give the shell leader the signal. This also
+                # preserves control delivery on platforms where the PTY does
+                # not expose a foreground process group.
+                os.kill(pid, sig)
         return
 
     os.write(fd, text.encode())
