@@ -72,9 +72,61 @@ def test_transient_bridge_failures_remain_retryable(status_code: int) -> None:
     assert _is_retryable_bridge_error(error) is True
 
 
+def test_bridge_config_headers_carry_organization() -> None:
+    """Positive control: a fully-configured BridgeConfig sends
+    X-Organization-Id alongside identity — aidream's AuthMiddleware refuses
+    any authenticated request missing it."""
+    cfg = BridgeConfig(
+        url="https://server.example",
+        token="token",
+        user_id="user",
+        organization_id="org-1",
+    )
+
+    headers = cfg.headers()
+
+    assert headers["X-Organization-Id"] == "org-1"
+    assert headers["X-Matrx-User-Id"] == "user"
+    assert headers["Authorization"] == "Bearer token"
+
+
+def test_bridge_config_from_env_refuses_without_organization_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """The orchestrator already injects ORGANIZATION_ID into every sandbox
+    container (sandbox_manager.py). A container missing it fails closed here
+    — same pattern as a missing URL/token/user id — never a fallback org."""
+    monkeypatch.setenv("MATRX_AIDREAM_URL", "https://server.example")
+    monkeypatch.setenv("MATRX_AIDREAM_SERVICE_TOKEN", "token")
+    monkeypatch.setenv("USER_ID", "user")
+    monkeypatch.delenv("ORGANIZATION_ID", raising=False)
+
+    assert BridgeConfig.from_env() is None
+
+
+def test_bridge_config_from_env_succeeds_with_organization_id(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Positive control for the refusal test above."""
+    monkeypatch.setenv("MATRX_AIDREAM_URL", "https://server.example")
+    monkeypatch.setenv("MATRX_AIDREAM_SERVICE_TOKEN", "token")
+    monkeypatch.setenv("USER_ID", "user")
+    monkeypatch.setenv("ORGANIZATION_ID", "org-1")
+
+    cfg = BridgeConfig.from_env()
+
+    assert cfg is not None
+    assert cfg.organization_id == "org-1"
+
+
 def test_cli_refuses_system_path_before_network(tmp_path: Path) -> None:
     local = tmp_path / "body.html"
     local.write_text("changed evidence", encoding="utf-8")
-    cfg = BridgeConfig(url="https://server.example", token="token", user_id="user")
+    cfg = BridgeConfig(
+        url="https://server.example",
+        token="token",
+        user_id="user",
+        organization_id="org-1",
+    )
 
     assert cmd_put(cfg, str(local), "system-files/scraper/body.html") == 2

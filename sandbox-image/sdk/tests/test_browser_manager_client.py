@@ -17,6 +17,7 @@ def _config() -> BrowserManagerConfig:
         base_url="https://server.example",
         service_token="approved-server-token",
         user_id="11111111-1111-1111-1111-111111111111",
+        organization_id="33333333-3333-3333-3333-333333333333",
         profile_id="22222222-2222-2222-2222-222222222222",
         execution_target="browser_fleet",
         sandbox_id="sbx-123",
@@ -28,6 +29,7 @@ def test_config_fails_closed_without_explicit_browser_identity(monkeypatch):
         "MATRX_AIDREAM_URL",
         "MATRX_AIDREAM_SERVICE_TOKEN",
         "USER_ID",
+        "ORGANIZATION_ID",
         "MATRX_BROWSER_PROFILE_ID",
         "MATRX_BROWSER_EXECUTION_TARGET",
         "SANDBOX_ID",
@@ -36,6 +38,38 @@ def test_config_fails_closed_without_explicit_browser_identity(monkeypatch):
 
     with pytest.raises(BrowserManagerNotConfiguredError, match="refuses to launch a local fallback"):
         BrowserManagerConfig.from_env()
+
+
+def test_config_fails_closed_without_organization_id_specifically(monkeypatch):
+    """The orchestrator already injects ORGANIZATION_ID into every sandbox
+    container; a missing one is a provisioning defect this client refuses to
+    paper over with a fallback organization."""
+    monkeypatch.setenv("MATRX_AIDREAM_URL", "https://server.example")
+    monkeypatch.setenv("MATRX_AIDREAM_SERVICE_TOKEN", "approved-server-token")
+    monkeypatch.setenv("USER_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("MATRX_BROWSER_PROFILE_ID", "22222222-2222-2222-2222-222222222222")
+    monkeypatch.setenv("MATRX_BROWSER_EXECUTION_TARGET", "browser_fleet")
+    monkeypatch.setenv("SANDBOX_ID", "sbx-123")
+    monkeypatch.delenv("ORGANIZATION_ID", raising=False)
+
+    with pytest.raises(BrowserManagerNotConfiguredError, match="ORGANIZATION_ID"):
+        BrowserManagerConfig.from_env()
+
+
+def test_config_succeeds_with_organization_id_set(monkeypatch):
+    """Positive control for the refusal test above."""
+    monkeypatch.setenv("MATRX_AIDREAM_URL", "https://server.example")
+    monkeypatch.setenv("MATRX_AIDREAM_SERVICE_TOKEN", "approved-server-token")
+    monkeypatch.setenv("USER_ID", "11111111-1111-1111-1111-111111111111")
+    monkeypatch.setenv("ORGANIZATION_ID", "33333333-3333-3333-3333-333333333333")
+    monkeypatch.setenv("MATRX_BROWSER_PROFILE_ID", "22222222-2222-2222-2222-222222222222")
+    monkeypatch.setenv("MATRX_BROWSER_EXECUTION_TARGET", "browser_fleet")
+    monkeypatch.setenv("SANDBOX_ID", "sbx-123")
+
+    config = BrowserManagerConfig.from_env()
+
+    assert config.organization_id == "33333333-3333-3333-3333-333333333333"
+    assert config.headers()["X-Organization-Id"] == config.organization_id
 
 
 @pytest.mark.asyncio
@@ -73,6 +107,7 @@ async def test_client_reuses_approved_server_auth_and_canonical_run():
     assert len(requests) == 2
     assert requests[0].headers["authorization"] == "Bearer approved-server-token"
     assert requests[0].headers["x-matrx-user-id"] == _config().user_id
+    assert requests[0].headers["x-organization-id"] == _config().organization_id
     start = __import__("json").loads(requests[0].content)
     assert start["profile_id"] == _config().profile_id
     assert start["execution_target"] == "browser_fleet"

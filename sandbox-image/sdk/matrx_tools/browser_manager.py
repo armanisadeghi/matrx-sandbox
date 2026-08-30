@@ -28,6 +28,7 @@ class BrowserManagerConfig:
     base_url: str
     service_token: str
     user_id: str
+    organization_id: str
     profile_id: str
     execution_target: str
     sandbox_id: str
@@ -38,6 +39,13 @@ class BrowserManagerConfig:
             "base_url": os.environ.get("MATRX_AIDREAM_URL", "").rstrip("/"),
             "service_token": os.environ.get("MATRX_AIDREAM_SERVICE_TOKEN", ""),
             "user_id": os.environ.get("USER_ID", ""),
+            # aidream's AuthMiddleware refuses every authenticated request
+            # that names no organization (400 organization_required) before
+            # it routes. The orchestrator already injects ORGANIZATION_ID
+            # into every sandbox container (sandbox_manager.py) — missing it
+            # here is a provisioning defect, not something this client papers
+            # over with a fallback organization.
+            "organization_id": os.environ.get("ORGANIZATION_ID", ""),
             "profile_id": os.environ.get("MATRX_BROWSER_PROFILE_ID", ""),
             "execution_target": os.environ.get("MATRX_BROWSER_EXECUTION_TARGET", ""),
             "sandbox_id": os.environ.get("SANDBOX_ID", ""),
@@ -48,6 +56,7 @@ class BrowserManagerConfig:
                 "base_url": "MATRX_AIDREAM_URL",
                 "service_token": "MATRX_AIDREAM_SERVICE_TOKEN",
                 "user_id": "USER_ID",
+                "organization_id": "ORGANIZATION_ID",
                 "profile_id": "MATRX_BROWSER_PROFILE_ID",
                 "execution_target": "MATRX_BROWSER_EXECUTION_TARGET",
                 "sandbox_id": "SANDBOX_ID",
@@ -67,6 +76,7 @@ class BrowserManagerConfig:
         return {
             "Authorization": f"Bearer {self.service_token}",
             "X-Matrx-User-Id": self.user_id,
+            "X-Organization-Id": self.organization_id,
             "Accept": "application/json",
         }
 

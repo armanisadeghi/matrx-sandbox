@@ -57,20 +57,30 @@ class BridgeConfig:
     url: str  # base URL, no trailing /
     token: str
     user_id: str
+    organization_id: str
 
     @classmethod
     def from_env(cls) -> Optional["BridgeConfig"]:
         url = os.environ.get("MATRX_AIDREAM_URL", "").rstrip("/")
         token = os.environ.get("MATRX_AIDREAM_SERVICE_TOKEN", "")
         user_id = os.environ.get("USER_ID", "")
-        if not (url and token and user_id):
+        organization_id = os.environ.get("ORGANIZATION_ID", "")
+        # Fail closed, same as the other required env vars above: aidream's
+        # AuthMiddleware refuses every authenticated request that names no
+        # organization (400 organization_required) before it routes, and the
+        # orchestrator already injects ORGANIZATION_ID into every sandbox
+        # container (sandbox_manager.py). A container missing it is a
+        # provisioning defect, not something this client papers over with a
+        # fallback organization.
+        if not (url and token and user_id and organization_id):
             return None
-        return cls(url=url, token=token, user_id=user_id)
+        return cls(url=url, token=token, user_id=user_id, organization_id=organization_id)
 
     def headers(self, extra: Optional[dict[str, str]] = None) -> dict[str, str]:
         h = {
             "Authorization": f"Bearer {self.token}",
             "X-Matrx-User-Id": self.user_id,
+            "X-Organization-Id": self.organization_id,
             "Accept": "application/json",
         }
         if extra:
@@ -81,7 +91,8 @@ class BridgeConfig:
 def report_missing(stream=sys.stderr) -> None:
     print(
         "AI Dream not configured for this sandbox.\n"
-        "Need: MATRX_AIDREAM_URL, MATRX_AIDREAM_SERVICE_TOKEN, USER_ID env vars.\n"
+        "Need: MATRX_AIDREAM_URL, MATRX_AIDREAM_SERVICE_TOKEN, USER_ID, "
+        "ORGANIZATION_ID env vars.\n"
         "Run `mtx whoami` to see what's set.",
         file=stream,
     )
@@ -100,6 +111,7 @@ class AsyncBridgeClient:
             headers={
                 "Authorization": f"Bearer {cfg.token}",
                 "X-Matrx-User-Id": cfg.user_id,
+                "X-Organization-Id": cfg.organization_id,
             },
         )
 
@@ -270,6 +282,7 @@ class LocalFilesClient:
             headers={
                 "Authorization": f"Bearer {cfg.token}",
                 "X-Matrx-User-Id": cfg.user_id,
+                "X-Organization-Id": cfg.organization_id,
             },
         )
 

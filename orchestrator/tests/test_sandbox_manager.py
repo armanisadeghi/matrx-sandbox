@@ -172,6 +172,11 @@ async def test_create_sandbox_scopes_vault_fetch_to_organization(mock_docker, mo
 
     assert captured["params"] == {"organization_id": organization_id}
     assert captured["headers"]["X-Matrx-User-Id"] == "test-user"
+    # aidream's AuthMiddleware refuses every authenticated request that names
+    # no organization (400 organization_required) before it routes, and the
+    # gate reads the HEADER — the query param above is for the route's own
+    # use only and does not satisfy it.
+    assert captured["headers"]["X-Organization-Id"] == organization_id
     assert sandbox.config["organization_id"] == organization_id
     docker_env = mock_docker.containers.run.call_args.kwargs["environment"]
     assert docker_env["ORGANIZATION_ID"] == organization_id

@@ -529,6 +529,13 @@ async def create_sandbox(
                         headers={
                             "Authorization": f"Bearer {resolved_aidream_token}",
                             "X-Matrx-User-Id": str(user_id),
+                            # aidream's AuthMiddleware refuses every
+                            # authenticated request that names no
+                            # organization (400 organization_required)
+                            # before it routes — the gate reads THIS header,
+                            # not the query param above (kept for the
+                            # route's own use).
+                            "X-Organization-Id": str(organization_id),
                             "Accept": "application/json",
                             "User-Agent": "matrx-sandbox-orchestrator",
                         },
