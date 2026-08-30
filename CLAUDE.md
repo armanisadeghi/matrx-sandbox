@@ -1,6 +1,8 @@
 # Matrx Sandbox
 
-## The six laws (SYNCED from common-docs/policies/the-campaign-pattern.md — edit there, never here)
+## The six laws (SYNCED — canonical: common-docs/skills/campaign-pattern; edit there, never here)
+
+🚨 **MANDATORY: before launching, coordinating, or working any large build or campaign, READ the full doctrine — it is IN THIS REPO at `.claude/skills/campaign-pattern/SKILL.md`.**
 
 1. **Done means done — never on your own word.** Finished = verified by someone who did not build it, against the original vision, on the live surface, with real data. Tests feeding manufactured data to their author's own code prove nothing and are defects.
 2. **Attack before you trust.** Hole-poke plans before commitment; adversarially re-verify "done" before believing it.
