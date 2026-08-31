@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -500,3 +501,84 @@ async def test_exec_in_sandbox_tracks_cwd(mock_docker, clean_sandbox_state):
     assert sentinel not in stdout
     # Server should cache the new CWD
     assert sandbox_manager._sandbox_cwd["sbx-cwd"] == "/tmp"
+
+
+@pytest.mark.asyncio
+async def test_exec_in_sandbox_preserves_heredoc_terminator(
+    mock_docker, clean_sandbox_state, tmp_path
+):
+    """The CWD trailer must not corrupt a command ending in a heredoc."""
+    from orchestrator import sandbox_manager
+
+    await clean_sandbox_state.save(SandboxResponse(
+        sandbox_id="sbx-heredoc",
+        user_id="alice",
+        organization_id=ORG_ID,
+        status=SandboxStatus.READY,
+        container_id="container-heredoc",
+        created_at=datetime.now(timezone.utc),
+    ))
+    container = MagicMock()
+    container.status = "running"
+
+    def execute_wrapped(*, cmd, **_kwargs):
+        completed = subprocess.run(
+            cmd,
+            cwd=tmp_path,
+            capture_output=True,
+            check=False,
+        )
+        return completed.returncode, (completed.stdout, completed.stderr)
+
+    container.exec_run.side_effect = execute_wrapped
+    mock_docker.containers.get.return_value = container
+    command = "python3 - <<'EOF'\nprint('heredoc-ok')\nEOF\n"
+
+    exit_code, stdout, stderr, cwd = await sandbox_manager.exec_in_sandbox(
+        "sbx-heredoc", command, cwd=str(tmp_path)
+    )
+
+    assert exit_code == 0
+    assert stdout == "heredoc-ok"
+    assert stderr == ""
+    assert cwd == str(tmp_path)
+
+
+@pytest.mark.asyncio
+async def test_exec_in_sandbox_heredoc_keeps_real_exit_code(
+    mock_docker, clean_sandbox_state, tmp_path
+):
+    """A valid heredoc command still reports its own nonzero exit status."""
+    from orchestrator import sandbox_manager
+
+    await clean_sandbox_state.save(SandboxResponse(
+        sandbox_id="sbx-heredoc-exit",
+        user_id="alice",
+        organization_id=ORG_ID,
+        status=SandboxStatus.READY,
+        container_id="container-heredoc-exit",
+        created_at=datetime.now(timezone.utc),
+    ))
+    container = MagicMock()
+    container.status = "running"
+
+    def execute_wrapped(*, cmd, **_kwargs):
+        completed = subprocess.run(
+            cmd,
+            cwd=tmp_path,
+            capture_output=True,
+            check=False,
+        )
+        return completed.returncode, (completed.stdout, completed.stderr)
+
+    container.exec_run.side_effect = execute_wrapped
+    mock_docker.containers.get.return_value = container
+    command = "python3 - <<'EOF'\nraise SystemExit(7)\nEOF\n"
+
+    exit_code, _stdout, stderr, cwd = await sandbox_manager.exec_in_sandbox(
+        "sbx-heredoc-exit", command, cwd=str(tmp_path)
+    )
+
+    assert exit_code == 7
+    assert stderr == ""
+    assert cwd == str(tmp_path)

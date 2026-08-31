@@ -869,9 +869,15 @@ async def exec_in_sandbox(
         #   1. cd's into the tracked CWD
         #   2. runs the user command
         #   3. prints a sentinel + pwd so we can capture the new CWD
+        # Pass the user command to ``eval`` as one shell-quoted argument instead
+        # of interpolating it into a brace group.  Appending ``; }`` directly
+        # after a heredoc terminator changes valid shell into a syntax error.
+        # ``eval`` parses the command as its own complete shell program while
+        # still running in this shell, so intentional ``cd`` changes remain
+        # visible to the CWD trailer.
         wrapped = (
             f"cd {shlex.quote(effective_cwd)} && "
-            f"{{ {command} ; }}; "
+            f"eval -- {shlex.quote(command)}; "
             f"__matrx_ec=$?; "
             f"echo '{_CWD_SENTINEL}'; "
             f"pwd; "

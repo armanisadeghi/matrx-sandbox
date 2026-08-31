@@ -16,6 +16,7 @@ Postgres never receives an org-less sandbox write. Read the emergency contract:
 
 ## Change log
 
+- 2026-08-31 — Sandbox command wrapping now shell-quotes the complete user program before evaluating it, so a valid trailing heredoc remains syntactically intact while the orchestrator still captures the real exit status and post-command working directory.
 - 2026-08-27 — Token and agent-binding issuance now pass the persisted literal tier directly to the strict tier resolver. Both endpoints previously dereferenced `.value` on a plain string and returned HTTP 500 for every valid sandbox row.
 - 2026-08-27 — Token issuance now projects development connection-hook diagnostics onto a bounded JSON-primitive contract before constructing the response. Hook internals can no longer cause a late response-serialization 500 after a valid token was minted.
 - 2026-08-25 — Made both deployment paths refuse a missing or wrong `MATRX_HOST_TIER` before swapping the orchestrator. Token issuance and lifecycle routing require exact tier identity; a bad deployment now stops with the actionable variable name instead of surfacing as an opaque token-mint HTTP 500.
