@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import json
 import logging
-from copy import deepcopy
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
 from uuid import UUID
@@ -38,10 +37,6 @@ def _explicit_organization_id(sandbox: SandboxResponse) -> UUID:
 
 
 class SandboxStore(ABC):
-    async def claim_terminal_cleanup(self, sandbox_id: str, *, container_id: str,
-                                     status: str, deleted: bool) -> bool:
-        raise NotImplementedError("store does not support terminal cleanup fencing")
-
     async def claim_migration(self, sandbox_id: str, *, op_id: str,
                               source_container_id: str, source_image: str,
                               target_image: str) -> dict | None:
@@ -214,16 +209,6 @@ class InMemorySandboxStore(SandboxStore):
         row = self._sandboxes.get(sandbox_id)
         return row.model_copy(deep=True) if row else None
 
-    async def claim_terminal_cleanup(self, sandbox_id: str, *, container_id: str,
-                                     status: str, deleted: bool) -> bool:
-        row = self._sandboxes.get(sandbox_id)
-        if (not row or row.container_id != container_id or row.status.value != status
-                or (sandbox_id in self._deleted) != deleted or migration_pending(row.config)
-                or not (deleted or status in ("stopped", "expired", "failed"))):
-            return False
-        row.status = SandboxStatus.SHUTTING_DOWN
-        return True
-
     async def claim_migration(self, sandbox_id: str, *, op_id: str,
                               source_container_id: str, source_image: str,
                               target_image: str) -> dict | None:
@@ -235,7 +220,7 @@ class InMemorySandboxStore(SandboxStore):
         journal = {"op_id": op_id, "phase": "claimed", "source_id": source_container_id,
                    "source_image": source_image, "target_image": target_image}
         row.config = {**row.config, MIGRATION_KEY: journal}
-        return deepcopy(journal)
+        return dict(journal)
 
     async def advance_migration(self, sandbox_id: str, *, op_id: str,
                                 expected_phase: str, phase: str, patch: dict) -> bool:
@@ -243,7 +228,7 @@ class InMemorySandboxStore(SandboxStore):
         journal = row.config.get(MIGRATION_KEY, {}) if row else {}
         if journal.get("op_id") != op_id or journal.get("phase") != expected_phase:
             return False
-        row.config = {**row.config, MIGRATION_KEY: deepcopy({**journal, **patch, "op_id": op_id, "phase": phase})}
+        row.config = {**row.config, MIGRATION_KEY: {**journal, **patch, "op_id": op_id, "phase": phase}}
         return True
 
     async def commit_migration(self, sandbox_id: str, *, op_id: str,
@@ -267,7 +252,7 @@ class InMemorySandboxStore(SandboxStore):
             sandboxes = [s for s in sandboxes if s.sandbox_id not in self._deleted]
         if user_id:
             sandboxes = [s for s in sandboxes if s.user_id == user_id]
-        return [row.model_copy(deep=True) for row in sandboxes]
+        return sandboxes
 
     async def delete(self, sandbox_id: str) -> bool:
         if migration_pending(self._sandboxes.get(sandbox_id).config if sandbox_id in self._sandboxes else None):
@@ -381,20 +366,6 @@ class PostgresSandboxStore(SandboxStore):
         self._database_url = database_url
         self._pool = None
         self._pool_lock = asyncio.Lock()
-
-    async def claim_terminal_cleanup(self, sandbox_id: str, *, container_id: str,
-                                     status: str, deleted: bool) -> bool:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """UPDATE sandbox_instances SET status = 'shutting_down'
-                   WHERE sandbox_id = $1 AND container_id = $2 AND status = $3
-                     AND (deleted_at IS NOT NULL) = $4
-                     AND ($4 OR status IN ('stopped', 'expired', 'failed'))
-                     AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                          OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))
-                   RETURNING sandbox_id""", sandbox_id, container_id, status, deleted)
-        return row is not None
 
     async def claim_migration(self, sandbox_id: str, *, op_id: str,
                               source_container_id: str, source_image: str,
