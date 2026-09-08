@@ -230,6 +230,9 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     # from fresh S3 → cutover), REFUSE to migrate a box whose /home/agent isn't a
     # shared volume. This makes auto-migrate structurally safe on every tier.
     if "/home/agent" not in {v.get("bind") for v in volumes.values()}:
+        if template != "core" or cfg.get("Cmd") != ["/opt/sandbox/scripts/entrypoint.sh"]:
+            return {"status": "unsupported_storage", "sandbox_id": sandbox_id,
+                    "reason": "No shared home volume and no verified core S3 lifecycle. Slim persists through git; uncommitted home data is not migration-safe."}
         if not settings.enable_s3_migrate:
             logger.info(
                 "migrate %s: home dir not on a shared volume (S3-backed/ec2) — refusing "

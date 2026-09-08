@@ -79,6 +79,20 @@ The in-flight accounting + migrating lock live in `orchestrator/activity.py` (th
 
 ## Automation
 
+**S3 migration remains unverified; keep `MATRX_ENABLE_S3_MIGRATE` disabled.**
+No-volume non-core templates explicitly refuse migration even if that gate is
+enabled. Slim uses git persistence; neither its uncommitted home nor an EC2
+tier label proves S3 durability. Existing user boxes require a mount/data
+census and independently verified preservation before any image replacement.
+
+The snapshot experiment in commit `7865f91` was reverted after independent
+review found missing exclusive migration admission, shared-user-prefix write
+isolation, verified rollback readiness, durable crash recovery, and protection
+from expiry/zombie cleanup. It is historical design evidence, not a production
+migration path. Future work must resolve those hazards and verify the real
+Docker tar round-trip plus user file bytes/modes after readiness; mocked archive
+tests cannot authorize a user-fleet rollout.
+
 `migrate_all_drifted()` rolls drifted boxes one at a time (busy ones return `busy_deferred` and retry on the next pass — the "keep checking until it's idle, then migrate" loop). It's wired into the reaper, gated behind `MATRX_AUTO_MIGRATE`:
 
 - `MATRX_AUTO_MIGRATE=1` — each reaper sweep (every 60s) migrates up to `MATRX_MIGRATE_MAX_PER_PASS` (default 2) drifted, **idle** boxes; busy ones defer to the next sweep.
