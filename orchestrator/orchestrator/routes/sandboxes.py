@@ -374,8 +374,7 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     )
 
     # 1. Destroy the existing container (preserves named volume).
-    if not await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="user_reset"):
-        raise HTTPException(status_code=409, detail="Sandbox lifecycle is busy; reset was not performed")
+    await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="user_reset")
 
     # 2. Optional volume wipe — clears the per-user Docker volume so the
     # new sandbox boots with an empty /home/agent.

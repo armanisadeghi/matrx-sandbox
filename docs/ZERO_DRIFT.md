@@ -102,10 +102,6 @@ store mutations skip an active journal. This foundation does **not** enable an
 archive migration route or authorize any existing sandbox replacement; paused
 original recovery, complete lifecycle fencing, and real disposable image/data
 proof must be finished before the feature gate can be enabled.
-Physical stop now honors a refused store transition, and reset cannot wipe or
-recreate after a refused stop. Boot reconstruction skips journal-owned rows;
-zombie teardown fences the row before touching its container. These are shared
-lifecycle safety checks, not evidence that archive migration is enabled.
 
 `migrate_all_drifted()` rolls drifted boxes one at a time (busy ones return `busy_deferred` and retry on the next pass — the "keep checking until it's idle, then migrate" loop). It's wired into the reaper, gated behind `MATRX_AUTO_MIGRATE`:
 

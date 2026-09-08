@@ -38,7 +38,7 @@ from datetime import datetime, timezone
 
 from orchestrator.config import settings
 from orchestrator.models import SandboxResponse, SandboxStatus
-from orchestrator.store import SandboxStore, migration_pending
+from orchestrator.store import SandboxStore
 
 logger = logging.getLogger(__name__)
 
@@ -176,9 +176,6 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
             # authoritative over the (now-stale sentinel) label.
             is_warm = labels.get("matrx.warm_pool") == "1"
             existing_row = await store.get(sandbox_id)
-            if existing_row is not None and migration_pending(existing_row.config):
-                summary["skipped"] += 1
-                continue
             if is_warm and existing_row is None:
                 summary["skipped"] += 1
                 continue
@@ -360,20 +357,13 @@ async def reap_zombie_containers(store: SandboxStore) -> list[str]:
             if not lifecycle:
                 continue
             if lifecycle["deleted"] or lifecycle["status"] in _TERMINAL_STATUSES:
-                # Atomically fence migration admission before removing Docker
-                # state; a prior terminal-state read is not an exclusive claim.
-                if not await store.update_status(sandbox_id, SandboxStatus.SHUTTING_DOWN):
-                    continue
                 logger.info(
                     "Zombie reap: %s row is %s but container is alive — removing "
                     "container (volume preserved, row untouched).",
                     sandbox_id,
                     "soft-deleted" if lifecycle["deleted"] else lifecycle["status"],
                 )
-                try:
-                    await asyncio.to_thread(container.remove, force=True)
-                finally:
-                    await store.update_status(sandbox_id, SandboxStatus(lifecycle["status"]))
+                await asyncio.to_thread(container.remove, force=True)
                 reaped.append(sandbox_id)
         except Exception as exc:
             logger.warning(

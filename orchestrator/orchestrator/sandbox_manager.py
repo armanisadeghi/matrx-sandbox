@@ -1053,11 +1053,7 @@ async def destroy_sandbox(
 
     forget_sandbox_cwd(sandbox_id)
 
-    # The store transition and migration claim serialize on the same row.
-    # A declined transition must prevent the physical Docker mutation too.
-    if not await store.update_status(sandbox_id, SandboxStatus.SHUTTING_DOWN):
-        logger.warning("Destroy refused for %s: lifecycle transition is fenced", sandbox_id)
-        return False
+    await store.update_status(sandbox_id, SandboxStatus.SHUTTING_DOWN)
 
     logger.info("Destroying sandbox %s (graceful=%s, reason=%s)", sandbox_id, graceful, reason)
 
