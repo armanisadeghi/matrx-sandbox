@@ -110,6 +110,11 @@ async def test_postgres_insert_carries_explicit_organization():
     assert "(user_id, organization_id, sandbox_id" in sql
     assert "organization_id = EXCLUDED.organization_id" in sql
     assert args[1] == UUID(ORG_ID)
+    # Live audit found 227 rows with user_id but no canonical created_by,
+    # making their actual owners fail the platform's access predicate.
+    assert "persistence_volume, created_by)" in sql
+    assert "$16, $1)" in sql
+    assert "created_by = COALESCE(sandbox_instances.created_by, sandbox_instances.user_id)" in sql
 
 
 @pytest.mark.asyncio

@@ -398,10 +398,13 @@ class PostgresSandboxStore(SandboxStore):
                 INSERT INTO sandbox_instances
                     (user_id, organization_id, sandbox_id, name, status, container_id, created_at, hot_path, cold_path,
                      config, ttl_seconds, tier, template, template_version, labels,
-                     persistence_volume)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15::jsonb, $16)
+                     persistence_volume, created_by)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15::jsonb, $16, $1)
                 ON CONFLICT (sandbox_id) DO UPDATE SET
                     organization_id = EXCLUDED.organization_id,
+                    -- Canonical access uses created_by. Repair legacy blanks
+                    -- from the persisted owner, never a replacement caller.
+                    created_by = COALESCE(sandbox_instances.created_by, sandbox_instances.user_id),
                     name = COALESCE(EXCLUDED.name, sandbox_instances.name),
                     status = EXCLUDED.status,
                     container_id = EXCLUDED.container_id,
