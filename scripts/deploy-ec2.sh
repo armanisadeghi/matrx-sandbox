@@ -81,8 +81,8 @@ EXPECTED_AIDREAM_URL="http://aidream.internal.matrxserver.com"
 # of letting /access-tokens fail as an opaque HTTP 500 later.
 [ "$HOST_TIER" = "ec2" ] \
   || fail "MATRX_HOST_TIER is '${HOST_TIER:-unset}'; the EC2 orchestrator must set it to 'ec2'"
-# EC2-origin sandbox traffic must stay on the co-located sandbox_host replica.
-# Falling back to the public Coolify app_server defeats the two-runtime topology
+# EC2-origin sandbox traffic must reach AI Dream through its private ECS endpoint.
+# Routing through the public endpoint defeats the intended private network path
 # and makes an internal dependency depend on public DNS.
 [ "$AIDREAM_URL" = "$EXPECTED_AIDREAM_URL" ] \
   || fail "MATRX_AIDREAM_URL is '${AIDREAM_URL:-unset}'; EC2 must use $EXPECTED_AIDREAM_URL, never the public app_server"

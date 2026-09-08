@@ -1,10 +1,10 @@
 # AI Dream ↔ Sandbox Integration
 
-**Status:** Both sides shipped 2026-04-26.
-- **Sandbox side** — orchestrator env-var passthrough, in-container `mtx` CLI, `cloud-files-sync.sh` bridge. Live on EC2 + hosted tier.
-- **AI Dream side** — `/api/cloud-files/{list,get,put,delete,quota}` router with service-token + `X-Matrx-User-Id` auth. Pushed to `aidream-current` `main` as commit `48f70d2a`. Disabled until `AIDREAM_SANDBOX_SERVICE_TOKEN` is set in AI Dream's env; setting it flips the bridge on.
+Cross-repo system-of-record: /Users/armanisadeghi/code/common-docs/systems/infrastructure/sandboxes/STATE.md — read it before touching sandbox routing in ANY repo.
 
-This doc is the contract. Both ends now match. The only remaining step is provisioning the shared service token + AWS creds (see Configuration checklist below).
+File traffic authority: /Users/armanisadeghi/code/common-docs/systems/media/file-service/STATE.md. The sandbox bridge has not been cut over to the independent file service.
+
+**Routing reviewed 2026-09-08.** Current machine ownership and public/private AI Dream URLs live in the production inventory linked by sandbox STATE. The April bridge design and API sketch below are implementation history, not proof of current readiness or a request to regenerate live credentials. Organization-vault and browser sections describe later integration boundaries; verify the deployed API before changing their callers.
 
 ## Canonical browser calls from a sandbox
 
@@ -283,15 +283,15 @@ In every sandbox container:
   - `shutdown.sh` / `shutdown-local.sh` → calls `cloud-files-sync.sh up` before container stop.
 - **Orchestrator passes:** `MATRX_AIDREAM_URL`, `MATRX_AIDREAM_SERVICE_TOKEN`, `USER_ID`, plus AWS creds (hosted tier).
 
-The whole pipeline already runs end-to-end. It just no-ops gracefully today because `MATRX_AIDREAM_URL` isn't configured. Once the AI Dream side ships the five endpoints above and you set the orchestrator env vars, every new sandbox will automatically pull the user's cloud_files into `~/cloud-files/` at startup and push changes back at shutdown.
+The April rollout initially left the bridge unconfigured. That historical condition is not the current deployment state; inspect the running tier's configuration and perform a real authorized file canary before claiming the bridge is enabled or disabled.
 
 ---
 
 ## Configuration checklist
 
-The code is in place on both sides. To turn the bridge on, you just have to round-trip a single shared secret.
+For a new deployment only: provision matching service credentials through the managed secret stores. Existing production credentials must be reused or rotated through the secret-location audit workflow; do not generate a replacement simply because this old checklist exists.
 
-### 1. Generate the shared service token (do this once)
+### 1. New installation: generate the shared service token
 
 ```bash
 openssl rand -hex 32
@@ -308,12 +308,12 @@ AIDREAM_SANDBOX_SERVICE_TOKEN=<value from step 1>
 
 Then redeploy AI Dream. The bridge endpoints `GET /api/cloud-files/list|get|quota`, `PUT /api/cloud-files/put`, `DELETE /api/cloud-files/delete` flip from 503 to active. Routes are public (no JWT required); the token + `X-Matrx-User-Id` header is the auth.
 
-### 3. Set it + the AI Dream URL on the orchestrator side
+### 3. Set it + the tier-appropriate AI Dream URL on the orchestrator side
 
 In `/srv/apps/sandbox-orchestrator/.env` on this dev server, plus the EC2 orchestrator's env (via SSM or the GitHub Actions deploy):
 
 ```
-MATRX_AIDREAM_URL=https://server.app.matrxserver.com
+MATRX_AIDREAM_URL=<AI Dream endpoint reachable from this tier; see production inventory>
 MATRX_AIDREAM_SERVICE_TOKEN=<same value as step 1>
 ```
 
