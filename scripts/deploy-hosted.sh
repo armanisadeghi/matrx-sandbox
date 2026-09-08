@@ -27,6 +27,7 @@
 #                         closed unless the checkout exactly matches it.
 #   FORCE=1             — rebuild everything regardless of the diff.
 #   MATRX_SANDBOX_DIR / ORCH_COMPOSE_DIR / ORCH_HEALTH_URL — path overrides.
+#   ORCH_STARTUP_TIMEOUT_SECONDS — startup verification budget, 30..1800 (300 default).
 
 set -uo pipefail
 
@@ -35,6 +36,7 @@ ORCH_COMPOSE_DIR="${ORCH_COMPOSE_DIR:-/srv/apps/sandbox-orchestrator}"
 ORCH_HEALTH_URL="${ORCH_HEALTH_URL:-https://orchestrator.dev.codematrx.com/health}"
 ORCH_IMAGE="matrx-orchestrator:latest"
 MAX_IMAGE_AGE_SECONDS="${MAX_IMAGE_AGE_SECONDS:-1209600}" # 14 days; matches Fleet Health
+ORCH_STARTUP_TIMEOUT_SECONDS="${ORCH_STARTUP_TIMEOUT_SECONDS:-300}"
 
 # Why a failure file: Fleet Health could see the poller was stuck but not WHY,
 # so its only advice was "ssh in and read journalctl". A 20 h wedge on
@@ -54,6 +56,9 @@ clear_failure() { rm -f "$FAILURE_FILE" 2>/dev/null || true; }
 
 log()  { echo "[deploy-hosted] $*"; }
 fail() { echo "[deploy-hosted] ERROR: $*" >&2; record_failure "$*"; exit 1; }
+[[ "$ORCH_STARTUP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{1,3}$ ]] \
+  && (( ORCH_STARTUP_TIMEOUT_SECONDS >= 30 && ORCH_STARTUP_TIMEOUT_SECONDS <= 1800 )) \
+  || fail "ORCH_STARTUP_TIMEOUT_SECONDS must be an integer from 30 through 1800"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/release-guard.sh
 source "$SCRIPT_DIR/lib/release-guard.sh" \
@@ -519,15 +524,19 @@ if [ -n "${LOCAL_CANDIDATE:-}" ] && [ -f "$REPO_DIR/sandbox-local/docker-compose
     || fail_release "starter pool recreate failed"
 fi
 
-# A cold boot reconciles every hosted sandbox before startup completes. With
-# ~160 live containers that regularly takes longer than one minute. Match the
-# fleet-health restart allowance and give the exact contract three minutes.
-log "waiting for orchestrator release contract (up to 180s)…"
+# A measured 229-row fleet startup took 157s. Budget elapsed time, not attempts
+# (each curl can consume five seconds); keep exact source/API verification.
+log "waiting for orchestrator release contract (up to ${ORCH_STARTUP_TIMEOUT_SECONDS}s)…"
 ORCH_API_KEY=$(grep '^MATRX_API_KEY=' "$ORCH_COMPOSE_DIR/.env" | head -1 | cut -d= -f2-)
 [ -n "$ORCH_API_KEY" ] || fail_release "MATRX_API_KEY is not resolved for post-deploy verification"
 verified=0
-for _ in $(seq 1 90); do
-  if payload=$(curl -fsS --max-time 5 -H "X-API-Key: $ORCH_API_KEY" \
+ORCH_WAIT_STARTED=$SECONDS
+ORCH_WAIT_DEADLINE=$((SECONDS + ORCH_STARTUP_TIMEOUT_SECONDS))
+while (( SECONDS < ORCH_WAIT_DEADLINE )); do
+  remaining=$((ORCH_WAIT_DEADLINE - SECONDS))
+  (( remaining > 0 )) || break
+  request_timeout=$((remaining < 5 ? remaining : 5))
+  if payload=$(curl -fsS --max-time "$request_timeout" -H "X-API-Key: $ORCH_API_KEY" \
       "${ORCH_HEALTH_URL%/health}/api-surface" 2>/dev/null) \
       && RELEASE_PAYLOAD="$payload" EXPECTED_SHA="$NEW_SHA" python3 - <<'PY'
 import json, os
@@ -538,11 +547,17 @@ assert d.get("source_sha") == os.environ["EXPECTED_SHA"]
 assert d.get("contracts", {}).get("filesystem") == 2
 assert required <= paths
 PY
-  then verified=1; break; fi
-  sleep 2
+  then
+    if (( SECONDS <= ORCH_WAIT_DEADLINE )); then verified=1; fi
+    break
+  fi
+  remaining=$((ORCH_WAIT_DEADLINE - SECONDS))
+  (( remaining > 0 )) || break
+  sleep "$((remaining < 2 ? remaining : 2))"
 done
-[ "$verified" = 1 ] || fail_release "exact source/API/filesystem contract verification failed"
-log "release contract verified at $NEW_SHA ✓"
+ORCH_WAIT_ELAPSED=$((SECONDS - ORCH_WAIT_STARTED))
+[ "$verified" = 1 ] || fail_release "exact source/API/filesystem contract verification failed after ${ORCH_WAIT_ELAPSED}s (startup budget ${ORCH_STARTUP_TIMEOUT_SECONDS}s)"
+log "release contract verified at $NEW_SHA in ${ORCH_WAIT_ELAPSED}s (budget ${ORCH_STARTUP_TIMEOUT_SECONDS}s) ✓"
 
 # Refresh the out-of-checkout poller and its timeout policy only after this
 # release is healthy. Installing only the runner previously left the live

@@ -1,0 +1,22 @@
+# Install atomically into the existing watched /srv/traefik/dynamic directory.
+# Exact-host availability response only; healthy Docker router priority wins.
+# No backend, second orchestrator, DNS, ACME, or global provider change.
+http:
+  routers:
+    sandbox-orchestrator-startup:
+      rule: Host(`orchestrator.dev.codematrx.com`)
+      priority: 1
+      entryPoints: [websecure]
+      tls: {}
+      service: sandbox-orchestrator-unavailable
+      middlewares: [sandbox-orchestrator-retry]
+  services:
+    sandbox-orchestrator-unavailable:
+      loadBalancer:
+        servers: []
+  middlewares:
+    sandbox-orchestrator-retry:
+      headers:
+        customResponseHeaders:
+          Retry-After: "5"
+          Cache-Control: no-store
