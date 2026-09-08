@@ -24,7 +24,7 @@ def _sandbox() -> SandboxResponse:
 
 
 @pytest.mark.asyncio
-async def test_connection_hook_refreshes_image_then_runs_safe_sync(monkeypatch):
+async def test_connection_hook_never_migrates_image_and_preserves_safe_sync(monkeypatch):
     connection_hooks._last_results.clear()
     connection_hooks._locks.clear()
     migrate = AsyncMock(return_value={"status": "already_current"})
@@ -37,12 +37,12 @@ async def test_connection_hook_refreshes_image_then_runs_safe_sync(monkeypatch):
     result = await connection_hooks.prepare_development_connection(_sandbox())
 
     assert result["status"] == "ok"
-    assert result["image_refresh"] == {"status": "already_current"}
+    assert result["image_refresh"] is None
     assert "matrx-frontend UPDATED" in result["summary"]
     assert execute.await_args.kwargs["command"] == connection_hooks._SYNC_COMMAND
     assert "reset" not in connection_hooks._SYNC_COMMAND
     assert "clean" not in connection_hooks._SYNC_COMMAND
-    migrate.assert_awaited_once()
+    migrate.assert_not_awaited()
 
 
 @pytest.mark.asyncio

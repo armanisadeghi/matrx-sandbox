@@ -51,19 +51,8 @@ async def prepare_development_connection(sandbox: SandboxResponse) -> dict:
             "cached": False,
         }
         try:
-            # Deploys migrate idle development workers immediately. This
-            # second event-driven gate closes the only remaining gap: if the
-            # worker was busy during deploy, the next fresh connection gets
-            # one more safe chance before any new agent tool call begins.
-            from orchestrator.migrate import migrate_sandbox
-
-            migration = await migrate_sandbox(
-                sandbox_id,
-                store=sandbox_manager._get_store(),
-                require_idle=True,
-            )
-            result["image_refresh"] = migration
-
+            # Opening a connection authorizes repository sync, not replacing
+            # its container. Image migration is an explicit lifecycle action.
             async with activity.track(sandbox_id):
                 exit_code, stdout, stderr, _cwd = await sandbox_manager.exec_in_sandbox(
                     sandbox_id=sandbox_id,
