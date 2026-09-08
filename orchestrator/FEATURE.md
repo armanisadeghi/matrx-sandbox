@@ -1,5 +1,12 @@
 # Sandbox orchestrator
 
+Cross-repo restoration and acceptance: /Users/armanisadeghi/code/common-docs/systems/infrastructure/sandboxes/REGISTER.md.
+
+`/agent-binding` advertises `MATRX_PUBLIC_URL`, like `/access-tokens`, because
+the binding can be used by local and development AI Dream runtimes outside
+AWS. Server consumers select their configured per-tier transport after minting;
+ECS uses private DNS without imposing that address on external callers.
+
 The orchestrator owns one explicit persistence tier: `ec2` (S3 home data) or
 `hosted` (Docker-volume home data). `Settings.resolve_host_tier` is the only
 resolver for operations that select between them.
@@ -15,6 +22,8 @@ Postgres never receives an org-less sandbox write. Read the emergency contract:
 [`no-db-assigned-org/PLAN.md`](../../common-docs/projects/no-db-assigned-org/PLAN.md).
 
 ## Change log
+
+- 2026-09-08 — Portable agent bindings use the public endpoint; private transport remains a server-consumer configuration decision. Regression proves a private address cannot replace a portable binding.
 
 - 2026-08-31 — Sandbox command wrapping now shell-quotes the complete user program before evaluating it, so a valid trailing heredoc remains syntactically intact while the orchestrator still captures the real exit status and post-command working directory.
 - 2026-08-27 — Token and agent-binding issuance now pass the persisted literal tier directly to the strict tier resolver. Both endpoints previously dereferenced `.value` on a plain string and returned HTTP 500 for every valid sandbox row.
