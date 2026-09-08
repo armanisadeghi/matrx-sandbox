@@ -1,6 +1,13 @@
 # Zero-Drift Sandbox Migration
 
-> **Requirement (the whole point):** when a new sandbox image is published, **every** running box must end up on it — automatically — with **no data loss, no agent confusion, and minimal delay**. Whether there are two boxes or two million, none may run stale code. This document is the authoritative description of how that works.
+> **Historical design and test evidence — not a current safety guarantee.**
+> The September 8 audit invalidated the blanket persistence, atomicity and
+> failure-safety claims below. EC2 does not imply S3-backed home storage; retained
+> volumes alone do not prove unchanged files. The current safety contract and
+> independent acceptance gates are in the canonical
+> [sandbox register](../../common-docs/systems/infrastructure/sandboxes/REGISTER.md).
+> Keep both migration gates disabled. Do not use this document to authorize a
+> user-container replacement or to re-enable automatic migration.
 
 ---
 
@@ -98,21 +105,17 @@ tests cannot authorize a user-fleet rollout.
 - `MATRX_AUTO_MIGRATE=1` — each reaper sweep (every 60s) migrates up to `MATRX_MIGRATE_MAX_PER_PASS` (default 2) drifted, **idle** boxes; busy ones defer to the next sweep.
 - With it OFF, nothing migrates automatically; `POST /migrate-all` and per-box `/migrate` still work for manual/triggered rollout.
 
-**Rollout status (2026-05-25):**
-- **Hosted tier: `MATRX_AUTO_MIGRATE=1` is ENABLED** (set in `/srv/apps/sandbox-orchestrator/.env`). Proven live: a drifted idle box auto-migrated to the current image within one reaper sweep (~48s) with data intact and drift cleared — no manual call.
-- **ec2 tier: still OFF** (deliberate soak-first). To enable: set `MATRX_AUTO_MIGRATE=1` in the ec2 orchestrator's systemd env (`/etc/systemd/system/matrx-orchestrator.service.d/*.conf` on `matrx-sandbox-host-dev`) and restart the service — reachable via SSM with the matrx-admin cred. Do this after hosted has soaked.
+**Current hold (2026-09-08):** actual runtime `MATRX_AUTO_MIGRATE` is false on
+both tiers; `MATRX_ENABLE_S3_MIGRATE` must remain disabled. The earlier May
+rollout is not current authorization. Source `c5794ea` removes migration from
+EC2 deployment, and `766d707` removes migration from development connection
+preparation while preserving repository synchronization. Deployment and live
+containment evidence belongs only in the canonical register linked above.
 
-**Internal development worker (event-driven):** every successful EC2 release
-calls `POST /migrate-all` after the new images and orchestrator pass their exact
-release checks. The permanent `development` worker mounts its EBS workspace at
-`/home/agent`, so it is eligible for the same-volume atomic swap and moves to
-the approved image immediately when idle. If it was busy during deployment,
-its next AI connection retries the idle-gated migration before running the
-SessionStart repository hook. This closes development-worker drift without
-enabling another polling schedule; ordinary S3-backed EC2 sandboxes remain
-refused unless the separately gated S3 migration path is enabled.
-
-The event-loop-blocking limitation that previously gated this is **fixed** (see below), so the orchestrator stays responsive during a migration — auto-migrate is safe to run.
+Event-loop responsiveness does not prove durable storage, exclusive admission,
+rollback safety or crash recovery. Explicit migration endpoints remain exposed,
+but their existence is not permission to run them against user work before the
+register's independent preservation gates pass.
 
 ### From the Server Manager UI
 
@@ -140,9 +143,9 @@ The Manager's **orchestrator-sandboxes** admin page (`manager.dev.codematrx.com`
 | [`orchestrator/activity.py`](../orchestrator/orchestrator/activity.py) | In-flight tracking + migrating lock |
 | [`orchestrator/main.py`](../orchestrator/orchestrator/main.py) | `GET /drift`, `POST /migrate-all` |
 | [`orchestrator/routes/sandboxes.py`](../orchestrator/orchestrator/routes/sandboxes.py) | `POST /{id}/migrate`; the 503-migrating guard on exec/fs/git |
-| [`orchestrator/connection_hooks.py`](../orchestrator/orchestrator/connection_hooks.py) | Next-connection drift retry + safe development-repository refresh |
+| [`orchestrator/connection_hooks.py`](../orchestrator/orchestrator/connection_hooks.py) | Development-repository synchronization; no implicit image migration |
 | [`orchestrator/reaper.py`](../orchestrator/orchestrator/reaper.py) | Drift alarm + opt-in auto-migrate |
-| [`scripts/deploy-ec2.sh`](../scripts/deploy-ec2.sh) | Release-triggered migration of idle persistent development workers |
+| [`scripts/deploy-ec2.sh`](../scripts/deploy-ec2.sh) | Orchestrator/image deployment; no implicit user-container migration |
 | aidream `matrx-ai/.../tools/_sandbox_proxy.py` | Agent-side transparent retry on 503-migrating |
 
 ---

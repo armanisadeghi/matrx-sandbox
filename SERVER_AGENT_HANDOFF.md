@@ -1,5 +1,14 @@
 # Server-Agent Handoff — Push-to-Main Auto-Rebuild & Roll
 
+> **SUPERSEDED HISTORICAL WORK ORDER — DO NOT EXECUTE.** September 8, 2026:
+> this handoff predates the verified migration-safety defects and the unexpected
+> development-container replacement. Its instructions to enable automatic/S3
+> migration and its completion checklist are withdrawn, not current authority.
+> Keep both migration gates disabled. All current work and independent
+> acceptance live in the canonical
+> [sandbox register](../common-docs/systems/infrastructure/sandboxes/REGISTER.md).
+> The remainder is retained only as historical design evidence.
+
 **Audience:** the agent operating **directly on the servers** (the `/srv` hosted
 host and the EC2 host). **Author:** the repo-side agent that landed the
 `claude/modest-babbage-htdoey` branch.
