@@ -24,11 +24,6 @@ import asyncio
 import logging
 import os
 import time
-import json
-import tarfile
-import io
-import uuid
-from dataclasses import asdict
 
 from docker.errors import APIError, NotFound
 
@@ -235,9 +230,6 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     # from fresh S3 → cutover), REFUSE to migrate a box whose /home/agent isn't a
     # shared volume. This makes auto-migrate structurally safe on every tier.
     if "/home/agent" not in {v.get("bind") for v in volumes.values()}:
-        if template != "core" or cfg.get("Cmd") != ["/opt/sandbox/scripts/entrypoint.sh"]:
-            return {"status": "unsupported_storage", "sandbox_id": sandbox_id,
-                    "reason": "No shared home volume and no core S3 lifecycle. Slim persists through git; uncommitted home data is not migration-safe."}
         if not settings.enable_s3_migrate:
             logger.info(
                 "migrate %s: home dir not on a shared volume (S3-backed/ec2) — refusing "
@@ -386,40 +378,32 @@ async def _migrate_s3_ordered(
     sandbox_id: str, *, old, target: str, env: list, volumes: dict, labels: dict,
     host: dict, cur, store, verify_timeout: int,
 ) -> dict:
-    """Core S3 migration requires a nonce-bound successful shutdown receipt,
-    then a versioned home archive verified by reading its exact bytes from S3.
-    Restore the archive before starting the replacement, skipping mutable
-    hot/cloud-files downloads. Persist the new identity before removing old.
-    Rollback retains the old writable layer and skips startup down-sync.
+    """In-place migrate for an S3-backed (EC2-tier) box, ordered so no edit is
+    lost. There is no shared /home/agent volume here — the home dir is S3-backed
+    (hot-sync down on boot, up-sync on graceful shutdown) — so the swap MUST:
 
-    Old images without receipt support and non-core templates refuse. The
-    enable_s3_migrate gate remains off until independent EC2/Docker/S3 canaries
-    prove successful migration and failed-flush/failed-target rollback.
-    """
+        1. drain in-flight calls, then GRACEFULLY stop the old box. Its
+           shutdown.sh trap runs the full flush (cloud-files up + hot-sync up),
+           so /home/agent is persisted to S3 BEFORE anything else boots.
+        2. boot the new box as a FRESH boot (SANDBOX_MIGRATION stripped) so its
+           entrypoint hot-syncs the just-flushed S3 down + re-pulls cloud-files.
+        3. verify readiness + version, then rename old->old-ts, new->sandbox_id.
+        4. remove the old box.
+
+    On ANY failure before cutover the OLD box is restarted (it re-hydrates the
+    flushed state from S3, so no data is lost) and the migration reports failed.
+
+    GATED by settings.enable_s3_migrate. This path cannot be unit-tested without
+    real S3 + an EC2 sandbox image; the server agent MUST validate it against a
+    throwaway sandbox before enabling the flag. Never raises."""
     from orchestrator import activity
     from orchestrator.sandbox_manager import _get_docker_client
 
     client = _get_docker_client()
     tmp_name = f"{sandbox_id}-mig"
-    from orchestrator.storage import get_s3_client
-    from orchestrator.migration_snapshot import preserve_home, restore_home
-
-    # Old images cannot prove shutdown preservation; refuse before stopping.
-    check, _ = await asyncio.to_thread(old.exec_run, ["grep", "-q", "MATRX_S3_SHUTDOWN_RECEIPT_V1", "/opt/sandbox/scripts/shutdown.sh"])
-    if check != 0:
-        return {"status": "unsupported_storage", "sandbox_id": sandbox_id,
-                "reason": "Old image lacks verified S3 shutdown receipts; preserve it before migration."}
-    target_meta = await asyncio.to_thread(client.images.get, target)
-    target_config = target_meta.attrs.get("Config") or {}
-    if target_config.get("Cmd") != ["/opt/sandbox/scripts/entrypoint.sh"] or (target_config.get("Labels") or {}).get("com.aimatrx.s3-migration") != "snapshot-v1":
-        return {"status": "unsupported_storage", "sandbox_id": sandbox_id,
-                "reason": "Target image does not implement verified S3 snapshot restoration."}
-    # Replacements restore the immutable archive before startup. Do not let a
-    # mutable per-user hot prefix or cloud-files download overwrite it.
+    # Fresh boot for the new box: it has no shared volume, so it must down-sync
+    # everything the old box just flushed.
     env_fresh = [e for e in env if not e.startswith("SANDBOX_MIGRATION=")]
-    env_fresh.append("SANDBOX_MIGRATION=1")
-    nonce = uuid.uuid4().hex
-    receipt = None
 
     await activity.mark_migrating(sandbox_id)
     new = None
@@ -427,10 +411,6 @@ async def _migrate_s3_ordered(
         if not await activity.drain_inflight(sandbox_id, timeout=20.0):
             return {"status": "busy_deferred", "sandbox_id": sandbox_id,
                     "reason": "in-flight tool calls did not drain; retry later"}
-
-        code, _ = await asyncio.to_thread(old.exec_run, ["sh", "-c", f"printf '%s' {nonce} > /tmp/matrx-s3-migration-nonce"])
-        if code != 0:
-            return {"status": "failed", "sandbox_id": sandbox_id, "reason": "Could not arm shutdown receipt"}
 
         # 1. Graceful stop = full flush to S3 via the old box's shutdown trap.
         # Give docker stop headroom over the in-container shutdown budget.
@@ -442,29 +422,6 @@ async def _migrate_s3_ordered(
             await _restart_container(old)
             return {"status": "failed", "sandbox_id": sandbox_id,
                     "reason": f"pre-migrate graceful flush failed: {exc}"}
-
-        try:
-            await asyncio.to_thread(old.reload)
-            if old.attrs.get("State", {}).get("ExitCode") != 0:
-                raise RuntimeError("Shutdown did not exit cleanly; flush is not proven")
-            chunks, _ = await asyncio.to_thread(old.get_archive, "/tmp/matrx-s3-shutdown-receipt.json")
-            raw = await asyncio.to_thread(lambda: b"".join(chunks))
-            with tarfile.open(fileobj=io.BytesIO(raw)) as archive:
-                member = archive.extractfile(archive.getmembers()[0])
-                proof = json.load(member) if member else None
-            if proof != {"version": 1, "nonce": nonce, "hot_sync": True, "cold_unmounted": True}:
-                raise RuntimeError("Shutdown receipt missing or stale")
-            sbx = await store.get(sandbox_id)
-            if not sbx or not settings.s3_bucket:
-                raise RuntimeError("Sandbox identity or S3 bucket unavailable")
-            receipt = await asyncio.to_thread(
-                preserve_home, old, get_s3_client(), bucket=settings.s3_bucket,
-                key=f"users/{sbx.user_id}/migrations/{sandbox_id}/{nonce}/home.tar",
-            )
-        except Exception as exc:
-            await _restart_container(old)
-            return {"status": "failed", "sandbox_id": sandbox_id,
-                    "reason": f"Durable preservation refused: {exc}"}
 
         # clear any stale temp container
         try:
@@ -489,15 +446,11 @@ async def _migrate_s3_ordered(
         if host.get("Memory"):
             run_kwargs["mem_limit"] = host["Memory"]
         try:
-            new = await asyncio.to_thread(lambda: client.containers.create(**run_kwargs))
-            await asyncio.to_thread(restore_home, new, get_s3_client(), receipt)
-            await asyncio.to_thread(new.start)
-        except Exception as exc:
+            new = await asyncio.to_thread(lambda: client.containers.run(**run_kwargs))
+        except APIError as exc:
             logger.error("migrate(s3) %s: new create failed: %s — restarting old", sandbox_id, exc)
             await _restart_container(old)
-            if new is not None:
-                await asyncio.to_thread(new.remove, force=True)
-            return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"create/restore failed: {exc}", "snapshot": asdict(receipt)}
+            return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"create failed: {exc}"}
 
         ready = await _wait_container_ready(new, verify_timeout, template)
         new_ver = (await _container_version(new)) if ready else None
@@ -533,32 +486,26 @@ async def _migrate_s3_ordered(
             await _restart_container(old)
             return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"cutover failed: {exc}"}
 
-        # Persist the new identity before retiring the rollback container.
-        try:
-            sbx = await store.get(sandbox_id)
-            if not sbx:
-                raise RuntimeError("Sandbox row disappeared during migration")
-            sbx.template_version = cur.version or new_ver
-            sbx.container_id = new.id
-            await store.save(sbx)
-        except Exception as exc:
-            await asyncio.to_thread(new.remove, force=True)
-            await asyncio.to_thread(old.rename, sandbox_id)
-            await _restart_container(old)
-            return {"status": "failed", "sandbox_id": sandbox_id,
-                    "reason": f"Store cutover failed; old container restored: {exc}",
-                    "snapshot": asdict(receipt)}
+        # 4. Remove the old box; the new one now answers as sandbox_id.
         try:
             await asyncio.to_thread(old.remove, force=True)
         except APIError as exc:
             logger.warning("migrate(s3) %s: old cleanup failed (non-fatal): %s", sandbox_id, exc)
+
+        try:
+            sbx = await store.get(sandbox_id)
+            if sbx:
+                sbx.template_version = cur.version or new_ver
+                sbx.container_id = new.id
+                await store.save(sbx)
+        except Exception as exc:
+            logger.warning("migrate(s3) %s: store update failed (non-fatal): %s", sandbox_id, exc)
     finally:
         await activity.release_migration(sandbox_id)
 
     logger.info("MIGRATED(s3) %s -> %s (version=%s)", sandbox_id, target, cur.version or new_ver)
     return {"status": "migrated", "sandbox_id": sandbox_id,
-            "to_version": cur.version or new_ver, "to_image": target,
-            "snapshot": asdict(receipt)}
+            "to_version": cur.version or new_ver, "to_image": target}
 
 
 async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
