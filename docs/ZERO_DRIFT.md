@@ -79,6 +79,28 @@ The in-flight accounting + migrating lock live in `orchestrator/activity.py` (th
 
 ## Automation
 
+### S3 migration admission and preservation
+
+**Keep `MATRX_ENABLE_S3_MIGRATE` disabled until independent disposable EC2
+canaries pass.** Without a shared `/home/agent` mount, only the `core` S3
+lifecycle is eligible. `slim` persists through git and explicitly refuses this
+path; uncommitted files in its writable layer are not promised durable.
+
+The old core image must implement nonce-bound shutdown receipts and the target
+must advertise `com.aimatrx.s3-migration=snapshot-v1`. Shutdown freezes agent
+writers, requires hot-sync success and a non-lazy cold unmount, and writes the
+nonce receipt only on success. Docker stop alone proves nothing. The
+orchestrator then archives the stopped home to encrypted, versioned S3, reads
+back the exact version, verifies SHA-256 and size, and restores that archive
+before starting the replacement. The verified archive is retained on every
+outcome. The old container is removed only after readiness and database
+cutover; failures restart its retained local home without down-sync overwrites.
+
+Old images without receipt support remain refused even if the global gate is
+enabled. Never infer safe migration from a template name, health response, or
+old successful hosted-volume tests. A rollback canary must deliberately fail
+flush and target startup, then prove the original identity and file bytes.
+
 `migrate_all_drifted()` rolls drifted boxes one at a time (busy ones return `busy_deferred` and retry on the next pass — the "keep checking until it's idle, then migrate" loop). It's wired into the reaper, gated behind `MATRX_AUTO_MIGRATE`:
 
 - `MATRX_AUTO_MIGRATE=1` — each reaper sweep (every 60s) migrates up to `MATRX_MIGRATE_MAX_PER_PASS` (default 2) drifted, **idle** boxes; busy ones defer to the next sweep.

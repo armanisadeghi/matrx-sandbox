@@ -21,7 +21,13 @@ done
 
 # ─── Step 1: Sync hot storage from S3 ────────────────────────────────────────
 echo "[1/5] Syncing hot storage from S3..."
-/opt/sandbox/scripts/hot-sync.sh down
+if [ "${SANDBOX_MIGRATION:-}" = "1" ] || [ -f /tmp/matrx-s3-migration-nonce ]; then
+    echo "Migration restore/rollback — preserving the verified local home."
+    export SANDBOX_MIGRATION=1
+    rm -f /tmp/matrx-s3-migration-nonce /tmp/matrx-s3-shutdown-receipt.json
+else
+    /opt/sandbox/scripts/hot-sync.sh down
+fi
 echo "[1/5] Hot storage sync complete."
 
 # ─── Step 2: Mount cold storage via FUSE ──────────────────────────────────────
@@ -106,7 +112,7 @@ echo "[5/5] Sandbox is READY."
 touch /tmp/.sandbox_ready
 
 # ─── Register shutdown handler ────────────────────────────────────────────────
-trap '/opt/sandbox/scripts/shutdown.sh' SIGTERM SIGINT
+trap 'if /opt/sandbox/scripts/shutdown.sh; then exit 0; else exit 1; fi' SIGTERM SIGINT
 
 # ─── Keep container running ───────────────────────────────────────────────────
 # In production, the orchestrator will exec commands into this container.

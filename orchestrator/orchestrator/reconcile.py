@@ -299,6 +299,10 @@ def _alive_container_ids(client, host_tier: str | None) -> set[str]:
             # Only consider containers belonging to this orchestrator's tier.
             if host_tier and tier and tier != host_tier:
                 continue
+            from orchestrator.activity import is_migrating
+            if is_migrating(labels.get("matrx.sandbox_id", "")):
+                alive.add(container.id)
+                continue
             status = _docker_state_to_status(attrs.get("State", {}) or {})
             if status in (
                 SandboxStatus.RUNNING,

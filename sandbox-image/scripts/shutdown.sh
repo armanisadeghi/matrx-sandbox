@@ -6,6 +6,25 @@ exec > >(tee -a "$LOG_FILE") 2>&1
 
 TIMEOUT="${SHUTDOWN_TIMEOUT_SECONDS:-30}"
 
+# MATRX_S3_SHUTDOWN_RECEIPT_V1: a migration may proceed only with this nonce-
+# bound receipt. Freeze the agent's writers before flushing; a busy FUSE mount
+# must refuse, never lazy-unmount and discard its cache. Ordinary shutdown keeps
+# its existing behavior below.
+if [ -f /tmp/matrx-s3-migration-nonce ]; then
+    nonce=$(cat /tmp/matrx-s3-migration-nonce)
+    rm -f /tmp/matrx-s3-shutdown-receipt.json
+    pkill -STOP -u agent || [ "$?" -eq 1 ]
+    if timeout "$TIMEOUT" /opt/sandbox/scripts/hot-sync.sh up &&
+       sync &&
+       { ! mountpoint -q "${COLD_PATH:-/data/cold}" || umount "${COLD_PATH:-/data/cold}"; }; then
+        printf '{"version":1,"nonce":"%s","hot_sync":true,"cold_unmounted":true}\n' "$nonce" > /tmp/matrx-s3-shutdown-receipt.json
+        exit 0
+    fi
+    echo "MIGRATION REFUSED: durable flush failed; old container filesystem retained."
+    pkill -CONT -u agent || true
+    exit 1
+fi
+
 echo "=========================================="
 echo "  Matrx Sandbox Shutting Down"
 echo "  Sandbox ID: ${SANDBOX_ID:-unknown}"

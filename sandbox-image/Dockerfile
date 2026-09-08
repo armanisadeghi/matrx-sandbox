@@ -203,6 +203,7 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # this entrypoint chain. Without it the env var said "local" even on
 # :aidream containers.
 RUN echo "core" > /etc/sandbox-image-tag
+LABEL com.aimatrx.s3-migration="snapshot-v1"
 
 # Persist the build-time version into the box so it can self-verify on wake
 # (the Phase-2 migrate/resume gate reads this) and so `mtx` / shells can show it.
