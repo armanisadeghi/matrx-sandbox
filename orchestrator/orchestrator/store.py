@@ -16,15 +16,6 @@ from orchestrator.models import SandboxResponse, SandboxStatus
 
 logger = logging.getLogger(__name__)
 
-MIGRATION_KEY = "_migration"
-
-
-def migration_pending(config: dict | None) -> bool:
-    journal = (config or {}).get(MIGRATION_KEY)
-    return MIGRATION_KEY in (config or {}) and (
-        not isinstance(journal, dict) or journal.get("phase") not in {"rolled_back", "complete"}
-    )
-
 
 def _explicit_organization_id(sandbox: SandboxResponse) -> UUID:
     """Validate organization identity before either store accepts a write."""
@@ -37,20 +28,6 @@ def _explicit_organization_id(sandbox: SandboxResponse) -> UUID:
 
 
 class SandboxStore(ABC):
-    async def claim_migration(self, sandbox_id: str, *, op_id: str,
-                              source_container_id: str, source_image: str,
-                              target_image: str) -> dict | None:
-        raise NotImplementedError("store does not support durable migration claims")
-
-    async def advance_migration(self, sandbox_id: str, *, op_id: str,
-                                expected_phase: str, phase: str, patch: dict) -> bool:
-        raise NotImplementedError("store does not support durable migration checkpoints")
-
-    async def commit_migration(self, sandbox_id: str, *, op_id: str,
-                               expected_phase: str, candidate_id: str,
-                               target_version: str) -> bool:
-        raise NotImplementedError("store does not support atomic migration commit")
-
     """Abstract base class for sandbox persistence."""
 
     @abstractmethod
@@ -146,8 +123,6 @@ class SandboxStore(ABC):
         now = datetime.now(timezone.utc)
         expired: list[str] = []
         for sb in await self.list():
-            if migration_pending(sb.config):
-                continue
             status = getattr(sb.status, "value", sb.status)
             if status in ("ready", "running") and sb.expires_at and sb.expires_at < now:
                 await self.update_status(sb.sandbox_id, SandboxStatus.EXPIRED)
@@ -193,56 +168,10 @@ class InMemorySandboxStore(SandboxStore):
 
     async def save(self, sandbox: SandboxResponse) -> None:
         _explicit_organization_id(sandbox)
-        existing = self._sandboxes.get(sandbox.sandbox_id)
-        if existing and (migration_pending(existing.config) or (
-            MIGRATION_KEY in existing.config and existing.container_id != sandbox.container_id
-        )):
-            raise RuntimeError("migration protects this container from a stale save")
-        saved = sandbox.model_copy(deep=True)
-        if existing and MIGRATION_KEY in existing.config:
-            saved.config[MIGRATION_KEY] = existing.config[MIGRATION_KEY]
-        else:
-            saved.config.pop(MIGRATION_KEY, None)
-        self._sandboxes[sandbox.sandbox_id] = saved
+        self._sandboxes[sandbox.sandbox_id] = sandbox
 
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
-        row = self._sandboxes.get(sandbox_id)
-        return row.model_copy(deep=True) if row else None
-
-    async def claim_migration(self, sandbox_id: str, *, op_id: str,
-                              source_container_id: str, source_image: str,
-                              target_image: str) -> dict | None:
-        row = self._sandboxes.get(sandbox_id)
-        if (row is None or sandbox_id in self._deleted or migration_pending(row.config)
-                or row.container_id != source_container_id
-                or row.status not in (SandboxStatus.RUNNING, SandboxStatus.READY)):
-            return None
-        journal = {"op_id": op_id, "phase": "claimed", "source_id": source_container_id,
-                   "source_image": source_image, "target_image": target_image}
-        row.config = {**row.config, MIGRATION_KEY: journal}
-        return dict(journal)
-
-    async def advance_migration(self, sandbox_id: str, *, op_id: str,
-                                expected_phase: str, phase: str, patch: dict) -> bool:
-        row = self._sandboxes.get(sandbox_id)
-        journal = row.config.get(MIGRATION_KEY, {}) if row else {}
-        if journal.get("op_id") != op_id or journal.get("phase") != expected_phase:
-            return False
-        row.config = {**row.config, MIGRATION_KEY: {**journal, **patch, "op_id": op_id, "phase": phase}}
-        return True
-
-    async def commit_migration(self, sandbox_id: str, *, op_id: str,
-                               expected_phase: str, candidate_id: str,
-                               target_version: str) -> bool:
-        row = self._sandboxes.get(sandbox_id)
-        journal = row.config.get(MIGRATION_KEY, {}) if row else {}
-        if (journal.get("op_id") != op_id or journal.get("phase") != expected_phase
-                or journal.get("candidate_id") != candidate_id):
-            return False
-        row.container_id = candidate_id
-        row.template_version = target_version
-        row.config = {**row.config, MIGRATION_KEY: {**journal, "phase": "committed"}}
-        return True
+        return self._sandboxes.get(sandbox_id)
 
     async def list(
         self, user_id: str | None = None, include_deleted: bool = False
@@ -255,14 +184,10 @@ class InMemorySandboxStore(SandboxStore):
         return sandboxes
 
     async def delete(self, sandbox_id: str) -> bool:
-        if migration_pending(self._sandboxes.get(sandbox_id).config if sandbox_id in self._sandboxes else None):
-            return False
         self._deleted.pop(sandbox_id, None)
         return self._sandboxes.pop(sandbox_id, None) is not None
 
     async def soft_delete(self, sandbox_id: str) -> bool:
-        if migration_pending(self._sandboxes.get(sandbox_id).config if sandbox_id in self._sandboxes else None):
-            return False
         if sandbox_id not in self._sandboxes or sandbox_id in self._deleted:
             return False
         self._deleted[sandbox_id] = datetime.now(timezone.utc)
@@ -272,8 +197,6 @@ class InMemorySandboxStore(SandboxStore):
         cutoff = datetime.now(timezone.utc) - timedelta(days=days)
         purged: list[str] = []
         for sid, sb in self._sandboxes.items():
-            if migration_pending(sb.config):
-                continue
             if sid in self._deleted:
                 continue
             status = getattr(sb.status, "value", sb.status)
@@ -296,7 +219,7 @@ class InMemorySandboxStore(SandboxStore):
 
     async def update_status(self, sandbox_id: str, status: SandboxStatus) -> bool:
         sandbox = self._sandboxes.get(sandbox_id)
-        if not sandbox or migration_pending(sandbox.config):
+        if not sandbox:
             return False
         sandbox.status = status
         self._sandboxes[sandbox_id] = sandbox
@@ -319,7 +242,7 @@ class InMemorySandboxStore(SandboxStore):
         # in-memory impl dropped both, so audit/diagnostics lost the reason and
         # timestamp in dev mode.
         sandbox = self._sandboxes.get(sandbox_id)
-        if not sandbox or migration_pending(sandbox.config):
+        if not sandbox:
             return False
         sandbox.status = SandboxStatus.STOPPED
         sandbox.stopped_at = datetime.now(timezone.utc)
@@ -366,53 +289,6 @@ class PostgresSandboxStore(SandboxStore):
         self._database_url = database_url
         self._pool = None
         self._pool_lock = asyncio.Lock()
-
-    async def claim_migration(self, sandbox_id: str, *, op_id: str,
-                              source_container_id: str, source_image: str,
-                              target_image: str) -> dict | None:
-        journal = {"op_id": op_id, "phase": "claimed", "source_id": source_container_id,
-                   "source_image": source_image, "target_image": target_image}
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """UPDATE sandbox_instances SET config = jsonb_set(COALESCE(config, '{}'::jsonb),
-                       '{_migration}', $2::jsonb), updated_at = NOW()
-                   WHERE sandbox_id = $1 AND container_id = $3 AND deleted_at IS NULL
-                     AND status IN ('running', 'ready')
-                     AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                          OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))
-                   RETURNING sandbox_id""", sandbox_id, json.dumps(journal), source_container_id)
-        return journal if row else None
-
-    async def advance_migration(self, sandbox_id: str, *, op_id: str,
-                                expected_phase: str, phase: str, patch: dict) -> bool:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """UPDATE sandbox_instances
-                   SET config = jsonb_set(config, '{_migration}',
-                         (config->'_migration') || $4::jsonb), updated_at = NOW()
-                   WHERE sandbox_id = $1 AND config #>> '{_migration,op_id}' = $2
-                     AND config #>> '{_migration,phase}' = $3
-                   RETURNING sandbox_id""", sandbox_id, op_id, expected_phase,
-                json.dumps({**patch, "op_id": op_id, "phase": phase}))
-        return row is not None
-
-    async def commit_migration(self, sandbox_id: str, *, op_id: str,
-                               expected_phase: str, candidate_id: str,
-                               target_version: str) -> bool:
-        pool = await self._get_pool()
-        async with pool.acquire() as conn:
-            row = await conn.fetchrow(
-                """UPDATE sandbox_instances SET container_id = $4, template_version = $5,
-                     config = jsonb_set(config, '{_migration,phase}', '"committed"'::jsonb),
-                     updated_at = NOW()
-                   WHERE sandbox_id = $1 AND config #>> '{_migration,op_id}' = $2
-                     AND config #>> '{_migration,phase}' = $3
-                     AND config #>> '{_migration,candidate_id}' = $4
-                   RETURNING sandbox_id""", sandbox_id, op_id, expected_phase,
-                candidate_id, target_version)
-        return row is not None
 
     async def _get_pool(self):
         """Lazy-initialize the connection pool.
@@ -517,7 +393,7 @@ class PostgresSandboxStore(SandboxStore):
             # ``persistence_volume`` is added in migration 003 and is nullable
             # in old environments — wrapped in COALESCE on update so the
             # UPDATE branch tolerates missing values.
-            result = await conn.execute(
+            await conn.execute(
                 """
                 INSERT INTO sandbox_instances
                     (user_id, organization_id, sandbox_id, name, status, container_id, created_at, hot_path, cold_path,
@@ -532,9 +408,7 @@ class PostgresSandboxStore(SandboxStore):
                     name = COALESCE(EXCLUDED.name, sandbox_instances.name),
                     status = EXCLUDED.status,
                     container_id = EXCLUDED.container_id,
-                    config = CASE WHEN sandbox_instances.config ? '_migration'
-                        THEN EXCLUDED.config || jsonb_build_object('_migration', sandbox_instances.config->'_migration')
-                        ELSE EXCLUDED.config END,
+                    config = EXCLUDED.config,
                     tier = COALESCE(EXCLUDED.tier, sandbox_instances.tier),
                     template = COALESCE(EXCLUDED.template, sandbox_instances.template),
                     template_version = COALESCE(EXCLUDED.template_version, sandbox_instances.template_version),
@@ -553,9 +427,6 @@ class PostgresSandboxStore(SandboxStore):
                         WHEN EXCLUDED.status IN ('stopped', 'expired', 'failed', 'shutting_down')
                         THEN sandbox_instances.stop_reason ELSE NULL END,
                     updated_at = NOW()
-                WHERE (NOT (COALESCE(sandbox_instances.config, '{}'::jsonb) ? '_migration')
-                       OR (sandbox_instances.config #>> '{_migration,phase}' IN ('rolled_back', 'complete')
-                           AND sandbox_instances.container_id IS NOT DISTINCT FROM EXCLUDED.container_id))
                 """,
                 UUID(sandbox.user_id),
                 organization_id,
@@ -566,7 +437,7 @@ class PostgresSandboxStore(SandboxStore):
                 sandbox.created_at,
                 sandbox.hot_path,
                 sandbox.cold_path,
-                json.dumps({k: v for k, v in sandbox.config.items() if k != MIGRATION_KEY}),
+                json.dumps(sandbox.config) if sandbox.config else '{}',
                 sandbox.ttl_seconds,
                 sandbox.tier,
                 sandbox.template,
@@ -574,8 +445,6 @@ class PostgresSandboxStore(SandboxStore):
                 json.dumps(sandbox.labels) if sandbox.labels else None,
                 sandbox.persistence_volume,
             )
-            if result == "INSERT 0 0":
-                raise RuntimeError("migration protects this container from a stale save")
 
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
         async def _do() -> SandboxResponse | None:
@@ -619,9 +488,7 @@ class PostgresSandboxStore(SandboxStore):
         pool = await self._get_pool()
         async with pool.acquire() as conn:
             result = await conn.execute(
-                """DELETE FROM sandbox_instances WHERE sandbox_id = $1
-                   AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                        OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))""",
+                "DELETE FROM sandbox_instances WHERE sandbox_id = $1",
                 sandbox_id,
             )
             return result == "DELETE 1"
@@ -632,9 +499,7 @@ class PostgresSandboxStore(SandboxStore):
             result = await conn.execute(
                 """UPDATE sandbox_instances
                    SET deleted_at = NOW(), updated_at = NOW()
-                   WHERE sandbox_id = $1 AND deleted_at IS NULL
-                     AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                          OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))""",
+                   WHERE sandbox_id = $1 AND deleted_at IS NULL""",
                 sandbox_id,
             )
             return result == "UPDATE 1"
@@ -646,8 +511,6 @@ class PostgresSandboxStore(SandboxStore):
                 """UPDATE sandbox_instances
                    SET deleted_at = NOW(), updated_at = NOW()
                    WHERE deleted_at IS NULL
-                     AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                          OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))
                      AND status IN ('stopped', 'expired', 'failed')
                      AND COALESCE(stopped_at, updated_at, created_at)
                          < NOW() - make_interval(days => $1)
@@ -663,17 +526,13 @@ class PostgresSandboxStore(SandboxStore):
                 result = await conn.execute(
                     """UPDATE sandbox_instances
                        SET status = $1, stopped_at = NOW()
-                       WHERE sandbox_id = $2
-                         AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                              OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))""",
+                       WHERE sandbox_id = $2""",
                     status.value,
                     sandbox_id,
                 )
             else:
                 result = await conn.execute(
-                    """UPDATE sandbox_instances SET status = $1 WHERE sandbox_id = $2
-                       AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                            OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))""",
+                    "UPDATE sandbox_instances SET status = $1 WHERE sandbox_id = $2",
                     status.value,
                     sandbox_id,
                 )
@@ -694,9 +553,7 @@ class PostgresSandboxStore(SandboxStore):
             result = await conn.execute(
                 """UPDATE sandbox_instances
                    SET status = 'stopped', stopped_at = NOW(), stop_reason = $1
-                   WHERE sandbox_id = $2
-                     AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                          OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))""",
+                   WHERE sandbox_id = $2""",
                 reason,
                 sandbox_id,
             )
@@ -772,8 +629,6 @@ class PostgresSandboxStore(SandboxStore):
                     active_rows = await conn.fetch(
                         """SELECT sandbox_id, container_id FROM sandbox_instances
                            WHERE status IN ('ready', 'running', 'starting')
-                             AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                                  OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))
                              AND deleted_at IS NULL
                              AND tier = $1""",
                         tier,
@@ -782,8 +637,6 @@ class PostgresSandboxStore(SandboxStore):
                     active_rows = await conn.fetch(
                         """SELECT sandbox_id, container_id FROM sandbox_instances
                            WHERE status IN ('ready', 'running', 'starting')
-                             AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                                  OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))
                              AND deleted_at IS NULL"""
                     )
 
@@ -815,8 +668,6 @@ class PostgresSandboxStore(SandboxStore):
                                SET status = 'stopped', stopped_at = NOW(),
                                    stop_reason = 'graceful_shutdown'
                                WHERE sandbox_id = $1
-                                 AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                                      OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))
                                  AND status IN ('ready', 'running', 'starting')""",
                             sandbox_id,
                         )
@@ -864,8 +715,6 @@ class PostgresSandboxStore(SandboxStore):
                     """UPDATE sandbox_instances
                        SET status = 'expired', stopped_at = NOW(), stop_reason = 'expired'
                        WHERE status IN ('ready', 'running')
-                         AND (NOT (COALESCE(config, '{}'::jsonb) ? '_migration')
-                              OR config #>> '{_migration,phase}' IN ('rolled_back', 'complete'))
                          AND expires_at IS NOT NULL
                          AND expires_at < NOW()
                          AND deleted_at IS NULL

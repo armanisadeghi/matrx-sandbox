@@ -93,16 +93,6 @@ migration path. Future work must resolve those hazards and verify the real
 Docker tar round-trip plus user file bytes/modes after readiness; mocked archive
 tests cannot authorize a user-fleet rollout.
 
-The follow-on durable migration work begins at the existing store boundary:
-an exclusive `_migration` config journal uses operation/phase compare-and-swap,
-and committing a candidate changes its container ID and journal phase in one
-database update. Ordinary saves cannot create or replace that journal, and a
-stale pre-migration model cannot overwrite the committed container. Lifecycle
-store mutations skip an active journal. This foundation does **not** enable an
-archive migration route or authorize any existing sandbox replacement; paused
-original recovery, complete lifecycle fencing, and real disposable image/data
-proof must be finished before the feature gate can be enabled.
-
 `migrate_all_drifted()` rolls drifted boxes one at a time (busy ones return `busy_deferred` and retry on the next pass — the "keep checking until it's idle, then migrate" loop). It's wired into the reaper, gated behind `MATRX_AUTO_MIGRATE`:
 
 - `MATRX_AUTO_MIGRATE=1` — each reaper sweep (every 60s) migrates up to `MATRX_MIGRATE_MAX_PER_PASS` (default 2) drifted, **idle** boxes; busy ones defer to the next sweep.
