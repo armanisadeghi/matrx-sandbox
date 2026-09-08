@@ -17,12 +17,17 @@ async def test_journal_claim_is_exclusive_and_fences_lifecycle_and_stale_save():
         tier="ec2", template="slim",
     )
     await store.save(source)
+    assert not await store.claim_terminal_cleanup(source.sandbox_id, container_id="source-id", status="stopped", deleted=False)
+    assert (await store.get(source.sandbox_id)).status == SandboxStatus.RUNNING
     claims = await asyncio.gather(*[
         store.claim_migration(source.sandbox_id, op_id=op, source_container_id="source-id", source_image="old", target_image="new")
         for op in ("operation-a", "operation-b")
     ])
     assert sum(bool(claim) for claim in claims) == 1
     journal = next(claim for claim in claims if claim)
+    exposed = (await store.list())[0]
+    exposed.config.clear()
+    assert (await store.get(source.sandbox_id)).config["_migration"]["op_id"] == journal["op_id"]
     assert await store.expire_stale() == []
     assert not await store.update_status(source.sandbox_id, SandboxStatus.STOPPED)
     assert not await store.delete(source.sandbox_id)

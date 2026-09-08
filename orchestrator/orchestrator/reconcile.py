@@ -362,7 +362,10 @@ async def reap_zombie_containers(store: SandboxStore) -> list[str]:
             if lifecycle["deleted"] or lifecycle["status"] in _TERMINAL_STATUSES:
                 # Atomically fence migration admission before removing Docker
                 # state; a prior terminal-state read is not an exclusive claim.
-                if not await store.update_status(sandbox_id, SandboxStatus.SHUTTING_DOWN):
+                if not await store.claim_terminal_cleanup(
+                    sandbox_id, container_id=container.id,
+                    status=lifecycle["status"], deleted=lifecycle["deleted"],
+                ):
                     continue
                 logger.info(
                     "Zombie reap: %s row is %s but container is alive — removing "
