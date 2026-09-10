@@ -1,6 +1,6 @@
 # Matrx Sandbox
 
-## The eight laws (SYNCED — canonical: common-docs/skills/campaign-pattern; edit there, never here)
+## The nine laws (SYNCED — canonical: common-docs/skills/campaign-pattern; edit there, never here)
 
 🚨 **MANDATORY: before launching, coordinating, or working any large build or campaign, READ the full doctrine — it is IN THIS REPO at `.claude/skills/campaign-pattern/SKILL.md`.**
 
@@ -12,6 +12,7 @@
 6. **Opinions become knobs.** Behavioral choices are org-configurable settings; organizations decide — never agents, never hardcoded taste.
 7. **Delegate down, never sideways.** The session that starts a task owns it end to end (plan → dispatch → check → finish) using subagents, never chips; results come back to the owner. Every dispatch names its lane. Model: Opus/Terra is the default worker; Sonnet/Luna when the task is obviously easy; Fable/Astra only for work the owner itself would struggle with — Fable-under-Fable on simple or owner-checked work is the cost killer. Effort: medium for every tier by default, high only for real reasoning, low never (Claude lanes: `quick`=sonnet, `standard`=opus, `deep`=high; Codex: `reasoning_effort`). No lane named = defect. `common-docs/policies/subagent-model-ladder.md`.
 8. **A delta is not a status.** Every status leads with terminal current truth and every unresolved action. “No new message/change” never means “nothing remains,” “no action required,” or “waiting on them” while earlier provider, agent, owner, blocker, or verification work remains open. `common-docs/policies/defect-ownership.md`.
+9. **Raise the bar.** Judge against the best in the world: Linear, Stripe, Vercel, Apple, Salesforce, Airtable, Notion, Google, Microsoft, Anthropic, OpenAI, Cursor. Every discipline has a world champion: name it before you build, match it before you ship, beat it before you call it done. Parity is the floor. Champions by discipline: `common-docs/policies/champions.md`.
 
 
 **Purpose of this file (per the [CLAUDE.md charter](/Users/armanisadeghi/code/common-docs/policies/claude-md-charter.md)):** you are doing sandbox work — the container image and/or the orchestrator for isolated agent machines on AWS (EC2 + hosted tiers). This file carries the sandbox-specific rules, the confusions that actually bite here, and pointers to the shared systems this repo integrates with. It does NOT carry feature detail (the docs table below does), API surfaces, deploy runbooks, or platform-rule bodies — those live in their canonical docs, one-liner + link here. Adding a line requires: "would removing it cause an agent to make a mistake in THIS repo?" Budget: ≤200 lines.
