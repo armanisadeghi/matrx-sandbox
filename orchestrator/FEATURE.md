@@ -29,7 +29,9 @@ Postgres never receives an org-less sandbox write. Read the emergency contract:
   actionable resume response; a Docker API outage returns retryable 503 rather
   than issuing credentials for an unverified box. This closes the short window
   before background Postgres boot reconciliation catches stale rows without
-  serializing the 215-container census.
+  serializing the 215-container census. Docker `created` and `restarting`
+  states are transitional (not vanished): they retain the row and return 503
+  until the container is running.
 - 2026-09-11 — A hosted release with 215 durable sandbox rows spent 157 seconds
   reconciling Docker before Uvicorn could accept traffic. The sole router then
   returned Traefik's ``no available server`` for token mints, dropping sandbox

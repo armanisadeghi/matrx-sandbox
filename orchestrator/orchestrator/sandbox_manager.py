@@ -50,6 +50,7 @@ class SandboxLivenessUnavailable(RuntimeError):
 
 
 _LIVE_CONTAINER_STATUSES = {"ready", "running", "starting"}
+_TRANSITIONAL_DOCKER_STATUSES = {"created", "restarting"}
 
 
 async def get_live_sandbox_for_issuance(sandbox_id: str) -> SandboxResponse | None:
@@ -76,6 +77,13 @@ async def get_live_sandbox_for_issuance(sandbox_id: str) -> SandboxResponse | No
         await asyncio.to_thread(container.reload)
         if container.status == "running":
             return sandbox
+        if container.status in _TRANSITIONAL_DOCKER_STATUSES:
+            # Docker has the box but has not finished its own startup.  The
+            # fleet reconciler counts these as alive; treating them as gone
+            # here would race startup and destroy a valid durable row.
+            raise SandboxLivenessUnavailable(
+                f"sandbox {sandbox_id} is still {container.status}"
+            )
     except NotFound:
         pass
     except (APIError, DockerException) as exc:
