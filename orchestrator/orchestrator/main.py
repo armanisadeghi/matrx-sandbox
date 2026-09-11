@@ -72,6 +72,43 @@ def _degraded_config_warnings() -> list[str]:
     return out
 
 
+async def _reconcile_boot_state(store: object) -> None:
+    """Reconcile Docker and durable state without making request readiness wait.
+
+    A Postgres-backed deployment can serve its existing sandbox rows immediately:
+    creation writes the row before it starts a container, and token issuance reads
+    that row directly.  Walking a large Docker fleet is still mandatory to repair
+    drift, but holding the only orchestrator behind that walk made every token
+    mint fail during a hosted deploy.  In-memory mode has no durable source and
+    therefore remains synchronous at startup (see ``lifespan``).
+    """
+    from orchestrator.reconcile import reconcile_from_docker, reconcile_liveness
+
+    try:
+        summary = await reconcile_from_docker(store)
+        if summary["reconciled"]:
+            _logger.info(
+                "Boot reconcile: rehydrated %d sandbox(es) from Docker "
+                "(scanned=%d, skipped=%d, failed=%d)",
+                summary["reconciled"],
+                summary["scanned"],
+                summary["skipped"],
+                summary["failed"],
+            )
+    except Exception as exc:
+        _logger.warning("Boot reconcile failed (continuing without it): %s", exc)
+
+    try:
+        live_summary = await reconcile_liveness(store)
+        if live_summary["stopped"] or live_summary["refreshed"]:
+            _logger.info(
+                "Boot liveness reconcile: stopped=%d refreshed=%d",
+                len(live_summary["stopped"]), live_summary["refreshed"],
+            )
+    except Exception as exc:
+        _logger.warning("Boot liveness reconcile failed (continuing): %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — startup and shutdown hooks."""
@@ -131,22 +168,6 @@ async def lifespan(app: FastAPI):
     # empty (so live containers go orphan in the FE) and even the Postgres
     # store goes stale if a container died while the orchestrator was
     # down. See orchestrator/reconcile.py for the full mapping.
-    try:
-        from orchestrator.reconcile import reconcile_from_docker
-        from orchestrator.sandbox_manager import _get_store
-
-        store = _get_store()
-        summary = await reconcile_from_docker(store)
-        if summary["reconciled"]:
-            _logger.info(
-                "Boot reconcile: rehydrated %d sandbox(es) from Docker "
-                "(scanned=%d, skipped=%d, failed=%d)",
-                summary["reconciled"], summary["scanned"],
-                summary["skipped"], summary["failed"],
-            )
-    except Exception as exc:
-        _logger.warning("Boot reconcile failed (continuing without it): %s", exc)
-
     # Liveness reconcile — the inverse sweep. ``reconcile_from_docker`` walks
     # containers that EXIST; it can never notice a row still marked live whose
     # container has vanished. That gap is what left rows stuck in 'running' for
@@ -154,18 +175,18 @@ async def lifespan(app: FastAPI):
     # stopped and, for the containers that ARE alive, refreshes updated_at so a
     # healthy long-lived sandbox doesn't trip the watchdog's max-age SLA.
     # Tier-scoped: never touches a sibling orchestrator's rows.
-    try:
-        from orchestrator.reconcile import reconcile_liveness
-        from orchestrator.sandbox_manager import _get_store
-
-        live_summary = await reconcile_liveness(_get_store())
-        if live_summary["stopped"] or live_summary["refreshed"]:
-            _logger.info(
-                "Boot liveness reconcile: stopped=%d refreshed=%d",
-                len(live_summary["stopped"]), live_summary["refreshed"],
-            )
-    except Exception as exc:
-        _logger.warning("Boot liveness reconcile failed (continuing): %s", exc)
+    # A durable store is already the request authority. Start serving it before
+    # this expensive repair pass so a large hosted fleet does not create a
+    # multi-minute ``no available server`` outage on every release. An in-memory
+    # store has no rows after restart, so it must finish rehydrating first.
+    boot_reconcile_task: asyncio.Task[None] | None = None
+    if isinstance(_store, PostgresSandboxStore):
+        _logger.info(
+            "Postgres store ready; continuing boot reconciliation in background"
+        )
+        boot_reconcile_task = asyncio.create_task(_reconcile_boot_state(_store))
+    else:
+        await _reconcile_boot_state(_store)
 
     # Start the expiry reaper — the missing half of the sandbox lifecycle.
     # Without it, sandboxes hit ``expires_at`` and nothing happens: the
@@ -174,8 +195,6 @@ async def lifespan(app: FastAPI):
     # gracefully tears down expired containers (running the in-container
     # final sync), preserves the per-user volume, and marks the row EXPIRED
     # so it can be resumed later. See orchestrator/reaper.py.
-    import asyncio
-
     from orchestrator.reaper import reaper_loop
 
     reaper_stop = asyncio.Event()
@@ -195,7 +214,9 @@ async def lifespan(app: FastAPI):
         # Shutdown: stop background loops, then close store and Docker client.
         reaper_stop.set()
         pool_stop.set()
-        for task in (reaper_task, pool_task):
+        for task in (reaper_task, pool_task, boot_reconcile_task):
+            if task is None:
+                continue
             try:
                 await asyncio.wait_for(task, timeout=10)
             except (asyncio.TimeoutError, asyncio.CancelledError):

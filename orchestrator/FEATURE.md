@@ -23,6 +23,12 @@ Postgres never receives an org-less sandbox write. Read the emergency contract:
 
 ## Change log
 
+- 2026-09-11 — A hosted release with 215 durable sandbox rows spent 157 seconds
+  reconciling Docker before Uvicorn could accept traffic. The sole router then
+  returned Traefik's ``no available server`` for token mints, dropping sandbox
+  tools from chat turns. Postgres is already the request authority, so its boot
+  reconciliation now continues in the background; in-memory mode retains the
+  synchronous rehydration requirement.
 - 2026-09-08 — Portable agent bindings use the public endpoint; private transport remains a server-consumer configuration decision. Regression proves a private address cannot replace a portable binding.
 
 - 2026-08-31 — Sandbox command wrapping now shell-quotes the complete user program before evaluating it, so a valid trailing heredoc remains syntactically intact while the orchestrator still captures the real exit status and post-command working directory.
