@@ -45,6 +45,56 @@ _store: SandboxStore | None = None
 _docker_client: docker.DockerClient | None = None
 
 
+class SandboxLivenessUnavailable(RuntimeError):
+    """Docker could not answer a single-box liveness check safely."""
+
+
+_LIVE_CONTAINER_STATUSES = {"ready", "running", "starting"}
+
+
+async def get_live_sandbox_for_issuance(sandbox_id: str) -> SandboxResponse | None:
+    """Read a durable row and prove its container is running before minting.
+
+    Boot reconciliation deliberately runs in the background for Postgres so a
+    large host can become routable quickly.  This narrow gate closes the
+    resulting stale-row window without turning every deployment into a
+    whole-fleet serialized startup.  A missing or stopped container is marked
+    terminal with a compare-and-set, so a concurrent resume cannot be clobbered.
+    """
+    sandbox = await get_sandbox(sandbox_id)
+    if sandbox is None:
+        return None
+    status = getattr(sandbox.status, "value", sandbox.status)
+    if status not in _LIVE_CONTAINER_STATUSES:
+        return sandbox
+
+    try:
+        client = _get_docker_client()
+        container = await asyncio.to_thread(
+            client.containers.get, sandbox.container_id or sandbox_id
+        )
+        await asyncio.to_thread(container.reload)
+        if container.status == "running":
+            return sandbox
+    except NotFound:
+        pass
+    except (APIError, DockerException) as exc:
+        raise SandboxLivenessUnavailable(
+            f"could not verify container liveness for sandbox {sandbox_id}"
+        ) from exc
+
+    store = _get_store()
+    changed = await store.mark_stopped_if_active(
+        sandbox_id, "container_missing_at_token_issuance"
+    )
+    if changed:
+        logger.warning(
+            "Sandbox %s container vanished during token issuance; marked STOPPED",
+            sandbox_id,
+        )
+    return _backfill_proxy_url(await store.get(sandbox_id)) or sandbox
+
+
 def _resolve_passthrough_keys() -> list[str]:
     """Union of names from settings.aidream_passthrough_env_file (parsed once,
     cached) and settings.aidream_passthrough_env (comma-separated). Values

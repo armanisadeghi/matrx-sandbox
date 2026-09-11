@@ -23,6 +23,13 @@ Postgres never receives an org-less sandbox write. Read the emergency contract:
 
 ## Change log
 
+- 2026-09-11 — Access-token and agent-binding issuance now perform one
+  per-sandbox Docker liveness check before minting. A durable live row whose
+  container vanished is atomically transitioned to `stopped` with an
+  actionable resume response; a Docker API outage returns retryable 503 rather
+  than issuing credentials for an unverified box. This closes the short window
+  before background Postgres boot reconciliation catches stale rows without
+  serializing the 215-container census.
 - 2026-09-11 — A hosted release with 215 durable sandbox rows spent 157 seconds
   reconciling Docker before Uvicorn could accept traffic. The sole router then
   returned Traefik's ``no available server`` for token mints, dropping sandbox

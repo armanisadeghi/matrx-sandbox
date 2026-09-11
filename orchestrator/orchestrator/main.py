@@ -109,6 +109,30 @@ async def _reconcile_boot_state(store: object) -> None:
         _logger.warning("Boot liveness reconcile failed (continuing): %s", exc)
 
 
+async def _start_boot_reconciliation(store: object) -> asyncio.Task[None] | None:
+    """Start durable reconciliation without delaying ready; await memory repair."""
+    from orchestrator.store import PostgresSandboxStore
+
+    if isinstance(store, PostgresSandboxStore):
+        _logger.info("Postgres store ready; continuing boot reconciliation in background")
+        return asyncio.create_task(_reconcile_boot_state(store))
+    await _reconcile_boot_state(store)
+    return None
+
+
+async def _cancel_boot_reconciliation(task: asyncio.Task[None] | None) -> None:
+    """Cancel the Docker census before closing its store during shutdown."""
+    if task is None or task.done():
+        return
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    except Exception as exc:  # pragma: no cover — defensive
+        _logger.warning("Boot reconciliation shutdown errored: %s", exc)
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Application lifespan — startup and shutdown hooks."""
@@ -179,14 +203,7 @@ async def lifespan(app: FastAPI):
     # this expensive repair pass so a large hosted fleet does not create a
     # multi-minute ``no available server`` outage on every release. An in-memory
     # store has no rows after restart, so it must finish rehydrating first.
-    boot_reconcile_task: asyncio.Task[None] | None = None
-    if isinstance(_store, PostgresSandboxStore):
-        _logger.info(
-            "Postgres store ready; continuing boot reconciliation in background"
-        )
-        boot_reconcile_task = asyncio.create_task(_reconcile_boot_state(_store))
-    else:
-        await _reconcile_boot_state(_store)
+    boot_reconcile_task = await _start_boot_reconciliation(_store)
 
     # Start the expiry reaper — the missing half of the sandbox lifecycle.
     # Without it, sandboxes hit ``expires_at`` and nothing happens: the
@@ -212,9 +229,10 @@ async def lifespan(app: FastAPI):
         yield
     finally:
         # Shutdown: stop background loops, then close store and Docker client.
+        await _cancel_boot_reconciliation(boot_reconcile_task)
         reaper_stop.set()
         pool_stop.set()
-        for task in (reaper_task, pool_task, boot_reconcile_task):
+        for task in (reaper_task, pool_task):
             if task is None:
                 continue
             try:

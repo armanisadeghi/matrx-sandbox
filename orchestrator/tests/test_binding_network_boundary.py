@@ -10,13 +10,17 @@ from types import SimpleNamespace
 import pytest
 from fastapi import HTTPException
 
+from orchestrator.models import SandboxStatus
 from orchestrator.routes import sandboxes
 
 
 @pytest.mark.asyncio
 async def test_portable_binding_uses_public_endpoint(monkeypatch):
     sandbox = SimpleNamespace(
-        sandbox_id="sbx-7ddc2eb0c364", tier="ec2", hot_path="/home/agent"
+        sandbox_id="sbx-7ddc2eb0c364",
+        tier="ec2",
+        hot_path="/home/agent",
+        status=SandboxStatus.RUNNING,
     )
 
     async def get_sandbox(sandbox_id):
@@ -26,6 +30,9 @@ async def test_portable_binding_uses_public_endpoint(monkeypatch):
         return None
 
     monkeypatch.setattr(sandboxes.sandbox_manager, "get_sandbox", get_sandbox)
+    monkeypatch.setattr(
+        sandboxes.sandbox_manager, "get_live_sandbox_for_issuance", get_sandbox
+    )
     monkeypatch.setattr(sandboxes, "_prepare_connection", prepare_connection)
     monkeypatch.setattr(sandboxes.settings, "access_token_secret", "test-only-boundary-secret")
     monkeypatch.setattr(sandboxes.settings, "public_url", "https://sandbox-orchestrator.matrxserver.com/")

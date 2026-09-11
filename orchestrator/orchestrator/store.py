@@ -75,6 +75,20 @@ class SandboxStore(ABC):
         """Mark a sandbox as stopped with a reason. Returns True if found and updated."""
         return await self.update_status(sandbox_id, SandboxStatus.STOPPED)
 
+    async def mark_stopped_if_active(self, sandbox_id: str, reason: str) -> bool:
+        """Atomically stop a row only while it is still serving a container.
+
+        This compare-and-set protects a concurrent resume/create from a late
+        liveness observation.  Backends that cannot make this atomic may use
+        their single-process implementation; Postgres overrides it with the
+        status guard in one UPDATE.
+        """
+        sandbox = await self.get(sandbox_id)
+        status = getattr(sandbox.status, "value", sandbox.status) if sandbox else None
+        if status not in ("ready", "running", "starting"):
+            return False
+        return await self.mark_stopped(sandbox_id, reason)
+
     @abstractmethod
     async def extend_ttl(self, sandbox_id: str, ttl_seconds: int) -> datetime | None:
         """Set ``expires_at = now() + ttl_seconds`` and persist ``ttl_seconds``.
@@ -243,6 +257,17 @@ class InMemorySandboxStore(SandboxStore):
         # timestamp in dev mode.
         sandbox = self._sandboxes.get(sandbox_id)
         if not sandbox:
+            return False
+        sandbox.status = SandboxStatus.STOPPED
+        sandbox.stopped_at = datetime.now(timezone.utc)
+        sandbox.stop_reason = reason
+        self._sandboxes[sandbox_id] = sandbox
+        return True
+
+    async def mark_stopped_if_active(self, sandbox_id: str, reason: str) -> bool:
+        sandbox = self._sandboxes.get(sandbox_id)
+        status = getattr(sandbox.status, "value", sandbox.status) if sandbox else None
+        if status not in ("ready", "running", "starting"):
             return False
         sandbox.status = SandboxStatus.STOPPED
         sandbox.stopped_at = datetime.now(timezone.utc)
@@ -554,6 +579,21 @@ class PostgresSandboxStore(SandboxStore):
                 """UPDATE sandbox_instances
                    SET status = 'stopped', stopped_at = NOW(), stop_reason = $1
                    WHERE sandbox_id = $2""",
+                reason,
+                sandbox_id,
+            )
+            return result == "UPDATE 1"
+
+    async def mark_stopped_if_active(self, sandbox_id: str, reason: str) -> bool:
+        """Stop a stale live row without overwriting a concurrent transition."""
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """UPDATE sandbox_instances
+                   SET status = 'stopped', stopped_at = NOW(), stop_reason = $1
+                   WHERE sandbox_id = $2
+                     AND status IN ('ready', 'running', 'starting')
+                     AND deleted_at IS NULL""",
                 reason,
                 sandbox_id,
             )

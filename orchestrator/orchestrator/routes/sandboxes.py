@@ -1355,9 +1355,17 @@ async def issue_access_token(sandbox_id: str, body: AccessTokenRequest) -> Acces
     Returns 503 when the orchestrator hasn't been configured with an HMAC
     secret (set ``MATRX_ACCESS_TOKEN_SECRET``).
     """
-    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    try:
+        sandbox = await sandbox_manager.get_live_sandbox_for_issuance(sandbox_id)
+    except sandbox_manager.SandboxLivenessUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="sandbox liveness could not be verified; retry shortly",
+            headers={"Retry-After": "3"},
+        ) from exc
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _require_live(sandbox)
 
     if not settings.access_token_secret:
         raise HTTPException(
@@ -1422,9 +1430,17 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
     Admin-authed via the global middleware (Next.js calls this after verifying
     the user owns the sandbox).
     """
-    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    try:
+        sandbox = await sandbox_manager.get_live_sandbox_for_issuance(sandbox_id)
+    except sandbox_manager.SandboxLivenessUnavailable as exc:
+        raise HTTPException(
+            status_code=503,
+            detail="sandbox liveness could not be verified; retry shortly",
+            headers={"Retry-After": "3"},
+        ) from exc
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _require_live(sandbox)
     if not settings.access_token_secret:
         raise HTTPException(status_code=503, detail="access tokens not configured (set MATRX_ACCESS_TOKEN_SECRET)")
     connection_hooks = await _prepare_connection(sandbox)
