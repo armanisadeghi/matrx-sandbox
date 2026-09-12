@@ -14,6 +14,39 @@ from orchestrator.routes.health import _docker_container_counts
 ORG_ID = "22222222-2222-4222-8222-222222222222"
 
 
+@pytest.mark.asyncio
+async def test_browser_agent_proxy_preflight_allows_canonical_identity_headers():
+    """The direct Code agent channel carries upstream identity and org scope.
+
+    This request never reaches the proxy route: Starlette's CORSMiddleware
+    validates the browser's requested header names first. Keep the exact
+    header set emitted by ``resolveBackendForConversation`` allowed here so
+    a browser receives a real response instead of a generic ``Failed to
+    fetch`` before the agent request can begin.
+    """
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.options(
+            "/sandboxes/sbx-agent/proxy/v2/ai/agents/agent-id",
+            headers={
+                "Origin": "http://localhost:3001",
+                "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": (
+                    "authorization,content-type,x-fingerprint-id,x-organization-id"
+                ),
+            },
+        )
+
+    assert response.status_code == 200, response.text
+    assert response.headers["access-control-allow-origin"] == "http://localhost:3001"
+    assert set(response.headers["access-control-allow-headers"].lower().split(", ")) >= {
+        "authorization",
+        "content-type",
+        "x-fingerprint-id",
+        "x-organization-id",
+    }
+
+
 @pytest.fixture
 def mock_sandbox_manager():
     """Mock out the sandbox_manager module used by route handlers."""

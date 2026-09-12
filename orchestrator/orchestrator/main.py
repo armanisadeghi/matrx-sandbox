@@ -338,7 +338,9 @@ app.add_middleware(
         "X-API-Key",
         "X-Sandbox-Access-Token",  # scoped proxy auth (browsers — doesn't collide with Authorization)
         "X-Conversation-Id",
+        "X-Fingerprint-ID",  # guest identity forwarded to the in-container agent service
         "X-Instance-Id",
+        "X-Organization-Id",  # required organization admission for authenticated agent requests
         "X-PTY-Cols",
         "X-PTY-Rows",
     ],
