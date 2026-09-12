@@ -126,6 +126,75 @@ async def test_websocket_lease_is_held_until_disconnect(hosted, monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_confirmed_migration_waits_past_route_close_for_websocket_lease(
+    hosted,
+    monkeypatch,
+):
+    """The route closes first; migration waits for the middleware flock to exit."""
+    from orchestrator import activity, migrate
+
+    rows = {"box": SimpleNamespace(persistence_volume="home")}
+    _wire(monkeypatch, hosted, rows)
+    opened = asyncio.Event()
+    route_closed = asyncio.Event()
+    allow_middleware_exit = asyncio.Event()
+
+    async def downstream(scope, _receive, _send):
+        operation_lease = scope["state"]["matrx_operation_lease"]
+        session = activity.session_opened("box", operation_lease)
+        opened.set()
+        await session.interrupt.wait()
+        activity.session_closed("box", session)
+        route_closed.set()
+        await allow_middleware_exit.wait()
+
+    engine_started = asyncio.Event()
+
+    async def hosted_engine(_sandbox_id, **_kwargs):
+        with hosted.lock("box"):
+            engine_started.set()
+        return {"status": "migrated", "sandbox_id": "box"}
+
+    monkeypatch.setattr(migrate, "_migrate_hosted_ordered", hosted_engine)
+    websocket = asyncio.create_task(
+        _call(
+            HostedOperationLeaseMiddleware(downstream),
+            {"type": "websocket", "path": "/sandboxes/box/pty"},
+        )
+    )
+    await opened.wait()
+
+    # A second connection that exits before registering a PTY/watch session
+    # releases only its own middleware token. It must not acknowledge the live
+    # connection's durable flock or let migration pass it.
+    async def early_rejected(_scope, _receive, _send):
+        return
+
+    await _call(
+        HostedOperationLeaseMiddleware(early_rejected),
+        {"type": "websocket", "path": "/sandboxes/box/pty"},
+    )
+
+    migration = asyncio.create_task(
+        migrate._migrate_hosted_with_admission(
+            "box",
+            interrupt_attached_sessions=True,
+        )
+    )
+    await route_closed.wait()
+    await asyncio.sleep(0)
+
+    assert activity.open_session_count("box") == 0
+    assert migration.done() is False
+    assert engine_started.is_set() is False
+
+    allow_middleware_exit.set()
+    await websocket
+    assert await migration == {"status": "migrated", "sandbox_id": "box"}
+    assert engine_started.is_set() is True
+
+
+@pytest.mark.asyncio
 async def test_pending_hosted_row_returns_sanitized_refusal(hosted, monkeypatch):
     rows = {"box": SimpleNamespace(persistence_volume="home")}; _wire(monkeypatch, hosted, rows)
     hosted.write(_record("other", "home"))

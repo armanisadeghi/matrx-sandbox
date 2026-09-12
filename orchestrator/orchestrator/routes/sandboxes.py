@@ -878,7 +878,8 @@ async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
     # An attached PTY/watch session marks the box BUSY for the rolling
     # auto-migrator — never swap a container out from under an open terminal
     # or editor. Balanced by session_closed in this handler's finally.
-    activity.session_opened(sandbox_id)
+    operation_lease = websocket.scope.get("state", {}).get("matrx_operation_lease")
+    session = activity.session_opened(sandbox_id, operation_lease)
 
     params = str(websocket.query_params)
     agent_tok = sandbox_manager.agent_token_for(sandbox_id)
@@ -914,19 +915,25 @@ async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
                 except Exception:
                     pass
 
+            async def interrupt_for_migration():
+                await session.interrupt.wait()
+                await client_ws.close(code=1012, reason="sandbox image update")
+
             task1 = asyncio.create_task(forward_to_client())
             task2 = asyncio.create_task(forward_to_sandbox())
+            task3 = asyncio.create_task(interrupt_for_migration())
 
             done, pending = await asyncio.wait(
-                [task1, task2],
+                [task1, task2, task3],
                 return_when=asyncio.FIRST_COMPLETED
             )
             for task in pending:
                 task.cancel()
+            await asyncio.gather(*done, *pending, return_exceptions=True)
     except Exception as e:
         logger.error(f"WebSocket proxy error: {e}")
     finally:
-        activity.session_closed(sandbox_id)
+        activity.session_closed(sandbox_id, session)
         try:
             await websocket.close()
         except Exception:
@@ -1142,7 +1149,8 @@ async def proxy_pty(sandbox_id: str, websocket: WebSocket):
     # An attached PTY/watch session marks the box BUSY for the rolling
     # auto-migrator — never swap a container out from under an open terminal
     # or editor. Balanced by session_closed in this handler's finally.
-    activity.session_opened(sandbox_id)
+    operation_lease = websocket.scope.get("state", {}).get("matrx_operation_lease")
+    session = activity.session_opened(sandbox_id, operation_lease)
 
     params = str(websocket.query_params)
     agent_tok = sandbox_manager.agent_token_for(sandbox_id)
@@ -1178,19 +1186,25 @@ async def proxy_pty(sandbox_id: str, websocket: WebSocket):
                 except Exception:
                     pass
 
+            async def interrupt_for_migration():
+                await session.interrupt.wait()
+                await client_ws.close(code=1012, reason="sandbox image update")
+
             task1 = asyncio.create_task(forward_to_client())
             task2 = asyncio.create_task(forward_to_sandbox())
+            task3 = asyncio.create_task(interrupt_for_migration())
 
             done, pending = await asyncio.wait(
-                [task1, task2],
+                [task1, task2, task3],
                 return_when=asyncio.FIRST_COMPLETED
             )
             for task in pending:
                 task.cancel()
+            await asyncio.gather(*done, *pending, return_exceptions=True)
     except Exception as e:
         logger.error(f"WebSocket proxy error: {e}")
     finally:
-        activity.session_closed(sandbox_id)
+        activity.session_closed(sandbox_id, session)
         try:
             await websocket.close()
         except Exception:

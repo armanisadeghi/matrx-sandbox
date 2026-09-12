@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 from datetime import datetime, timedelta, timezone
 
 from orchestrator.migrate import _has_recent_heartbeat
@@ -134,7 +135,16 @@ async def test_confirmed_manual_migration_fences_new_work_and_allows_attached_se
     )
     monkeypatch.setattr(migrate, "_migrate_hosted_ordered", hosted)
 
-    activity.session_opened(sid)
+    operation_lease = await activity.acquire_operation_lease(sid)
+    assert operation_lease is not None
+    session = activity.session_opened(sid, operation_lease)
+
+    async def attached_proxy():
+        await session.interrupt.wait()
+        activity.session_closed(sid, session)
+        await activity.release_operation_lease(operation_lease)
+
+    proxy = asyncio.create_task(attached_proxy())
     try:
         result = await migrate.migrate_sandbox(
             sid,
@@ -143,11 +153,117 @@ async def test_confirmed_manual_migration_fences_new_work_and_allows_attached_se
             interrupt_attached_sessions=True,
         )
     finally:
-        activity.session_closed(sid)
+        await proxy
 
     assert result == {"status": "migrated", "sandbox_id": sid}
     assert hosted.await_args.kwargs["interrupt_attached_sessions"] is True
     assert activity.is_migrating(sid) is False
+
+
+@pytest.mark.asyncio
+async def test_confirmed_manual_migration_waits_for_attached_proxy_lease_release(
+    monkeypatch,
+):
+    """The hosted engine must not run while its PTY/watch proxy is still attached."""
+    from orchestrator import migrate
+
+    sid = "sbx-interrupt-before-exclusive"
+    operation_lease = await activity.acquire_operation_lease(sid)
+    assert operation_lease is not None
+    session = activity.session_opened(sid, operation_lease)
+    released = asyncio.Event()
+
+    async def attached_proxy():
+        await session.interrupt.wait()
+        await asyncio.sleep(0)
+        activity.session_closed(sid, session)
+        await activity.release_operation_lease(operation_lease)
+        released.set()
+
+    async def hosted_engine(_sandbox_id, **_kwargs):
+        assert released.is_set()
+        assert activity.open_session_count(sid) == 0
+        return {"status": "migrated", "sandbox_id": sid}
+
+    monkeypatch.setattr(migrate, "_migrate_hosted_ordered", hosted_engine)
+    proxy = asyncio.create_task(attached_proxy())
+    result = await migrate._migrate_hosted_with_admission(
+        sid,
+        interrupt_attached_sessions=True,
+    )
+    await proxy
+
+    assert result == {"status": "migrated", "sandbox_id": sid}
+    assert activity.is_migrating(sid) is False
+
+
+@pytest.mark.asyncio
+async def test_default_migration_refuses_attached_operation_lease(monkeypatch):
+    """Automatic migration never interrupts a user's attached session."""
+    from orchestrator import migrate
+
+    sid = "sbx-default-keeps-session"
+    operation_lease = await activity.acquire_operation_lease(sid)
+    assert operation_lease is not None
+    session = activity.session_opened(sid, operation_lease)
+    engine = AsyncMock()
+    monkeypatch.setattr(migrate, "_migrate_hosted_ordered", engine)
+    try:
+        result = await migrate._migrate_hosted_with_admission(sid)
+        assert result["status"] == "busy_deferred"
+        assert session.interrupt.is_set() is False
+        engine.assert_not_awaited()
+    finally:
+        activity.session_closed(sid, session)
+        await activity.release_operation_lease(operation_lease)
+
+
+@pytest.mark.asyncio
+async def test_migration_drains_pre_fence_non_session_operation(monkeypatch):
+    """A request between middleware admission and route tracking must drain."""
+    from orchestrator import migrate
+
+    sid = "sbx-drain-short-operation"
+    operation_lease = await activity.acquire_operation_lease(sid)
+    assert operation_lease is not None
+    engine = AsyncMock(return_value={"status": "migrated", "sandbox_id": sid})
+    monkeypatch.setattr(migrate, "_migrate_hosted_ordered", engine)
+
+    migration = asyncio.create_task(migrate._migrate_hosted_with_admission(sid))
+    await asyncio.sleep(0)
+    assert migration.done() is False
+    engine.assert_not_awaited()
+
+    await activity.release_operation_lease(operation_lease)
+    assert await migration == {"status": "migrated", "sandbox_id": sid}
+    engine.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_confirmed_migration_interrupts_late_session_registration(monkeypatch):
+    """A pre-fence WebSocket token may become a session after drain starts."""
+    from orchestrator import migrate
+
+    sid = "sbx-late-session-registration"
+    operation_lease = await activity.acquire_operation_lease(sid)
+    assert operation_lease is not None
+    engine = AsyncMock(return_value={"status": "migrated", "sandbox_id": sid})
+    monkeypatch.setattr(migrate, "_migrate_hosted_ordered", engine)
+
+    migration = asyncio.create_task(
+        migrate._migrate_hosted_with_admission(
+            sid,
+            interrupt_attached_sessions=True,
+        )
+    )
+    await asyncio.wait_for(operation_lease.interrupt.wait(), timeout=0.5)
+    session = activity.session_opened(sid, operation_lease)
+    assert session.interrupt.is_set() is True
+    activity.session_closed(sid, session)
+    await activity.release_operation_lease(operation_lease)
+
+    assert await migration == {"status": "migrated", "sandbox_id": sid}
+    engine.assert_awaited_once()
 
 
 @pytest.mark.asyncio

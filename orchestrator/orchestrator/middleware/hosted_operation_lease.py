@@ -4,6 +4,7 @@ from __future__ import annotations
 from typing import Callable
 
 from orchestrator.config import settings
+from orchestrator import activity
 from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease
 from orchestrator.sandbox_manager import _get_store
 from orchestrator.storage_layout import user_volume_name
@@ -55,6 +56,9 @@ class HostedOperationLeaseMiddleware:
         volume = _authoritative_home(sandbox)
         if not volume:
             await self._deny(scope, send); return
+        operation_lease = await activity.acquire_operation_lease(sandbox_id)
+        if operation_lease is None:
+            await self._deny(scope, send); return
         try:
             async with hosted_operation_lease(sandbox_id, volume):
                 # Re-read under flock: a replaced/deleted row cannot inherit a
@@ -66,9 +70,15 @@ class HostedOperationLeaseMiddleware:
                     or _authoritative_home(fresh) != volume
                 ):
                     await self._deny(scope, send); return
+                scope.setdefault("state", {})["matrx_operation_lease"] = operation_lease
                 await self.app(scope, receive, send)
         except HostedOperationDenied:
             await self._deny(scope, send)
+        finally:
+            # This acknowledgement occurs only after the durable shared flock
+            # exits. It is tokenized, so an early-rejected request cannot
+            # decrement another request's outstanding lease.
+            await activity.release_operation_lease(operation_lease)
 
     async def _deny(self, scope, send) -> None:
         if scope["type"] == "websocket":

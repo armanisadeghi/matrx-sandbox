@@ -23,6 +23,7 @@ import asyncio
 import logging
 import time
 from contextlib import asynccontextmanager
+from dataclasses import dataclass, field
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,18 @@ _cond = asyncio.Condition()
 #     (the in-flight + heartbeat gates still apply after).
 _last_activity: dict[str, float] = {}
 _open_sessions: dict[str, int] = {}
+_operation_leases: dict[str, set["OperationLease"]] = {}
+
+
+@dataclass(eq=False)
+class OperationLease:
+    """Exact process-local witness for one durable middleware lease."""
+
+    sandbox_id: str
+    interrupt: asyncio.Event = field(default_factory=asyncio.Event)
+    released_event: asyncio.Event = field(default_factory=asyncio.Event)
+    session_open: bool = False
+    released: bool = False
 
 
 def note_activity(sandbox_id: str) -> None:
@@ -56,12 +69,64 @@ def last_activity_age(sandbox_id: str) -> float | None:
     return None if ts is None else time.monotonic() - ts
 
 
-def session_opened(sandbox_id: str) -> None:
+async def acquire_operation_lease(sandbox_id: str) -> OperationLease | None:
+    """Reserve one middleware operation before it takes a durable shared lock.
+
+    Reservation and migration admission use the same condition, closing the
+    check-to-flock race: either this operation is visible to the migration
+    drain, or the already-admitted migration refuses it.
+    """
+    async with _cond:
+        if sandbox_id in _migrating:
+            return None
+        lease = OperationLease(sandbox_id=sandbox_id)
+        _operation_leases.setdefault(sandbox_id, set()).add(lease)
+        return lease
+
+
+async def release_operation_lease(lease: OperationLease) -> None:
+    """Release only the exact middleware reservation that acquired the lock."""
+    async with _cond:
+        if lease.released:
+            return
+        lease.released = True
+        lease.released_event.set()
+        leases = _operation_leases.get(lease.sandbox_id)
+        if leases is not None:
+            leases.discard(lease)
+            if not leases:
+                _operation_leases.pop(lease.sandbox_id, None)
+        _cond.notify_all()
+
+
+def session_opened(
+    sandbox_id: str,
+    lease: OperationLease | None = None,
+) -> OperationLease:
+    """Register one interruptible PTY/watch attachment.
+
+    The returned lease belongs to this exact connection. Confirmed manual
+    migration sets it so the proxy can close both websocket legs and release
+    its cross-process shared home lease before migration takes the exclusive
+    lease. Automatic migration never sets these events.
+    """
+    if lease is None:
+        # Non-hosted/local call sites have no durable middleware lease. They
+        # still participate in the idle gate but require no lease drain.
+        lease = OperationLease(sandbox_id=sandbox_id)
+    elif lease.sandbox_id != sandbox_id or lease.released:
+        raise RuntimeError("session lease does not belong to this sandbox")
+    lease.session_open = True
     _open_sessions[sandbox_id] = _open_sessions.get(sandbox_id, 0) + 1
     note_activity(sandbox_id)
+    return lease
 
 
-def session_closed(sandbox_id: str) -> None:
+def session_closed(sandbox_id: str, lease: OperationLease | None = None) -> None:
+    if lease is not None:
+        if lease.sandbox_id != sandbox_id:
+            raise RuntimeError("session lease does not belong to this sandbox")
+        lease.session_open = False
     n = _open_sessions.get(sandbox_id, 0) - 1
     if n <= 0:
         _open_sessions.pop(sandbox_id, None)
@@ -72,6 +137,49 @@ def session_closed(sandbox_id: str) -> None:
 
 def open_session_count(sandbox_id: str) -> int:
     return _open_sessions.get(sandbox_id, 0)
+
+
+async def drain_operation_leases(
+    sandbox_id: str,
+    *,
+    interrupt_attached_sessions: bool,
+    timeout: float = 10.0,
+) -> bool:
+    """Drain pre-fence middleware leases before exclusive migration work.
+
+    The migration fence must already be held, preventing replacement sessions
+    and requests from entering while existing operations unwind. A confirmed
+    manual migration signals attached PTY/watch proxies; automatic/default
+    migration refuses them. False means the runtime is still in use, so callers
+    must leave its container and home untouched.
+    """
+    async with _cond:
+        leases = tuple(_operation_leases.get(sandbox_id, ()))
+        attached = tuple(lease for lease in leases if lease.session_open)
+        if attached and not interrupt_attached_sessions:
+            return False
+        if interrupt_attached_sessions:
+            # Signal every pre-fence reservation, not only leases already
+            # registered as sessions. A WebSocket may have acquired its
+            # middleware token and still be resolving the row/IP when the
+            # migration fence lands; if it becomes a PTY/watch afterward, it
+            # must observe the already-set signal and unwind instead of
+            # recreating the impossible attached-session gate.
+            for lease in leases:
+                lease.interrupt.set()
+    try:
+        await asyncio.wait_for(
+            asyncio.gather(*(lease.released_event.wait() for lease in leases)),
+            timeout=timeout,
+        )
+        return True
+    except asyncio.TimeoutError:
+        logger.warning(
+            "operation lease drain timed out for %s (leases=%d) - deferring",
+            sandbox_id,
+            sum(not lease.released for lease in leases),
+        )
+        return False
 
 
 def is_migrating(sandbox_id: str) -> bool:

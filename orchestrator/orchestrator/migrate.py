@@ -280,6 +280,7 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         return await _migrate_s3_ordered(
             sandbox_id, old=old, target=target, env=env, volumes=volumes,
             labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
+            interrupt_attached_sessions=interrupt_attached_sessions,
         )
 
     return await _migrate_hosted_with_admission(sandbox_id, old=old, target=target, env=env, volumes=volumes,
@@ -305,6 +306,13 @@ async def _migrate_hosted_with_admission(sandbox_id: str, **kwargs) -> dict:
         if not await activity.drain_inflight(sandbox_id, timeout=20.0):
             return {"status": "busy_deferred", "sandbox_id": sandbox_id,
                     "reason": "in-flight tool calls did not drain; retry later"}
+        if not await activity.drain_operation_leases(
+            sandbox_id,
+            interrupt_attached_sessions=bool(kwargs.get("interrupt_attached_sessions")),
+            timeout=10.0,
+        ):
+            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                    "reason": "attached sessions or operations did not drain; retry later"}
         return await _migrate_hosted_ordered(sandbox_id, **kwargs)
     finally:
         await activity.release_migration(sandbox_id)
@@ -324,6 +332,7 @@ async def _restart_container(container) -> None:
 async def _migrate_s3_ordered(
     sandbox_id: str, *, old, target: str, env: list, volumes: dict, labels: dict,
     host: dict, cur, store, verify_timeout: int,
+    interrupt_attached_sessions: bool = False,
 ) -> dict:
     """In-place migrate for an S3-backed (EC2-tier) box, ordered so no edit is
     lost. There is no shared /home/agent volume here — the home dir is S3-backed
@@ -361,6 +370,13 @@ async def _migrate_s3_ordered(
         if not await activity.drain_inflight(sandbox_id, timeout=20.0):
             return {"status": "busy_deferred", "sandbox_id": sandbox_id,
                     "reason": "in-flight tool calls did not drain; retry later"}
+        if not await activity.drain_operation_leases(
+            sandbox_id,
+            interrupt_attached_sessions=interrupt_attached_sessions,
+            timeout=10.0,
+        ):
+            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                    "reason": "attached sessions or operations did not drain; retry later"}
 
         # 1. Graceful stop = full flush to S3 via the old box's shutdown trap.
         # Give docker stop headroom over the in-container shutdown budget.
