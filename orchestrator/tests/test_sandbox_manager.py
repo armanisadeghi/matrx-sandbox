@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from datetime import datetime, timezone
 import subprocess
+import struct
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -13,6 +14,38 @@ from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.store import InMemorySandboxStore
 
 ORG_ID = "22222222-2222-4222-8222-222222222222"
+
+
+class _FragmentedExecSocket:
+    """A Docker exec socket whose multiplex frames cross recv boundaries."""
+
+    def __init__(self, payload: bytes, chunk_sizes: list[int]):
+        self._chunks: list[bytes] = []
+        offset = 0
+        for size in chunk_sizes:
+            self._chunks.append(payload[offset:offset + size])
+            offset += size
+        if offset < len(payload):
+            self._chunks.append(payload[offset:])
+        self.sent = b""
+        self.shutdown_calls: list[int] = []
+        self.closed = False
+
+    def sendall(self, data: bytes) -> None:
+        self.sent += data
+
+    def shutdown(self, how: int) -> None:
+        self.shutdown_calls.append(how)
+
+    def recv(self, _size: int) -> bytes:
+        return self._chunks.pop(0) if self._chunks else b""
+
+    def close(self) -> None:
+        self.closed = True
+
+
+def _docker_exec_frame(stream: int, payload: bytes) -> bytes:
+    return struct.pack(">BxxxL", stream, len(payload)) + payload
 
 
 @pytest.fixture(autouse=True)
@@ -523,6 +556,45 @@ async def test_exec_in_sandbox_tracks_cwd(mock_docker, clean_sandbox_state):
     assert sentinel not in stdout
     # Server should cache the new CWD
     assert sandbox_manager._sandbox_cwd["sbx-cwd"] == "/tmp"
+
+
+@pytest.mark.asyncio
+async def test_stdin_exec_demuxes_fragmented_docker_frames_before_cwd_parse():
+    """Raw Docker multiplex headers must never leak into stdin exec output."""
+    from orchestrator import sandbox_manager
+
+    sentinel = sandbox_manager._CWD_SENTINEL.encode()
+    wire_bytes = b"".join((
+        _docker_exec_frame(1, b'{"ok":true}\n'),
+        _docker_exec_frame(2, "warning: caf\xc3\xa9\n".encode("latin1")),
+        _docker_exec_frame(1, sentinel + b"\n/workspace\n"),
+    ))
+    # Split both frame headers and the two-byte UTF-8 character across recv().
+    raw = _FragmentedExecSocket(wire_bytes, [1, 5, 4, 9, 2, 3, 7, 1, 8])
+    api = MagicMock()
+    api.exec_create.return_value = {"Id": "exec-stdin-framed"}
+    api.exec_start.return_value = raw
+    api.exec_inspect.return_value = {"ExitCode": 17}
+    container = MagicMock()
+    container.id = "container-stdin"
+    container.client.api = api
+
+    exit_code, stdout, stderr, cwd = await sandbox_manager._exec_with_stdin(
+        container=container,
+        wrapped="ignored-by-fake-docker",
+        user="agent",
+        env={"EXAMPLE": "1"},
+        stdin_data="input \U0001f642",
+        sandbox_id="sbx-stdin-framed",
+        effective_cwd="/home/agent",
+    )
+
+    assert exit_code == 17
+    assert stdout == '{"ok":true}'
+    assert stderr == "warning: caf\u00e9\n"
+    assert cwd == "/workspace"
+    assert raw.sent == "input \U0001f642".encode("utf-8")
+    assert raw.closed is True
 
 
 @pytest.mark.asyncio

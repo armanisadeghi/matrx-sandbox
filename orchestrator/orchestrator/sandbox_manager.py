@@ -1113,7 +1113,10 @@ async def _exec_with_stdin(
             stderr=True,
         )["Id"]
 
-        sock = api.exec_start(exec_id, socket=True, demux=True)
+        # ``socket=True`` returns Docker's raw multiplexed wire stream.  The
+        # SDK's ``demux`` option only applies when it consumes that socket, so
+        # demux it below after we have written stdin and closed its write side.
+        sock = api.exec_start(exec_id, socket=True)
         raw = sock._sock if hasattr(sock, "_sock") else sock
         try:
             raw.sendall(stdin_data.encode("utf-8"))
@@ -1122,17 +1125,7 @@ async def _exec_with_stdin(
             except OSError:
                 pass
 
-            chunks_out = bytearray()
-            chunks_err = bytearray()
-            while True:
-                data = raw.recv(65536)
-                if not data:
-                    break
-                chunks_out.extend(data)
-            # NOTE: exec_start with demux=True returns multiplexed frames; we
-            # accept the simpler interleaved approach for stdin-fed execs and
-            # surface the combined stream as stdout. The frontend's primary use
-            # case for stdin is non-interactive piping (heredoc replacement).
+            chunks_out, chunks_err = _demux_docker_exec_socket(raw)
         finally:
             try:
                 raw.close()
@@ -1154,6 +1147,48 @@ async def _exec_with_stdin(
     else:
         new_cwd = effective_cwd
     return exit_code, stdout, stderr, new_cwd
+
+
+def _demux_docker_exec_socket(raw: Any) -> tuple[bytearray, bytearray]:
+    """Read Docker's non-TTY exec stream, separating stdout and stderr frames.
+
+    Docker sends every frame as an 8-byte header (stream id plus big-endian
+    payload length) followed by that many bytes.  ``recv`` is allowed to split
+    either a header or a UTF-8 payload across arbitrary boundaries, so bytes
+    remain buffered until a complete frame is available and decoding happens
+    only after all frames have been collected.
+    """
+    stdout = bytearray()
+    stderr = bytearray()
+    pending = bytearray()
+
+    while True:
+        data = raw.recv(65536)
+        if not data:
+            break
+        pending.extend(data)
+
+        while len(pending) >= 8:
+            stream_id = pending[0]
+            payload_length = int.from_bytes(pending[4:8], "big")
+            frame_length = 8 + payload_length
+            if len(pending) < frame_length:
+                break
+
+            payload = pending[8:frame_length]
+            del pending[:frame_length]
+            if stream_id == 1:
+                stdout.extend(payload)
+            elif stream_id == 2:
+                stderr.extend(payload)
+            else:
+                raise RuntimeError(
+                    f"Docker exec stream used unsupported stream id {stream_id}"
+                )
+
+    if pending:
+        raise RuntimeError("Docker exec stream ended with an incomplete multiplex frame")
+    return stdout, stderr
 
 
 def _parse_cwd_sentinel(raw: str) -> tuple[str, str | None]:
