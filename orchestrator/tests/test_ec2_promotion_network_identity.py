@@ -45,16 +45,31 @@ def test_hosted_target_create_contract_is_held_even_without_ec2_promotion():
     assert runtime["Env"] == ["OLD=1", "MATRX_MIGRATION_HOLD=1"]
 
 
-def test_reconnect_identity_requires_the_original_dynamic_ip_aliases_and_observed_mac():
-    """Break caught: rollback reconnected a paused source to a new endpoint."""
+def test_reconnect_identity_accepts_reassigned_auto_ip_but_requires_aliases():
+    """Docker-generated IP/MAC may change; requested aliases remain durable."""
     old = _old()
     identity = source_endpoint_identity(old, SimpleNamespace(id="network-id", attrs={"IPAM": {"Config": []}}))
     exact = {"Aliases": ["sbx-123456789abc", "service-alias", "a" * 12],
              "IPAddress": "172.17.0.22/16", "GlobalIPv6Address": "",
              "IPPrefixLen": 16, "MacAddress": "02:42:ac:11:00:02"}
     assert _endpoint_matches(exact, identity)
-    assert not _endpoint_matches({**exact, "IPAddress": "172.17.0.23/16"}, identity)
+    assert _endpoint_matches({**exact, "IPAddress": "172.17.0.23/16"}, identity)
     assert _endpoint_matches({**exact, "MacAddress": "02:42:ac:11:00:03"}, identity)
+    assert _endpoint_matches({**exact, "IPPrefixLen": 24}, identity)
+    assert not _endpoint_matches({**exact, "Aliases": ["wrong"]}, identity)
+    assert not _endpoint_matches({**exact, "IPAddress": ""}, identity)
+    assert not _endpoint_matches({**exact, "IPAddress": "not-an-ip"}, identity)
+    assert not _endpoint_matches({**exact, "IPPrefixLen": 99}, identity)
+
+
+def test_reconnect_identity_requires_explicit_ip_and_prefix_exactly():
+    old = _old(ipam_config={"IPv4Address": "172.17.0.22"})
+    identity = source_endpoint_identity(old, SimpleNamespace(id="network-id", attrs={"IPAM": {"Config": []}}))
+    exact = {"Aliases": ["sbx-123456789abc", "service-alias", "a" * 12],
+             "IPAddress": "172.17.0.22/16", "GlobalIPv6Address": "",
+             "IPPrefixLen": 16, "MacAddress": "02:42:ac:11:00:02"}
+    assert _endpoint_matches(exact, identity)
+    assert not _endpoint_matches({**exact, "IPAddress": "172.17.0.23/16"}, identity)
     assert not _endpoint_matches({**exact, "IPPrefixLen": 24}, identity)
 
 

@@ -185,17 +185,33 @@ def source_endpoint_identity(old, client_network=None):
 
 
 def _endpoint_matches(endpoint, identity):
-    """Exact endpoint validation after reconnect; MAC is comparison-only."""
+    """Validate the durable endpoint contract after reconnect.
+
+    Auto-IPAM addresses and Docker-generated MACs are observations, not stable
+    identities: Docker may legitimately reassign both on reconnect. Explicit
+    endpoint IPAM and requested aliases remain strict.
+    """
     if not isinstance(endpoint, dict):
         return False
-    if endpoint.get("IPAddress", "").split("/", 1)[0] != identity["ipv4_address"]:
+    ipv4 = endpoint.get("IPAddress", "").split("/", 1)[0]
+    try:
+        if ipaddress.ip_address(ipv4).version != 4:
+            return False
+    except ValueError:
         return False
-    if endpoint.get("IPPrefixLen") != identity.get("ipv4_address_prefixlen"):
+    ipv4_prefix = endpoint.get("IPPrefixLen")
+    if not isinstance(ipv4_prefix, int) or not 0 <= ipv4_prefix <= 32:
         return False
-    if identity.get("ipv6_address") and endpoint.get("GlobalIPv6Address", "").split("/", 1)[0] != identity["ipv6_address"]:
-        return False
-    if identity.get("ipv6_address") and endpoint.get("GlobalIPv6PrefixLen") != identity.get("ipv6_address_prefixlen"):
-        return False
+    if identity.get("ipv4_explicit_ipam"):
+        if ipv4 != identity["ipv4_address"]:
+            return False
+        if ipv4_prefix != identity.get("ipv4_address_prefixlen"):
+            return False
+    if identity.get("ipv6_explicit_ipam"):
+        if endpoint.get("GlobalIPv6Address", "").split("/", 1)[0] != identity.get("ipv6_address"):
+            return False
+        if endpoint.get("GlobalIPv6PrefixLen") != identity.get("ipv6_address_prefixlen"):
+            return False
     # Docker is allowed to regenerate its endpoint MAC after reconnect.  It is
     # recorded for diagnostics only; explicit caller-requested MACs were
     # already refused at admission, so no consumer contract depends on it.
