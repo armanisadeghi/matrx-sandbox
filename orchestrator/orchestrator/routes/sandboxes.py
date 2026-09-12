@@ -15,6 +15,7 @@ import httpx
 from orchestrator import activity, sandbox_manager, storage
 from orchestrator.auth import sandbox_token
 from orchestrator.config import settings
+from orchestrator.knobs import knob_int
 from orchestrator.models import (
     AccessResponse,
     AccessTokenRequest,
@@ -147,7 +148,7 @@ async def claim_sandbox(req: CreateSandboxRequest):
         )
 
     from orchestrator import pool
-    template = req.template or settings.warm_pool_template
+    template = req.template or await pool._warm_template()
 
     # Warm-pool sandboxes are pre-booted with NO per-user env, and Docker
     # cannot change the environment of a running container — so a /claim
@@ -1452,7 +1453,8 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
     if not base:
         raise HTTPException(status_code=503, detail="MATRX_PUBLIC_URL must be set for portable sandbox bindings")
 
-    ttl = (body.ttl_seconds if body else None) or settings.max_session_duration_seconds
+    max_session_seconds = await knob_int("max_session_duration_seconds")
+    ttl = (body.ttl_seconds if body else None) or max_session_seconds
     # The agent's hands need the full tool surface. The middleware now enforces a
     # per-subpath scope (see _required_scope_for), so this default set must cover
     # every structured tool route; it also satisfies the /proxy/* "ai" scope.
@@ -1471,7 +1473,7 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
             # Server-to-server binding (co-located AI Dream): allow a full
             # session, not the 15-min browser ceiling, so a long agent run
             # isn't silently cut off mid-turn.
-            max_ttl_seconds=settings.max_session_duration_seconds,
+            max_ttl_seconds=max_session_seconds,
         )
     except sandbox_token.TokenError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc

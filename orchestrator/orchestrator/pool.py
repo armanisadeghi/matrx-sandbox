@@ -36,6 +36,7 @@ import uuid
 from datetime import datetime, timedelta, timezone
 
 from orchestrator.config import settings
+from orchestrator.knobs import knob_float, knob_int, knob_str
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.runtime_isolation import warm_pool_supports_template
 
@@ -53,18 +54,20 @@ POOL_INTERVAL_SECONDS = 30
 _claim_lock = asyncio.Lock()
 
 
-def _warm_template() -> str:
-    return settings.warm_pool_template or "slim"
+async def _warm_template() -> str:
+    return await knob_str("warm_pool_template") or "slim"
 
 
-def _warm_targets() -> list[tuple[str, int]]:
+async def _warm_targets() -> list[tuple[str, int]]:
     """The (template, count) pairs to keep warmed.
 
-    Parsed from ``MATRX_WARM_POOL_TEMPLATES`` ("slim:1,aidream:1"); a bare name
-    uses ``warm_pool_size``. Falls back to the single-template config when the
-    multi-template spec is empty.
+    Parsed from the ``infrastructure.sandbox.warm_pool_templates`` setting
+    ("slim:1,aidream:1"); a bare name uses ``warm_pool_size``. Falls back to
+    the single-template setting when the multi-template spec is empty. These
+    were MATRX_WARM_POOL_* env vars until 2026-09-11 (USD-5).
     """
-    spec = (settings.warm_pool_templates or "").strip()
+    warm_pool_size = await knob_int("warm_pool_size")
+    spec = (await knob_str("warm_pool_templates")).strip()
     if spec:
         targets: list[tuple[str, int]] = []
         for part in spec.split(","):
@@ -76,20 +79,20 @@ def _warm_targets() -> list[tuple[str, int]]:
             if not name:
                 continue
             try:
-                n = int(cnt) if sep else settings.warm_pool_size
+                n = int(cnt) if sep else warm_pool_size
             except ValueError:
-                n = settings.warm_pool_size
+                n = warm_pool_size
             if n > 0:
                 targets.append((name, n))
         if targets:
             return targets
-    if settings.warm_pool_size > 0:
-        return [(_warm_template(), settings.warm_pool_size)]
+    if warm_pool_size > 0:
+        return [(await _warm_template(), warm_pool_size)]
     return []
 
 
-def _pool_enabled() -> bool:
-    return bool(_warm_targets())
+async def _pool_enabled() -> bool:
+    return bool(await _warm_targets())
 
 
 def _current_image_id(template: str) -> str | None:
@@ -144,12 +147,19 @@ def list_warm_containers(template: str | None = None) -> list:
     return out
 
 
-def _warm_run_container(template: str):
+def _warm_run_container(
+    template: str,
+    *,
+    shutdown_timeout_seconds: int,
+    container_cpu_limit: float,
+    container_memory_limit: str,
+):
     """Boot one unclaimed warm container. Returns the docker container or None.
 
     Minimal sibling of ``create_sandbox``'s run block: warm labels, sentinel
     user, NO DB row, NO per-user volume (slim is git-persistence; a warm box
-    has no owner to mount for).
+    has no owner to mount for). The three fleet settings are resolved by the
+    async caller (``ensure_warm_pool``) because this runs in a thread.
     """
     if not warm_pool_supports_template(template):
         logger.error(
@@ -171,7 +181,7 @@ def _warm_run_container(template: str):
         "USER_ID": settings.warm_pool_sentinel_user,
         "HOT_PATH": "/home/agent",
         "MATRX_TIER": settings.host_tier or "",
-        "SHUTDOWN_TIMEOUT_SECONDS": str(settings.shutdown_timeout_seconds),
+        "SHUTDOWN_TIMEOUT_SECONDS": str(shutdown_timeout_seconds),
     }
     if template:
         env["SANDBOX_TEMPLATE"] = template
@@ -191,8 +201,8 @@ def _warm_run_container(template: str):
             detach=True,
             environment=env,
             cpu_period=100000,
-            cpu_quota=int(settings.container_cpu_limit * 100000),
-            mem_limit=settings.container_memory_limit,
+            cpu_quota=int(container_cpu_limit * 100000),
+            mem_limit=container_memory_limit,
             cap_add=["SYS_ADMIN"],
             devices=["/dev/fuse"],
             cap_drop=[],
@@ -244,12 +254,20 @@ async def ensure_warm_pool() -> dict:
     """For every (template, count) target: retire warm boxes whose image was
     superseded (version-refresh), then top the template up to its count."""
     summary = {"per_template": {}, "warmed": 0, "retired": 0}
-    for template, target in _warm_targets():
+    targets = await _warm_targets()
+    if not targets:
+        return summary
+    run_kwargs = {
+        "shutdown_timeout_seconds": await knob_int("shutdown_timeout_seconds"),
+        "container_cpu_limit": await knob_float("container_cpu_limit"),
+        "container_memory_limit": await knob_str("container_memory_limit"),
+    }
+    for template, target in targets:
         retired = await _retire_stale_warm(template, await asyncio.to_thread(_current_image_id, template))
         have = len(await _unclaimed_warm(template))  # post-retire count of fresh boxes
         warmed = 0
         for _ in range(max(0, target - have)):
-            if await asyncio.to_thread(_warm_run_container, template) is not None:
+            if await asyncio.to_thread(_warm_run_container, template, **run_kwargs) is not None:
                 warmed += 1
         summary["per_template"][template] = {"target": target, "have": have, "warmed": warmed, "retired": retired}
         summary["warmed"] += warmed
@@ -266,9 +284,9 @@ async def claim_warm(
     """Adopt a warm box for ``user_id``. Returns the SandboxResponse, or None
     if no warm box of the right template is available (caller cold-creates).
     """
-    template = template or _warm_template()
-    if not _pool_enabled():
+    if not await _pool_enabled():
         return None
+    template = template or await _warm_template()
 
     from orchestrator.sandbox_manager import _get_store, _proxy_url_for
 
@@ -308,7 +326,7 @@ async def claim_warm(
             hot_path="/home/agent",
             cold_path="/data/cold",
             config={"warm_claimed": True, "organization_id": organization_id},
-            ttl_seconds=ttl_seconds or settings.max_session_duration_seconds,
+            ttl_seconds=ttl_seconds or await knob_int("max_session_duration_seconds"),
             tier=settings.host_tier or None,
             template=template,
             ssh_port=ssh_port,
@@ -364,12 +382,15 @@ async def _replenish_async() -> None:
 
 async def pool_loop(stop_event: asyncio.Event) -> None:
     """Maintain the warm pool on an interval until stop_event is set."""
-    if not _pool_enabled():
-        logger.info("Warm pool disabled (set MATRX_WARM_POOL_SIZE or MATRX_WARM_POOL_TEMPLATES)")
+    if not await _pool_enabled():
+        logger.info(
+            "Warm pool disabled (infrastructure.sandbox.warm_pool_size is 0 and "
+            "warm_pool_templates is empty — settings, not env vars)"
+        )
         return
     logger.info(
         "Warm pool started (targets=%s, interval=%ds)",
-        _warm_targets(), POOL_INTERVAL_SECONDS,
+        await _warm_targets(), POOL_INTERVAL_SECONDS,
     )
     while not stop_event.is_set():
         try:

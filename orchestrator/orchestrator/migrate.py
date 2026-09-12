@@ -28,6 +28,7 @@ import time
 from docker.errors import APIError, NotFound
 
 from orchestrator.config import settings
+from orchestrator.knobs import knob_bool, knob_int
 from orchestrator.runtime_isolation import container_runtime_isolation
 from orchestrator.versioning import current_image
 
@@ -128,8 +129,9 @@ async def _safe_get(store, sandbox_id: str):
         return None
 
 
-def _has_recent_heartbeat(sbx) -> bool:
-    """True if the sandbox row has a heartbeat within the configured window."""
+def _has_recent_heartbeat(sbx, window_seconds: int) -> bool:
+    """True if the sandbox row has a heartbeat within ``window_seconds``
+    (the ``infrastructure.sandbox.migrate_recent_heartbeat_seconds`` setting)."""
     if sbx is None:
         return False
     hb = getattr(sbx, "last_heartbeat_at", None)
@@ -139,7 +141,7 @@ def _has_recent_heartbeat(sbx) -> bool:
     if hb.tzinfo is None:
         hb = hb.replace(tzinfo=timezone.utc)
     age = (datetime.now(timezone.utc) - hb).total_seconds()
-    return age < settings.migrate_recent_heartbeat_seconds
+    return age < window_seconds
 
 
 async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = None,
@@ -169,11 +171,12 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         # Recent tool activity = an agent mid-task between commands. Hosted
         # boxes rarely heartbeat, so orchestrator-side activity is the real
         # "recently in use" signal; reuse the heartbeat window as the cutoff.
+        recent_window = await knob_int("migrate_recent_heartbeat_seconds")
         age = activity.last_activity_age(sandbox_id)
-        if age is not None and age < settings.migrate_recent_heartbeat_seconds:
+        if age is not None and age < recent_window:
             return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                    "reason": f"tool activity {int(age)}s ago (< {settings.migrate_recent_heartbeat_seconds}s); defer until idle"}
-        if _has_recent_heartbeat(await _safe_get(store, sandbox_id)):
+                    "reason": f"tool activity {int(age)}s ago (< {recent_window}s); defer until idle"}
+        if _has_recent_heartbeat(await _safe_get(store, sandbox_id), recent_window):
             return {"status": "busy_deferred", "sandbox_id": sandbox_id,
                     "reason": "box had a recent heartbeat; defer migration until idle"}
 
@@ -233,17 +236,19 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         if template != "core" or cfg.get("Cmd") != ["/opt/sandbox/scripts/entrypoint.sh"]:
             return {"status": "unsupported_storage", "sandbox_id": sandbox_id,
                     "reason": "No shared home volume and no verified core S3 lifecycle. Slim persists through git; uncommitted home data is not migration-safe."}
-        if not settings.enable_s3_migrate:
+        if not await knob_bool("enable_s3_migrate"):
             logger.info(
                 "migrate %s: home dir not on a shared volume (S3-backed/ec2) — refusing "
-                "(set MATRX_ENABLE_S3_MIGRATE=1 after validating the sync-ordered path)",
+                "(turn on the infrastructure.sandbox.enable_s3_migrate setting after "
+                "validating the sync-ordered path)",
                 sandbox_id,
             )
             return {
                 "status": "unsupported_storage", "sandbox_id": sandbox_id,
                 "reason": ("home dir is not on a shared persistent volume (S3-backed / ec2 tier); "
-                           "S3-ordered migration is implemented but disabled — enable "
-                           "MATRX_ENABLE_S3_MIGRATE only after validating it end-to-end"),
+                           "S3-ordered migration is implemented but disabled — turn on the "
+                           "infrastructure.sandbox.enable_s3_migrate setting only after "
+                           "validating it end-to-end"),
             }
         return await _migrate_s3_ordered(
             sandbox_id, old=old, target=target, env=env, volumes=volumes,
@@ -326,7 +331,9 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         old_renamed = f"{sandbox_id}-old-{int(time.time())}"
         try:
             try:
-                await asyncio.to_thread(old.stop, timeout=settings.shutdown_timeout_seconds)
+                await asyncio.to_thread(
+                    old.stop, timeout=await knob_int("shutdown_timeout_seconds")
+                )
             except APIError:
                 pass
             await asyncio.to_thread(old.rename, old_renamed)
@@ -396,7 +403,7 @@ async def _migrate_s3_ordered(
     On ANY failure before cutover the OLD box is restarted (it re-hydrates the
     flushed state from S3, so no data is lost) and the migration reports failed.
 
-    GATED by settings.enable_s3_migrate. This path cannot be unit-tested without
+    GATED by the infrastructure.sandbox.enable_s3_migrate setting. This path cannot be unit-tested without
     real S3 + an EC2 sandbox image; the server agent MUST validate it against a
     throwaway sandbox before enabling the flag. Never raises."""
     from orchestrator import activity
@@ -417,7 +424,7 @@ async def _migrate_s3_ordered(
 
         # 1. Graceful stop = full flush to S3 via the old box's shutdown trap.
         # Give docker stop headroom over the in-container shutdown budget.
-        stop_timeout = settings.shutdown_timeout_seconds + 30
+        stop_timeout = await knob_int("shutdown_timeout_seconds") + 30
         try:
             await asyncio.to_thread(old.stop, timeout=stop_timeout)
         except APIError as exc:

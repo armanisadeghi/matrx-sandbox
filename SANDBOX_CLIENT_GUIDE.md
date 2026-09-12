@@ -133,7 +133,7 @@ DELETE /sandboxes/{id}?graceful=true               → 204 No Content (stop; res
 DELETE /sandboxes/{id}?graceful=false&purge=true   → 204 No Content (user-facing "delete")
 ```
 
-`graceful=true` runs `shutdown.sh` (S3 sync-back + FUSE flush on EC2; daemon-stop + ttyd kill on hosted). `graceful=false` is `docker stop --time=0`. **`purge=true` additionally soft-deletes the row** so it disappears from every default list immediately; without it the row stays visible + resumable until the retention sweep soft-deletes it (`MATRX_TERMINAL_RETENTION_DAYS`, default 7). `GET /sandboxes` hides soft-deleted rows — pass `include_deleted=true` for audit views.
+`graceful=true` runs `shutdown.sh` (S3 sync-back + FUSE flush on EC2; daemon-stop + ttyd kill on hosted). `graceful=false` is `docker stop --time=0`. **`purge=true` additionally soft-deletes the row** so it disappears from every default list immediately; without it the row stays visible + resumable until the retention sweep soft-deletes it (the `infrastructure.sandbox.terminal_retention_days` setting, 7 today). `GET /sandboxes` hides soft-deleted rows — pass `include_deleted=true` for audit views.
 
 **Dead-box tool calls:** any tool route (fs/exec/git/search/processes/ports/pty) called on an expired/stopped sandbox returns **410** with a resume hint (`POST /sandboxes/{id}/resume`, then retry) — build "Resume" affordances off that, don't treat it as an error. **Scopes:** a token issued with `scopes: ["ai"]` is the superset — it satisfies every per-subpath scope (fs.read, exec.run, …); request narrower scopes only when you want narrower access.
 

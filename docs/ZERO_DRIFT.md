@@ -100,13 +100,13 @@ migration path. Future work must resolve those hazards and verify the real
 Docker tar round-trip plus user file bytes/modes after readiness; mocked archive
 tests cannot authorize a user-fleet rollout.
 
-`migrate_all_drifted()` rolls drifted boxes one at a time (busy ones return `busy_deferred` and retry on the next pass — the "keep checking until it's idle, then migrate" loop). It's wired into the reaper, gated behind `MATRX_AUTO_MIGRATE`:
+`migrate_all_drifted()` rolls drifted boxes one at a time (busy ones return `busy_deferred` and retry on the next pass — the "keep checking until it's idle, then migrate" loop). It's wired into the reaper, gated behind the `infrastructure.sandbox.auto_migrate` setting (a `platform.feature_knob` row since 2026-09-11 — it was the env var `MATRX_AUTO_MIGRATE`; USD-5, never an env var):
 
-- `MATRX_AUTO_MIGRATE=1` — each reaper sweep (every 60s) migrates up to `MATRX_MIGRATE_MAX_PER_PASS` (default 2) drifted, **idle** boxes; busy ones defer to the next sweep.
+- `auto_migrate` on — each reaper sweep (every 60s) migrates up to the `migrate_max_per_pass` setting (2 today) drifted, **idle** boxes; busy ones defer to the next sweep.
 - With it OFF, nothing migrates automatically; `POST /migrate-all` and per-box `/migrate` still work for manual/triggered rollout.
 
-**Current hold (2026-09-08):** actual runtime `MATRX_AUTO_MIGRATE` is false on
-both tiers; `MATRX_ENABLE_S3_MIGRATE` must remain disabled. The earlier May
+**Current hold (2026-09-08, re-verified 2026-09-11 as the seeded setting values):** `auto_migrate` is false on
+both tiers; `enable_s3_migrate` must remain off. The earlier May
 rollout is not current authorization. Source `c5794ea` removes migration from
 EC2 deployment, and `766d707` removes migration from development connection
 preparation while preserving repository synchronization. Deployment and live
@@ -155,6 +155,6 @@ The Manager's **orchestrator-sandboxes** admin page (`manager.dev.codematrx.com`
 | Env var | Default | Meaning |
 |---|---|---|
 | `MATRX_IMAGE_VERSION` | `dev` (build ARG) | Baked image version. Set by `build.sh`. |
-| `MATRX_AUTO_MIGRATE` | `0` (off) | Reaper auto-migrates drifted idle boxes each sweep. |
-| `MATRX_MIGRATE_MAX_PER_PASS` | `2` | Max boxes migrated per reaper sweep (rolling cap). |
+| ~~`MATRX_AUTO_MIGRATE`~~ → setting `infrastructure.sandbox.auto_migrate` | off | Reaper auto-migrates drifted idle boxes each sweep. Not an env var since 2026-09-11. |
+| ~~`MATRX_MIGRATE_MAX_PER_PASS`~~ → setting `infrastructure.sandbox.migrate_max_per_pass` | `2` | Max boxes migrated per reaper sweep (rolling cap). |
 | `SANDBOX_MIGRATION` | unset | Set to `1` by the migrator on the new container; entrypoint skips cloud-sync. Not for manual use. |

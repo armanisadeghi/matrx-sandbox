@@ -110,8 +110,8 @@ chat-speed claims on EC2:
   (CI pushes immutable `:slim-<commit-sha>` candidates to ECR and the SSM
   deploy pulls the approved revision and tags it locally; baking it into the
   AMI removes even the pull).
-- Set `MATRX_WARM_POOL_SIZE=2` on the EC2 orchestrator so it keeps 2 warm
-  containers ready on each warm instance.
+- The warm pool is the `infrastructure.sandbox.warm_pool_size` setting (2 today,
+  shared by both tiers since 2026-09-11 — no per-host env var to set).
 
 Nothing in the orchestrator code needs to change for EC2 — claim/replenish is
 identical. This is purely an AWS provisioning step (instance + image presence).

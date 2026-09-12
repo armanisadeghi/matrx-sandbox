@@ -176,6 +176,35 @@ async def lifespan(app: FastAPI):
     for line in _degraded_config_warnings():
         _logger.warning("DEGRADED CONFIG: %s", line)
 
+    # The fleet's settings (infrastructure.sandbox knobs) must resolve through
+    # the store before the reaper and warm pool start reading them every tick.
+    # A postgres store with the rows missing, or a memory store nobody seeded,
+    # is named here once, loudly, instead of once per sweep. The orchestrator
+    # still boots — a running fleet must not be bricked by a settings read —
+    # but every consumer raises on its own read until this is fixed.
+    from orchestrator import knobs
+
+    try:
+        _logger.info(
+            "Fleet settings (infrastructure.sandbox): cpu=%s mem=%s session=%ss "
+            "warm_pool=%s/%s auto_migrate=%s retention=%sd",
+            await knobs.knob_float("container_cpu_limit"),
+            await knobs.knob_str("container_memory_limit"),
+            await knobs.knob_int("max_session_duration_seconds"),
+            await knobs.knob_int("warm_pool_size"),
+            await knobs.knob_str("warm_pool_template"),
+            await knobs.knob_bool("auto_migrate"),
+            await knobs.knob_int("terminal_retention_days"),
+        )
+    except Exception as exc:  # noqa: BLE001 — announced, never silent
+        _logger.error(
+            "FLEET SETTINGS UNREADABLE: %s — sandbox creates, the warm pool, the "
+            "retention sweep and auto-migrate will each fail on their own read "
+            "until platform.feature_knob rows for 'infrastructure.sandbox' can be "
+            "read through this store (aidream db/migrations/0636 seeds them).",
+            exc,
+        )
+
     # Startup: validate S3 bucket is accessible (C8)
     try:
         await validate_bucket()

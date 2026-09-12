@@ -1,5 +1,15 @@
 # Server-Agent Handoff — Push-to-Main Auto-Rebuild & Roll
 
+> **2026-09-11 (USD-5, lane D of the Unified Settings Platform):** every `MATRX_AUTO_MIGRATE`,
+> `MATRX_MIGRATE_*`, `MATRX_ENABLE_S3_MIGRATE`, `MATRX_WARM_POOL_*`, `MATRX_CONTAINER_*`,
+> `MATRX_SHUTDOWN_TIMEOUT_SECONDS` and `MATRX_TERMINAL_RETENTION_DAYS` mention below is
+> HISTORICAL. Those values are `platform.feature_knob` rows under `infrastructure.sandbox`
+> (read by `orchestrator/knobs.py`, seeded by aidream migration 0636); setting the env var
+> now does nothing. Change them in the settings UI — no restart needed for most (a 60s cache).
+> Only the secrets and endpoints in the table (`MATRX_ACCESS_TOKEN_SECRET`,
+> `MATRX_AIDREAM_SERVICE_TOKEN`, …) are still environment.
+
+
 > **SUPERSEDED HISTORICAL WORK ORDER — DO NOT EXECUTE.** September 8, 2026:
 > this handoff predates the verified migration-safety defects and the unexpected
 > development-container replacement. Its instructions to enable automatic/S3

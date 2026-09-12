@@ -20,6 +20,7 @@ import docker
 from docker.errors import DockerException, NotFound, APIError
 
 from orchestrator.config import settings
+from orchestrator.knobs import knob_float, knob_int, knob_str
 from orchestrator.runtime_isolation import container_runtime_isolation
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.storage_layout import (
@@ -412,7 +413,7 @@ async def create_sandbox(
             "S3_REGION": config.get("s3_region", settings.s3_region),
             "HOT_PATH": "/home/agent",
             "COLD_PATH": "/data/cold",
-            "SHUTDOWN_TIMEOUT_SECONDS": str(settings.shutdown_timeout_seconds),
+            "SHUTDOWN_TIMEOUT_SECONDS": str(await knob_int("shutdown_timeout_seconds")),
             # Tier hint — the in-container persistence module reads this to
             # decide whether to also push to S3 (Phase 1.5). When empty / "ec2"
             # the existing hot-sync.sh + cold-mount.sh handle S3 directly.
@@ -697,10 +698,11 @@ async def create_sandbox(
                     "internal development sandbox requires a vaulted GitHub token"
                 )
 
-        # Resource overrides — fall back to settings defaults
-        cpu_limit = resources.get("cpu") or settings.container_cpu_limit
+        # Resource overrides — fall back to the fleet settings
+        # (infrastructure.sandbox knobs; MATRX_CONTAINER_* env until 2026-09-11)
+        cpu_limit = resources.get("cpu") or await knob_float("container_cpu_limit")
         memory_limit = resources.get("memory_mb")
-        memory_limit = f"{memory_limit}m" if memory_limit else settings.container_memory_limit
+        memory_limit = f"{memory_limit}m" if memory_limit else await knob_str("container_memory_limit")
 
         # Per-template image override. Most templates share the bare image
         # (they differ via env vars / init scripts), but variants like
@@ -896,10 +898,11 @@ async def exec_in_sandbox(
     if not sandbox or not sandbox.container_id:
         raise ValueError(f"Sandbox {sandbox_id} not found or has no container")
 
-    # C2: Validate command length
-    if len(command) > settings.max_command_length:
+    # C2: Validate command length (infrastructure.sandbox.max_command_length)
+    max_command_length = await knob_int("max_command_length")
+    if len(command) > max_command_length:
         raise ValueError(
-            f"Command exceeds max length ({settings.max_command_length} chars)"
+            f"Command exceeds max length ({max_command_length} chars)"
         )
 
     # Resolve CWD: explicit param > server cache > default
@@ -1130,7 +1133,9 @@ async def destroy_sandbox(
                 logger.warning("Memory capture skipped for %s: %s", sandbox_id, exc)
 
         if graceful:
-            await asyncio.to_thread(container.stop, timeout=settings.shutdown_timeout_seconds + 10)
+            await asyncio.to_thread(
+                container.stop, timeout=await knob_int("shutdown_timeout_seconds") + 10
+            )
         else:
             await asyncio.to_thread(container.kill)
 

@@ -69,7 +69,10 @@ async def test_concurrent_claim_does_not_double_assign_warm_box(monkeypatch):
     from orchestrator import pool
 
     store = InMemorySandboxStore()
-    monkeypatch.setattr(pool, "_pool_enabled", lambda: True)
+    async def _enabled() -> bool:
+        return True
+
+    monkeypatch.setattr(pool, "_pool_enabled", _enabled)
     monkeypatch.setattr("orchestrator.sandbox_manager._get_store", lambda: store)
     monkeypatch.setattr("orchestrator.sandbox_manager._proxy_url_for", lambda sid: None)
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: object())

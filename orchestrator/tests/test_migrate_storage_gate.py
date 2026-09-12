@@ -16,7 +16,9 @@ async def test_noncore_without_shared_home_never_enters_s3_migration(monkeypatch
     client = SimpleNamespace(containers=SimpleNamespace(get=lambda _: old))
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: client)
     monkeypatch.setattr(migrate, "current_image", lambda *_: SimpleNamespace(tag="new", image_id="new"))
-    monkeypatch.setattr(migrate.settings, "enable_s3_migrate", True)
+    from tests.conftest import seed_sandbox_knobs
+
+    seed_sandbox_knobs({"enable_s3_migrate": True})
     async def forbidden(*args, **kwargs):
         pytest.fail("Noncore entered S3 migration without a verified hot-sync lifecycle")
     monkeypatch.setattr(migrate, "_migrate_s3_ordered", forbidden)

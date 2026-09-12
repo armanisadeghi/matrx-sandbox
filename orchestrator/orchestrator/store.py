@@ -10,6 +10,7 @@ import json
 import logging
 from abc import ABC, abstractmethod
 from datetime import datetime, timedelta, timezone
+from typing import Any
 from uuid import UUID
 
 from orchestrator.models import SandboxResponse, SandboxStatus
@@ -25,6 +26,10 @@ def _explicit_organization_id(sandbox: SandboxResponse) -> UUID:
         raise ValueError(
             "sandbox persistence requires an explicit organization_id"
         ) from exc
+
+
+class KnobSourceUnavailableError(RuntimeError):
+    """This store has no database to read ``platform.feature_knob`` from."""
 
 
 class SandboxStore(ABC):
@@ -62,6 +67,15 @@ class SandboxStore(ABC):
         retention sweep behind "finished sandboxes disappear after a while".
         Returns the affected sandbox_ids."""
         return []
+
+    @abstractmethod
+    async def feature_knobs(self, feature: str) -> dict[str, Any]:
+        """Every ``platform.feature_knob`` row for one feature, as ``{key: value}``.
+
+        The store is the orchestrator's ONE platform-database connection, so
+        it is also where the fleet's settings are read (orchestrator/knobs.py).
+        Raises :class:`KnobSourceUnavailableError` when this store has no
+        database to ask."""
 
     @abstractmethod
     async def update_status(self, sandbox_id: str, status: SandboxStatus) -> bool:
@@ -179,6 +193,26 @@ class InMemorySandboxStore(SandboxStore):
         self._deleted: dict[str, datetime] = {}
         # user_id -> {path -> (content, updated_at)}
         self._memory: dict[str, dict[str, tuple[str, datetime]]] = {}
+        # feature -> {key: value}. EMPTY on purpose: an in-memory store has no
+        # platform database, so it carries no settings until a test (or a
+        # deliberate local-dev boot) seeds them with ``seed_feature_knobs``.
+        # A silent default here would be the env var in a new coat.
+        self._feature_knobs: dict[str, dict[str, Any]] = {}
+
+    def seed_feature_knobs(self, feature: str, values: dict[str, Any]) -> None:
+        """The test seam: give this store the settings a database would hold."""
+        self._feature_knobs[feature] = dict(values)
+
+    async def feature_knobs(self, feature: str) -> dict[str, Any]:
+        try:
+            return dict(self._feature_knobs[feature])
+        except KeyError:
+            raise KnobSourceUnavailableError(
+                f"the in-memory sandbox store carries no settings for {feature!r}. "
+                f"It has no platform database to read platform.feature_knob from: "
+                f"use MATRX_SANDBOX_STORE=postgres, or seed the values explicitly "
+                f"with store.seed_feature_knobs({feature!r}, {{...}}) in a test."
+            ) from None
 
     async def save(self, sandbox: SandboxResponse) -> None:
         _explicit_organization_id(sandbox)
@@ -410,6 +444,22 @@ class PostgresSandboxStore(SandboxStore):
             # concurrent failure may already have published a healthy pool.
             await self._discard_pool(attempted_pool)
             return await fn(*args, **kwargs)
+
+    async def feature_knobs(self, feature: str) -> dict[str, Any]:
+        async def _fetch() -> dict[str, Any]:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                rows = await conn.fetch(
+                    "SELECT key, value FROM platform.feature_knob WHERE feature = $1",
+                    feature,
+                )
+            # asyncpg hands jsonb back as text unless a codec is installed.
+            return {
+                str(r["key"]): (json.loads(r["value"]) if isinstance(r["value"], str) else r["value"])
+                for r in rows
+            }
+
+        return await self._execute_with_retry(_fetch)
 
     async def save(self, sandbox: SandboxResponse) -> None:
         organization_id = _explicit_organization_id(sandbox)

@@ -34,9 +34,20 @@ import asyncio
 import logging
 import time
 
-from orchestrator.config import settings
+from orchestrator.knobs import knob_bool, knob_int
 
 logger = logging.getLogger(__name__)
+
+
+async def _auto_migrate_enabled() -> bool:
+    """`infrastructure.sandbox.auto_migrate` — a setting, never an env var
+    (MATRX_AUTO_MIGRATE until 2026-09-11). An unreadable setting is logged
+    and counts as OFF for this tick: the reaper must keep sweeping."""
+    try:
+        return await knob_bool("auto_migrate")
+    except Exception as exc:
+        logger.warning("Reaper: auto_migrate setting unreadable this tick (treated as off): %s", exc)
+        return False
 
 # How often to sweep for expired sandboxes. 60s is responsive enough that
 # "at 2h it tears down" feels accurate without hammering Docker/Postgres.
@@ -113,18 +124,19 @@ async def _reap_once() -> dict:
     # Retention sweep: rows finished (stopped/expired/failed) for more than
     # terminal_retention_days get soft-deleted so every UI's default list
     # forgets them. Resumable until then; the row + per-user volume survive.
-    if settings.terminal_retention_days > 0:
-        try:
-            purged = await store.purge_terminal_older_than(settings.terminal_retention_days)
+    try:
+        retention_days = await knob_int("terminal_retention_days")
+        if retention_days > 0:
+            purged = await store.purge_terminal_older_than(retention_days)
             summary["retention_purged"] = len(purged)
             if purged:
                 logger.info(
                     "Retention sweep: soft-deleted %d finished sandbox(es) older "
                     "than %dd: %s",
-                    len(purged), settings.terminal_retention_days, ", ".join(purged),
+                    len(purged), retention_days, ", ".join(purged),
                 )
-        except Exception as exc:
-            logger.warning("Reaper: retention sweep failed this tick: %s", exc)
+    except Exception as exc:
+        logger.warning("Reaper: retention sweep failed this tick: %s", exc)
 
     # Liveness reconcile every tick — two jobs the TTL sweep above can't do:
     #   1. Mark rows whose container has VANISHED as stopped within ~60s,
@@ -155,14 +167,16 @@ async def _reap_once() -> dict:
 
     # Opt-in rolling auto-migration: when enabled, migrate a few drifted boxes
     # each sweep (busy ones deferred to the next sweep). Off by default.
-    if settings.auto_migrate and summary.get("drifted"):
+    if summary.get("drifted") and await _auto_migrate_enabled():
         now = time.monotonic()
         if now < _migrate_backoff["next_attempt"]:
             summary["auto_migrate_deferred_until"] = _migrate_backoff["next_attempt"]
         else:
             try:
                 from orchestrator.migrate import migrate_all_drifted
-                mig = await migrate_all_drifted(store=store, max_per_pass=settings.migrate_max_per_pass)
+                mig = await migrate_all_drifted(
+                    store=store, max_per_pass=await knob_int("migrate_max_per_pass")
+                )
                 summary["auto_migrated"] = len(mig.get("migrated", []))
                 # Back off only on genuine FAILURES (broken/missing image), not
                 # on busy 'deferred' boxes which should keep retrying each sweep.

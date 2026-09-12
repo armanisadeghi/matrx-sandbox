@@ -33,20 +33,30 @@ class Settings(BaseSettings):
     # Docker
     sandbox_image: str = "matrx-sandbox:latest"
     docker_network: str = "bridge"
-    container_cpu_limit: float = 2.0        # CPU cores
-    container_memory_limit: str = "4g"
-    container_disk_limit: str = "20g"
 
     # AWS / S3
     s3_bucket: str = ""
     s3_region: str = "us-east-1"
 
-    # Sandbox defaults
-    max_session_duration_seconds: int = 7200  # 2 hours
-    shutdown_timeout_seconds: int = 30
-    healthcheck_interval_seconds: int = 30
-    max_command_length: int = 10000
-    command_timeout_seconds: int = 300
+    # ── The fleet's SHAPE is not here — it is settings (USD-5) ──────────────
+    # Container CPU/memory limits, session lifetime, shutdown allowance, the
+    # command-length cap, the warm pool, retention and the auto-migrate gates
+    # are `platform.feature_knob` rows under `infrastructure.sandbox`, read
+    # through orchestrator/knobs.py (seeded by aidream migration 0636). Arman,
+    # 2026-09-10: "Never an env var. Env values are only for secrets, not for
+    # controlling behavior." They were MATRX_CONTAINER_CPU_LIMIT,
+    # MATRX_CONTAINER_MEMORY_LIMIT, MATRX_MAX_SESSION_DURATION_SECONDS,
+    # MATRX_SHUTDOWN_TIMEOUT_SECONDS, MATRX_MAX_COMMAND_LENGTH,
+    # MATRX_WARM_POOL_SIZE / _TEMPLATE / _TEMPLATES, MATRX_AUTO_MIGRATE,
+    # MATRX_MIGRATE_MAX_PER_PASS, MATRX_TERMINAL_RETENTION_DAYS,
+    # MATRX_MIGRATE_RECENT_HEARTBEAT_SECONDS and MATRX_ENABLE_S3_MIGRATE until
+    # 2026-09-11; setting any of them now does nothing. Three had NO reader at
+    # all and were deleted rather than converted: MATRX_CONTAINER_DISK_LIMIT,
+    # MATRX_HEALTHCHECK_INTERVAL_SECONDS, MATRX_COMMAND_TIMEOUT_SECONDS.
+    #
+    # What stays below names the ENVIRONMENT (secrets, endpoints, host
+    # identity, paths) or this process's own launcher (debug reload, log
+    # format) — never product behaviour.
 
     # ── Sandbox store persistence — NO DEFAULT, ON PURPOSE ──────────────────
     # This used to default to "memory". A host that never set (or misspelled)
@@ -109,47 +119,9 @@ class Settings(BaseSettings):
             if value.strip()
         }
 
-    # ── Warm pool ───────────────────────────────────────────────────────────
-    # Keep N pre-booted, unclaimed sandboxes ready so "launch from a chat
-    # window" is a fast CLAIM (adopt an already-running box) instead of a cold
-    # create. The user's spec: "2 warm instances ready; when one is launched,
-    # prepare another." Disabled by default (size 0) so EC2/other orchestrators
-    # are unaffected; the hosted orchestrator sets MATRX_WARM_POOL_SIZE=2.
-    warm_pool_size: int = 0             # env var: MATRX_WARM_POOL_SIZE
-    warm_pool_template: str = "slim"    # which template to pre-warm (single-template fallback)
-    # Optional per-template warm pool, e.g. "slim:1,aidream:1" (MATRX_WARM_POOL_TEMPLATES).
-    # When set it takes precedence: the pool keeps EACH listed template warmed to
-    # its own count, so heavy templates users actually launch (aidream) are
-    # claim-fast too — not just slim. A bare name ("aidream") uses warm_pool_size.
-    warm_pool_templates: str = ""       # env var: MATRX_WARM_POOL_TEMPLATES
     # Sentinel user_id stamped on unclaimed warm boxes (no real owner yet).
+    # An identity, not a setting.
     warm_pool_sentinel_user: str = "00000000-0000-0000-0000-000000000000"
-
-    # Zero-drift auto-migration. When MATRX_AUTO_MIGRATE=1 the reaper, each
-    # sweep, migrates drifted boxes onto the current image (busy boxes deferred
-    # to the next sweep). Default OFF so migration is opt-in per deployment until
-    # an operator flips it on; per-box POST /sandboxes/{id}/migrate and
-    # POST /migrate-all work regardless. migrate_max_per_pass caps swaps per
-    # sweep so a big drift wave rolls gradually rather than all at once.
-    auto_migrate: bool = False          # env var: MATRX_AUTO_MIGRATE
-    migrate_max_per_pass: int = 2       # env var: MATRX_MIGRATE_MAX_PER_PASS
-    # Retention for FINISHED sandboxes. A stopped/expired/failed row stays
-    # visible (and resumable) this many days after it stopped, then the reaper
-    # soft-deletes it (sets deleted_at) so every UI's default list drops it.
-    # The row itself is kept for audit; per-user volumes are untouched. 0
-    # disables the sweep entirely.
-    terminal_retention_days: int = 7    # env var: MATRX_TERMINAL_RETENTION_DAYS
-    # A box is treated as "in use" (migration deferred) if it has in-flight tool
-    # calls OR a heartbeat newer than this many seconds — so a recently-active
-    # session is never interrupted by a rolling migrate.
-    migrate_recent_heartbeat_seconds: int = 120  # env var: MATRX_MIGRATE_RECENT_HEARTBEAT_SECONDS
-    # S3-backed (EC2-tier) in-place migration. OFF by default: the swap must
-    # flush the old box to S3 BEFORE booting the new one, or the new box would
-    # hot-sync stale S3 and lose the final edits. The code path exists
-    # (migrate._migrate_s3_ordered) but MUST be validated end-to-end against a
-    # throwaway EC2/S3 sandbox before enabling. When off, S3 boxes are refused
-    # (unsupported_storage), exactly as before.
-    enable_s3_migrate: bool = False     # env var: MATRX_ENABLE_S3_MIGRATE
 
     # ── AI Dream integration ────────────────────────────────────────────────
     # Sandboxes need a way to call the AI Dream backend (cld_files,

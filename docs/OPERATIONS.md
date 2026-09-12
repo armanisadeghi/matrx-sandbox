@@ -467,16 +467,19 @@ Should show 25+ keys with `SUPABASE_MATRIX_JWT_SECRET` among them. If it doesn't
 
 Everything below is **live state that is NOT captured by the matrx-sandbox repo**. If this server were rebuilt from the repos alone, these would be missing. Recorded here so they're replicable.
 
-### 1. Warm-pool config (hosted orchestrator `.env`)
+### 1. Warm-pool config — now a SETTING, not host state (2026-09-11)
 
-Appended to `/srv/apps/sandbox-orchestrator/.env` (not in any git repo):
-
-```
-MATRX_WARM_POOL_SIZE=2
-MATRX_WARM_POOL_TEMPLATE=slim
-```
-
-This makes the orchestrator keep 2 pre-booted, unclaimed `slim` boxes ready so `POST /sandboxes/claim` adopts one in ~0.5s. Default is `0` (disabled) — so any orchestrator without this set behaves as before. To replicate on the EC2 orchestrator, set the same vars in its systemd env (see "Tier env var" pattern above). Code: `orchestrator/pool.py`, wired in `orchestrator/main.py` lifespan.
+Historically appended to `/srv/apps/sandbox-orchestrator/.env` as
+`MATRX_WARM_POOL_SIZE=2` / `MATRX_WARM_POOL_TEMPLATE=slim` (and mirrored in the
+EC2 systemd unit). Since 2026-09-11 (USD-5, "Never an env var") the warm pool —
+with every other fleet-shape value — is a `platform.feature_knob` row under
+`infrastructure.sandbox` (`warm_pool_size` = 2, `warm_pool_template` = slim,
+seeded by aidream migration 0636 at the values both tiers were running). Both
+orchestrators read the same rows through `orchestrator/knobs.py`, so this is
+no longer "live state not captured by the repo": rebuild a host and it inherits
+the setting. The env lines still present in the hosted `.env` and the EC2 unit
+are inert and can be deleted at the next touch. Code: `orchestrator/pool.py`,
+wired in `orchestrator/main.py` lifespan.
 
 ### 2. `user_memory` migration applied to Supabase
 
