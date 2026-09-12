@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from orchestrator.hosted_migration import HostedMigrationStateError
-from orchestrator.hosted_runtime import _disconnect_paused_source, _endpoint_matches, _hold_runtime_config, _pin_helper_image, _source_reconnect_kwargs, migrate_hosted, replacement_config, source_endpoint_identity
+from orchestrator.hosted_runtime import _disconnect_paused_source, _endpoint_matches, _hold_runtime_config, _pin_helper_image, _reconnect_paused_source, _source_reconnect_kwargs, migrate_hosted, replacement_config, source_endpoint_identity
 
 
 def _old(*, explicit_mac: str = "", binds=None, ipam_config=None):
@@ -115,6 +115,40 @@ async def test_network_name_reuse_cannot_disconnect_the_wrong_immutable_network(
     client = SimpleNamespace(networks=SimpleNamespace(get=lambda _name: network))
     with pytest.raises(HostedMigrationStateError, match="network ID"):
         await _disconnect_paused_source({"source_endpoint": {"network": "bridge", "network_id": "original-network"}}, old, client)
+
+
+@pytest.mark.asyncio
+async def test_reconnect_retry_accepts_already_valid_dynamic_endpoint_without_duplicate_connect():
+    """Crash after Docker connect must not make recovery connect the endpoint twice."""
+    old = _old()
+    old.reload = lambda: None
+    identity = source_endpoint_identity(old, SimpleNamespace(id="network-id", attrs={"IPAM": {"Config": []}}))
+    old.attrs["NetworkSettings"]["Networks"]["bridge"]["IPAddress"] = "172.17.0.23/16"
+    old.attrs["NetworkSettings"]["Networks"]["bridge"]["IPPrefixLen"] = 16
+    connect_calls = []
+    network = SimpleNamespace(id="network-id", connect=lambda *_args, **_kwargs: connect_calls.append(True))
+    client = SimpleNamespace(networks=SimpleNamespace(get=lambda _name: network))
+    record = {"source_endpoint": identity,
+              "network_disconnect_receipt": {"old_id": old.id, "absent": True}}
+
+    await _reconnect_paused_source(record, old, client)
+    assert connect_calls == []
+
+
+@pytest.mark.asyncio
+async def test_reconnect_retry_refuses_already_attached_wrong_aliases():
+    old = _old()
+    old.reload = lambda: None
+    identity = source_endpoint_identity(old, SimpleNamespace(id="network-id", attrs={"IPAM": {"Config": []}}))
+    old.attrs["NetworkSettings"]["Networks"]["bridge"]["Aliases"] = ["wrong"]
+    old.attrs["NetworkSettings"]["Networks"]["bridge"]["IPPrefixLen"] = 16
+    network = SimpleNamespace(id="network-id", connect=lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("must not reconnect")))
+    client = SimpleNamespace(networks=SimpleNamespace(get=lambda _name: network))
+    record = {"source_endpoint": identity,
+              "network_disconnect_receipt": {"old_id": old.id, "absent": True}}
+
+    with pytest.raises(HostedMigrationStateError, match="disagrees"):
+        await _reconnect_paused_source(record, old, client)
 
 
 def test_replacement_refuses_explicit_mac_that_cannot_survive_overlap():

@@ -240,6 +240,15 @@ async def _reconnect_paused_source(record, old, client):
     network = await _docker(client.networks.get, identity["network"])
     if getattr(network, "id", None) != identity["network_id"]:
         raise HostedMigrationStateError("source network name no longer binds the journaled network ID")
+    # A process may die after Docker connects the endpoint but before recovery
+    # records/resumes it. Treat the already-valid endpoint as the receipt;
+    # never issue a duplicate connect that Docker rejects as name-conflicting.
+    await _docker(old.reload)
+    existing = old.attrs.get("NetworkSettings", {}).get("Networks", {}).get(identity["network"])
+    if existing is not None:
+        if not _endpoint_matches(existing, identity):
+            raise HostedMigrationStateError("existing source endpoint disagrees with reconnect receipt")
+        return
     kwargs = _source_reconnect_kwargs(identity)
     await _docker(network.connect, old, **kwargs)
     await _docker(old.reload)
