@@ -9,7 +9,7 @@ from orchestrator.sandbox_manager import _get_store
 from orchestrator.storage_layout import user_volume_name
 
 _COLLECTION_PATHS = frozenset({"claim"})
-_EXCLUSIVE_MIGRATION_ACTIONS = frozenset({"migrate", "refresh-platform-env"})
+_SELF_LOCKING_ACTIONS = frozenset({"migrate", "refresh-platform-env", "reset", "resume", "destroy", "wipe"})
 
 
 def _sandbox_id(scope: dict) -> str | None:
@@ -20,17 +20,16 @@ def _sandbox_id(scope: dict) -> str | None:
     if parts[2] in _COLLECTION_PATHS:
         return None
     # These endpoints acquire the migration's exclusive locks themselves.
-    if len(parts) >= 4 and parts[3] in _EXCLUSIVE_MIGRATION_ACTIONS:
+    if scope.get("method") == "DELETE":
+        return None
+    if len(parts) >= 4 and parts[3] in _SELF_LOCKING_ACTIONS:
         return None
     return parts[2]
 
 
 def _authoritative_home(sandbox) -> str | None:
-    volume = getattr(sandbox, "persistence_volume", None)
-    if volume:
-        return volume
-    user_id = getattr(sandbox, "user_id", None)
-    return user_volume_name(user_id) if user_id else None
+    from orchestrator.home_identity import home_key
+    return home_key(sandbox)
 
 
 class HostedOperationLeaseMiddleware:
@@ -39,7 +38,7 @@ class HostedOperationLeaseMiddleware:
         self.app = app
 
     async def __call__(self, scope, receive, send):
-        if scope["type"] not in {"http", "websocket"} or settings.host_tier != "hosted":
+        if scope["type"] not in {"http", "websocket"} or settings.host_tier not in {"hosted", "ec2"}:
             await self.app(scope, receive, send); return
         sandbox_id = _sandbox_id(scope)
         if not sandbox_id:

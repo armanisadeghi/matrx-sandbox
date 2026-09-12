@@ -88,7 +88,7 @@ def digest(path):
         for chunk in iter(lambda:f.read(1024*1024), b""): h.update(chunk)
     return h.hexdigest()
 def acl(path):
-    p=subprocess.run(["getfacl","-h","-cpn","--",path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+    p=subprocess.run(["getfacl","-P","-cpn","--",path], stdout=subprocess.PIPE, stderr=subprocess.PIPE)
     if p.returncode: raise SystemExit("getfacl failed for %s" % path)
     return p.stdout.decode("utf-8", "surrogateescape")
 entries=[]; inodes={}
@@ -221,8 +221,8 @@ async def snapshot_volume(client: Any, *, volume: str, backup_volume: str, image
     copy = _shell_program("""
 python3 -c 'import os,sys; sys.exit("reserved backup volume is not empty" if os.listdir("/backup") else 0)'
 mkdir /backup/payload
-tar --create --file=/backup/archive.tar --numeric-owner --xattrs --acls --sparse -C /source .
-tar --extract --file=/backup/archive.tar --numeric-owner --xattrs --acls --sparse -C /backup/payload
+tar --create --format=posix --file=/backup/archive.tar --numeric-owner --xattrs --acls --sparse -C /source .
+tar --extract --file=/backup/archive.tar --numeric-owner --xattrs --xattrs-include='*' --acls --sparse -C /backup/payload
 printf 'HOSTED_BACKUP_SOURCE='
 """ + _manifest_command("/source") + "\nprintf '\\nHOSTED_BACKUP_BACKUP='\n" + _manifest_command("/backup/payload")
         + "\nprintf '\\nHOSTED_BACKUP_ARCHIVE='\nsha256sum -- /backup/archive.tar\nsync -f /backup\n")
@@ -256,6 +256,36 @@ printf 'HOSTED_BACKUP_SOURCE='
     }
 
 
+async def verify_volume_unchanged(client: Any, *, receipt: dict, image: str) -> dict[str, Any]:
+    """Prove a retained named home still equals its immutable backup manifest.
+
+    This is intentionally a read-only helper invocation.  A migration target is
+    held/paused before this is called, so this receipt is the pre-CAS and
+    rollback proof that neither image has changed the shared user home.
+    """
+    _require_image_id(image)
+    source_manifest, backup_manifest = _validate_receipt(receipt, image)
+    if source_manifest != backup_manifest:
+        raise HostedBackupError("backup source and payload manifests disagree")
+    source_name = receipt["source_volume"]["name"]
+    _, source_identity = await _get_volume(client, source_name)
+    if source_identity != receipt["source_volume"]:
+        raise HostedBackupError("source volume identity no longer matches Docker")
+    output = await _run_helper(
+        client,
+        image=image,
+        volumes={source_name: {"bind": "/source", "mode": "ro"}},
+        command=_shell_program("printf '" + _RESULT_PREFIX + "'\n" + _manifest_command("/source") + "\nprintf '\\n'"),
+    )
+    current = _read_manifest(output)
+    if current != source_manifest:
+        raise HostedBackupError("shared home manifest changed while migration target was held")
+    return {
+        "source_volume": source_identity,
+        "manifest_sha256": receipt["source_manifest_sha256"],
+    }
+
+
 async def restore_volume(client: Any, *, receipt: dict, image: str) -> None:
     """Restore only a previously verified backup; validate before touching target."""
     _require_image_id(image)
@@ -277,7 +307,7 @@ async def restore_volume(client: Any, *, receipt: dict, image: str) -> None:
     # deleting anything. The read-only payload is not the archive we extract.
     restore = _shell_program("printf '%s  /backup/archive.tar\\n' '" + receipt["archive_sha256"] + "' | sha256sum --check --status\n" + """
 find /target -mindepth 1 -maxdepth 1 -exec rm -rf -- {} +
-tar --extract --file=/backup/archive.tar --numeric-owner --xattrs --acls --sparse -C /target
+tar --extract --file=/backup/archive.tar --numeric-owner --xattrs --xattrs-include='*' --acls --sparse -C /target
 sync -f /target
 printf '""" + _RESULT_PREFIX + "'\n" + _manifest_command("/target") + "\n")
     verified = _read_manifest(await _run_helper(client, image=image, volumes={source_name: {"bind": "/target", "mode": "rw"}, backup_name: {"bind": "/backup", "mode": "ro"}}, command=restore))

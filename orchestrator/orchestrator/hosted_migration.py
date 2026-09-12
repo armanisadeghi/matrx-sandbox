@@ -20,9 +20,11 @@ STATE_DIR = Path("/var/lib/matrx-sandbox/hosted-migrations")
 TERMINAL_PHASES = frozenset({"committed", "recovered"})
 VALID_PHASES = frozenset({
     "admitted", "old_stopped", "backup_verified", "target_create_intent",
-    "target_created", "target_start_intent", "target_ready", "names_cut_over",
-    "commit_intent", "commit_uncertain", "committed", "recovered", "recovery_required",
+    "target_created", "target_start_intent", "target_ready", "target_quiesce_intent",
+    "postboot_verified", "names_cut_over", "commit_intent", "activation_intent",
+    "commit_uncertain", "committed", "recovered", "recovery_required",
     "backup_intent", "rename_intent", "rollback_intent", "restore_intent",
+    "network_disconnect_intent", "network_disconnected",
 })
 _RECORD_SCHEMA_VERSION = 1
 _REQUIRED_RECORD_FIELDS = frozenset({
@@ -33,12 +35,39 @@ _REQUIRED_RECORD_FIELDS = frozenset({
 })
 
 
+def _unescape_mountinfo(value: str) -> str:
+    """Decode Linux mountinfo's octal path escaping without shell parsing."""
+    return re.sub(r"\\([0-7]{3})", lambda match: chr(int(match.group(1), 8)), value)
+
+
+def _mountinfo_has_mountpoint(mountinfo: str, path: Path) -> bool:
+    """Recognize bind mounts, which deliberately fail ``os.path.ismount``."""
+    # Mount namespaces address the literal mount target.  Resolving host-side
+    # symlinks (for example macOS /var -> /private/var in tests) would compare
+    # a different namespace path.
+    expected = os.path.abspath(path)
+    for line in mountinfo.splitlines():
+        fields = line.split()
+        # mountinfo has mandatory fields through mount-point at index 4; later
+        # optional propagation fields cannot move that position.
+        if len(fields) >= 6 and _unescape_mountinfo(fields[4]) == expected:
+            return True
+    return False
+
+
+def _has_required_state_mount(path: Path) -> bool:
+    try:
+        return _mountinfo_has_mountpoint(Path("/proc/self/mountinfo").read_text(), path)
+    except OSError:
+        return False
+
+
 def recovery_action(record: dict[str, Any], *, db_container_id: str | None,
                     target_exists_ready: bool) -> str:
     """Choose recovery without ever inventing a backup or trusting DB alone.
 
-    ``restart_old`` means original home only; ``restore_then_restart_old`` is
-    permitted solely after a verified snapshot receipt. ``preserve_fenced`` is
+    ``resume_old`` means the original *paused* process only; it never starts a
+    container.  ``preserve_fenced`` is
     deliberately boring: ambiguous CAS/cutover state must remain inspectable.
     """
     phase = record.get("phase")
@@ -48,10 +77,14 @@ def recovery_action(record: dict[str, Any], *, db_container_id: str | None,
         return "preserve_fenced"
     if record.get("target_id") and db_container_id == record["target_id"]:
         return "finalize_committed" if target_exists_ready else "preserve_fenced"
-    if phase in {"admitted", "old_stopped", "backup_intent"}:
-        return "restart_old"
-    if phase in {"backup_verified", "target_create_intent", "target_created", "target_start_intent", "target_ready", "rename_intent", "names_cut_over", "commit_intent", "commit_uncertain", "rollback_intent", "restore_intent"}:
-        return "restore_then_restart_old" if record.get("backup_receipt") else "preserve_fenced"
+    if phase in {"admitted", "old_stopped", "backup_intent"} and not record.get("backup_receipt"):
+        return "resume_pre_copy_source"
+    if phase in {"backup_verified",
+                 "network_disconnect_intent", "network_disconnected", "target_create_intent",
+                 "target_created", "target_start_intent", "target_ready", "target_quiesce_intent",
+                 "postboot_verified", "rename_intent", "names_cut_over", "commit_intent",
+                 "activation_intent", "commit_uncertain", "rollback_intent", "restore_intent"}:
+        return "resume_old" if record.get("backup_receipt") else "preserve_fenced"
     return "preserve_fenced"
 
 
@@ -66,7 +99,12 @@ def transition(record: dict[str, Any], phase: str, **fields: Any) -> dict[str, A
         "target_create_intent": {"target_name", "target_image", "operation_label"},
         "target_created": {"target_id"},
         "target_start_intent": {"target_id"},
+        "target_quiesce_intent": {"target_id"},
+        "postboot_verified": {"target_id", "postboot_verified_receipt"},
         "commit_intent": {"target_id"},
+        "activation_intent": {"target_id"},
+        "network_disconnect_intent": {"source_endpoint"},
+        "network_disconnected": {"source_endpoint", "network_disconnect_receipt"},
     }
     missing = [key for key in required.get(phase, set()) if not next_record.get(key)]
     if missing:
@@ -102,23 +140,81 @@ def validate_record(record: dict[str, Any]) -> None:
         raise HostedMigrationStateError("hosted migration journal source identity does not match volume")
     if record["row_identity"].get("sandbox_id") != record["sandbox_id"]:
         raise HostedMigrationStateError("hosted migration journal row identity does not match sandbox")
+    process = record.get("old_process_identity")
+    if process is not None and (not isinstance(process, dict) or not isinstance(process.get("pid"), int)
+                                or process["pid"] <= 0 or not isinstance(process.get("started_at"), str)
+                                or not process["started_at"]):
+        raise HostedMigrationStateError("hosted migration journal has invalid original process identity")
+    if "row_persistence_volume" in record and record["row_persistence_volume"] is not None and not isinstance(record["row_persistence_volume"], str):
+        raise HostedMigrationStateError("hosted migration journal has invalid row persistence identity")
+    if record.get("storage_kind") == "ec2_writable_layer":
+        if (record.get("source_home_key") != "layer-" + record["sandbox_id"]
+                or not isinstance(record.get("source_graph_driver"), dict)
+                or record["source_volume"] != "matrx-ec2-home-" + record["sandbox_id"]):
+            raise HostedMigrationStateError("writable-layer migration has invalid source identity")
+    elif record.get("storage_kind") not in {None, "named_volume"}:
+        raise HostedMigrationStateError("unknown migration storage kind")
+    if record["phase"] in {"network_disconnect_intent", "network_disconnected", "target_create_intent",
+                            "target_created", "target_start_intent", "target_ready", "target_quiesce_intent",
+                            "postboot_verified", "rename_intent", "names_cut_over", "commit_intent",
+                            "activation_intent", "commit_uncertain", "committed", "rollback_intent",
+                            "restore_intent"}:
+        endpoint = record.get("source_endpoint")
+        if (not isinstance(endpoint, dict) or not isinstance(endpoint.get("network"), str)
+                or not endpoint["network"] or not isinstance(endpoint.get("network_id"), str)
+                or not endpoint["network_id"]):
+            raise HostedMigrationStateError("migration journal has no source network identity")
+    if record["phase"] in {"network_disconnected", "target_create_intent", "target_created",
+                            "target_start_intent", "target_ready", "target_quiesce_intent", "postboot_verified",
+                            "rename_intent", "names_cut_over", "commit_intent", "activation_intent",
+                            "commit_uncertain", "committed", "rollback_intent", "restore_intent"}:
+        receipt = record.get("network_disconnect_receipt")
+        if (not isinstance(receipt, dict) or receipt.get("old_id") != record["old_id"]
+                or receipt.get("network_id") != record["source_endpoint"]["network_id"]):
+            raise HostedMigrationStateError("migration journal has no verified network disconnect receipt")
     if not isinstance(record.get("verify_timeout"), int) or record["verify_timeout"] <= 0:
         raise HostedMigrationStateError("hosted migration journal has invalid verify timeout")
     if not isinstance(record.get("stop_timeout"), int) or record["stop_timeout"] <= 0:
         raise HostedMigrationStateError("hosted migration journal has invalid stop timeout")
     post_backup = {
         "backup_verified", "target_create_intent", "target_created", "target_start_intent",
-        "target_ready", "rename_intent", "names_cut_over", "commit_intent",
+        "target_ready", "target_quiesce_intent", "postboot_verified", "rename_intent", "names_cut_over", "commit_intent", "activation_intent",
         "commit_uncertain", "committed", "rollback_intent", "restore_intent",
     }
     if record["phase"] in post_backup and not isinstance(record.get("backup_receipt"), dict):
         raise HostedMigrationStateError("hosted migration journal has no verified backup receipt")
+    if (record.get("storage_kind") != "ec2_writable_layer"
+            and record["phase"] in {"postboot_verified", "rename_intent", "names_cut_over",
+                                    "commit_intent", "activation_intent", "commit_uncertain", "committed"}
+            and not isinstance(record.get("pre_cas_home_receipt"), dict)):
+        raise HostedMigrationStateError("hosted migration has no held-target home manifest receipt")
     target_known = {
-        "target_created", "target_start_intent", "target_ready", "rename_intent",
-        "names_cut_over", "commit_intent", "commit_uncertain", "committed",
+        "target_created", "target_start_intent", "target_ready", "target_quiesce_intent",
+        "postboot_verified", "rename_intent", "names_cut_over", "commit_intent", "activation_intent", "commit_uncertain", "committed",
     }
     if record["phase"] in target_known and not isinstance(record.get("target_id"), str):
         raise HostedMigrationStateError("hosted migration journal has no target identity")
+    if record.get("storage_kind") == "ec2_writable_layer":
+        postboot_phases = {
+            "postboot_verified", "rename_intent", "names_cut_over", "commit_intent",
+            "commit_uncertain", "activation_intent", "committed",
+        }
+        if record["phase"] in postboot_phases:
+            receipt = record.get("postboot_verified_receipt")
+            backup = record.get("backup_receipt")
+            if not isinstance(receipt, dict) or not isinstance(backup, dict):
+                raise HostedMigrationStateError("EC2 promotion has no durable postboot verification receipt")
+            if (receipt.get("ok") is not True
+                    or receipt.get("operation") != record["operation_label"]
+                    or receipt.get("target_id") != record.get("target_id")
+                    or receipt.get("target_image") != record["target_image"]
+                    or receipt.get("manifest_sha256") != backup.get("manifest_sha256")):
+                raise HostedMigrationStateError("EC2 postboot verification receipt does not bind copied target")
+        if record["phase"] == "committed":
+            activation = record.get("activation_receipt")
+            if (not isinstance(activation, dict) or activation.get("target_id") != record.get("target_id")
+                    or activation.get("migration_state") != "active"):
+                raise HostedMigrationStateError("EC2 promotion has no durable active-target receipt")
 
 
 def _safe_component(value: str) -> None:
@@ -132,7 +228,7 @@ class HostedMigrationJournal:
 
     def ensure_ready(self) -> None:
         """Require real mounted state in production; tests use an injected root."""
-        if self.root == STATE_DIR and not os.path.ismount(self.root):
+        if self.root == STATE_DIR and not _has_required_state_mount(self.root):
             raise HostedMigrationStateError("hosted migration state mount is absent")
         try:
             st = self.root.lstat()
@@ -236,7 +332,7 @@ class HostedMigrationJournal:
 def hosted_fenced(sandbox_id: str) -> bool:
     """Cross-process fence; unavailable/corrupt hosted state is denial, never absence."""
     from orchestrator.config import settings
-    if settings.host_tier != "hosted":
+    if settings.host_tier not in {"hosted", "ec2"}:
         return False
     try:
         journal = HostedMigrationJournal()
@@ -249,10 +345,11 @@ def hosted_fenced(sandbox_id: str) -> bool:
 def hosted_volume_fenced(volume: str | None) -> bool:
     """Deny sibling lifecycle writes while any hosted migration owns its home."""
     from orchestrator.config import settings
-    if settings.host_tier != "hosted" or not volume:
+    if settings.host_tier not in {"hosted", "ec2"} or not volume:
         return False
     try:
         journal = HostedMigrationJournal(); journal.ensure_ready()
-        return any(record.get("source_volume") == volume for record in journal.pending())
+        return any(volume in {record.get("source_volume"), record.get("source_home_key")}
+                   for record in journal.pending())
     except HostedMigrationStateError:
         return True

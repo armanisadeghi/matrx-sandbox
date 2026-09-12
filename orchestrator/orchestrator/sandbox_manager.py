@@ -15,6 +15,7 @@ import shlex
 import uuid
 from datetime import datetime, timezone
 from typing import Any
+from types import SimpleNamespace
 
 import docker
 from docker.errors import DockerException, NotFound, APIError
@@ -25,9 +26,12 @@ from orchestrator.runtime_isolation import container_runtime_isolation
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.storage_layout import (
     StorageLocation,
+    ec2_home_volume_name,
+    ensure_ec2_home_volume,
     ensure_user_volume,
     resolve_user_storage,
     user_volume_name,
+    validate_ec2_home_volume,
 )
 from orchestrator.store import SandboxStore, create_store
 
@@ -333,6 +337,7 @@ async def create_sandbox(
     resources: dict | None = None,
     labels: dict | None = None,
     ttl_seconds: int | None = None,
+    persistence_from: str | None = None,
 ) -> SandboxResponse:
     """Create under the hosted home lease before the first durable write."""
     config = config or {}
@@ -343,17 +348,54 @@ async def create_sandbox(
         )
     location = resolve_user_storage(user_id, tier)
     sandbox_id = f"sbx-{uuid.uuid4().hex[:12]}"
-    if location.tier != "hosted":
-        return await _create_sandbox_unleased(
-            sandbox_id, user_id, organization_id, name, config, template,
-            template_version, tier, resources, labels, ttl_seconds,
+    persistence_reference: str | None = None
+    if persistence_from is not None:
+        if template == "development":
+            raise RuntimeError("development workspaces cannot adopt a named EC2 home")
+        prior = await _get_store().get(persistence_from)
+        if not prior or prior.user_id != user_id or prior.organization_id != organization_id:
+            raise RuntimeError("prior EC2 persistence row is missing or belongs to another user or organization")
+        prior_tier = getattr(prior.tier, "value", prior.tier)
+        if location.tier != "ec2" or prior_tier != "ec2":
+            raise RuntimeError("prior persistence may only be reused by the matching EC2 sandbox")
+        reference = getattr(prior, "persistence_volume", None)
+        if not reference or reference.startswith("host:"):
+            raise RuntimeError("prior EC2 sandbox has no reusable named durable home")
+        persistence_reference = await asyncio.to_thread(
+            validate_ec2_home_volume, _get_docker_client(), reference, prior
         )
     from orchestrator.hosted_operation_lease import hosted_operation_lease
-    volume = user_volume_name(user_id)
-    async with hosted_operation_lease(sandbox_id, volume):
+    if persistence_reference:
+        home_key = persistence_reference
+    elif location.tier == "hosted":
+        home_key = user_volume_name(user_id)
+    elif template == "development":
+        # Keep development binds in the same canonical lock namespace, using
+        # the hashed bind identity rather than a path-shaped lock key.
+        from orchestrator.home_identity import home_key as canonical_home_key
+        workspace_key = str(config.get("workspace_key") or "primary")
+        home_key = canonical_home_key(SimpleNamespace(
+            persistence_volume=f"host:{workspace_key}", sandbox_id=sandbox_id, tier="ec2", user_id=user_id
+        ))
+    else:
+        home_key = ec2_home_volume_name(sandbox_id)
+    async with hosted_operation_lease(sandbox_id, home_key, lifecycle=True):
+        if persistence_reference:
+            prior = await _get_store().get(persistence_from)
+            life = await _get_store().get_lifecycle(persistence_from)
+            if (not prior or not life or life.get("deleted")
+                    or prior.user_id != user_id or prior.organization_id != organization_id
+                    or prior.persistence_volume != persistence_reference
+                    or getattr(prior.status, "value", prior.status) not in {"stopped", "expired", "failed"}):
+                raise RuntimeError("prior home routing is not a retained terminal workspace")
+            await asyncio.to_thread(validate_ec2_home_volume, _get_docker_client(), persistence_reference, prior)
+            attached = await asyncio.to_thread(_get_docker_client().containers.list, all=True,
+                                               filters={"volume": persistence_reference})
+            if attached:
+                raise RuntimeError("retained EC2 home is already attached; refusing concurrent reuse")
         return await _create_sandbox_unleased(
             sandbox_id, user_id, organization_id, name, config, template,
-            template_version, tier, resources, labels, ttl_seconds,
+            template_version, tier, resources, labels, ttl_seconds, persistence_reference,
         )
 
 
@@ -369,6 +411,7 @@ async def _create_sandbox_unleased(
     resources: dict | None = None,
     labels: dict | None = None,
     ttl_seconds: int | None = None,
+    persistence_reference: str | None = None,
 ) -> SandboxResponse:
     """Create and start a new sandbox container for a user.
 
@@ -412,15 +455,31 @@ async def _create_sandbox_unleased(
         # ── Resolve persistence location for this (user, tier) pair ───────────
         location: StorageLocation = resolve_user_storage(user_id, tier)
         volumes: dict[str, dict] = {}
+        reusing_home = bool(persistence_reference)
         if location.tier == "hosted":
             # Hosted tier: per-user Docker volume mounted at /home/agent.
             # Volume survives container destruction; subsequent sandboxes for
             # the same user see the same home dir.
+            try:
+                await asyncio.to_thread(client.volumes.get, user_volume_name(user_id))
+                reusing_home = True
+            except NotFound:
+                pass
             volume_name = await asyncio.to_thread(ensure_user_volume, client, user_id)
             volumes[volume_name] = {"bind": "/home/agent", "mode": "rw"}
             sandbox.persistence_volume = volume_name
             logger.info(
                 "Hosted-tier sandbox %s: mounting user volume %s -> /home/agent",
+                sandbox_id, volume_name,
+            )
+        elif location.tier == "ec2" and template != "development":
+            volume_name = persistence_reference or await asyncio.to_thread(
+                ensure_ec2_home_volume, client, sandbox_id, user_id, organization_id
+            )
+            volumes[volume_name] = {"bind": "/home/agent", "mode": "rw"}
+            sandbox.persistence_volume = volume_name
+            logger.info(
+                "EC2 sandbox %s: mounting durable per-sandbox home %s -> /home/agent",
                 sandbox_id, volume_name,
             )
         elif template == "development":
@@ -429,6 +488,7 @@ async def _create_sandbox_unleased(
             workspace_path = (workspace_root / workspace_key).resolve()
             if workspace_path.parent != workspace_root:
                 raise RuntimeError("internal development workspace escapes configured root")
+            reusing_home = workspace_path.exists()
             workspace_path.mkdir(mode=0o700, parents=True, exist_ok=True)
             os.chown(workspace_path, 1000, 1000)
             volumes[str(workspace_path)] = {"bind": "/home/agent", "mode": "rw"}
@@ -718,6 +778,10 @@ async def _create_sandbox_unleased(
         # entry. Same shape filtering as above (str/int/float, no bools).
         for k, v in secrets_env.items():
             env[k] = v
+        if reusing_home:
+            # Storage identity is server-owned. Caller env/secrets may not
+            # re-enable hydration over an already retained home.
+            env["SANDBOX_MIGRATION"] = "1"
 
         if template == "development":
             github_token_keys = (
@@ -811,7 +875,7 @@ async def _create_sandbox_unleased(
         # Hydrate the user's central memory into .matrx/memory/ so a fresh box
         # already knows the user/projects/preferences. Best-effort: a memory
         # failure must never fail the create. Only when the box actually came up.
-        if sandbox.status == SandboxStatus.READY:
+        if sandbox.status == SandboxStatus.READY and not reusing_home:
             try:
                 from orchestrator.memory_sync import hydrate_memory_into_container
                 await hydrate_memory_into_container(container, user_id, store)
@@ -1141,7 +1205,15 @@ async def destroy_sandbox(
     sandbox = await _get_store().get(sandbox_id)
     if not sandbox:
         return False
-    volume = getattr(sandbox, "persistence_volume", None)
+    from orchestrator.home_identity import home_key
+    volume = home_key(sandbox)
+    tier = getattr(sandbox.tier, "value", sandbox.tier) or settings.host_tier
+    if tier == "ec2" and not volume:
+        # Legacy EC2 homes live in the writable layer.  Keeping the stopped
+        # container is the only non-lossy lifecycle until promotion completes.
+        from orchestrator.hosted_operation_lease import hosted_operation_lease
+        async with hosted_operation_lease(sandbox_id, f"layer-{sandbox_id}"):
+            return await _destroy_sandbox_unleased(sandbox_id, graceful, reason, final_status)
     if not volume and getattr(sandbox, "user_id", None):
         volume = user_volume_name(sandbox.user_id)
     if not volume:
@@ -1150,7 +1222,7 @@ async def destroy_sandbox(
             return False
         return await _destroy_sandbox_unleased(sandbox_id, graceful, reason, final_status)
     from orchestrator.hosted_operation_lease import hosted_operation_lease
-    async with hosted_operation_lease(sandbox_id, volume):
+    async with hosted_operation_lease(sandbox_id, volume, lifecycle=True):
         return await _destroy_sandbox_unleased(sandbox_id, graceful, reason, final_status)
 
 
@@ -1187,7 +1259,16 @@ async def _destroy_sandbox_unleased(
 
     client = _get_docker_client()
     try:
-        container = await asyncio.to_thread(client.containers.get, sandbox.sandbox_id)
+        # Prefer the immutable recorded id.  A legacy EC2 writable layer is
+        # retained by that exact container, not by whatever later acquires its
+        # human-readable sandbox name.
+        from orchestrator.hosted_runtime import _docker
+        container = await _docker(
+            client.containers.get, sandbox.container_id or sandbox.sandbox_id
+        )
+        await _docker(container.reload)
+        if sandbox.container_id and container.id != sandbox.container_id:
+            raise RuntimeError("refusing teardown of a substituted sandbox runtime")
 
         # Capture the box's .matrx/memory/ back to central memory BEFORE we stop
         # it (the dir must still be readable). Best-effort — never block teardown.
@@ -1200,11 +1281,11 @@ async def _destroy_sandbox_unleased(
                 logger.warning("Memory capture skipped for %s: %s", sandbox_id, exc)
 
         if graceful:
-            await asyncio.to_thread(
+            await _docker(
                 container.stop, timeout=await knob_int("shutdown_timeout_seconds") + 10
             )
         else:
-            await asyncio.to_thread(container.kill)
+            await _docker(container.kill)
 
         # ``container.remove`` deletes the container itself — anonymous
         # volumes go with it, but the *named* per-user volume we mounted
@@ -1212,7 +1293,14 @@ async def _destroy_sandbox_unleased(
         # point of the persistence model: user data survives sandbox
         # lifecycle. Explicit volume wipe is a separate, admin-only path
         # (see ``delete_user_volume``).
-        await asyncio.to_thread(container.remove, force=True)
+        tier = getattr(sandbox.tier, "value", sandbox.tier) or settings.host_tier
+        if tier == "ec2" and not sandbox.persistence_volume:
+            logger.warning(
+                "Retained legacy EC2 writable-layer container %s; promotion is required before replacement",
+                sandbox_id,
+            )
+        else:
+            await _docker(container.remove, force=True)
 
         await _finalize_terminal_status(store, sandbox_id, reason, final_status)
 
@@ -1231,6 +1319,143 @@ async def _destroy_sandbox_unleased(
         await store.update_status(sandbox_id, SandboxStatus.FAILED)
         logger.error("Failed to destroy sandbox %s: %s", sandbox_id, e)
         return False
+
+
+async def resume_retained_ec2_layer(sandbox: SandboxResponse) -> SandboxResponse:
+    """Restart exactly the stopped legacy EC2 container; never replace its layer."""
+    if getattr(sandbox.tier, "value", sandbox.tier) != "ec2" or sandbox.persistence_volume:
+        raise RuntimeError("sandbox is not a retained EC2 writable-layer sandbox")
+    if not sandbox.container_id:
+        raise RuntimeError("retained EC2 writable-layer sandbox has no recorded container identity")
+    client = _get_docker_client()
+    try:
+        container = await asyncio.to_thread(client.containers.get, sandbox.container_id)
+        await asyncio.to_thread(container.reload)
+    except NotFound as exc:
+        raise RuntimeError("retained EC2 writable-layer container is missing; it cannot be resumed safely") from exc
+    if container.id != sandbox.container_id or container.status not in {"exited", "created"}:
+        raise RuntimeError("retained EC2 writable-layer container identity or state is unsafe to resume")
+    from orchestrator.hosted_operation_lease import hosted_operation_lease
+    async with hosted_operation_lease(sandbox.sandbox_id, f"layer-{sandbox.sandbox_id}", lifecycle=True):
+        fresh = await _get_store().get(sandbox.sandbox_id)
+        life = await _get_store().get_lifecycle(sandbox.sandbox_id)
+        if not fresh or not life or life.get("deleted") or fresh.container_id != sandbox.container_id or fresh.persistence_volume:
+            raise RuntimeError("retained layer routing changed before resume")
+        await asyncio.to_thread(container.reload)
+        if container.status not in {"exited", "created"}:
+            raise RuntimeError("retained layer was already resumed")
+        sandbox.status = SandboxStatus.STARTING
+        await _get_store().save(sandbox)
+        await asyncio.to_thread(container.start)
+        sandbox = await _wait_for_ready(sandbox)
+        await _get_store().save(sandbox)
+        return sandbox
+
+
+async def wipe_retained_ec2_layer(sandbox: SandboxResponse) -> None:
+    """Explicitly discard one stopped legacy EC2 writable layer by exact ID.
+
+    The lease covers the row re-read and Docker removal: a concurrent resume
+    must either win before this operation is admitted or be denied until the
+    removal finishes.  A stale reset request must never delete a successor.
+    """
+    if getattr(sandbox.tier, "value", sandbox.tier) != "ec2" or sandbox.persistence_volume or not sandbox.container_id:
+        raise RuntimeError("sandbox has no retained EC2 writable layer to wipe")
+    expected = (sandbox.sandbox_id, sandbox.user_id, sandbox.organization_id,
+                sandbox.container_id, sandbox.created_at)
+
+    async def remove_under_lease() -> None:
+        store = _get_store()
+        fresh = await store.get(sandbox.sandbox_id)
+        lifecycle = await store.get_lifecycle(sandbox.sandbox_id)
+        terminal = {"stopped", "expired", "failed"}
+        if (
+            not fresh or not lifecycle or lifecycle.get("deleted")
+            or getattr(fresh.tier, "value", fresh.tier) != "ec2"
+            or fresh.persistence_volume
+            or (fresh.sandbox_id, fresh.user_id, fresh.organization_id,
+                fresh.container_id, fresh.created_at) != expected
+            or lifecycle.get("status") not in terminal
+            or getattr(fresh.status, "value", fresh.status) not in terminal
+        ):
+            raise RuntimeError("retained EC2 layer routing is no longer terminal and exact")
+
+        client = _get_docker_client()
+        container = await asyncio.to_thread(client.containers.get, fresh.container_id)
+        await asyncio.to_thread(container.reload)
+        labels = ((getattr(container, "attrs", None) or {}).get("Config") or {}).get("Labels") or {}
+        expected_labels = {
+            "matrx.sandbox_id": fresh.sandbox_id,
+            "matrx.user_id": fresh.user_id,
+            "matrx.organization_id": fresh.organization_id,
+            "matrx.tier": "ec2",
+        }
+        if (
+            container.id != fresh.container_id
+            or container.status not in {"exited", "created"}
+            or any(labels.get(key) != value for key, value in expected_labels.items())
+        ):
+            raise RuntimeError("refusing to wipe a non-retained EC2 writable-layer container")
+        await asyncio.to_thread(container.remove, force=False)
+        logger.warning("Explicitly wiped retained EC2 writable layer for %s", fresh.sandbox_id)
+
+    from orchestrator.hosted_operation_lease import hosted_operation_lease
+    async with hosted_operation_lease(sandbox.sandbox_id, f"layer-{sandbox.sandbox_id}", lifecycle=True):
+        task = asyncio.create_task(remove_under_lease())
+        try:
+            await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                raise
+
+
+async def delete_ec2_home_volume(sandbox: SandboxResponse) -> bool:
+    """Delete exactly one validated, terminal EC2 home under its home lease."""
+    reference = sandbox.persistence_volume
+    if getattr(sandbox.tier, "value", sandbox.tier) != "ec2" or not reference:
+        raise RuntimeError("sandbox has no EC2 durable home to wipe")
+    expected = (sandbox.sandbox_id, sandbox.user_id, sandbox.organization_id,
+                reference, sandbox.created_at)
+
+    async def remove_under_lease() -> bool:
+        store = _get_store()
+        fresh = await store.get(sandbox.sandbox_id)
+        lifecycle = await store.get_lifecycle(sandbox.sandbox_id)
+        terminal = {"stopped", "expired", "failed"}
+        if (
+            not fresh or not lifecycle or lifecycle.get("deleted")
+            or getattr(fresh.tier, "value", fresh.tier) != "ec2"
+            or (fresh.sandbox_id, fresh.user_id, fresh.organization_id,
+                fresh.persistence_volume, fresh.created_at) != expected
+            or lifecycle.get("status") not in terminal
+            or getattr(fresh.status, "value", fresh.status) not in terminal
+        ):
+            raise RuntimeError("EC2 durable home routing is no longer terminal and exact")
+
+        client = _get_docker_client()
+        await asyncio.to_thread(validate_ec2_home_volume, client, reference, fresh)
+        attached = await asyncio.to_thread(
+            client.containers.list, all=True, filters={"volume": reference}
+        )
+        if attached:
+            raise RuntimeError("EC2 durable home is attached to a successor or writer")
+        volume = await asyncio.to_thread(client.volumes.get, reference)
+        await asyncio.to_thread(volume.remove, force=False)
+        logger.warning("Explicitly wiped EC2 durable home %s for %s", reference, fresh.sandbox_id)
+        return True
+
+    from orchestrator.hosted_operation_lease import hosted_operation_lease
+    async with hosted_operation_lease(sandbox.sandbox_id, reference, lifecycle=True):
+        task = asyncio.create_task(remove_under_lease())
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                raise
 
 
 async def delete_user_volume(user_id: str) -> bool:

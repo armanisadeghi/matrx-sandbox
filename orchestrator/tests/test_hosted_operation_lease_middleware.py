@@ -9,7 +9,7 @@ from types import SimpleNamespace
 import pytest
 
 from orchestrator.hosted_migration import HostedMigrationJournal, HostedMigrationStateError
-from orchestrator.hosted_operation_lease import hosted_operation_lease
+from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease
 from orchestrator.middleware import hosted_operation_lease as middleware_module
 from orchestrator.middleware.hosted_operation_lease import HostedOperationLeaseMiddleware
 
@@ -63,10 +63,54 @@ async def test_http_stream_holds_real_home_lock_until_stream_finishes(hosted, mo
     async def downstream(scope, receive, send):
         entered.set(); await release.wait(); await send({"type": "http.response.start", "status": 200, "headers": []}); await send({"type": "http.response.body", "body": b"ok"})
     task = asyncio.create_task(_call(HostedOperationLeaseMiddleware(downstream), {"type": "http", "path": "/sandboxes/box/exec"}))
-    await entered.wait(); queue = multiprocessing.Queue(); process = multiprocessing.Process(target=_exclusive_try, args=(str(hosted.root), "volume-home", queue)); process.start(); process.join(5)
+    await entered.wait(); queue = multiprocessing.Queue(); process = multiprocessing.Process(target=_exclusive_try, args=(str(hosted.root), "lifecycle-home", queue)); process.start(); process.join(5)
     assert queue.get(timeout=1) == "blocked"
     release.set(); assert (await task)[0]["status"] == 200
-    process = multiprocessing.Process(target=_exclusive_try, args=(str(hosted.root), "volume-home", queue)); process.start(); process.join(5); assert queue.get(timeout=1) == "acquired"
+    process = multiprocessing.Process(target=_exclusive_try, args=(str(hosted.root), "lifecycle-home", queue)); process.start(); process.join(5); assert queue.get(timeout=1) == "acquired"
+
+
+@pytest.mark.asyncio
+async def test_stream_blocks_destroy_until_its_lease_closes(hosted, monkeypatch):
+    """Break caught: destroy ignores the lifecycle lease held by a live proxy stream."""
+    from orchestrator import sandbox_manager
+
+    row = SimpleNamespace(sandbox_id="box", persistence_volume="home", tier="hosted")
+    rows = {"box": row}
+    _wire(monkeypatch, hosted, rows)
+    monkeypatch.setattr(
+        "orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: hosted
+    )
+    monkeypatch.setattr(sandbox_manager, "_get_store", lambda: SimpleNamespace(get=lambda sandbox_id: _row_get(rows, sandbox_id)))
+    destroyed = []
+
+    async def teardown(*_args, **_kwargs):
+        destroyed.append(True)
+        return True
+
+    monkeypatch.setattr(sandbox_manager, "_destroy_sandbox_unleased", teardown)
+    entered, release = asyncio.Event(), asyncio.Event()
+
+    async def downstream(scope, receive, send):
+        entered.set()
+        await release.wait()
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    stream = asyncio.create_task(
+        _call(HostedOperationLeaseMiddleware(downstream), {"type": "http", "path": "/sandboxes/box/exec"})
+    )
+    await entered.wait()
+    with pytest.raises(HostedOperationDenied, match="lease unavailable"):
+        await sandbox_manager.destroy_sandbox("box")
+    assert destroyed == []
+
+    release.set()
+    await stream
+    assert await sandbox_manager.destroy_sandbox("box") is True
+    assert destroyed == [True]
+
+
+async def _row_get(rows, sandbox_id):
+    return rows.get(sandbox_id)
 
 
 @pytest.mark.asyncio

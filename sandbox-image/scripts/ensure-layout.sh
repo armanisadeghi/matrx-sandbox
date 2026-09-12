@@ -14,19 +14,34 @@ set -uo pipefail
 
 AGENT_HOME="${AGENT_HOME:-/home/agent}"
 AGENT_USER="${AGENT_USER:-agent}"
+COMMIT_MARKER="/tmp/.matrx-migration-committed"
 
-mkdir -p \
-  "$AGENT_HOME/.matrx/plans" \
-  "$AGENT_HOME/.matrx/skills" \
-  "$AGENT_HOME/.matrx/instructions" \
-  "$AGENT_HOME/.matrx/memory" \
-  "$AGENT_HOME/.matrx/runtime/tool-calls" \
-  "$AGENT_HOME/.matrx/runtime/shell-logs" \
-  "$AGENT_HOME/.matrx/runtime/session-reports" \
-  "$AGENT_HOME/cloud-files" \
-  "$AGENT_HOME/repos" \
-  "$AGENT_HOME/projects" \
-  "$AGENT_HOME/scratch"
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ] && [ ! -f "$COMMIT_MARKER" ]; then
+  echo "migration hold active; refusing layout writes" >&2
+  exit 0
+fi
+
+ensure_dir() {
+  local path="$1"
+  if [ ! -e "$path" ]; then
+    mkdir "$path"
+    if [ "$(id -u)" = "0" ]; then chown "$AGENT_USER:$AGENT_USER" "$path"; fi
+  fi
+}
+ensure_dir "$AGENT_HOME"
+ensure_dir "$AGENT_HOME/.matrx"
+ensure_dir "$AGENT_HOME/.matrx/plans"
+ensure_dir "$AGENT_HOME/.matrx/skills"
+ensure_dir "$AGENT_HOME/.matrx/instructions"
+ensure_dir "$AGENT_HOME/.matrx/memory"
+ensure_dir "$AGENT_HOME/.matrx/runtime"
+ensure_dir "$AGENT_HOME/.matrx/runtime/tool-calls"
+ensure_dir "$AGENT_HOME/.matrx/runtime/shell-logs"
+ensure_dir "$AGENT_HOME/.matrx/runtime/session-reports"
+ensure_dir "$AGENT_HOME/cloud-files"
+ensure_dir "$AGENT_HOME/repos"
+ensure_dir "$AGENT_HOME/projects"
+ensure_dir "$AGENT_HOME/scratch"
 
 cat > "$AGENT_HOME/.matrx/instructions/SANDBOX_LAYOUT.md" <<'LAYOUT_EOF'
 # Sandbox layout — read this first
@@ -90,11 +105,3 @@ Files panel without manual upload.
 LAYOUT_EOF
 
 # Permissions — only chown if running as root (e.g., entrypoint).
-if [ "$(id -u)" = "0" ]; then
-  chown -R "$AGENT_USER:$AGENT_USER" \
-    "$AGENT_HOME/.matrx" \
-    "$AGENT_HOME/cloud-files" \
-    "$AGENT_HOME/repos" \
-    "$AGENT_HOME/projects" \
-    "$AGENT_HOME/scratch"
-fi

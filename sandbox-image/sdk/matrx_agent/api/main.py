@@ -42,6 +42,94 @@ _checkpoint = CheckpointDaemon(interval_seconds=int(os.environ.get(
 )))
 _cloud_watcher = CloudFilesWatcher()
 
+# Image migration starts a replacement daemon before its runtime CAS commits.
+# Until the root-owned Docker exec creates this marker, this process may answer
+# health only: no mounted-home path may be created, traversed for persistence,
+# or written.  The marker is intentionally outside /home/agent and survives a
+# daemon restart within the committed replacement container.
+MIGRATION_COMMIT_MARKER = Path("/tmp/.matrx-migration-committed")
+MIGRATION_ACTIVATED_MARKER = Path("/tmp/.matrx-migration-activated")
+_background_ready = False
+_activation_task: asyncio.Task | None = None
+_cloud_watcher_starter: asyncio.Task | None = None
+_list_session_reaper: asyncio.Task | None = None
+_activation_lock = asyncio.Lock()
+_watcher_started = False
+
+
+def _migration_hold_requested() -> bool:
+    return os.environ.get("MATRX_MIGRATION_HOLD") == "1"
+
+
+def _migration_state() -> str:
+    if _migration_hold_requested() and not MIGRATION_COMMIT_MARKER.is_file():
+        return "held"
+    if _migration_hold_requested() and not MIGRATION_ACTIVATED_MARKER.is_file():
+        return "activating"
+    return "active" if _background_ready else "activating"
+
+
+def _migration_restricts_api() -> bool:
+    return _migration_hold_requested() and _migration_state() != "active"
+
+
+async def _activate_background_capabilities(*, strict: bool) -> None:
+    """Start all home-writing background services exactly once after commit."""
+    global _background_ready, _cloud_watcher_starter, _list_session_reaper, _watcher_started
+    async with _activation_lock:
+        if _background_ready:
+            return
+        failures: list[str] = []
+        prior = None
+        try:
+            prior = read_prior_manifest()
+            render_report(prior)
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"session report: {exc}")
+            _logger.warning("matrx_agent: failed to render session report: %s", exc)
+        try:
+            await _checkpoint.start()
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"checkpoint: {exc}")
+            _logger.warning("matrx_agent: failed to start checkpoint daemon: %s", exc)
+        # In held mode do not start a later service after an earlier required
+        # one failed. Retrying from this clean boundary avoids duplicate
+        # watcher/reaper tasks while normal boots retain independent attempts.
+        if failures and strict:
+            raise RuntimeError("; ".join(failures))
+        try:
+            if not _watcher_started:
+                if strict:
+                    # ``start`` schedules its own down-marker probe and does
+                    # not wait for that probe. Migration boot intentionally
+                    # skips cloud down-sync, so do not await that boundary.
+                    await _cloud_watcher.start()
+                else:
+                    # Preserve the original non-blocking normal-boot start.
+                    _cloud_watcher_starter = asyncio.create_task(_cloud_watcher.start())
+                _watcher_started = True
+            if _list_session_reaper is None:
+                _list_session_reaper = asyncio.create_task(_reap_list_sessions())
+        except Exception as exc:  # noqa: BLE001
+            failures.append(f"cloud watcher: {exc}")
+            _logger.warning("matrx_agent: failed to start cloud watcher: %s", exc)
+        if failures and strict:
+            raise RuntimeError("; ".join(failures))
+        _background_ready = True
+        _logger.info("matrx_agent: persistence module active (prior=%s)", "yes" if prior else "no")
+
+
+async def _wait_for_migration_commit() -> None:
+    """Poll only /tmp; never touch the mounted home before durable commit."""
+    while not MIGRATION_COMMIT_MARKER.is_file():
+        await asyncio.sleep(0.2)
+    while not _background_ready:
+        try:
+            await _activate_background_capabilities(strict=True)
+        except Exception as exc:  # noqa: BLE001
+            _logger.error("matrx_agent: migration activation failed; retrying: %s", exc)
+            await asyncio.sleep(0.2)
+
 
 # Filesystem inspection endpoints are agent-facing and can be invoked on trees
 # or files whose size is not known in advance. Keep every response bounded.
@@ -67,27 +155,34 @@ async def lifespan(app: FastAPI):
     those two events. The ``/internal/shutdown`` route can be hit before the
     container exits to also run the auto-stash pass.
     """
-    # Startup: render the welcome / session-report.md from any prior manifest.
-    try:
-        prior = read_prior_manifest()
-        render_report(prior)
-        _logger.info("matrx_agent: persistence module ready (prior=%s)", "yes" if prior else "no")
-    except Exception as e:  # noqa: BLE001
-        _logger.warning("matrx_agent: failed to render session report: %s", e)
-
-    # Start the periodic checkpoint loop.
-    try:
-        await _checkpoint.start()
-    except Exception as e:  # noqa: BLE001
-        _logger.warning("matrx_agent: failed to start checkpoint daemon: %s", e)
-
-    # Start the cloud-files real-time watcher (no-ops if AI Dream env is unset).
-    # Runs as a background task so a slow down-marker wait doesn't block the
-    # daemon from accepting requests.
-    cloud_watcher_starter = asyncio.create_task(_cloud_watcher.start())
-    list_session_reaper = asyncio.create_task(_reap_list_sessions())
+    global _activation_task, _background_ready, _cloud_watcher_starter, _list_session_reaper, _watcher_started
+    _background_ready = False
+    _cloud_watcher_starter = None
+    _list_session_reaper = None
+    _watcher_started = False
+    if _migration_hold_requested() and not MIGRATION_COMMIT_MARKER.is_file():
+        _logger.info("matrx_agent: migration hold active; persistence is deferred")
+        _activation_task = asyncio.create_task(_wait_for_migration_commit())
+    else:
+        try:
+            await _activate_background_capabilities(strict=False)
+        except Exception as exc:  # noqa: BLE001
+            _logger.error("matrx_agent: failed to activate persistence module: %s", exc)
 
     yield
+
+    # A held daemon has never touched /home/agent, so shutdown must not become
+    # its first writer.  Cancel its waiter before any cleanup path can run.
+    if _activation_task is not None:
+        _activation_task.cancel()
+        try:
+            await _activation_task
+        except asyncio.CancelledError:
+            pass
+        _activation_task = None
+    if not _background_ready:
+        _background_ready = False
+        return
 
     # Shutdown: best-effort final manifest write. The container may still be
     # killed mid-write — that's fine, the prior checkpoint is the floor.
@@ -96,9 +191,11 @@ async def lifespan(app: FastAPI):
     except Exception as e:  # noqa: BLE001
         _logger.warning("matrx_agent: checkpoint daemon stop error: %s", e)
     try:
-        list_session_reaper.cancel()
+        if _list_session_reaper is not None:
+            _list_session_reaper.cancel()
         try:
-            await list_session_reaper
+            if _list_session_reaper is not None:
+                await _list_session_reaper
         except asyncio.CancelledError:
             pass
         with _fs_list_sessions_lock:
@@ -110,9 +207,11 @@ async def lifespan(app: FastAPI):
     try:
         # Cancel the starter in case it's still waiting on the down-marker; then
         # stop the watcher itself (idempotent if it never started).
-        cloud_watcher_starter.cancel()
+        if _cloud_watcher_starter is not None:
+            _cloud_watcher_starter.cancel()
         try:
-            await cloud_watcher_starter
+            if _cloud_watcher_starter is not None:
+                await _cloud_watcher_starter
         except (asyncio.CancelledError, Exception):  # noqa: BLE001
             pass
         await _cloud_watcher.stop()
@@ -127,9 +226,29 @@ async def lifespan(app: FastAPI):
         write_manifest(manifest)
     except Exception as e:  # noqa: BLE001
         _logger.warning("matrx_agent: final manifest write failed: %s", e)
+    _background_ready = False
+    _cloud_watcher_starter = None
+    _list_session_reaper = None
+    _watcher_started = False
 
 
 app = FastAPI(title="Matrx Sandbox Agent API", lifespan=lifespan)
+
+
+class _MigrationHoldWebSocketGate:
+    """Reject direct PTY/watch sockets before they can touch a held home."""
+
+    def __init__(self, app):
+        self.app = app
+
+    async def __call__(self, scope, receive, send):
+        if scope["type"] == "websocket" and _migration_restricts_api():
+            await send({"type": "websocket.close", "code": 1013})
+            return
+        await self.app(scope, receive, send)
+
+
+app.add_middleware(_MigrationHoldWebSocketGate)
 
 
 # Per-sandbox daemon auth (fail-open when MATRX_AGENT_TOKEN is unset — see
@@ -144,6 +263,11 @@ _AGENT_AUTH_EXEMPT_PREFIXES = ("/health", "/internal/")
 
 @app.middleware("http")
 async def _agent_token_guard(request, call_next):
+    if _migration_restricts_api() and request.url.path != "/health":
+        return JSONResponse(
+            status_code=503,
+            content={"detail": "sandbox migration is held pending durable commit", "migration_state": _migration_state()},
+        )
     if _auth.enforcement_enabled():
         path = request.url.path
         if not path.startswith(_AGENT_AUTH_EXEMPT_PREFIXES) and request.method != "OPTIONS":
@@ -753,6 +877,8 @@ async def health() -> dict:
         "status": "ok",
         "service": "matrx_agent",
         "sandbox_id": os.environ.get("SANDBOX_ID", ""),
+        "migration_state": _migration_state(),
+        "cloud_sync_state": _cloud_watcher.mode,
     }
 
 
@@ -1177,6 +1303,8 @@ app.include_router(processes_router)
 @app.post("/internal/startup")
 def internal_startup() -> dict:
     """Idempotent startup hook — re-renders session-report.md from the prior manifest."""
+    if _migration_restricts_api():
+        return {"ok": False, "migration_state": _migration_state(), "detail": "migration hold defers session report"}
     try:
         prior = read_prior_manifest()
         report = render_report(prior)
@@ -1199,6 +1327,8 @@ def internal_shutdown(graceful: bool = True, auto_stash: bool = True,
     2. Collect a final manifest including the auto-stash results.
     3. Write the manifest atomically.
     """
+    if _migration_restricts_api():
+        return {"ok": False, "migration_state": _migration_state(), "detail": "migration hold defers shutdown persistence"}
     autostashes: dict[str, dict] = {}
     if auto_stash:
         try:

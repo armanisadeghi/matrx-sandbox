@@ -19,10 +19,36 @@ for var in SANDBOX_ID USER_ID S3_BUCKET; do
     fi
 done
 
+MATRX_MIGRATION_COMMIT_MARKER="/tmp/.matrx-migration-committed"
+MATRX_MIGRATION_ACTIVATED_MARKER="/tmp/.matrx-migration-activated"
+AGENT_API_STARTED=0
+
+start_agent_api() {
+    echo "[hold] Starting Sandbox API Daemon..."
+    # Held migrations must not leave Python bytecode in a mounted home before
+    # the runtime's durable CAS has committed the replacement.
+    PYTHONDONTWRITEBYTECODE=1 sudo -E -u agent bash -c "cd /home/agent && PYTHONDONTWRITEBYTECODE=1 python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
+    AGENT_API_STARTED=1
+}
+
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ] && [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; then
+    rm -f "$MATRX_MIGRATION_ACTIVATED_MARKER"
+    export PYTHONDONTWRITEBYTECODE=1
+    echo "Migration hold active: API health only; home boot is deferred until commit marker."
+    start_agent_api
+    touch /tmp/.sandbox_ready
+    while [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; do sleep 1; done
+    echo "Migration commit marker observed; activating normal boot."
+fi
+
 # ─── Step 1: Sync hot storage from S3 ────────────────────────────────────────
-echo "[1/5] Syncing hot storage from S3..."
-/opt/sandbox/scripts/hot-sync.sh down
-echo "[1/5] Hot storage sync complete."
+if [ "${SANDBOX_MIGRATION:-}" = "1" ]; then
+    echo "[1/5] Migration boot — skipping hot storage download."
+else
+    echo "[1/5] Syncing hot storage from S3..."
+    /opt/sandbox/scripts/hot-sync.sh down
+    echo "[1/5] Hot storage sync complete."
+fi
 
 # ─── Step 2: Mount cold storage via FUSE ──────────────────────────────────────
 echo "[2/5] Mounting cold storage FUSE filesystem..."
@@ -32,15 +58,7 @@ echo "[2/5] Cold storage mounted."
 # ─── Step 3: Set up environment for agent ─────────────────────────────────────
 echo "[3/5] Preparing agent environment..."
 
-# Ensure agent owns their home directory after hot sync
-chown -R agent:agent "$HOT_PATH"
-
-# Restore SSH authorized_keys (hot sync may have overwritten /home/agent)
-mkdir -p /home/agent/.ssh
-cp /opt/sandbox/config/admin_authorized_keys /home/agent/.ssh/authorized_keys
-chown -R agent:agent /home/agent/.ssh
-chmod 700 /home/agent/.ssh
-chmod 600 /home/agent/.ssh/authorized_keys
+/opt/sandbox/scripts/prepare-agent-home.sh
 
 # Write a small env file the agent can source
 cat > /home/agent/.sandbox_env <<EOF
@@ -83,7 +101,9 @@ echo "[4/5] SSH server running on port 22."
 echo "[4.5/5] Starting Sandbox API Daemon..."
 # ``-E`` so env vars (SANDBOX_ID, USER_ID, MATRX_TIER, etc.) reach the
 # persistence module — see comment in entrypoint-local.sh for why.
-sudo -E -u agent bash -c "cd /home/agent && python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
+if [ "$AGENT_API_STARTED" = "0" ]; then
+    start_agent_api
+fi
 echo "[4.5/5] Sandbox API Daemon running on port 8000."
 
 # ─── Step 4.6: Pull AI Dream cloud_files into ~/cloud-files/ ─────────────────
@@ -104,6 +124,9 @@ fi
 # ─── Step 5: Signal readiness ────────────────────────────────────────────────
 echo "[5/5] Sandbox is READY."
 touch /tmp/.sandbox_ready
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
+    touch "$MATRX_MIGRATION_ACTIVATED_MARKER"
+fi
 
 # ─── Register shutdown handler ────────────────────────────────────────────────
 trap '/opt/sandbox/scripts/shutdown.sh' SIGTERM SIGINT

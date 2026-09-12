@@ -31,17 +31,33 @@ for var in SANDBOX_ID USER_ID; do
     fi
 done
 
+MATRX_MIGRATION_COMMIT_MARKER="/tmp/.matrx-migration-committed"
+MATRX_MIGRATION_ACTIVATED_MARKER="/tmp/.matrx-migration-activated"
+AGENT_API_STARTED=0
+
+start_agent_api() {
+    echo "[hold] Starting Sandbox API Daemon..."
+    # Held migrations must not leave Python bytecode in a mounted home before
+    # the runtime's durable CAS has committed the replacement.
+    PYTHONDONTWRITEBYTECODE=1 sudo -E -u agent bash -c "cd /home/agent && PYTHONDONTWRITEBYTECODE=1 python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
+    AGENT_API_STARTED=1
+}
+
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ] && [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; then
+    rm -f "$MATRX_MIGRATION_ACTIVATED_MARKER"
+    export PYTHONDONTWRITEBYTECODE=1
+    echo "Migration hold active: API health only; home boot is deferred until commit marker."
+    start_agent_api
+    touch /tmp/.sandbox_ready
+    while [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; do sleep 1; done
+    echo "Migration commit marker observed; activating normal boot."
+fi
+
 HOT_PATH="${HOT_PATH:-/home/agent}"
 
 # ─── Step 1: Agent environment ───────────────────────────────────────────────
 echo "[1/4] Preparing agent environment..."
-chown -R agent:agent "$HOT_PATH"
-
-mkdir -p /home/agent/.ssh
-cp /opt/sandbox/config/admin_authorized_keys /home/agent/.ssh/authorized_keys
-chown -R agent:agent /home/agent/.ssh
-chmod 700 /home/agent/.ssh
-chmod 600 /home/agent/.ssh/authorized_keys
+/opt/sandbox/scripts/prepare-agent-home.sh
 
 cat > /home/agent/.sandbox_env <<EOF
 export SANDBOX_ID="${SANDBOX_ID}"
@@ -74,7 +90,9 @@ echo "[2/4] SSH server running on port 22."
 
 # ─── Step 3: Start Agent API Daemon (the capability surface) ─────────────────
 echo "[3/4] Starting Sandbox API Daemon..."
-sudo -E -u agent bash -c "cd /home/agent && python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
+if [ "$AGENT_API_STARTED" = "0" ]; then
+    start_agent_api
+fi
 echo "[3/4] Sandbox API Daemon running on port 8000."
 
 # ─── Step 3.5: Pull AI Dream cloud_files (best effort; PDF/image use case) ───
@@ -92,6 +110,9 @@ fi
 # ─── Step 4: Signal readiness ─────────────────────────────────────────────────
 echo "[4/4] Lightweight sandbox is READY."
 touch /tmp/.sandbox_ready
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
+    touch "$MATRX_MIGRATION_ACTIVATED_MARKER"
+fi
 
 # ─── Register shutdown handler ────────────────────────────────────────────────
 trap '/opt/sandbox/scripts/shutdown-slim.sh' SIGTERM SIGINT

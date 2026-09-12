@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import logging
 import re
+from docker.errors import NotFound
 from dataclasses import dataclass
 
 from orchestrator.config import settings
@@ -31,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 
 _USER_ID_RE = re.compile(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$", re.IGNORECASE)
+_SANDBOX_ID_RE = re.compile(r"^sbx-[a-f0-9]{12}$")
 
 
 def user_volume_name(user_id: str) -> str:
@@ -43,6 +45,64 @@ def user_volume_name(user_id: str) -> str:
     if not _USER_ID_RE.match(user_id or ""):
         raise ValueError(f"user_id must be a UUID, got: {user_id!r}")
     return f"matrx-user-{user_id.lower()}"
+
+
+def ec2_home_volume_name(sandbox_id: str) -> str:
+    """Return the server-owned, per-sandbox EC2 home volume name."""
+    if not _SANDBOX_ID_RE.fullmatch(sandbox_id or ""):
+        raise ValueError(f"sandbox_id must be a generated sandbox id, got: {sandbox_id!r}")
+    return f"matrx-ec2-home-{sandbox_id}"
+
+
+def ensure_ec2_home_volume(docker_client, sandbox_id: str, user_id: str, organization_id: str) -> str:
+    """Create the durable local home for a new non-development EC2 sandbox."""
+    name = ec2_home_volume_name(sandbox_id)
+    labels = {
+        "matrx.owner": "orchestrator", "matrx.sandbox_id": sandbox_id,
+        "matrx.user_id": user_id, "matrx.organization_id": organization_id,
+        "matrx.kind": "ec2-home", "matrx.tier": "ec2",
+    }
+    try:
+        docker_client.volumes.get(name)
+    except NotFound:
+        pass
+    else:
+        raise RuntimeError("new EC2 home name is already occupied; refusing adoption")
+    docker_client.volumes.create(
+        name=name, driver="local",
+        labels=labels,
+    )
+    logger.info("Created EC2 durable home %s for sandbox %s", name, sandbox_id)
+    return name
+
+
+def validate_ec2_home_volume(docker_client, reference: str, sandbox) -> str:
+    """Prove an existing EC2 home belongs exactly to its recorded row."""
+    prefix = "matrx-ec2-home-"
+    owner_sandbox_id = reference[len(prefix):] if reference.startswith(prefix) else ""
+    # A reset/resume successor keeps the original per-sandbox home reference,
+    # so its row id need not equal the volume's immutable owner id.
+    if not _SANDBOX_ID_RE.fullmatch(owner_sandbox_id):
+        raise RuntimeError("EC2 durable home reference is not a server-owned volume name")
+    try:
+        volume = docker_client.volumes.get(reference)
+        if hasattr(volume, "reload"):
+            volume.reload()
+    except Exception as exc:
+        raise RuntimeError("Recorded EC2 durable home is missing; refusing to create an empty replacement") from exc
+    attrs = getattr(volume, "attrs", None) or {}
+    labels = attrs.get("Labels") or {}
+    if (attrs.get("Name") != reference or attrs.get("Driver") != "local"
+            or attrs.get("Options") or attrs.get("Scope") not in {None, "local"}):
+        raise RuntimeError("Recorded EC2 durable home is not the expected local volume")
+    expected_labels = {
+        "matrx.owner": "orchestrator", "matrx.sandbox_id": owner_sandbox_id,
+        "matrx.user_id": sandbox.user_id, "matrx.organization_id": sandbox.organization_id,
+        "matrx.kind": "ec2-home", "matrx.tier": "ec2",
+    }
+    if any(labels.get(key) != value for key, value in expected_labels.items()):
+        raise RuntimeError("Recorded EC2 durable home labels do not match its sandbox row")
+    return reference
 
 
 @dataclass

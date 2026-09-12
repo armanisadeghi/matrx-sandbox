@@ -111,7 +111,7 @@ def _ssh_host_port(container_attrs: dict) -> int | None:
 
 async def _lease_discovered_container(stack, container, store, sandbox_id):
     """Fence discovery by its actual home, then revalidate routing under lock."""
-    if settings.host_tier != "hosted":
+    if settings.host_tier not in {"hosted", "ec2"}:
         return
     from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease
     from orchestrator.storage_layout import user_volume_name
@@ -126,13 +126,20 @@ async def _lease_discovered_container(stack, container, store, sandbox_id):
         raise HostedOperationDenied("discovered home disagrees with routing")
     if not volume:
         user_id = getattr(row, "user_id", None) or labels.get("matrx.user_id")
-        volume = recorded or user_volume_name(user_id)
+        if row:
+            from orchestrator.home_identity import home_key
+            volume = home_key(row)
+        else:
+            volume = ("layer-" + sandbox_id if settings.host_tier == "ec2"
+                      else user_volume_name(user_id))
     await stack.enter_async_context(hosted_operation_lease(sandbox_id, volume))
     fresh = await store.get(sandbox_id)
     if fresh and fresh.container_id and fresh.container_id != container.id:
         raise HostedOperationDenied("discovered runtime is not current routing")
-    if fresh and fresh.persistence_volume and fresh.persistence_volume != volume:
-        raise HostedOperationDenied("home changed before discovery lease")
+    if fresh:
+        from orchestrator.home_identity import home_key
+        if home_key(fresh) != volume:
+            raise HostedOperationDenied("home changed before discovery lease")
 
 
 async def reconcile_from_docker(store: SandboxStore) -> dict:
@@ -171,7 +178,7 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
     summary["scanned"] = len(containers)
 
     retained_container_ids: set[str] = set()
-    if settings.host_tier == "hosted":
+    if settings.host_tier in {"hosted", "ec2"}:
         try:
             from orchestrator.hosted_migration import HostedMigrationJournal
             journal = HostedMigrationJournal(); journal.ensure_ready()
@@ -416,6 +423,13 @@ async def reap_zombie_containers(store: SandboxStore) -> list[str]:
             if not lifecycle:
                 continue
             if lifecycle["deleted"] or lifecycle["status"] in _TERMINAL_STATUSES:
+                row = await store.get(sandbox_id)
+                if tier == "ec2" and row and not row.persistence_volume:
+                    # A retained writable layer is storage, not a disposable
+                    # zombie. Stop unexpected execution but never remove it.
+                    if container.status == "running":
+                        await _docker(container.stop, timeout=30)
+                    continue
                 logger.info(
                     "Zombie reap: %s row is %s but container is alive — removing "
                     "container (volume preserved, row untouched).",
@@ -448,14 +462,15 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
     excluded: frozenset[str] = frozenset()
     included: frozenset[str] | None = None
     lease_stack: AsyncExitStack | None = None
-    if settings.host_tier == "hosted":
+    if settings.host_tier in {"hosted", "ec2"}:
         try:
             from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease
             lease_stack = AsyncExitStack()
             blocked: set[str] = set()
             leased: set[str] = set()
             for sandbox in await store.list():
-                volume = getattr(sandbox, "persistence_volume", None)
+                from orchestrator.home_identity import home_key
+                volume = home_key(sandbox)
                 sandbox_id = getattr(sandbox, "sandbox_id", None)
                 if not sandbox_id:
                     continue

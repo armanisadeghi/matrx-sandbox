@@ -28,6 +28,7 @@ ORCH_STARTUP_TIMEOUT_SECONDS=31
 ORCH_API_KEY=synthetic
 ORCH_HEALTH_URL=https://unused.invalid/health
 NEW_SHA=synthetic
+unset SECONDS
 SECONDS=0
 curl() { printf '%s\n' "$*" >> "$CALLS"; return 1; }
 sleep() { SECONDS=$((SECONDS + $1)); }
@@ -50,6 +51,7 @@ ORCH_STARTUP_TIMEOUT_SECONDS=31
 ORCH_API_KEY=synthetic
 ORCH_HEALTH_URL=https://unused.invalid/health
 NEW_SHA=synthetic
+unset SECONDS
 SECONDS=0
 curl() { echo CURL_MUST_NOT_RUN >> "$CALLS"; return 1; }
 sleep() { :; }

@@ -6,8 +6,14 @@ from types import SimpleNamespace
 import pytest
 
 from orchestrator.hosted_migration import HostedMigrationJournal
-from orchestrator.hosted_operation_lease import HostedOperationDenied
+from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease
 from orchestrator.reconcile import reconcile_liveness
+
+
+def _inject_journal(monkeypatch, journal: HostedMigrationJournal) -> None:
+    """Keep direct fence checks and operation leases on the same durable state."""
+    monkeypatch.setattr("orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: journal)
+    monkeypatch.setattr("orchestrator.hosted_migration.HostedMigrationJournal", lambda: journal)
 
 
 def _record(sandbox_id: str, volume: str) -> dict:
@@ -23,11 +29,36 @@ def _record(sandbox_id: str, volume: str) -> dict:
 
 
 @pytest.mark.asyncio
+async def test_ec2_operation_lease_fails_closed_without_durable_journal(monkeypatch):
+    """Break caught: EC2 lifecycle cannot bypass an unavailable migration journal."""
+    monkeypatch.setattr("orchestrator.hosted_operation_lease.settings.host_tier", "ec2")
+    with pytest.raises(HostedOperationDenied, match="lease unavailable"):
+        async with hosted_operation_lease("ec2-box", "layer-ec2-box"):
+            raise AssertionError("missing journal admitted an EC2 operation")
+
+
+@pytest.mark.asyncio
+async def test_ec2_operation_lease_allows_clean_journal_then_denies_pending_home(monkeypatch, tmp_path):
+    """Break caught: a pending EC2 migration must fence its exact durable home."""
+    journal = HostedMigrationJournal(tmp_path)
+    _inject_journal(monkeypatch, journal)
+    monkeypatch.setattr("orchestrator.hosted_operation_lease.settings.host_tier", "ec2")
+
+    async with hosted_operation_lease("ec2-box", "layer-ec2-box"):
+        pass
+
+    journal.write(_record("old-box", "layer-ec2-box"))
+    with pytest.raises(HostedOperationDenied, match="migration is pending"):
+        async with hosted_operation_lease("ec2-box", "layer-ec2-box"):
+            raise AssertionError("pending EC2 home admitted lifecycle work")
+
+
+@pytest.mark.asyncio
 async def test_liveness_excludes_only_migrating_home_while_reconciling_unrelated_home(monkeypatch, tmp_path):
     """A migration admission cannot race its row to stopped, but is not fleet-wide."""
     journal = HostedMigrationJournal(tmp_path)
     journal.write(_record("box-a", "home-a"))
-    monkeypatch.setattr("orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: journal)
+    _inject_journal(monkeypatch, journal)
     monkeypatch.setattr("orchestrator.reconcile.settings.host_tier", "hosted")
     monkeypatch.setattr("orchestrator.reconcile._alive_container_ids", lambda *_: {"live-b"})
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: object())
@@ -36,8 +67,8 @@ async def test_liveness_excludes_only_migrating_home_while_reconciling_unrelated
         def __init__(self): self.called = None
         async def list(self):
             return [
-                SimpleNamespace(sandbox_id="box-a", persistence_volume="home-a"),
-                SimpleNamespace(sandbox_id="box-b", persistence_volume="home-b"),
+                SimpleNamespace(sandbox_id="box-a", persistence_volume="home-a", tier="hosted"),
+                SimpleNamespace(sandbox_id="box-b", persistence_volume="home-b", tier="hosted"),
             ]
         async def reconcile(self, alive_ids, *, tier, exclude_sandbox_ids=frozenset(), include_sandbox_ids=None):
             self.called = (alive_ids, tier, exclude_sandbox_ids, include_sandbox_ids)
@@ -53,11 +84,11 @@ async def test_liveness_derives_missing_home_and_releases_lease_on_docker_failur
     """A legacy null volume neither bypasses the lease nor leaks it on an early return."""
     from orchestrator.hosted_operation_lease import hosted_operation_lease
     journal = HostedMigrationJournal(tmp_path)
-    monkeypatch.setattr("orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: journal)
+    _inject_journal(monkeypatch, journal)
     monkeypatch.setattr("orchestrator.reconcile.settings.host_tier", "hosted")
     user_id = "12345678-1234-1234-1234-123456789abc"
     class Store:
-        async def list(self): return [SimpleNamespace(sandbox_id="legacy", persistence_volume=None, user_id=user_id)]
+        async def list(self): return [SimpleNamespace(sandbox_id="legacy", persistence_volume=None, user_id=user_id, tier="hosted")]
         async def reconcile(self, *_args, **_kwargs): raise AssertionError("Docker failure must not mutate")
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
     assert await reconcile_liveness(Store()) == {"stopped": [], "refreshed": 0}
@@ -106,9 +137,9 @@ async def test_destroy_refuses_pending_same_home_before_any_teardown(monkeypatch
     journal = HostedMigrationJournal(tmp_path)
     journal.write(_record("old", "home-a"))
     monkeypatch.setattr(sandbox_manager.settings, "host_tier", "hosted")
-    monkeypatch.setattr("orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: journal)
+    _inject_journal(monkeypatch, journal)
     monkeypatch.setattr(sandbox_manager, "_get_store", lambda: SimpleNamespace(
-        get=lambda _id: _one(SimpleNamespace(sandbox_id="box-new", persistence_volume="home-a")),
+        get=lambda _id: _one(SimpleNamespace(sandbox_id="box-new", persistence_volume="home-a", tier="hosted")),
     ))
     called = False
     async def teardown(*_args, **_kwargs):
@@ -128,9 +159,9 @@ async def test_destroy_on_unrelated_home_proceeds_while_migration_is_pending(mon
     journal = HostedMigrationJournal(tmp_path)
     journal.write(_record("old", "home-a"))
     monkeypatch.setattr(sandbox_manager.settings, "host_tier", "hosted")
-    monkeypatch.setattr("orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: journal)
+    _inject_journal(monkeypatch, journal)
     monkeypatch.setattr(sandbox_manager, "_get_store", lambda: SimpleNamespace(
-        get=lambda _id: _one(SimpleNamespace(sandbox_id="box-b", persistence_volume="home-b")),
+        get=lambda _id: _one(SimpleNamespace(sandbox_id="box-b", persistence_volume="home-b", tier="hosted")),
     ))
     async def teardown(*_args, **_kwargs):
         return True
@@ -148,9 +179,9 @@ async def test_destroy_derives_legacy_home_and_refuses_pending_migration(monkeyp
     from orchestrator.storage_layout import user_volume_name
     journal.write(_record("old", user_volume_name(user_id)))
     monkeypatch.setattr(sandbox_manager.settings, "host_tier", "hosted")
-    monkeypatch.setattr("orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: journal)
+    _inject_journal(monkeypatch, journal)
     monkeypatch.setattr(sandbox_manager, "_get_store", lambda: SimpleNamespace(
-        get=lambda _id: _one(SimpleNamespace(sandbox_id="legacy", persistence_volume=None, user_id=user_id)),
+        get=lambda _id: _one(SimpleNamespace(sandbox_id="legacy", persistence_volume=None, user_id=user_id, tier="hosted")),
     ))
     async def teardown(*_args, **_kwargs): raise AssertionError("unleased teardown")
     monkeypatch.setattr(sandbox_manager, "_destroy_sandbox_unleased", teardown)

@@ -343,7 +343,30 @@ async def destroy_sandbox(sandbox_id: str, graceful: bool = True, purge: bool = 
         raise HTTPException(status_code=500, detail="Failed to destroy sandbox")
     if purge:
         from orchestrator.sandbox_manager import _get_store
-        await _get_store().soft_delete(sandbox_id)
+        from orchestrator.home_identity import home_key
+        from orchestrator.hosted_operation_lease import hosted_operation_lease
+
+        store = _get_store()
+        fresh = await store.get(sandbox_id)
+        if not fresh:
+            raise HTTPException(status_code=409, detail="Sandbox changed before purge; no row was deleted")
+        async with hosted_operation_lease(sandbox_id, home_key(fresh), lifecycle=True):
+            # A retained legacy EC2 layer resumes the same row/id.  Re-read
+            # while holding the lifecycle fence so delete cannot erase a box
+            # that restarted after destroy released its own lease.
+            fresh = await store.get(sandbox_id)
+            lifecycle = await store.get_lifecycle(sandbox_id)
+            terminal = {"stopped", "expired", "failed"}
+            if (
+                not fresh
+                or not lifecycle
+                or lifecycle.get("deleted")
+                or lifecycle.get("status") not in terminal
+                or getattr(fresh.status, "value", fresh.status) not in terminal
+            ):
+                raise HTTPException(status_code=409, detail="Sandbox resumed or changed before purge; no row was deleted")
+            if not await store.soft_delete(sandbox_id):
+                raise HTTPException(status_code=409, detail="Sandbox changed before purge; no row was deleted")
 
 
 @router.post("/{sandbox_id}/reset", response_model=SandboxResponse)
@@ -378,6 +401,20 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     config = dict(old.config or {})
     organization_id = old.organization_id
     resources = config.get("resources") if isinstance(config.get("resources"), dict) else None
+    is_ec2 = tier == "ec2"
+    legacy_ec2_layer = is_ec2 and not getattr(old, "persistence_volume", None)
+    development_bind = is_ec2 and str(old.persistence_volume or "").startswith("host:")
+    if development_bind and wipe_volume:
+        raise HTTPException(status_code=409, detail="Development host workspace wipe requires a verified dedicated workspace operation; no container or files were changed")
+
+    if legacy_ec2_layer and not wipe_volume:
+        raise HTTPException(
+            status_code=409,
+            detail=(
+                "Reset is refused: this EC2 sandbox's home is still in its retained writable layer. "
+                "Promote it to a durable home before replacing the container, or explicitly wipe it."
+            ),
+        )
 
     logger.info(
         "Resetting sandbox %s (user=%s, template=%s, wipe_volume=%s)",
@@ -393,8 +430,14 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     # new sandbox boots with an empty /home/agent.
     if wipe_volume:
         try:
-            wiped = await sandbox_manager.delete_user_volume(user_id)
-            logger.info("Reset wiped per-user volume for %s: %s", user_id, wiped)
+            if legacy_ec2_layer:
+                await sandbox_manager.wipe_retained_ec2_layer(old)
+                wiped = True
+            elif is_ec2:
+                wiped = await sandbox_manager.delete_ec2_home_volume(old)
+            else:
+                wiped = await sandbox_manager.delete_user_volume(user_id)
+            logger.info("Reset wiped exact persistent home for %s: %s", sandbox_id, wiped)
         except Exception as exc:
             raise HTTPException(status_code=502, detail=f"Reset volume wipe failed: {exc}") from exc
         if not wiped:
@@ -413,6 +456,7 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
             resources=resources,
             labels=labels,
             ttl_seconds=ttl_seconds,
+            persistence_from=(sandbox_id if is_ec2 and not wipe_volume and old.persistence_volume and not development_bind else None),
         )
     except Exception as exc:
         logger.exception("Reset re-create failed for %s", sandbox_id)
@@ -484,6 +528,7 @@ async def resume_sandbox(sandbox_id: str):
     config = dict(old.config or {})
     organization_id = old.organization_id
     resources = config.get("resources") if isinstance(config.get("resources"), dict) else None
+    is_ec2 = tier == "ec2"
 
     logger.info(
         "Resuming sandbox %s (user=%s, template=%s, prior_status=%s)",
@@ -491,6 +536,8 @@ async def resume_sandbox(sandbox_id: str):
     )
 
     try:
+        if is_ec2 and not getattr(old, "persistence_volume", None):
+            return await sandbox_manager.resume_retained_ec2_layer(old)
         await storage.ensure_user_storage(user_id)
         new_sandbox = await sandbox_manager.create_sandbox(
             user_id=user_id,
@@ -503,6 +550,7 @@ async def resume_sandbox(sandbox_id: str):
             resources=resources,
             labels=labels,
             ttl_seconds=ttl_seconds,
+            persistence_from=(sandbox_id if is_ec2 and old.persistence_volume and not old.persistence_volume.startswith("host:") else None),
         )
     except Exception as exc:
         logger.exception("Resume re-create failed for %s", sandbox_id)

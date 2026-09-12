@@ -224,6 +224,8 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         and cur.image_id
         and old_image_id == cur.image_id
         and platform_env_changes == 0
+        and not (settings.host_tier == "ec2" and template in {"slim", "bare"}
+                 and not any(m.get("Destination") == "/home/agent" for m in old.attrs.get("Mounts", [])))
     ):
         return {
             "status": "already_current", "sandbox_id": sandbox_id,
@@ -235,6 +237,12 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     env.append("SANDBOX_MIGRATION=1")
     volumes = _binds_to_volumes(host)
     tmp_name = f"{sandbox_id}-mig"
+
+    if settings.host_tier == "ec2" and template in {"slim", "bare"}:
+        return await _migrate_hosted_ordered(
+            sandbox_id, old=old, target=target, env=env, volumes=volumes,
+            labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
+            platform_env_changes=platform_env_changes)
 
     # ── DATA-SAFETY GUARD ─────────────────────────────────────────────────────
     # The proven-safe swap relies on the new container mounting the SAME

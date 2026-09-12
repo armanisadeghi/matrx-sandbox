@@ -169,6 +169,48 @@ sudo -u ec2-user env PATH="/home/ec2-user/.local/bin:$PATH" \
 sudo -u ec2-user "$CANDIDATE_DIR/.venv/bin/python" -m uvicorn --version >/dev/null \
   || fail "candidate venv cannot run 'python -m uvicorn' — refusing to promote a release that cannot boot"
 
+# Durable recovery state is a host directory explicitly bound into the service
+# namespace. Never substitute an ephemeral service cwd or chmod existing state.
+JOURNAL_DIR=/var/lib/matrx-sandbox/hosted-migrations
+[ ! -L /var/lib/matrx-sandbox ] && [ ! -L "$JOURNAL_DIR" ] \
+  || fail "migration journal path is a symlink"
+install -d -o root -g root -m 0755 /var/lib/matrx-sandbox
+if [ ! -e "$JOURNAL_DIR" ]; then
+  install -d -o ec2-user -g ec2-user -m 0700 "$JOURNAL_DIR"
+fi
+sudo -u ec2-user /usr/bin/python3.11 - "$JOURNAL_DIR" <<'PY'
+import os, stat, sys, tempfile
+p=sys.argv[1]; s=os.lstat(p)
+assert stat.S_ISDIR(s.st_mode) and s.st_uid == os.geteuid() and not s.st_mode & 0o077
+fd,n=tempfile.mkstemp(dir=p)
+try: os.write(fd,b'preflight'); os.fsync(fd)
+finally: os.close(fd); os.unlink(n)
+PY
+command -v getfacl >/dev/null || yum install -y acl
+install -d -o root -g root -m 0755 /usr/local/libexec
+HELPER_DIGEST=$(sha256sum "$CANDIDATE_DIR/orchestrator/ec2_home_copy.py" | cut -d' ' -f1)
+HELPER="/usr/local/libexec/matrx-ec2-home-copy-$HELPER_DIGEST.py"
+[ ! -L "$HELPER" ] || fail "home-copy helper is a symlink"
+if [ ! -e "$HELPER" ]; then
+  install -o root -g root -m 0755 "$CANDIDATE_DIR/orchestrator/ec2_home_copy.py" "$HELPER"
+fi
+cmp "$CANDIDATE_DIR/orchestrator/ec2_home_copy.py" "$HELPER" \
+  || fail "home-copy helper differs from approved candidate"
+sudo -u ec2-user sudo -n env -i PATH=/usr/bin:/bin \
+  /usr/bin/python3.11 -I "$HELPER" --preflight \
+  || fail "home-copy helper is unavailable to actual service user"
+docker image inspect "$ECR_REPO-orchestrator:$TARGET_SHA" --format '{{.Id}}' \
+  > "$CANDIDATE_DIR/.migration-helper-image"
+# Keep the exact helper image reachable after release-candidate tag cleanup.
+docker tag "$ECR_REPO-orchestrator:$TARGET_SHA" matrx-orchestrator:home-helper
+chown ec2-user:ec2-user "$CANDIDATE_DIR/.migration-helper-image"
+systemd-run --quiet --wait --pipe --collect \
+  --unit="matrx-home-preflight-$TARGET_SHA" \
+  -p User=ec2-user -p "BindPaths=$JOURNAL_DIR" -p "WorkingDirectory=$CANDIDATE_DIR" \
+  "$CANDIDATE_DIR/.venv/bin/python" -c \
+  'import asyncio; from orchestrator.hosted_migration import HostedMigrationJournal; from orchestrator.ec2_home_copy_client import preflight_helper; HostedMigrationJournal().ensure_ready(); asyncio.run(preflight_helper())' \
+  || fail "candidate service-user journal/helper preflight failed"
+
 log "applying required migrations before promotion"
 validate_release_authority
 sudo -u ec2-user env MATRX_DATABASE_URL="$DB_URL" \
@@ -281,6 +323,7 @@ DROPIN_CHANGED=1
 cat > "$RELEASE_DROPIN" <<'EOF'
 [Service]
 WorkingDirectory=/home/ec2-user/orchestrator
+BindPaths=/var/lib/matrx-sandbox/hosted-migrations
 ExecStart=
 ExecStart=/home/ec2-user/orchestrator/.venv/bin/python -m uvicorn orchestrator.main:app --host 0.0.0.0 --port 8000 --workers 1
 EOF

@@ -70,7 +70,7 @@ async def _reap_once() -> dict:
     }
     try:
         from orchestrator.models import SandboxStatus
-        from orchestrator.sandbox_manager import _get_store, destroy_sandbox
+        from orchestrator.sandbox_manager import _get_store, _destroy_sandbox_unleased
         store = _get_store()
     except Exception as exc:
         logger.warning("Reaper: store unavailable this tick: %s", exc)
@@ -82,7 +82,24 @@ async def _reap_once() -> dict:
     # Marking first means that even if a teardown fails, the row already
     # reflects "expired" so the FE stops showing it as usable.
     try:
-        expired_ids = await store.expire_stale()
+        from contextlib import AsyncExitStack
+        from orchestrator.config import settings
+        from orchestrator.home_identity import home_key
+        from orchestrator.hosted_operation_lease import hosted_operation_lease, HostedOperationDenied
+        if settings.host_tier not in {"ec2", "hosted"}:
+            raise RuntimeError("expiry requires an authoritative host tier")
+        async with AsyncExitStack() as leases:
+            included = set()
+            for sandbox in await store.list():
+                if getattr(sandbox.tier, "value", sandbox.tier) != settings.host_tier:
+                    continue
+                try:
+                    await leases.enter_async_context(hosted_operation_lease(sandbox.sandbox_id, home_key(sandbox)))
+                    included.add(sandbox.sandbox_id)
+                except HostedOperationDenied:
+                    continue
+            expired_ids = await store.expire_stale(tier=settings.host_tier,
+                                                   include_sandbox_ids=frozenset(included))
     except Exception as exc:
         logger.warning("Reaper: expire_stale failed this tick: %s", exc)
         return summary
@@ -95,12 +112,24 @@ async def _reap_once() -> dict:
             # anything"). final_status=EXPIRED keeps the row resumable and
             # distinct from a user-stopped sandbox; the per-user volume is
             # preserved either way.
-            ok = await destroy_sandbox(
-                sandbox_id,
-                graceful=True,
-                reason="expired",
-                final_status=SandboxStatus.EXPIRED,
-            )
+            # Re-enter under the exclusive lifecycle key and re-read: a resume
+            # that won the gap after expire_stale must never be stopped by this
+            # stale sweep decision.
+            from orchestrator.home_identity import home_key
+            from orchestrator.hosted_operation_lease import hosted_operation_lease
+            fresh = await store.get(sandbox_id)
+            if not fresh:
+                continue
+            async with hosted_operation_lease(sandbox_id, home_key(fresh), lifecycle=True):
+                fresh = await store.get(sandbox_id)
+                life = await store.get_lifecycle(sandbox_id)
+                if (not fresh or not life or life.get("deleted")
+                        or life.get("status") != "expired"
+                        or getattr(fresh.status, "value", fresh.status) != "expired"):
+                    continue
+                ok = await _destroy_sandbox_unleased(
+                    sandbox_id, graceful=True, reason="expired", final_status=SandboxStatus.EXPIRED
+                )
             if ok:
                 summary["torn_down"] += 1
                 summary["sandbox_ids"].append(sandbox_id)

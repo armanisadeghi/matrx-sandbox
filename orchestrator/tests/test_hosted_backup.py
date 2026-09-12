@@ -13,7 +13,7 @@ from types import SimpleNamespace
 import pytest
 from docker.errors import ContainerError, NotFound
 
-from orchestrator.hosted_backup import HostedBackupError, restore_volume, snapshot_volume
+from orchestrator.hosted_backup import HostedBackupError, restore_volume, snapshot_volume, verify_volume_unchanged
 
 
 IMAGE = "sha256:" + "a" * 64
@@ -124,3 +124,12 @@ async def test_archive_corruption_with_intact_payload_never_mounts_target_writab
         await restore_volume(client, receipt=receipt, image=IMAGE)
     assert len(client.calls) == 1
     assert SOURCE not in client.calls[0][1]["volumes"]
+
+
+@pytest.mark.asyncio
+async def test_held_target_manifest_mismatch_refuses_cas_with_read_only_home():
+    """Break caught: a held image changed UID/GID/xattr data before routing CAS."""
+    client = FakeClient(["HOSTED_BACKUP_RESULT=" + json.dumps(MANIFEST_B) + "\n"])
+    with pytest.raises(HostedBackupError, match="shared home manifest changed"):
+        await verify_volume_unchanged(client, receipt=_receipt(), image=IMAGE)
+    assert client.calls[0][1]["volumes"][SOURCE]["mode"] == "ro"

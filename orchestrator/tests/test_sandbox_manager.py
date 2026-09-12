@@ -7,6 +7,7 @@ import subprocess
 from unittest.mock import MagicMock, patch
 
 import pytest
+from docker.errors import NotFound
 
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.store import InMemorySandboxStore
@@ -15,7 +16,7 @@ ORG_ID = "22222222-2222-4222-8222-222222222222"
 
 
 @pytest.fixture(autouse=True)
-def clean_sandbox_state():
+def clean_sandbox_state(tmp_path, monkeypatch):
     """Reset sandbox manager state before and after each test.
 
     Injects a fresh InMemorySandboxStore so tests don't rely on
@@ -23,8 +24,20 @@ def clean_sandbox_state():
     """
     from orchestrator import sandbox_manager
     from orchestrator.config import settings
+    from orchestrator.hosted_migration import HostedMigrationJournal
 
     store = InMemorySandboxStore()
+    # EC2 now shares the durable operation-fence contract.  Use its real
+    # filesystem journal in a test root; do not bypass the lease in unit tests.
+    journal_root = tmp_path / "migration-state"
+    journal_root.mkdir(mode=0o700)
+    journal = HostedMigrationJournal(journal_root)
+    monkeypatch.setattr(
+        "orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: journal,
+    )
+    monkeypatch.setattr(
+        "orchestrator.hosted_migration.HostedMigrationJournal", lambda: journal,
+    )
     original_host_tier = settings.host_tier
     # Unit creates explicitly emulate the EC2 orchestrator; production code no
     # longer invents this identity when MATRX_HOST_TIER is absent.
@@ -45,6 +58,9 @@ def clean_sandbox_state():
 def mock_docker():
     with patch("orchestrator.sandbox_manager._get_docker_client") as mock:
         client = MagicMock()
+        # New EC2 homes must refuse adopting an existing name.  A bare
+        # MagicMock falsely looks like an already-present Docker volume.
+        client.volumes.get.side_effect = NotFound("test volume is absent")
         mock.return_value = client
         yield client
 
@@ -425,6 +441,7 @@ async def test_destroy_sandbox_marks_stopped(mock_docker, clean_sandbox_state):
     ))
 
     container = MagicMock()
+    container.id = "container-destroy"
     mock_docker.containers.get.return_value = container
 
     result = await sandbox_manager.destroy_sandbox("sbx-destroy")

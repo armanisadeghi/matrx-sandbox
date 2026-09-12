@@ -40,13 +40,18 @@ class SandboxStore(ABC):
         """Save or update a sandbox record."""
 
     async def replace_container_if_current(self, sandbox_id: str, old_container_id: str,
-                                           new_container_id: str, template_version: str | None) -> SandboxResponse | None:
+                                           new_container_id: str, template_version: str | None,
+                                           *, persistence_volume: str | None = None,
+                                           old_persistence_volume: str | None = None) -> SandboxResponse | None:
         """Guarded migration routing update; None means preserve/fence artifacts."""
         sandbox = await self.get(sandbox_id)
         if (sandbox is None or sandbox.container_id != old_container_id
+                or (persistence_volume is not None and sandbox.persistence_volume != old_persistence_volume)
                 or getattr(sandbox.status, "value", sandbox.status) not in {"ready", "running", "starting"}):
             return None
         sandbox.container_id, sandbox.template_version = new_container_id, template_version
+        if persistence_volume is not None:
+            sandbox.persistence_volume = persistence_volume
         await self.save(sandbox)
         return await self.get(sandbox_id)
 
@@ -149,7 +154,8 @@ class SandboxStore(ABC):
         """
         return {"stopped": [], "refreshed": 0}
 
-    async def expire_stale(self) -> list[str]:
+    async def expire_stale(self, *, tier: str | None = None,
+                           include_sandbox_ids: frozenset[str] | None = None) -> list[str]:
         """Mark every sandbox past ``expires_at`` (still in a live status) as
         EXPIRED and return their ids.
 
@@ -164,6 +170,10 @@ class SandboxStore(ABC):
         now = datetime.now(timezone.utc)
         expired: list[str] = []
         for sb in await self.list():
+            if tier and getattr(sb.tier, "value", sb.tier) != tier:
+                continue
+            if include_sandbox_ids is not None and sb.sandbox_id not in include_sandbox_ids:
+                continue
             status = getattr(sb.status, "value", sb.status)
             if status in ("ready", "running") and sb.expires_at and sb.expires_at < now:
                 await self.update_status(sb.sandbox_id, SandboxStatus.EXPIRED)
@@ -535,15 +545,20 @@ class PostgresSandboxStore(SandboxStore):
             )
 
     async def replace_container_if_current(self, sandbox_id: str, old_container_id: str,
-                                           new_container_id: str, template_version: str | None) -> SandboxResponse | None:
+                                           new_container_id: str, template_version: str | None,
+                                           *, persistence_volume: str | None = None,
+                                           old_persistence_volume: str | None = None) -> SandboxResponse | None:
         async def _do() -> SandboxResponse | None:
             pool = await self._get_pool()
             async with pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    """UPDATE sandbox_instances SET container_id = $3, template_version = $4, updated_at = NOW()
+                    """UPDATE sandbox_instances SET container_id = $3, template_version = $4,
+                           persistence_volume = COALESCE($5::text, persistence_volume), updated_at = NOW()
                        WHERE sandbox_id = $1 AND container_id = $2 AND deleted_at IS NULL
+                         AND ($5::text IS NULL OR persistence_volume IS NOT DISTINCT FROM $6::text)
                          AND status IN ('ready', 'running', 'starting') RETURNING *""",
-                    sandbox_id, old_container_id, new_container_id, template_version)
+                    sandbox_id, old_container_id, new_container_id, template_version,
+                    persistence_volume, old_persistence_volume)
                 return _row_to_sandbox(row) if row else None
         return await self._execute_with_retry(_do)
 
@@ -838,7 +853,8 @@ class PostgresSandboxStore(SandboxStore):
 
         return await self._execute_with_retry(_do)
 
-    async def expire_stale(self) -> list[str]:
+    async def expire_stale(self, *, tier: str | None = None,
+                           include_sandbox_ids: frozenset[str] | None = None) -> list[str]:
         """Find and mark expired sandboxes. Returns list of sandbox_ids that expired.
 
         Wrapped in ``_execute_with_retry`` because the reaper calls this from
@@ -856,7 +872,10 @@ class PostgresSandboxStore(SandboxStore):
                          AND expires_at IS NOT NULL
                          AND expires_at < NOW()
                          AND deleted_at IS NULL
-                       RETURNING sandbox_id"""
+                         AND ($1::text IS NULL OR tier = $1)
+                         AND ($2::text[] IS NULL OR sandbox_id = ANY($2::text[]))
+                       RETURNING sandbox_id""",
+                    tier, list(include_sandbox_ids) if include_sandbox_ids is not None else None,
                 )
                 expired = [row["sandbox_id"] for row in rows]
                 if expired:

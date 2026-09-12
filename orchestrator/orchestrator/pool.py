@@ -286,6 +286,13 @@ async def claim_warm(
     """
     if not await _pool_enabled():
         return None
+    # An unclaimed EC2 warm box has a writable-layer /home/agent and cannot
+    # acquire an owner-bound durable volume without replacing the container.
+    # Returning None sends the caller through canonical cold creation, which
+    # creates and labels the per-sandbox EC2 home before the first write.
+    if settings.host_tier == "ec2":
+        logger.info("Pool: refusing EC2 warm claim without a durable home; cold-create required")
+        return None
     template = template or await _warm_template()
 
     from orchestrator.sandbox_manager import _get_store, _proxy_url_for

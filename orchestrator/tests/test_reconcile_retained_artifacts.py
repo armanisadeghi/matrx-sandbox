@@ -15,7 +15,7 @@ def _patch_journal(monkeypatch, journal):
 
 
 def _record(*, phase: str, old_id: str, target_id: str | None = None) -> dict:
-    record = {"schema_version": 1, "sandbox_id": "sbx-old", "phase": phase, "old_id": old_id, "old_name": "old", "old_image": "sha256:" + "a" * 64, "source_volume": "home", "source_identity": {"name": "home"}, "row_identity": {"sandbox_id": "sbx-old"}, "target_name": "target", "target_image": "sha256:" + "b" * 64, "target_id": target_id, "operation_label": "op", "backup_name": "backup", "helper_image": "sha256:" + "c" * 64, "rollback_name": "rollback", "verify_timeout": 1, "stop_timeout": 1}
+    record = {"schema_version": 1, "sandbox_id": "sbx-old", "phase": phase, "old_id": old_id, "old_name": "old", "old_image": "sha256:" + "a" * 64, "source_volume": "home", "source_identity": {"name": "home"}, "row_identity": {"sandbox_id": "sbx-old"}, "target_name": "target", "target_image": "sha256:" + "b" * 64, "target_id": target_id, "operation_label": "op", "backup_name": "backup", "helper_image": "sha256:" + "c" * 64, "rollback_name": "rollback", "verify_timeout": 1, "stop_timeout": 1, "source_endpoint": {"network": "bridge", "network_id": "network-id", "aliases": ["old"], "requested_aliases": ["old"], "ipv4_address": "172.17.0.2", "ipv4_address_prefixlen": 16, "mac_address": "02:42:ac:11:00:02"}, "network_disconnect_receipt": {"old_id": old_id, "network": "bridge", "network_id": "network-id", "absent": True}, "pre_cas_home_receipt": {"manifest_sha256": "digest", "source_volume": {"name": "home"}}}
     if phase == "committed":
         record["backup_receipt"] = {"verified": True}
     return record
