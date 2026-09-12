@@ -106,8 +106,8 @@ async def delete_user_volume(user_id: str) -> None:
 # The backing store for /home/agent/.matrx/memory/. The orchestrator hydrates
 # these into a sandbox on create and captures edits on graceful teardown (see
 # orchestrator/memory_sync.py), so memory follows the user across every project
-# and every box — including the ephemeral slim/EC2 ones that keep no volume.
-# These routes also let the matrx-frontend show + edit the memory directly.
+# and every selected durable-home template. These routes also let the
+# matrx-frontend show + edit the memory directly.
 
 @router.get("/{user_id}/memory", response_model=MemoryListResponse)
 async def list_user_memory(user_id: str) -> MemoryListResponse:

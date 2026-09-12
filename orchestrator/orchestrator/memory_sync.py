@@ -2,10 +2,10 @@
 
 The user wants a small folder where the agent keeps .md/text files that serve
 as persistent memory of the user, their projects, and preferences — the SAME
-across every project and every sandbox. That can't live only in an ephemeral
-box (slim/EC2 keep no volume), so the canonical copy lives centrally in the
-``user_memory`` table (keyed on user_id only) and the orchestrator moves it in
-and out of ``/home/agent/.matrx/memory/``:
+across every project and sandbox. The canonical copy lives centrally in
+``users.user_memory`` (keyed by ``created_by`` + ``path``) and the
+orchestrator moves it in and out of ``/home/agent/.matrx/memory/`` so the
+memory follows the user regardless of the selected durable-home template:
 
   - **hydrate** (on create/resume): central rows → files in the box, so a fresh
     box already knows the user.
