@@ -597,6 +597,50 @@ async def test_stdin_exec_demuxes_fragmented_docker_frames_before_cwd_parse():
     assert raw.closed is True
 
 
+def test_docker_exec_demux_keeps_complete_stdout_and_stderr_frames_separate():
+    """A complete Docker wire stream preserves each supported output channel."""
+    from orchestrator import sandbox_manager
+
+    raw = _FragmentedExecSocket(
+        _docker_exec_frame(1, b"visible stdout\n")
+        + _docker_exec_frame(2, b"visible stderr\n"),
+        [3, 8, 4, 7, 6],
+    )
+
+    stdout, stderr = sandbox_manager._demux_docker_exec_socket(raw)
+
+    assert bytes(stdout) == b"visible stdout\n"
+    assert bytes(stderr) == b"visible stderr\n"
+
+
+@pytest.mark.parametrize(
+    ("wire_bytes", "error"),
+    [
+        (
+            _docker_exec_frame(3, b"unknown channel"),
+            "unsupported stream id 3",
+        ),
+        (
+            b"\x01\x00\x00\x00\x00\x00\x00",
+            "incomplete multiplex frame",
+        ),
+        (
+            struct.pack(">BxxxL", 1, 4) + b"xy",
+            "incomplete multiplex frame",
+        ),
+    ],
+    ids=("unknown-stream-id", "truncated-header", "truncated-payload"),
+)
+def test_docker_exec_demux_refuses_malformed_wire_frames(wire_bytes, error):
+    """Malformed Docker multiplex frames must fail closed, never leak or truncate output."""
+    from orchestrator import sandbox_manager
+
+    raw = _FragmentedExecSocket(wire_bytes, [1, 2, 3])
+
+    with pytest.raises(RuntimeError, match=error):
+        sandbox_manager._demux_docker_exec_socket(raw)
+
+
 @pytest.mark.asyncio
 async def test_exec_in_sandbox_preserves_heredoc_terminator(
     mock_docker, clean_sandbox_state, tmp_path
