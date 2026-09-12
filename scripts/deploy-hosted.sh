@@ -95,11 +95,47 @@ run_db_migrations() {
     || fail "MATRX_SANDBOX_STORE must be 'postgres' in $ORCH_COMPOSE_DIR/.env (in-memory loses every sandbox row on restart)"
   grep -q '^MATRX_HOST_TIER=hosted[[:space:]]*$' "$ORCH_COMPOSE_DIR/.env" \
     || fail "MATRX_HOST_TIER must be 'hosted' in $ORCH_COMPOSE_DIR/.env (token issuance and lifecycle routing require exact tier identity)"
+  prepare_hosted_journal "$image"
   if ! docker run --rm --env-file "$ORCH_COMPOSE_DIR/.env" "$image" \
         python -m orchestrator.migrate_runner; then
     fail "DB migrations failed — aborting before recreating orchestrator"
   fi
   log "DB migrations applied ✓"
+}
+
+prepare_hosted_journal() {
+  local image="$1" source override state
+  source="$REPO_DIR/infra/hosted/docker-compose.override.yml"
+  override="$ORCH_COMPOSE_DIR/docker-compose.override.yml"
+  state="$ORCH_COMPOSE_DIR/hosted-migrations"
+  [ -f "$source" ] || fail "canonical hosted journal compose overlay is missing"
+  # Never overwrite an operator's unrelated override or follow a substituted
+  # state/override symlink. An existing journal's permissions are evidence to
+  # validate, not something a deploy should silently repair.
+  [ ! -L "$override" ] && [ ! -L "$state" ] \
+    || fail "hosted journal override/state must not be symbolic links"
+  if [ -e "$override" ]; then
+    cmp -s "$source" "$override" \
+      || fail "hosted compose override differs from canonical journal overlay; reconcile before deploy"
+  fi
+  if [ ! -e "$state" ]; then
+    install -d -m 0700 "$state" || fail "cannot provision durable hosted journal directory"
+  fi
+  # Run as the candidate image's actual USER against the actual mount. This
+  # validates ownership, mode, mount, writes and fsync before any service swap.
+  docker run --rm --network none --entrypoint python \
+    --mount "type=bind,src=$state,dst=/var/lib/matrx-sandbox/hosted-migrations" \
+    "$image" -c 'from orchestrator.hosted_migration import HostedMigrationJournal; HostedMigrationJournal().ensure_ready()' \
+    || fail "candidate cannot safely use durable hosted migration journal"
+  # Only add the mount to subsequent Manager recreates after its real directory
+  # is ready; a failed preflight leaves the previous compose configuration intact.
+  if [ ! -e "$override" ]; then
+    install -m 0644 "$source" "$override" \
+      || fail "cannot install hosted journal compose overlay"
+  fi
+  ( cd "$ORCH_COMPOSE_DIR" && docker compose config --format json ) \
+    | python3 -c 'import json,sys; c=json.load(sys.stdin); v=c["services"]["orchestrator"].get("volumes",[]); p="/var/lib/matrx-sandbox/hosted-migrations"; matches=[m for m in v if m.get("target")==p]; sys.exit(0 if len(matches)==1 and matches[0].get("type")=="bind" and not matches[0].get("read_only",False) and matches[0].get("source")==sys.argv[1] else 1)' "$state" \
+    || fail "effective hosted compose does not retain the verified journal mount"
 }
 
 cd "$REPO_DIR" || fail "repo dir $REPO_DIR not found"

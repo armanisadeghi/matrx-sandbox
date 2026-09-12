@@ -2,6 +2,17 @@ FROM python:3.11-slim
 
 WORKDIR /app
 
+# Hosted-volume snapshot helpers execute inside this controlled orchestrator
+# image, not inside whichever sandbox image happens to be old or incomplete.
+# These are the verification/copy tools the helper invokes directly.
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        acl \
+        coreutils \
+        findutils \
+        tar \
+    && rm -rf /var/lib/apt/lists/*
+
 ARG UV_VERSION=0.10.8
 ARG MATRX_SOURCE_SHA=dev
 COPY pyproject.toml uv.lock ./
@@ -12,6 +23,7 @@ RUN pip install --no-cache-dir "uv==${UV_VERSION}" \
 
 COPY . .
 RUN uv sync --locked --no-dev
+RUN install -d -m 0700 /var/lib/matrx-sandbox/hosted-migrations
 RUN printf '%s\n' "${MATRX_SOURCE_SHA}" > /app/.source-sha
 
 ENV PATH="/app/.venv/bin:${PATH}"

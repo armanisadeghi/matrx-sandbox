@@ -31,6 +31,11 @@ from orchestrator.config import settings
 from orchestrator.knobs import knob_bool, knob_int
 from orchestrator.runtime_isolation import container_runtime_isolation
 from orchestrator.versioning import current_image
+from orchestrator.hosted_runtime import (
+    migrate_hosted as _migrate_hosted_ordered,
+    recover_hosted_migration,
+    recover_hosted_migrations,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -80,6 +85,8 @@ def _binds_to_volumes(host_config: dict) -> dict:
         if len(parts) >= 2:
             out[parts[0]] = {"bind": parts[1], "mode": parts[2] if len(parts) > 2 else "rw"}
     return out
+
+
 
 
 async def _wait_container_ready(container, timeout: int, template: str | None = None) -> bool:
@@ -190,6 +197,13 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     template = labels.get("matrx.template")
     cur = await asyncio.to_thread(current_image, client, template)
     target = target_image or cur.tag
+    # A caller-selected tag can drift between admission and target boot. The
+    # hosted phase journal must bind an immutable image identity instead.
+    if target_image and not target_image.startswith("sha256:"):
+        return {"status": "failed", "sandbox_id": sandbox_id,
+                "reason": "hosted migration requires an immutable sha256 target image ID"}
+    if not target_image and cur.image_id:
+        target = cur.image_id
     old_image_id = (old.attrs or {}).get("Image")
 
     cfg = old.attrs.get("Config") or {}
@@ -255,125 +269,10 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
             labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
         )
 
-    # Lock for the WHOLE migration up front. While building the new container,
-    # both it and the old one carry the same matrx.sandbox_id label, and the
-    # store row / container lookup briefly flux — so rather than let calls race
-    # that (they 404'd / timed out in testing), we refuse every call with a
-    # retryable 503 from here until release. The agent's tool proxy waits it out
-    # and lands on the migrated box. We only auto-migrate idle boxes, so in
-    # practice few/no calls arrive during the window.
-    from orchestrator import activity
+    return await _migrate_hosted_ordered(sandbox_id, old=old, target=target, env=env, volumes=volumes,
+        labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
+        platform_env_changes=platform_env_changes)
 
-    await activity.mark_migrating(sandbox_id)
-    new = None
-    try:
-        try:
-            await asyncio.to_thread(lambda: client.containers.get(tmp_name).remove(force=True))  # clear any stale temp
-        except NotFound:
-            pass
-        except APIError as exc:
-            logger.warning("migrate %s: could not clear stale temp container: %s", sandbox_id, exc)
-
-        logger.info(
-            "migrate %s: %s -> %s (template=%s)",
-            sandbox_id, (old_image_id or "?")[:19], target, template,
-        )
-        tier = labels.get("matrx.tier")
-        run_kwargs: dict = dict(
-            image=target, name=tmp_name, detach=True, environment=env,
-            volumes=volumes or None, network=settings.docker_network,
-            ports={"22/tcp": None}, extra_hosts={"host.docker.internal": "host-gateway"},
-            labels=labels, restart_policy={"Name": "no", "MaximumRetryCount": 0},
-        )
-        run_kwargs.update(container_runtime_isolation(template, tier))
-        if host.get("NanoCpus"):
-            run_kwargs["nano_cpus"] = host["NanoCpus"]
-        if host.get("Memory"):
-            run_kwargs["mem_limit"] = host["Memory"]
-
-        try:
-            new = await asyncio.to_thread(lambda: client.containers.run(**run_kwargs))
-        except APIError as exc:
-            logger.error("migrate %s: new container create failed: %s", sandbox_id, exc)
-            return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"create failed: {exc}"}
-
-        ready = await _wait_container_ready(new, verify_timeout, template)
-        new_ver = (await _container_version(new)) if ready else None
-        # Skip strict version equality when the current image is itself
-        # unversioned (built before the stamp) — fall back to readiness + image id.
-        version_ok = cur.version is None or new_ver == cur.version
-        if not ready or not version_ok:
-            logger.error(
-                "MIGRATE FAILED %s: ready=%s new_version=%s expected=%s — OLD box kept running, ALARM",
-                sandbox_id, ready, new_ver, cur.version,
-            )
-            try:
-                await asyncio.to_thread(new.remove, force=True)
-            except APIError:
-                pass
-            return {
-                "status": "failed", "sandbox_id": sandbox_id,
-                "reason": f"new box not ready / version mismatch (ready={ready}, version={new_ver}->{cur.version})",
-            }
-
-        # Drain calls that were already in-flight when we locked, so cutover
-        # never interrupts a tool mid-execution. New calls are already refused.
-        if not await activity.drain_inflight(sandbox_id, timeout=20.0):
-            logger.info("migrate %s: box busy, deferring (will retry later)", sandbox_id)
-            try:
-                await asyncio.to_thread(new.remove, force=True)
-            except APIError:
-                pass
-            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                    "reason": "in-flight tool calls did not drain; retry later"}
-
-        # ── Atomic cutover ────────────────────────────────────────────────────
-        old_renamed = f"{sandbox_id}-old-{int(time.time())}"
-        try:
-            try:
-                await asyncio.to_thread(
-                    old.stop, timeout=await knob_int("shutdown_timeout_seconds")
-                )
-            except APIError:
-                pass
-            await asyncio.to_thread(old.rename, old_renamed)
-            await asyncio.to_thread(new.rename, sandbox_id)
-        except APIError as exc:
-            logger.error("MIGRATE CUTOVER FAILED %s: %s — rolling back to old box", sandbox_id, exc)
-            try:
-                await asyncio.to_thread(new.remove, force=True)
-            except APIError:
-                pass
-            try:  # best-effort restore of the old box
-                await asyncio.to_thread(old.rename, sandbox_id)
-                await asyncio.to_thread(old.start)
-            except APIError:
-                pass
-            return {"status": "failed", "sandbox_id": sandbox_id, "reason": f"cutover failed: {exc}"}
-
-        try:
-            await asyncio.to_thread(old.remove, force=True)
-        except APIError as exc:
-            logger.warning("migrate %s: old container cleanup failed (non-fatal): %s", sandbox_id, exc)
-
-        try:
-            sbx = await store.get(sandbox_id)
-            if sbx:
-                sbx.template_version = cur.version or new_ver
-                sbx.container_id = new.id
-                await store.save(sbx)
-        except Exception as exc:
-            logger.warning("migrate %s: store update failed (non-fatal): %s", sandbox_id, exc)
-    finally:
-        # Unlock — the new container now answers as sandbox_id; calls resume.
-        await activity.release_migration(sandbox_id)
-
-    logger.info("MIGRATED %s -> %s (version=%s)", sandbox_id, target, cur.version or new_ver)
-    return {
-        "status": "migrated", "sandbox_id": sandbox_id,
-        "to_version": cur.version or new_ver, "to_image": target,
-        "platform_env_changed": platform_env_changes,
-    }
 
 
 async def _restart_container(container) -> None:
@@ -382,6 +281,8 @@ async def _restart_container(container) -> None:
     except APIError as exc:
         logger.error("migrate(s3): could not restart old container %s: %s",
                      getattr(container, "name", "?"), exc)
+
+
 
 
 async def _migrate_s3_ordered(

@@ -27,6 +27,7 @@ from orchestrator.storage_layout import (
     StorageLocation,
     ensure_user_volume,
     resolve_user_storage,
+    user_volume_name,
 )
 from orchestrator.store import SandboxStore, create_store
 
@@ -333,6 +334,42 @@ async def create_sandbox(
     labels: dict | None = None,
     ttl_seconds: int | None = None,
 ) -> SandboxResponse:
+    """Create under the hosted home lease before the first durable write."""
+    config = config or {}
+    config_organization_id = config.get("organization_id")
+    if config_organization_id is not None and config_organization_id != organization_id:
+        raise ValueError(
+            "config.organization_id must match the explicit organization_id"
+        )
+    location = resolve_user_storage(user_id, tier)
+    sandbox_id = f"sbx-{uuid.uuid4().hex[:12]}"
+    if location.tier != "hosted":
+        return await _create_sandbox_unleased(
+            sandbox_id, user_id, organization_id, name, config, template,
+            template_version, tier, resources, labels, ttl_seconds,
+        )
+    from orchestrator.hosted_operation_lease import hosted_operation_lease
+    volume = user_volume_name(user_id)
+    async with hosted_operation_lease(sandbox_id, volume):
+        return await _create_sandbox_unleased(
+            sandbox_id, user_id, organization_id, name, config, template,
+            template_version, tier, resources, labels, ttl_seconds,
+        )
+
+
+async def _create_sandbox_unleased(
+    sandbox_id: str,
+    user_id: str,
+    organization_id: str,
+    name: str | None = None,
+    config: dict | None = None,
+    template: str | None = None,
+    template_version: str | None = None,
+    tier: str | None = None,
+    resources: dict | None = None,
+    labels: dict | None = None,
+    ttl_seconds: int | None = None,
+) -> SandboxResponse:
     """Create and start a new sandbox container for a user.
 
     ``template``/``template_version``/``tier``/``labels`` are recorded on the
@@ -341,13 +378,9 @@ async def create_sandbox(
     overrides for now). ``ttl_seconds`` overrides the default TTL for this sandbox.
     """
     store = _get_store()
-    sandbox_id = f"sbx-{uuid.uuid4().hex[:12]}"
-    config = config or {}
-    config_organization_id = config.get("organization_id")
-    if config_organization_id is not None and config_organization_id != organization_id:
-        raise ValueError(
-            "config.organization_id must match the explicit organization_id"
-        )
+    from orchestrator.hosted_migration import hosted_volume_fenced
+    if (tier or settings.host_tier) == "hosted" and hosted_volume_fenced(user_volume_name(user_id)):
+        raise RuntimeError("hosted user home is fenced by an in-progress migration/recovery")
     config["organization_id"] = organization_id
     resources = resources or {}
 
@@ -844,6 +877,13 @@ async def get_sandbox(sandbox_id: str) -> SandboxResponse | None:
     return _backfill_proxy_url(await store.get(sandbox_id))
 
 
+async def migration_fenced(sandbox_id: str) -> bool:
+    """Resolve exact shared-home scope from the durable row, never labels."""
+    from orchestrator.hosted_migration import hosted_fenced, hosted_volume_fenced
+    sandbox = await get_sandbox(sandbox_id)
+    return hosted_fenced(sandbox_id) or bool(sandbox and hosted_volume_fenced(sandbox.persistence_volume))
+
+
 async def list_sandboxes(
     user_id: str | None = None, include_deleted: bool = False
 ) -> list[SandboxResponse]:
@@ -1097,6 +1137,29 @@ async def destroy_sandbox(
     reason: str = "user_requested",
     final_status: SandboxStatus | None = None,
 ) -> bool:
+    """Destroy under the exact hosted home lease, including reaper callers."""
+    sandbox = await _get_store().get(sandbox_id)
+    if not sandbox:
+        return False
+    volume = getattr(sandbox, "persistence_volume", None)
+    if not volume and getattr(sandbox, "user_id", None):
+        volume = user_volume_name(sandbox.user_id)
+    if not volume:
+        logger.warning("Refusing hosted destroy without an authoritative home for %s", sandbox_id)
+        if settings.host_tier == "hosted":
+            return False
+        return await _destroy_sandbox_unleased(sandbox_id, graceful, reason, final_status)
+    from orchestrator.hosted_operation_lease import hosted_operation_lease
+    async with hosted_operation_lease(sandbox_id, volume):
+        return await _destroy_sandbox_unleased(sandbox_id, graceful, reason, final_status)
+
+
+async def _destroy_sandbox_unleased(
+    sandbox_id: str,
+    graceful: bool = True,
+    reason: str = "user_requested",
+    final_status: SandboxStatus | None = None,
+) -> bool:
     """Destroy a sandbox, optionally with graceful shutdown.
 
     Records the stop reason (user_requested, expired, error, graceful_shutdown, admin)
@@ -1110,6 +1173,10 @@ async def destroy_sandbox(
     store = _get_store()
     sandbox = await store.get(sandbox_id)
     if not sandbox:
+        return False
+    from orchestrator.hosted_migration import hosted_fenced, hosted_volume_fenced
+    if hosted_fenced(sandbox_id) or hosted_volume_fenced(getattr(sandbox, "persistence_volume", None)):
+        logger.warning("Refusing destroy for hosted migration-fenced sandbox/home %s", sandbox_id)
         return False
 
     forget_sandbox_cwd(sandbox_id)
@@ -1177,31 +1244,41 @@ async def delete_user_volume(user_id: str) -> bool:
     from orchestrator.storage_layout import user_volume_name
 
     name = user_volume_name(user_id)
-    client = _get_docker_client()
 
-    # Refuse if any sandbox is still using the volume — would surprise the user.
-    in_use = await asyncio.to_thread(
-        lambda: client.containers.list(all=True, filters={"volume": name})
-    )
-    if in_use:
-        raise RuntimeError(
-            f"Volume {name} is still in use by {len(in_use)} container(s). "
-            "Stop those sandboxes first."
+    async def remove_under_lease() -> bool:
+        client = _get_docker_client()
+        in_use = await asyncio.to_thread(
+            lambda: client.containers.list(all=True, filters={"volume": name})
         )
+        if in_use:
+            raise RuntimeError(
+                f"Volume {name} is still in use by {len(in_use)} container(s). "
+                "Stop those sandboxes first."
+            )
+        try:
+            volume = await asyncio.to_thread(client.volumes.get, name)
+        except NotFound:
+            logger.info("delete_user_volume(%s): volume not found, no-op", user_id)
+            return True
+        try:
+            await asyncio.to_thread(volume.remove, force=False)
+            logger.warning("Deleted user volume %s for user %s", name, user_id)
+            return True
+        except APIError as e:
+            logger.error("Failed to delete volume %s: %s", name, e)
+            return False
 
-    try:
-        volume = await asyncio.to_thread(client.volumes.get, name)
-    except NotFound:
-        logger.info("delete_user_volume(%s): volume not found, no-op", user_id)
-        return True
-
-    try:
-        await asyncio.to_thread(volume.remove, force=False)
-        logger.warning("Deleted user volume %s for user %s", name, user_id)
-        return True
-    except APIError as e:
-        logger.error("Failed to delete volume %s: %s", name, e)
-        return False
+    from orchestrator.hosted_operation_lease import hosted_operation_lease
+    operation_id = f"volume-delete-{user_id}"
+    async with hosted_operation_lease(operation_id, name):
+        task = asyncio.create_task(remove_under_lease())
+        try:
+            return await asyncio.shield(task)
+        except asyncio.CancelledError:
+            try:
+                await task
+            finally:
+                raise
 
 
 async def get_user_volume_size(user_id: str) -> int | None:

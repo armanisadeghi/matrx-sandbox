@@ -86,9 +86,13 @@ variable "ssh_cidr_blocks" {
 }
 
 variable "api_cidr_blocks" {
-  description = "CIDR blocks allowed API access. Empty = no external API access."
+  description = "Trusted private callers allowed direct port 8000 access; public clients use authenticated HTTPS ingress. Empty denies direct API ingress."
   type        = list(string)
   default     = []
+  validation {
+    condition     = alltrue([for cidr in var.api_cidr_blocks : can(cidrnetmask(cidr)) && !contains(["0.0.0.0/0", "::/0"], cidr)])
+    error_message = "Direct orchestrator API ingress must not be open to the internet; use the authenticated HTTPS hostname for public clients."
+  }
 }
 
 variable "ecr_repo_arn" {

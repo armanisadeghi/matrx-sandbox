@@ -419,7 +419,7 @@ async def test_destroy_sandbox_marks_stopped(mock_docker, clean_sandbox_state):
 
     store = clean_sandbox_state
     await store.save(SandboxResponse(
-        sandbox_id="sbx-destroy", user_id="alice", organization_id=ORG_ID, status=SandboxStatus.READY,
+        sandbox_id="sbx-destroy", user_id="00000000-0000-4000-8000-000000000001", organization_id=ORG_ID, status=SandboxStatus.READY,
         container_id="container-destroy",
         created_at=datetime.now(timezone.utc),
     ))

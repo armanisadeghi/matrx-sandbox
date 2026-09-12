@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import hmac
+import inspect
 import logging
 import re
 from datetime import datetime, timezone
@@ -36,6 +37,11 @@ from orchestrator.models import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+async def _migration_fenced(sandbox_id: str) -> bool:
+    value = sandbox_manager.migration_fenced(sandbox_id)
+    return bool(await value) if inspect.isawaitable(value) else False
 
 router = APIRouter(prefix="/sandboxes", tags=["sandboxes"])
 _WORKSPACE_KEY_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,62}$")
@@ -255,7 +261,7 @@ def _require_live(sandbox) -> None:
 @router.post("/{sandbox_id}/exec", response_model=ExecResponse)
 async def exec_command(sandbox_id: str, req: ExecRequest):
     """Execute a command inside a running sandbox."""
-    if activity.is_migrating(sandbox_id):
+    if await _migration_fenced(sandbox_id):
         raise _migrating_503(sandbox_id)
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
@@ -324,6 +330,8 @@ async def destroy_sandbox(sandbox_id: str, graceful: bool = True, purge: bool = 
     every default list immediately ("delete" in user-facing UIs). The
     per-user volume is preserved either way.
     """
+    if await _migration_fenced(sandbox_id):
+        raise _migrating_503(sandbox_id)
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -352,6 +360,8 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     in-memory store generates a new id). Callers must swap their cached
     reference to the returned sandbox.
     """
+    if await _migration_fenced(sandbox_id):
+        raise _migrating_503(sandbox_id)
     old = await sandbox_manager.get_sandbox(sandbox_id)
     if not old:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -375,7 +385,9 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     )
 
     # 1. Destroy the existing container (preserves named volume).
-    await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="user_reset")
+    destroyed = await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="user_reset")
+    if not destroyed:
+        raise HTTPException(status_code=503, detail="Reset deferred: sandbox or shared home is migration-fenced")
 
     # 2. Optional volume wipe — clears the per-user Docker volume so the
     # new sandbox boots with an empty /home/agent.
@@ -384,7 +396,9 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
             wiped = await sandbox_manager.delete_user_volume(user_id)
             logger.info("Reset wiped per-user volume for %s: %s", user_id, wiped)
         except Exception as exc:
-            logger.warning("Reset volume wipe for %s failed: %s", user_id, exc)
+            raise HTTPException(status_code=502, detail=f"Reset volume wipe failed: {exc}") from exc
+        if not wiped:
+            raise HTTPException(status_code=502, detail="Reset volume wipe did not complete; refusing recreate")
 
     # 3. Re-create with the same shape.
     try:
@@ -429,6 +443,8 @@ async def resume_sandbox(sandbox_id: str):
     ``user_id``, not ``sandbox_id``. Callers must swap their cached reference
     to the returned sandbox. The old row is left as audit history.
     """
+    if await _migration_fenced(sandbox_id):
+        raise _migrating_503(sandbox_id)
     old = await sandbox_manager.get_sandbox(sandbox_id)
     if not old:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -602,7 +618,8 @@ async def migrate_sandbox_route(sandbox_id: str, target_image: str | None = None
     from orchestrator.migrate import migrate_sandbox
 
     store = sandbox_manager._get_store()
-    result = await migrate_sandbox(sandbox_id, store=store, target_image=target_image)
+    # Manual callers are not exempt from PTY/watch/in-flight quiescence.
+    result = await migrate_sandbox(sandbox_id, store=store, target_image=target_image, require_idle=True)
     if result["status"] in ("migrated", "already_current"):
         return result
     if result["status"] == "not_found":
@@ -769,6 +786,9 @@ def _authenticate_websocket(websocket: WebSocket, sandbox_id: str, required_scop
 
 @router.websocket("/{sandbox_id}/fs/watch")
 async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
+    if await _migration_fenced(sandbox_id):
+        await websocket.close(code=1013, reason="sandbox migration/recovery in progress")
+        return
     """Proxy WebSocket for file watching to the internal sandbox daemon."""
     if not _authenticate_websocket(websocket, sandbox_id, required_scope="fs.watch"):
         await websocket.close(code=1008, reason="Unauthorized: master key or fs.watch-scoped token required")
@@ -855,7 +875,7 @@ async def proxy_fs_watch(sandbox_id: str, websocket: WebSocket):
 @router.api_route("/{sandbox_id}/fs/{path:path}", methods=["GET", "POST", "PUT", "DELETE", "PATCH"])
 async def proxy_fs(sandbox_id: str, path: str, request: Request):
     """Proxy file system requests to the internal sandbox daemon."""
-    if activity.is_migrating(sandbox_id):
+    if await _migration_fenced(sandbox_id):
         raise _migrating_503(sandbox_id)
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
@@ -907,7 +927,7 @@ async def proxy_exec_stream(sandbox_id: str, request: Request):
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
     _require_live(sandbox)
-    if activity.is_migrating(sandbox_id):
+    if await _migration_fenced(sandbox_id):
         raise _migrating_503(sandbox_id)
 
     container_ip = await sandbox_manager.get_sandbox_internal_ip(sandbox_id)
@@ -943,7 +963,7 @@ async def proxy_exec_stream(sandbox_id: str, request: Request):
 @router.api_route("/{sandbox_id}/git/{path:path}", methods=["GET", "POST"])
 async def proxy_git(sandbox_id: str, path: str, request: Request):
     """Proxy git requests to the internal sandbox daemon."""
-    if activity.is_migrating(sandbox_id):
+    if await _migration_fenced(sandbox_id):
         raise _migrating_503(sandbox_id)
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
@@ -986,6 +1006,8 @@ async def proxy_git(sandbox_id: str, path: str, request: Request):
 @router.api_route("/{sandbox_id}/credentials", methods=["POST"])
 @router.api_route("/{sandbox_id}/credentials/revoke", methods=["POST"])
 async def proxy_credentials(sandbox_id: str, request: Request):
+    if await _migration_fenced(sandbox_id):
+        raise _migrating_503(sandbox_id)
     """Proxy credentials requests to the internal sandbox daemon."""
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
@@ -1027,6 +1049,9 @@ async def proxy_credentials(sandbox_id: str, request: Request):
 
 @router.websocket("/{sandbox_id}/pty")
 async def proxy_pty(sandbox_id: str, websocket: WebSocket):
+    if await _migration_fenced(sandbox_id):
+        await websocket.close(code=1013, reason="sandbox migration/recovery in progress")
+        return
     """Proxy PTY WebSocket to the internal sandbox daemon."""
     if not _authenticate_websocket(websocket, sandbox_id, required_scope="pty"):
         await websocket.close(code=1008, reason="Unauthorized: master key or pty-scoped token required")
@@ -1112,6 +1137,8 @@ async def proxy_pty(sandbox_id: str, websocket: WebSocket):
 
 @router.api_route("/{sandbox_id}/search/{path:path}", methods=["GET", "POST"])
 async def proxy_search(sandbox_id: str, path: str, request: Request):
+    if await _migration_fenced(sandbox_id):
+        raise _migrating_503(sandbox_id)
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -1148,6 +1175,8 @@ async def proxy_search(sandbox_id: str, path: str, request: Request):
 @router.api_route("/{sandbox_id}/processes", methods=["GET"])
 @router.api_route("/{sandbox_id}/processes/{pid:int}/signal", methods=["POST"])
 async def proxy_processes(sandbox_id: str, request: Request, pid: int = None):
+    if await _migration_fenced(sandbox_id):
+        raise _migrating_503(sandbox_id)
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -1185,6 +1214,8 @@ async def proxy_processes(sandbox_id: str, request: Request, pid: int = None):
 
 @router.api_route("/{sandbox_id}/ports", methods=["GET"])
 async def proxy_ports(sandbox_id: str, request: Request):
+    if await _migration_fenced(sandbox_id):
+        raise _migrating_503(sandbox_id)
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -1556,6 +1587,8 @@ async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
     methods=["GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD"],
 )
 async def proxy_to_container(sandbox_id: str, path: str, request: Request):
+    if await _migration_fenced(sandbox_id):
+        raise _migrating_503(sandbox_id)
     """Reverse-proxy arbitrary HTTP requests into the in-container daemon.
 
     Browser → ``{public_url}/sandboxes/{sandbox_id}/proxy/<path>`` →

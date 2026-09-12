@@ -6,6 +6,7 @@ import os
 import re
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -132,19 +133,17 @@ def _extract_legacy_orchestrator(
     checkout: Path, destination: Path, legacy_sha: str = LEGACY_EC2_SOURCE_SHAS[0]
 ) -> None:
     destination.mkdir()
-    archive = subprocess.Popen(
+    archive = subprocess.run(
         ["git", "archive", legacy_sha, "orchestrator"],
         cwd=checkout,
-        stdout=subprocess.PIPE,
+        check=True,
+        capture_output=True,
     )
-    assert archive.stdout is not None
     subprocess.run(
         ["tar", "-x", "--strip-components=1", "-C", str(destination)],
-        stdin=archive.stdout,
+        input=archive.stdout,
         check=True,
     )
-    archive.stdout.close()
-    assert archive.wait() == 0
 
 
 def test_release_guard_accepts_only_current_forward_release(tmp_path: Path):
@@ -429,7 +428,38 @@ def test_every_aidream_container_path_uses_shared_isolation_and_readiness():
     pool = (REPO_ROOT / "orchestrator/orchestrator/pool.py").read_text()
 
     assert "**container_runtime_isolation(template, location.tier)" in manager
-    assert migrate.count("run_kwargs.update(container_runtime_isolation(template, tier))") == 2
+    from orchestrator.hosted_runtime import replacement_config
+
+    old = SimpleNamespace(
+        id="0123456789abcdef",
+        attrs={
+            "Config": {
+                "Cmd": ["/opt/sandbox/scripts/entrypoint.sh"],
+                "Entrypoint": ["/bin/sh", "-ec"],
+                "User": "agent",
+                "WorkingDir": "/home/agent",
+                "Env": ["OLD=1"],
+                "Volumes": {},
+            },
+            "HostConfig": {
+                "Binds": ["home:/home/agent:rw"],
+                "ReadonlyRootfs": True,
+                "CapDrop": ["ALL"],
+                "SecurityOpt": ["no-new-privileges"],
+                "Tmpfs": {"/tmp": "rw,noexec"},
+            },
+            "Mounts": [{"Type": "volume", "Name": "home", "Destination": "/home/agent", "RW": True}],
+            "NetworkSettings": {"Networks": {"bridge": {"Aliases": ["sandbox"]}}},
+        },
+    )
+    config = replacement_config(old, image="sha256:" + "a" * 64, environment=["NEW=1"], operation="proof")
+    assert config["HostConfig"]["ReadonlyRootfs"] is True
+    assert config["HostConfig"]["CapDrop"] == ["ALL"]
+    assert config["HostConfig"]["SecurityOpt"] == ["no-new-privileges"]
+    assert config["HostConfig"]["Tmpfs"] == {"/tmp": "rw,noexec"}
+    assert config["Cmd"] == old.attrs["Config"]["Cmd"]
+    assert config["Entrypoint"] == old.attrs["Config"]["Entrypoint"]
+    assert config["User"] == "agent" and config["WorkingDir"] == "/home/agent"
     assert '_wait_container_ready(new, verify_timeout, template)' in migrate
     assert "http://127.0.0.1:8001/api/health/ready" in migrate
     assert "aidream-helpers.sh verify-release" in migrate

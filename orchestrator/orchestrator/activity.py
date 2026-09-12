@@ -75,7 +75,10 @@ def open_session_count(sandbox_id: str) -> int:
 
 
 def is_migrating(sandbox_id: str) -> bool:
-    return sandbox_id in _migrating
+    if sandbox_id in _migrating:
+        return True
+    from orchestrator.hosted_migration import hosted_fenced
+    return hosted_fenced(sandbox_id)
 
 
 def inflight_count(sandbox_id: str) -> int:

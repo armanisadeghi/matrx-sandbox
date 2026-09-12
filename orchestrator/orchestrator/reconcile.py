@@ -33,14 +33,21 @@ expire path.
 from __future__ import annotations
 
 import asyncio
+from contextlib import AsyncExitStack
 import logging
 from datetime import datetime, timezone
 
 from orchestrator.config import settings
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.store import SandboxStore
+from orchestrator.hosted_runtime import _docker
 
 logger = logging.getLogger(__name__)
+
+
+def _migration_fenced(sandbox_id: str) -> bool:
+    from orchestrator.hosted_migration import hosted_fenced
+    return hosted_fenced(sandbox_id)
 
 # A row in one of these statuses reflects a deliberate end-of-life. If a
 # container for such a row is still alive, that's an orphan ("system says
@@ -86,7 +93,7 @@ def _persistence_volume_from_mounts(container_attrs: dict) -> str | None:
     """
     for mount in container_attrs.get("Mounts", []) or []:
         name = mount.get("Name") or ""
-        if name.startswith("matrx-user-"):
+        if mount.get("Type") == "volume" and mount.get("Destination") == "/home/agent" and name:
             return name
     return None
 
@@ -100,6 +107,32 @@ def _ssh_host_port(container_attrs: dict) -> int | None:
         except (TypeError, ValueError):
             return None
     return None
+
+
+async def _lease_discovered_container(stack, container, store, sandbox_id):
+    """Fence discovery by its actual home, then revalidate routing under lock."""
+    if settings.host_tier != "hosted":
+        return
+    from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease
+    from orchestrator.storage_layout import user_volume_name
+    attrs = container.attrs or {}
+    row = await store.get(sandbox_id)
+    labels = (attrs.get("Config") or {}).get("Labels") or {}
+    if labels.get("matrx.warm_pool") == "1" and row is None:
+        return  # The caller skips unclaimed pool containers without mutation.
+    volume = _persistence_volume_from_mounts(attrs)
+    recorded = getattr(row, "persistence_volume", None)
+    if recorded and volume and recorded != volume:
+        raise HostedOperationDenied("discovered home disagrees with routing")
+    if not volume:
+        user_id = getattr(row, "user_id", None) or labels.get("matrx.user_id")
+        volume = recorded or user_volume_name(user_id)
+    await stack.enter_async_context(hosted_operation_lease(sandbox_id, volume))
+    fresh = await store.get(sandbox_id)
+    if fresh and fresh.container_id and fresh.container_id != container.id:
+        raise HostedOperationDenied("discovered runtime is not current routing")
+    if fresh and fresh.persistence_volume and fresh.persistence_volume != volume:
+        raise HostedOperationDenied("home changed before discovery lease")
 
 
 async def reconcile_from_docker(store: SandboxStore) -> dict:
@@ -137,8 +170,24 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
 
     summary["scanned"] = len(containers)
 
-    for container in containers:
+    retained_container_ids: set[str] = set()
+    if settings.host_tier == "hosted":
         try:
+            from orchestrator.hosted_migration import HostedMigrationJournal
+            journal = HostedMigrationJournal(); journal.ensure_ready()
+            retained_container_ids = journal.retained_container_ids()
+        except Exception as exc:
+            logger.error("Reconcile denied: hosted migration state unavailable: %s", exc)
+            summary["skipped"] = len(containers)
+            return summary
+
+    for container in containers:
+        operation_lease = AsyncExitStack()
+        try:
+            if container.id in retained_container_ids:
+                summary["skipped"] += 1
+                logger.info("Reconcile skipped retained migration artifact %s", container.id)
+                continue
             await asyncio.to_thread(container.reload)
             attrs = container.attrs or {}
             labels = (attrs.get("Config", {}) or {}).get("Labels") or {}
@@ -146,6 +195,10 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
             user_id = labels.get("matrx.user_id")
 
             if not sandbox_id or not user_id:
+                summary["skipped"] += 1
+                continue
+            await _lease_discovered_container(operation_lease, container, store, sandbox_id)
+            if _migration_fenced(sandbox_id):
                 summary["skipped"] += 1
                 continue
 
@@ -220,7 +273,7 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
                     "soft-deleted" if lifecycle["deleted"] else lifecycle["status"],
                 )
                 try:
-                    await asyncio.to_thread(container.remove, force=True)
+                    await _docker(container.remove, force=True)
                 except Exception as exc:
                     logger.warning("Reconcile: failed to reap orphan %s: %s", sandbox_id, exc)
                 continue
@@ -268,6 +321,8 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
                 "Reconcile failed for container %s: %s",
                 getattr(container, "id", "?")[:12], exc,
             )
+        finally:
+            await operation_lease.aclose()
 
     logger.info(
         "Reconcile complete: scanned=%d reconciled=%d skipped=%d reaped=%d failed=%d",
@@ -343,10 +398,14 @@ async def reap_zombie_containers(store: SandboxStore) -> list[str]:
         return reaped
 
     for container in containers:
+        operation_lease = AsyncExitStack()
         try:
             labels = ((container.attrs or {}).get("Config", {}) or {}).get("Labels") or {}
             sandbox_id = labels.get("matrx.sandbox_id")
             if not sandbox_id:
+                continue
+            await _lease_discovered_container(operation_lease, container, store, sandbox_id)
+            if _migration_fenced(sandbox_id):
                 continue
             tier = labels.get("matrx.tier") or host_tier
             if host_tier and tier and tier != host_tier:
@@ -363,13 +422,15 @@ async def reap_zombie_containers(store: SandboxStore) -> list[str]:
                     sandbox_id,
                     "soft-deleted" if lifecycle["deleted"] else lifecycle["status"],
                 )
-                await asyncio.to_thread(container.remove, force=True)
+                await _docker(container.remove, force=True)
                 reaped.append(sandbox_id)
         except Exception as exc:
             logger.warning(
                 "Zombie reap failed for container %s: %s",
                 getattr(container, "id", "?")[:12], exc,
             )
+        finally:
+            await operation_lease.aclose()
     return reaped
 
 
@@ -384,37 +445,79 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
     """
     summary = {"stopped": [], "refreshed": 0}
 
-    host_tier = settings.host_tier or None
-    if not host_tier:
-        # Without a known tier we can't tell which rows in the shared
-        # sandbox_instances table are "ours" — skip rather than risk marking a
-        # sibling tier's healthy rows as stopped.
-        return summary
-
-    reconcile = getattr(store, "reconcile", None)
-    if reconcile is None:
-        return summary
+    excluded: frozenset[str] = frozenset()
+    included: frozenset[str] | None = None
+    lease_stack: AsyncExitStack | None = None
+    if settings.host_tier == "hosted":
+        try:
+            from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease
+            lease_stack = AsyncExitStack()
+            blocked: set[str] = set()
+            leased: set[str] = set()
+            for sandbox in await store.list():
+                volume = getattr(sandbox, "persistence_volume", None)
+                sandbox_id = getattr(sandbox, "sandbox_id", None)
+                if not sandbox_id:
+                    continue
+                if not volume:
+                    user_id = getattr(sandbox, "user_id", None)
+                    if user_id:
+                        from orchestrator.storage_layout import user_volume_name
+                        volume = user_volume_name(user_id)
+                    else:
+                        blocked.add(sandbox_id)
+                        continue
+                try:
+                    await lease_stack.enter_async_context(hosted_operation_lease(sandbox_id, volume))
+                    leased.add(sandbox_id)
+                except HostedOperationDenied:
+                    blocked.add(sandbox_id)
+            excluded = frozenset(blocked)
+            included = frozenset(leased)
+        except Exception:
+            if lease_stack:
+                await lease_stack.aclose()
+            logger.error("Liveness reconcile deferred: hosted migration state unavailable")
+            return summary
 
     try:
-        from orchestrator.sandbox_manager import _get_docker_client
-        client = _get_docker_client()
-    except Exception as exc:
-        logger.warning("Liveness reconcile skipped: docker client unavailable: %s", exc)
-        return summary
+        host_tier = settings.host_tier or None
+        if not host_tier:
+            # Without a known tier we can't tell which rows in the shared
+            # sandbox_instances table are "ours" — skip rather than risk marking a
+            # sibling tier's healthy rows as stopped.
+            return summary
 
-    try:
-        alive_ids = await asyncio.to_thread(_alive_container_ids, client, host_tier)
-    except Exception as exc:
-        # If we can't enumerate containers, do NOT proceed — an empty/partial
-        # alive set would wrongly stop healthy rows. Better to skip this tick.
-        logger.warning("Liveness reconcile skipped: container list failed: %s", exc)
-        return summary
+        reconcile = getattr(store, "reconcile", None)
+        if reconcile is None:
+            return summary
 
-    try:
-        return await reconcile(alive_ids, tier=host_tier)
-    except Exception as exc:
-        logger.warning("Liveness reconcile failed: %s", exc)
-        return summary
+        try:
+            from orchestrator.sandbox_manager import _get_docker_client
+            client = _get_docker_client()
+        except Exception as exc:
+            logger.warning("Liveness reconcile skipped: docker client unavailable: %s", exc)
+            return summary
+
+        try:
+            alive_ids = await asyncio.to_thread(_alive_container_ids, client, host_tier)
+        except Exception as exc:
+            # If we can't enumerate containers, do NOT proceed — an empty/partial
+            # alive set would wrongly stop healthy rows. Better to skip this tick.
+            logger.warning("Liveness reconcile skipped: container list failed: %s", exc)
+            return summary
+
+        try:
+            return await reconcile(
+                alive_ids, tier=host_tier, exclude_sandbox_ids=excluded,
+                include_sandbox_ids=included,
+            )
+        except Exception as exc:
+            logger.warning("Liveness reconcile failed: %s", exc)
+            return summary
+    finally:
+        if lease_stack:
+            await lease_stack.aclose()
 
 
 __all__ = ["reconcile_from_docker", "reconcile_liveness", "reap_zombie_containers"]

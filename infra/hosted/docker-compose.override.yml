@@ -1,0 +1,10 @@
+# Canonical additive hosted state mount. Installed by deploy-hosted.sh so
+# ordinary Manager `docker compose up` also retains the recovery journal.
+services:
+  orchestrator:
+    volumes:
+      - type: bind
+        source: ./hosted-migrations
+        target: /var/lib/matrx-sandbox/hosted-migrations
+        bind:
+          create_host_path: false

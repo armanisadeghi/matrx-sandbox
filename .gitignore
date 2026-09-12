@@ -29,6 +29,7 @@ Thumbs.db
 
 # Docker
 docker-compose.override.yml
+!infra/hosted/docker-compose.override.yml
 
 # Terraform
 .terraform/

@@ -36,6 +36,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./orchestrator:/app
+      - hosted-migration-state:/var/lib/matrx-sandbox/hosted-migrations
     depends_on:
       - localstack
     security_opt:
@@ -59,6 +60,7 @@ services:
     volumes:
       - /var/run/docker.sock:/var/run/docker.sock:ro
       - ./orchestrator:/app
+      - hosted-migration-state:/var/lib/matrx-sandbox/hosted-migrations
     security_opt:
       - no-new-privileges:true
     restart: unless-stopped
@@ -76,3 +78,4 @@ services:
 
 volumes:
   localstack-data:
+  hosted-migration-state:

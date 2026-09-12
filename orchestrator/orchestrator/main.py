@@ -15,6 +15,7 @@ from fastapi.routing import APIRoute, APIWebSocketRoute
 from orchestrator.config import settings
 from orchestrator.logging_config import setup_logging
 from orchestrator.middleware.auth import APIKeyMiddleware
+from orchestrator.middleware.hosted_operation_lease import HostedOperationLeaseMiddleware
 from orchestrator.middleware.request_logging import RequestLoggingMiddleware
 from orchestrator.models import APISurfaceResponse, RouteInfo
 from orchestrator.routes import health, sandboxes, templates, users
@@ -82,7 +83,12 @@ async def _reconcile_boot_state(store: object) -> None:
     mint fail during a hosted deploy.  In-memory mode has no durable source and
     therefore remains synchronous at startup (see ``lifespan``).
     """
+    from orchestrator.migrate import recover_hosted_migrations
     from orchestrator.reconcile import reconcile_from_docker, reconcile_liveness
+
+    recovery = await recover_hosted_migrations(store=store)
+    if recovery["recovered"] or recovery["failed"]:
+        _logger.warning("Hosted migration recovery before reconcile: %s", recovery)
 
     try:
         summary = await reconcile_from_docker(store)
@@ -304,6 +310,7 @@ app = FastAPI(
 
 # API key authentication middleware
 app.add_middleware(APIKeyMiddleware)
+app.add_middleware(HostedOperationLeaseMiddleware)
 # Request/response logging middleware (runs after auth, so only logs authed requests)
 app.add_middleware(RequestLoggingMiddleware)
 

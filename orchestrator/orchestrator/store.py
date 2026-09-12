@@ -39,6 +39,17 @@ class SandboxStore(ABC):
     async def save(self, sandbox: SandboxResponse) -> None:
         """Save or update a sandbox record."""
 
+    async def replace_container_if_current(self, sandbox_id: str, old_container_id: str,
+                                           new_container_id: str, template_version: str | None) -> SandboxResponse | None:
+        """Guarded migration routing update; None means preserve/fence artifacts."""
+        sandbox = await self.get(sandbox_id)
+        if (sandbox is None or sandbox.container_id != old_container_id
+                or getattr(sandbox.status, "value", sandbox.status) not in {"ready", "running", "starting"}):
+            return None
+        sandbox.container_id, sandbox.template_version = new_container_id, template_version
+        await self.save(sandbox)
+        return await self.get(sandbox_id)
+
     @abstractmethod
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
         """Get a sandbox by ID. Returns None if not found."""
@@ -123,7 +134,9 @@ class SandboxStore(ABC):
         return {"status": getattr(sb.status, "value", sb.status), "deleted": False}
 
     async def reconcile(
-        self, alive_container_ids: set[str], tier: str | None = None
+        self, alive_container_ids: set[str], tier: str | None = None,
+        exclude_sandbox_ids: frozenset[str] = frozenset(),
+        include_sandbox_ids: frozenset[str] | None = None,
     ) -> dict:
         """Liveness reconcile against the host's actually-alive containers.
 
@@ -521,6 +534,19 @@ class PostgresSandboxStore(SandboxStore):
                 sandbox.persistence_volume,
             )
 
+    async def replace_container_if_current(self, sandbox_id: str, old_container_id: str,
+                                           new_container_id: str, template_version: str | None) -> SandboxResponse | None:
+        async def _do() -> SandboxResponse | None:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """UPDATE sandbox_instances SET container_id = $3, template_version = $4, updated_at = NOW()
+                       WHERE sandbox_id = $1 AND container_id = $2 AND deleted_at IS NULL
+                         AND status IN ('ready', 'running', 'starting') RETURNING *""",
+                    sandbox_id, old_container_id, new_container_id, template_version)
+                return _row_to_sandbox(row) if row else None
+        return await self._execute_with_retry(_do)
+
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
         async def _do() -> SandboxResponse | None:
             pool = await self._get_pool()
@@ -690,7 +716,9 @@ class PostgresSandboxStore(SandboxStore):
             logger.info("Postgres connection pool closed")
 
     async def reconcile(
-        self, alive_container_ids: set[str], tier: str | None = None
+        self, alive_container_ids: set[str], tier: str | None = None,
+        exclude_sandbox_ids: frozenset[str] = frozenset(),
+        include_sandbox_ids: frozenset[str] | None = None,
     ) -> dict:
         """Reconcile DB state against the containers actually alive on this host.
 
@@ -720,14 +748,21 @@ class PostgresSandboxStore(SandboxStore):
                         """SELECT sandbox_id, container_id FROM sandbox_instances
                            WHERE status IN ('ready', 'running', 'starting')
                              AND deleted_at IS NULL
+                             AND NOT (sandbox_id = ANY($2::text[]))
+                             AND ($3::text[] IS NULL OR sandbox_id = ANY($3::text[]))
                              AND tier = $1""",
-                        tier,
+                        tier, list(exclude_sandbox_ids),
+                        list(include_sandbox_ids) if include_sandbox_ids is not None else None,
                     )
                 else:
                     active_rows = await conn.fetch(
                         """SELECT sandbox_id, container_id FROM sandbox_instances
                            WHERE status IN ('ready', 'running', 'starting')
-                             AND deleted_at IS NULL"""
+                             AND deleted_at IS NULL
+                             AND NOT (sandbox_id = ANY($1::text[]))
+                             AND ($2::text[] IS NULL OR sandbox_id = ANY($2::text[]))""",
+                        list(exclude_sandbox_ids),
+                        list(include_sandbox_ids) if include_sandbox_ids is not None else None,
                     )
 
                 # Safety valve: an EMPTY alive-set while live rows exist is far
@@ -753,19 +788,26 @@ class PostgresSandboxStore(SandboxStore):
                         # stomp a row a concurrent request just moved to terminal.
                         # 'graceful_shutdown' is the closest allowed stop_reason
                         # for "container is simply no longer here".
-                        await conn.execute(
+                        result = await conn.execute(
                             """UPDATE sandbox_instances
                                SET status = 'stopped', stopped_at = NOW(),
                                    stop_reason = 'graceful_shutdown'
                                WHERE sandbox_id = $1
-                                 AND status IN ('ready', 'running', 'starting')""",
-                            sandbox_id,
+                                 AND container_id IS NOT DISTINCT FROM $2
+                                 AND status IN ('ready', 'running', 'starting')
+                                 AND deleted_at IS NULL
+                                 AND ($3::text IS NULL OR tier = $3)
+                                 AND NOT (sandbox_id = ANY($4::text[]))
+                                 AND ($5::text[] IS NULL OR sandbox_id = ANY($5::text[]))""",
+                            sandbox_id, container_id, tier, list(exclude_sandbox_ids),
+                            list(include_sandbox_ids) if include_sandbox_ids is not None else None,
                         )
-                        stopped.append(sandbox_id)
-                        logger.warning(
-                            "Reconciled sandbox %s: marked STOPPED (container gone)",
-                            sandbox_id,
-                        )
+                        if result.endswith(" 1"):
+                            stopped.append(sandbox_id)
+                            logger.warning(
+                                "Reconciled sandbox %s: marked STOPPED (container gone)",
+                                sandbox_id,
+                            )
                     elif container_id:
                         alive_sandbox_ids.append(sandbox_id)
 
@@ -774,8 +816,14 @@ class PostgresSandboxStore(SandboxStore):
                     result = await conn.execute(
                         """UPDATE sandbox_instances SET updated_at = NOW()
                            WHERE sandbox_id = ANY($1::text[])
-                             AND status IN ('ready', 'running', 'starting')""",
+                             AND status IN ('ready', 'running', 'starting')
+                             AND deleted_at IS NULL
+                             AND ($2::text IS NULL OR tier = $2)
+                             AND NOT (sandbox_id = ANY($3::text[]))
+                             AND ($4::text[] IS NULL OR sandbox_id = ANY($4::text[]))""",
                         alive_sandbox_ids,
+                        tier, list(exclude_sandbox_ids),
+                        list(include_sandbox_ids) if include_sandbox_ids is not None else None,
                     )
                     try:
                         refreshed = int(result.split()[-1])
