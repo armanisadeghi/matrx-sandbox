@@ -85,4 +85,8 @@ async def test_loop_waits_exactly_the_retry_after_the_bridge_asked_for(monkeypat
     await subscriber._loop(on_change)
 
     assert client.calls == 1
-    assert waits == [27.0], "a shed poll waits what the server asked, not the local backoff"
+    assert len(waits) == 1
+    spread = 27.0 * downstream.POLL_JITTER_FRACTION
+    assert 27.0 - spread <= waits[0] <= 27.0 + spread, (
+        "a shed poll waits what the server asked (jittered), not the local backoff"
+    )

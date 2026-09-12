@@ -144,7 +144,9 @@ class PollingSubscriber:
                 return
             except (httpx.HTTPError, Exception) as e:  # noqa: BLE001
                 retry_after = _retry_after_seconds(e)
-                wait = retry_after if retry_after is not None else _jittered(backoff)
+                # Jittered in BOTH branches: the server randomises Retry-After per
+                # response today, but this loop must not depend on that staying true.
+                wait = _jittered(retry_after if retry_after is not None else backoff)
                 _logger.warning(
                     "cloud-files: polling cycle failed: %s (retrying in %.0fs%s)",
                     e,
