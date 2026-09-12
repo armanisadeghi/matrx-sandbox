@@ -9,6 +9,8 @@
 > Keep both migration gates disabled. Do not use this document to authorize a
 > user-container replacement or to re-enable automatic migration.
 
+Cross-repo system-of-record: /Users/armanisadeghi/code/common-docs/systems/infrastructure/sandboxes/STATE.md — read it before touching this feature in ANY repo.
+
 ---
 
 ## The mental model in one paragraph
@@ -66,7 +68,7 @@ Detection is **tier-scoped by construction**: each orchestrator only sees its ow
 **Failure is safe at every step.** If the new box doesn't come up healthy/correct, it's removed and the **old box keeps running untouched** (loud `MIGRATE FAILED` alarm). If cutover itself fails, it rolls back to the old container. Data is in the volume throughout, so nothing is ever at risk.
 
 Endpoints:
-- **`POST /sandboxes/{id}/migrate`** — migrate one box (master-key). `?target_image=` to force a specific image. `502` (with the old box intact) on failure; `200` with `{status: migrated|already_current|busy_deferred}`.
+- **`POST /sandboxes/{id}/migrate`** — migrate one box (master-key). The default remains idle-only. An owner-facing caller that has shown an interruption warning may send `?interrupt_attached_sessions=true`; this permits idle PTY/watch attachments, but executing tool calls are fenced and must drain. `?target_image=` accepts only an immutable image identity. Busy refusal is a structured `409`; failure is `502` with the old box intact; success is `200` with `{status: migrated|already_current}`.
 - **`POST /migrate-all`** — roll every drifted box on this tier (the manual trigger for the rolling migration).
 
 ---
@@ -77,7 +79,7 @@ Endpoints:
 |---|---|
 | **No data loss** | The per-user volume / S3 is never touched by the swap. The new container mounts the same volume. Verified live: writes made before *and* during a migration are all present afterward (49/49 acked writes). Migration verifies the new box *before* cutover and keeps the old box on any failure. |
 | **No agent confusion** | The box is "migrating" for the whole swap; calls get a retryable `503` and the matrx-ai tool proxy ([`_sandbox_proxy.py`](../../aidream/packages/matrx-ai/matrx_ai/tools/_sandbox_proxy.py)) retries (Retry-After-paced, long enough to outlast a full migration). Same `sandbox_id` + token survive the swap, so the retried call just lands on the new container. No `404`, no hard error. |
-| **Never interrupt a running tool** | In-flight calls are *drained* before cutover. The auto-path additionally only migrates boxes with **zero in-flight calls** (`require_idle=True`). |
+| **Never interrupt a running tool** | In-flight calls are fenced and drained before cutover. Automatic and unconfirmed paths additionally require no PTY/watch attachment or recent activity. A confirmed owner update may interrupt idle attachments, never an executing tool call. |
 | **Minimal delay** | Idle boxes (the only ones the auto-path migrates) migrate with zero agent-visible impact. The `SANDBOX_MIGRATION=1` cloud-sync skip cuts migration time substantially. |
 
 The in-flight accounting + migrating lock live in `orchestrator/activity.py` (the orchestrator proxies every tool call, so it knows exactly when a box is idle vs busy — no guessing, no cross-service polling).

@@ -141,6 +141,35 @@ async def test_migrate_route_keeps_unknown_migration_failure_loud(mock_sandbox_m
 
 
 @pytest.mark.asyncio
+async def test_migrate_route_forwards_confirmed_session_interruption(
+    mock_sandbox_manager, monkeypatch
+):
+    """A confirmed Code update must reach the migration engine as an explicit opt-in."""
+    from orchestrator import migrate
+
+    mock_sandbox_manager._get_store.return_value = object()
+    migrate_call = AsyncMock(
+        return_value={"status": "migrated", "sandbox_id": "sbx-confirmed"}
+    )
+    monkeypatch.setattr(migrate, "migrate_sandbox", migrate_call)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            "/sandboxes/sbx-confirmed/migrate?interrupt_attached_sessions=true"
+        )
+
+    assert response.status_code == 200
+    migrate_call.assert_awaited_once_with(
+        "sbx-confirmed",
+        store=mock_sandbox_manager._get_store.return_value,
+        target_image=None,
+        require_idle=True,
+        interrupt_attached_sessions=True,
+    )
+
+
+@pytest.mark.asyncio
 async def test_post_sandboxes_invalid_user_id(mock_sandbox_manager, mock_storage):
     """POST /sandboxes with an invalid user_id should return 422."""
     transport = ASGITransport(app=app)

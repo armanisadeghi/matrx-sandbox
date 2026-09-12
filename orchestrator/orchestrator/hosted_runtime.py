@@ -22,6 +22,19 @@ from docker.errors import NotFound
 from orchestrator.hosted_migration import HostedMigrationJournal, HostedMigrationStateError, recovery_action, transition
 
 
+class HostedMigrationBusyError(HostedMigrationStateError):
+    """Expected pre-admission activity refusal, safe to retry unchanged."""
+
+
+def _migration_failure_status(exc: Exception, *, admitted: bool) -> str:
+    """Classify only a proven activity refusal as expected busy control flow."""
+    if admitted:
+        return "recovery_required"
+    if isinstance(exc, HostedMigrationBusyError):
+        return "busy_deferred"
+    return "failed"
+
+
 async def _docker(function, *args, **kwargs):
     task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
     try:
@@ -744,7 +757,8 @@ async def recover_hosted_migrations(*, store):
 
 
 async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
-                         cur, store, verify_timeout, platform_env_changes):
+                         cur, store, verify_timeout, platform_env_changes,
+                         interrupt_attached_sessions=False):
     """Stop, snapshot, replace, prove routing, then retire exact old artifacts."""
     from orchestrator import activity
     from orchestrator.config import settings
@@ -775,8 +789,13 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
             if any((r["sandbox_id"] == sandbox_id or r["source_volume"] == volume)
                    and not r.get("cleanup_complete") for r in journal.records()):
                 raise HostedMigrationStateError("an earlier migration still requires recovery")
-            if activity.inflight_count(sandbox_id) or activity.open_session_count(sandbox_id):
-                raise HostedMigrationStateError("sandbox still has active work or an interactive session")
+            if activity.inflight_count(sandbox_id) or (
+                activity.open_session_count(sandbox_id)
+                and not interrupt_attached_sessions
+            ):
+                raise HostedMigrationBusyError(
+                    "sandbox still has active work or an interactive session"
+                )
             await _docker(old.reload)
             row = await store.get(sandbox_id)
             if (row is None or row.container_id != old.id or old.status != "running"
@@ -951,5 +970,5 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
                 return {**outcome, "reason": type(exc).__name__,
                         "status": "migrated" if outcome["status"] == "committed" else outcome["status"]}
     except Exception as exc:
-        return {"status": "recovery_required" if record else "busy_deferred", "sandbox_id": sandbox_id,
+        return {"status": _migration_failure_status(exc, admitted=record is not None), "sandbox_id": sandbox_id,
                 "reason": str(exc)}

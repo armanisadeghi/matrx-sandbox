@@ -80,6 +80,8 @@ def test_platform_environment_refresh_removes_retired_platform_key(monkeypatch):
 # BEFORE any docker lookups, so these tests need no docker.
 
 import pytest
+from types import SimpleNamespace
+from unittest.mock import AsyncMock
 
 from orchestrator import activity
 
@@ -95,6 +97,90 @@ async def test_open_session_defers_migration():
         assert "session" in result["reason"]
     finally:
         activity.session_closed(sid)
+
+
+@pytest.mark.asyncio
+async def test_confirmed_manual_migration_fences_new_work_and_allows_attached_session(
+    monkeypatch,
+):
+    """The Code page can update its box without making its own PTY an impossible gate."""
+    from orchestrator import migrate
+
+    sid = "sbx-confirmed-pty"
+    old = SimpleNamespace(
+        id="old-container",
+        labels={"matrx.template": "bare"},
+        attrs={
+            "Image": "sha256:" + "a" * 64,
+            "Config": {"Env": []},
+            "HostConfig": {"Binds": ["home-volume:/home/agent:rw"]},
+        },
+    )
+    client = SimpleNamespace(
+        containers=SimpleNamespace(get=lambda received: old if received == sid else None)
+    )
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: client)
+    monkeypatch.setattr(
+        migrate,
+        "current_image",
+        lambda *_: SimpleNamespace(
+            tag="matrx-sandbox:bare",
+            image_id="sha256:" + "b" * 64,
+            version="new-version",
+        ),
+    )
+    hosted = AsyncMock(
+        return_value={"status": "migrated", "sandbox_id": sid}
+    )
+    monkeypatch.setattr(migrate, "_migrate_hosted_ordered", hosted)
+
+    activity.session_opened(sid)
+    try:
+        result = await migrate.migrate_sandbox(
+            sid,
+            store=object(),
+            require_idle=True,
+            interrupt_attached_sessions=True,
+        )
+    finally:
+        activity.session_closed(sid)
+
+    assert result == {"status": "migrated", "sandbox_id": sid}
+    assert hosted.await_args.kwargs["interrupt_attached_sessions"] is True
+    assert activity.is_migrating(sid) is False
+
+
+@pytest.mark.asyncio
+async def test_concurrent_migration_cannot_release_active_owners_fence(monkeypatch):
+    """A rejected second request must not reopen tool admission under the first."""
+    import asyncio
+
+    from orchestrator import migrate
+
+    sid = "sbx-exclusive-migration"
+    entered = asyncio.Event()
+    finish = asyncio.Event()
+
+    async def held_migration(_sandbox_id, **_kwargs):
+        entered.set()
+        await finish.wait()
+        return {"status": "migrated", "sandbox_id": sid}
+
+    monkeypatch.setattr(migrate, "_migrate_hosted_ordered", held_migration)
+    first = asyncio.create_task(migrate._migrate_hosted_with_admission(sid))
+    await entered.wait()
+
+    second = await migrate._migrate_hosted_with_admission(sid)
+    assert second == {
+        "status": "busy_deferred",
+        "sandbox_id": sid,
+        "reason": "another migration already owns this sandbox; retry later",
+    }
+    assert activity.is_migrating(sid) is True
+
+    finish.set()
+    assert await first == {"status": "migrated", "sandbox_id": sid}
+    assert activity.is_migrating(sid) is False
 
 
 @pytest.mark.asyncio

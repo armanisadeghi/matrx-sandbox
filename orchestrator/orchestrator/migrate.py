@@ -153,13 +153,17 @@ def _has_recent_heartbeat(sbx, window_seconds: int) -> bool:
 
 async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = None,
                           verify_timeout: int = 90, require_idle: bool = False,
-                          refresh_platform_env: bool = False) -> dict:
+                          refresh_platform_env: bool = False,
+                          interrupt_attached_sessions: bool = False) -> dict:
     """Migrate one box to the current image (or an explicit target_image).
     Returns a status dict; never raises.
 
     ``require_idle`` (used by the rolling auto-migrator): refuse to start if the
     box has any in-flight tool call, so a call already mid-execution is never
-    caught by the swap. Defers to the next pass instead."""
+    caught by the swap. ``interrupt_attached_sessions`` is an explicit manual
+    opt-in: it permits idle PTY/watch attachments and recent presence signals,
+    but still fences new work and drains executing tool calls before pausing the
+    runtime. Defers instead of interrupting a tool call that cannot drain."""
     from orchestrator import activity
     from orchestrator.sandbox_manager import _get_docker_client
 
@@ -169,23 +173,23 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         if activity.inflight_count(sandbox_id) > 0:
             return {"status": "busy_deferred", "sandbox_id": sandbox_id,
                     "reason": "box has in-flight tool calls; defer migration to an idle gap"}
-        # An attached interactive session (PTY terminal, fs-watch websocket) is
-        # ALWAYS busy — never swap a box out from under an open editor/terminal,
-        # even if no command is executing this instant.
-        if activity.open_session_count(sandbox_id) > 0:
-            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                    "reason": "box has an open interactive session (PTY/watch); defer until it closes"}
-        # Recent tool activity = an agent mid-task between commands. Hosted
-        # boxes rarely heartbeat, so orchestrator-side activity is the real
-        # "recently in use" signal; reuse the heartbeat window as the cutoff.
-        recent_window = await knob_int("migrate_recent_heartbeat_seconds")
-        age = activity.last_activity_age(sandbox_id)
-        if age is not None and age < recent_window:
-            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                    "reason": f"tool activity {int(age)}s ago (< {recent_window}s); defer until idle"}
-        if _has_recent_heartbeat(await _safe_get(store, sandbox_id), recent_window):
-            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                    "reason": "box had a recent heartbeat; defer migration until idle"}
+        if not interrupt_attached_sessions:
+            # Automatic/unconfirmed migration never swaps a box out from under
+            # an attached person, editor, or recently active agent.
+            if activity.open_session_count(sandbox_id) > 0:
+                return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                        "reason": "box has an open interactive session (PTY/watch); defer until it closes"}
+            # Recent tool activity = an agent mid-task between commands. Hosted
+            # boxes rarely heartbeat, so orchestrator-side activity is the real
+            # "recently in use" signal; reuse the heartbeat window as the cutoff.
+            recent_window = await knob_int("migrate_recent_heartbeat_seconds")
+            age = activity.last_activity_age(sandbox_id)
+            if age is not None and age < recent_window:
+                return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                        "reason": f"tool activity {int(age)}s ago (< {recent_window}s); defer until idle"}
+            if _has_recent_heartbeat(await _safe_get(store, sandbox_id), recent_window):
+                return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                        "reason": "box had a recent heartbeat; defer migration until idle"}
 
     client = _get_docker_client()
     try:
@@ -239,10 +243,11 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     tmp_name = f"{sandbox_id}-mig"
 
     if settings.host_tier == "ec2" and template in {"slim", "bare"}:
-        return await _migrate_hosted_ordered(
+        return await _migrate_hosted_with_admission(
             sandbox_id, old=old, target=target, env=env, volumes=volumes,
             labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
-            platform_env_changes=platform_env_changes)
+            platform_env_changes=platform_env_changes,
+            interrupt_attached_sessions=interrupt_attached_sessions)
 
     # ── DATA-SAFETY GUARD ─────────────────────────────────────────────────────
     # The proven-safe swap relies on the new container mounting the SAME
@@ -277,9 +282,32 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
             labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
         )
 
-    return await _migrate_hosted_ordered(sandbox_id, old=old, target=target, env=env, volumes=volumes,
+    return await _migrate_hosted_with_admission(sandbox_id, old=old, target=target, env=env, volumes=volumes,
         labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
-        platform_env_changes=platform_env_changes)
+        platform_env_changes=platform_env_changes,
+        interrupt_attached_sessions=interrupt_attached_sessions)
+
+
+async def _migrate_hosted_with_admission(sandbox_id: str, **kwargs) -> dict:
+    """Fence new calls and drain existing tool work before hosted migration.
+
+    Open PTY/watch sockets are presence signals, not counted tool calls. A
+    confirmed manual update may interrupt those sockets after this point; an
+    executing HTTP tool call must still drain or the update is deferred.
+    """
+    from orchestrator import activity
+
+    owns_fence = await activity.mark_migrating(sandbox_id)
+    if not owns_fence:
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": "another migration already owns this sandbox; retry later"}
+    try:
+        if not await activity.drain_inflight(sandbox_id, timeout=20.0):
+            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                    "reason": "in-flight tool calls did not drain; retry later"}
+        return await _migrate_hosted_ordered(sandbox_id, **kwargs)
+    finally:
+        await activity.release_migration(sandbox_id)
 
 
 
@@ -324,7 +352,10 @@ async def _migrate_s3_ordered(
     # everything the old box just flushed.
     env_fresh = [e for e in env if not e.startswith("SANDBOX_MIGRATION=")]
 
-    await activity.mark_migrating(sandbox_id)
+    owns_fence = await activity.mark_migrating(sandbox_id)
+    if not owns_fence:
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": "another migration already owns this sandbox; retry later"}
     new = None
     try:
         if not await activity.drain_inflight(sandbox_id, timeout=20.0):

@@ -1,6 +1,6 @@
 from orchestrator.hosted_migration import HostedMigrationJournal, _mountinfo_has_mountpoint, recovery_action, transition, HostedMigrationStateError, validate_record
 from orchestrator.hosted_migration import hosted_fenced, hosted_volume_fenced
-from orchestrator.hosted_runtime import _assert_no_unowned_home_writer, _pause_target_for_rollback, _quiesce_target, _recover_pre_copy_source, _remove_verified_pre_copy_helper, _require_paused_source, _require_rollback_safe_target
+from orchestrator.hosted_runtime import HostedMigrationBusyError, _assert_no_unowned_home_writer, _migration_failure_status, _pause_target_for_rollback, _quiesce_target, _recover_pre_copy_source, _remove_verified_pre_copy_helper, _require_paused_source, _require_rollback_safe_target
 from orchestrator.hosted_runtime import _activate_promoted_target, _record_error, _wait_migration_state
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.store import InMemorySandboxStore
@@ -167,6 +167,18 @@ def test_target_id_must_be_journaled_before_start_intent():
         pass
     else:
         raise AssertionError("mutant without target ID was accepted")
+
+
+def test_only_expected_activity_refusal_is_classified_busy_before_admission():
+    assert _migration_failure_status(
+        HostedMigrationBusyError("active session"), admitted=False
+    ) == "busy_deferred"
+    assert _migration_failure_status(
+        HostedMigrationStateError("target image missing"), admitted=False
+    ) == "failed"
+    assert _migration_failure_status(
+        HostedMigrationStateError("journaled operation failed"), admitted=True
+    ) == "recovery_required"
 
 
 @pytest.mark.parametrize("phase,expected", [

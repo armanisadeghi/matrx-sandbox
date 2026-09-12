@@ -110,14 +110,20 @@ async def track(sandbox_id: str):
             _cond.notify_all()
 
 
-async def mark_migrating(sandbox_id: str) -> None:
-    """Lock the box for the WHOLE migration (call at migrate start). From here on
+async def mark_migrating(sandbox_id: str) -> bool:
+    """Exclusively lock the box for the WHOLE migration.
+
+    Returns ``False`` when another migration already owns the lock. From here on
     every new tool call is refused with a retryable 503 (see is_migrating + the
     route guards), so calls don't hit the brief windows where the box's row/
     container is in flux — they just retry and land on the migrated box. Must be
-    paired with release_migration() in a finally."""
+    paired with release_migration() in a finally only by the caller that received
+    ``True``."""
     async with _cond:
+        if sandbox_id in _migrating:
+            return False
         _migrating.add(sandbox_id)
+        return True
 
 
 async def drain_inflight(sandbox_id: str, *, timeout: float = 20.0) -> bool:

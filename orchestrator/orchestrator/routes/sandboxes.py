@@ -653,21 +653,32 @@ async def sandbox_agent_env(sandbox_id: str) -> dict:
 
 
 @router.post("/{sandbox_id}/migrate")
-async def migrate_sandbox_route(sandbox_id: str, target_image: str | None = None):
+async def migrate_sandbox_route(
+    sandbox_id: str,
+    target_image: str | None = None,
+    interrupt_attached_sessions: bool = False,
+):
     """Zero-drift migration: swap this box onto the current image for its
     template, keeping the SAME sandbox_id and per-user volume (data intact).
 
     Unlike /resume and /reset, the sandbox_id does NOT change — the agent's
     existing binding (``/sandboxes/<id>``) stays valid across the swap, which is
-    what lets a chat suspend, migrate, and resume in place. The CALLER must
-    quiesce the chat first (aidream parks the turn); this primitive verifies
-    readiness + version before cutover and rolls back to the old box on failure.
-    Master-key only (global APIKeyMiddleware)."""
+    what lets a chat suspend, migrate, and resume in place. The default is
+    idle-only. An owner-facing caller that has shown an interruption warning may
+    explicitly set ``interrupt_attached_sessions=true``; executing tool calls
+    are still fenced and drained before the runtime is paused. This primitive
+    verifies readiness + version before cutover and rolls back to the old box on
+    failure. Master-key only (global APIKeyMiddleware)."""
     from orchestrator.migrate import migrate_sandbox
 
     store = sandbox_manager._get_store()
-    # Manual callers are not exempt from PTY/watch/in-flight quiescence.
-    result = await migrate_sandbox(sandbox_id, store=store, target_image=target_image, require_idle=True)
+    result = await migrate_sandbox(
+        sandbox_id,
+        store=store,
+        target_image=target_image,
+        require_idle=True,
+        interrupt_attached_sessions=interrupt_attached_sessions,
+    )
     if result["status"] in ("migrated", "already_current"):
         return result
     if result["status"] == "busy_deferred":
