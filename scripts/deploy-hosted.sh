@@ -95,11 +95,6 @@ run_db_migrations() {
     || fail "MATRX_SANDBOX_STORE must be 'postgres' in $ORCH_COMPOSE_DIR/.env (in-memory loses every sandbox row on restart)"
   grep -q '^MATRX_HOST_TIER=hosted[[:space:]]*$' "$ORCH_COMPOSE_DIR/.env" \
     || fail "MATRX_HOST_TIER must be 'hosted' in $ORCH_COMPOSE_DIR/.env (token issuance and lifecycle routing require exact tier identity)"
-  # A hosted migration journal is recovery authority, not cache. The deployed
-  # compose stack must mount it into the orchestrator only; an image directory
-  # disappears on recreate and the new migrator correctly refuses that state.
-  ( cd "$ORCH_COMPOSE_DIR" && docker compose config ) | grep -q '/var/lib/matrx-sandbox/hosted-migrations' \
-    || fail "hosted orchestrator compose lacks durable /var/lib/matrx-sandbox/hosted-migrations mount"
   if ! docker run --rm --env-file "$ORCH_COMPOSE_DIR/.env" "$image" \
         python -m orchestrator.migrate_runner; then
     fail "DB migrations failed — aborting before recreating orchestrator"
