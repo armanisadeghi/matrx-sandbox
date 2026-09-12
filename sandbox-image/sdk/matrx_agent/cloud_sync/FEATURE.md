@@ -36,9 +36,14 @@ to the loop with `call_soon_threadsafe` and never perform network I/O.
 ## Verification
 
 - `pytest sandbox-image/sdk/tests/test_cloud_sync_boundaries.py`
+- `pytest sandbox-image/sdk/tests/test_downstream_retry_after.py`
 
 ## Change log
 
+- 2026-09-12 — The polling fallback honours the bridge's `Retry-After` on a shed poll
+  (`503 cloud_file_change_feed_shed` / `429`, clamped to the backoff ceiling) and jitters every
+  wait by ±20% so a fleet started together stops polling AI Dream in the same second. Evidence:
+  43 sandboxes polled inside one second three times on 2026-09-12 and consumed the server pool.
 - 2026-08-17 — Excluded canonical system paths at every local ingress and
   replay point, and stopped retrying permanent 4xx responses. This closes the
   loop that repeatedly tried to overwrite immutable scraper evidence mirrored

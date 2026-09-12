@@ -34,6 +34,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import random
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -48,6 +49,11 @@ _logger = logging.getLogger("matrx_agent.cloud_sync.downstream")
 POLL_INTERVAL_SECONDS = 30.0
 POLL_BACKOFF_INITIAL = 5.0
 POLL_BACKOFF_MAX = 300.0  # 5 min
+# Every wait is jittered by this fraction so a fleet of sandboxes that started
+# together does not poll AI Dream in the same second forever (2026-09-12: 43
+# pollers landed inside one second and consumed the server's pool; the server
+# now sheds such herds with a 503 + Retry-After, which the loop honours).
+POLL_JITTER_FRACTION = 0.2
 REALTIME_RETRY_INTERVAL = 300.0  # try Realtime again every 5 min when we've fallen back to polling
 
 
@@ -137,9 +143,16 @@ class PollingSubscriber:
             except asyncio.CancelledError:
                 return
             except (httpx.HTTPError, Exception) as e:  # noqa: BLE001
-                _logger.warning("cloud-files: polling cycle failed: %s (retrying in %.0fs)", e, backoff)
+                retry_after = _retry_after_seconds(e)
+                wait = retry_after if retry_after is not None else _jittered(backoff)
+                _logger.warning(
+                    "cloud-files: polling cycle failed: %s (retrying in %.0fs%s)",
+                    e,
+                    wait,
+                    " as the server's Retry-After asked" if retry_after is not None else "",
+                )
                 try:
-                    await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+                    await asyncio.wait_for(self._stop.wait(), timeout=wait)
                     return
                 except asyncio.TimeoutError:
                     pass
@@ -147,10 +160,42 @@ class PollingSubscriber:
                 continue
 
             try:
-                await asyncio.wait_for(self._stop.wait(), timeout=POLL_INTERVAL_SECONDS)
+                await asyncio.wait_for(
+                    self._stop.wait(), timeout=_jittered(POLL_INTERVAL_SECONDS)
+                )
                 return  # stop signal
             except asyncio.TimeoutError:
                 pass
+
+
+def _jittered(seconds: float) -> float:
+    """``seconds`` ± ``POLL_JITTER_FRACTION``, never below one second."""
+    spread = seconds * POLL_JITTER_FRACTION
+    return max(1.0, seconds + random.uniform(-spread, spread))
+
+
+def _retry_after_seconds(error: BaseException) -> Optional[float]:
+    """The server's ``Retry-After`` (seconds) on a 429/503, clamped to the backoff
+    ceiling; ``None`` when the failure carried no such instruction.
+
+    The bridge sheds a poll with an honest 503 + Retry-After when the server's
+    pool is under pressure; retrying sooner than asked is what turned one stall
+    into a herd. A non-numeric or missing header falls back to the local backoff.
+    """
+    if not isinstance(error, httpx.HTTPStatusError):
+        return None
+    if error.response.status_code not in {429, 503}:
+        return None
+    raw = error.response.headers.get("Retry-After")
+    if raw is None:
+        return None
+    try:
+        seconds = float(raw)
+    except (TypeError, ValueError):
+        return None
+    if seconds <= 0:
+        return None
+    return min(seconds, POLL_BACKOFF_MAX)
 
 
 # ──────────────────────────────────────────────────────────────────────────
