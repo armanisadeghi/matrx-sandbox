@@ -422,7 +422,7 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     )
 
     # 1. Destroy the existing container (preserves named volume).
-    destroyed = await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="user_reset")
+    destroyed = await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="user_requested")
     if not destroyed:
         raise HTTPException(status_code=503, detail="Reset deferred: sandbox or shared home is migration-fenced")
 

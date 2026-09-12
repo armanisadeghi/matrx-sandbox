@@ -104,7 +104,9 @@ async def test_ec2_named_reset_passes_prior_row_to_keep_exact_home(monkeypatch):
     captured = {}
 
     async def get(_): return old
-    async def destroy(*_args, **_kwargs): return True
+    async def destroy(*_args, **kwargs):
+        captured["stop_reason"] = kwargs["reason"]
+        return True
     async def create(**kwargs):
         captured.update(kwargs)
         return old
@@ -117,6 +119,7 @@ async def test_ec2_named_reset_passes_prior_row_to_keep_exact_home(monkeypatch):
     result = await sandboxes.reset_sandbox(SID)
     assert result is old
     assert captured["persistence_from"] == SID
+    assert captured["stop_reason"] == "user_requested"
 
 
 @pytest.mark.asyncio
