@@ -888,8 +888,9 @@ class PostgresSandboxStore(SandboxStore):
             pool = await self._get_pool()
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
-                    """SELECT path, content, updated_at FROM user_memory
-                       WHERE user_id = $1 ORDER BY path""",
+                    """SELECT path, content, updated_at FROM users.user_memory
+                       WHERE created_by = $1 AND deleted_at IS NULL
+                       ORDER BY path""",
                     UUID(user_id),
                 )
                 return [
@@ -902,12 +903,24 @@ class PostgresSandboxStore(SandboxStore):
         async def _do() -> None:
             pool = await self._get_pool()
             async with pool.acquire() as conn:
+                owner = UUID(user_id)
+                organization_id = await conn.fetchval(
+                    "SELECT public.ensure_personal_organization($1)", owner,
+                )
+                if organization_id is None:
+                    raise RuntimeError(
+                        "personal organization resolution returned no organization for memory owner"
+                    )
                 await conn.execute(
-                    """INSERT INTO user_memory (user_id, path, content)
-                       VALUES ($1, $2, $3)
-                       ON CONFLICT (user_id, path) DO UPDATE
-                       SET content = EXCLUDED.content, updated_at = NOW()""",
-                    UUID(user_id), path, content,
+                    """INSERT INTO users.user_memory
+                           (created_by, updated_by, organization_id, path, content)
+                       VALUES ($1, $1, $2, $3, $4)
+                       ON CONFLICT (created_by, path) DO UPDATE
+                       SET content = EXCLUDED.content,
+                           updated_by = EXCLUDED.updated_by,
+                           updated_at = NOW(),
+                           deleted_at = NULL""",
+                    owner, UUID(str(organization_id)), path, content,
                 )
         await self._execute_with_retry(_do)
 
@@ -916,10 +929,12 @@ class PostgresSandboxStore(SandboxStore):
             pool = await self._get_pool()
             async with pool.acquire() as conn:
                 result = await conn.execute(
-                    "DELETE FROM user_memory WHERE user_id = $1 AND path = $2",
+                    """UPDATE users.user_memory
+                       SET deleted_at = NOW(), updated_by = $1, updated_at = NOW()
+                       WHERE created_by = $1 AND path = $2 AND deleted_at IS NULL""",
                     UUID(user_id), path,
                 )
-                return result == "DELETE 1"
+                return result == "UPDATE 1"
         return await self._execute_with_retry(_do)
 
 

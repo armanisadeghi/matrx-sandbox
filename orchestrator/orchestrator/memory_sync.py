@@ -61,11 +61,27 @@ async def hydrate_memory_into_container(container, user_id: str, store) -> int:
     written = 0
     try:
         with tarfile.open(fileobj=buf, mode="w") as tar:
+            directories: set[str] = set()
             for e in entries:
                 rel = _safe_rel(e.get("path", ""))
                 if not rel:
                     continue
                 data = (e.get("content") or "").encode("utf-8")
+                directory = ""
+                for segment in rel.split("/")[:-1]:
+                    directory = f"{directory}/{segment}" if directory else segment
+                    directories.add(directory)
+                for directory in sorted(directories):
+                    name = f"{MEMORY_REL}/{directory}"
+                    if name in tar.getnames():
+                        continue
+                    info = tarfile.TarInfo(name=name)
+                    info.type = tarfile.DIRTYPE
+                    info.mtime = int(datetime.now(timezone.utc).timestamp())
+                    info.uid = 1000   # agent
+                    info.gid = 1000
+                    info.mode = 0o755
+                    tar.addfile(info)
                 info = tarfile.TarInfo(name=f"{MEMORY_REL}/{rel}")
                 info.size = len(data)
                 info.mtime = int(datetime.now(timezone.utc).timestamp())
@@ -77,10 +93,23 @@ async def hydrate_memory_into_container(container, user_id: str, store) -> int:
         buf.seek(0)
         if written == 0:
             return 0
+        # Make only the memory root agent-writable.  Do not recursively chown
+        # .matrx: that directory can also hold unrelated, intentionally owned
+        # agent state.
+        install_result = await asyncio.to_thread(
+            container.exec_run,
+            ["install", "-d", "-o", "1000", "-g", "1000", "-m", "755", MEMORY_ABS],
+        )
+        install_exit_code = getattr(
+            install_result,
+            "exit_code",
+            install_result[0] if isinstance(install_result, tuple) else 0,
+        )
+        if install_exit_code != 0:
+            raise RuntimeError(
+                f"memory hydrate: cannot prepare agent-owned memory directory (exit {install_exit_code})"
+            )
         await asyncio.to_thread(container.put_archive, AGENT_HOME, buf.getvalue())
-        # Make sure agent owns the tree (put_archive sets uid/gid numerically
-        # but the .matrx parent dir may pre-exist root-owned from an early boot).
-        await asyncio.to_thread(container.exec_run, ["chown", "-R", "agent:agent", f"{AGENT_HOME}/.matrx"])
         logger.info("memory hydrate: wrote %d file(s) into %s for user %s",
                     written, MEMORY_ABS, user_id)
         return written
