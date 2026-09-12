@@ -1,7 +1,7 @@
 from orchestrator.hosted_migration import HostedMigrationJournal, _mountinfo_has_mountpoint, recovery_action, transition, HostedMigrationStateError, validate_record
 from orchestrator.hosted_migration import hosted_fenced, hosted_volume_fenced
-from orchestrator.hosted_runtime import HostedMigrationBusyError, _assert_no_unowned_home_writer, _migration_failure_status, _pause_target_for_rollback, _quiesce_target, _recover_pre_copy_source, _remove_verified_pre_copy_helper, _require_paused_source, _require_rollback_safe_target
-from orchestrator.hosted_runtime import _activate_promoted_target, _record_error, _wait_migration_state
+from orchestrator.hosted_runtime import HostedMigrationBusyError, _assert_migration_home_exclusive, _assert_no_unowned_home_writer, _migration_failure_status, _pause_target_for_rollback, _quiesce_target, _recover_pre_copy_source, _remove_verified_pre_copy_helper, _require_paused_source, _require_rollback_safe_target
+from orchestrator.hosted_runtime import _activate_promoted_target, _ensure_rollback_home, _record_error, _wait_migration_state, recover_hosted_migration
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.store import InMemorySandboxStore
 from datetime import datetime, timezone
@@ -332,6 +332,138 @@ async def test_running_target_is_paused_before_rollback_manifest_or_remove():
 
 
 @pytest.mark.asyncio
+async def test_changed_held_home_restores_verified_backup_before_rollback(monkeypatch):
+    """Break caught live: target drift must recover, not strand both containers paused."""
+    from orchestrator.hosted_backup import HostedBackupError
+
+    verified = {"manifest_sha256": "restored"}
+    checks = iter([
+        HostedBackupError("shared home manifest changed while migration target was held"),
+        verified,
+    ])
+
+    async def verify(*_args, **_kwargs):
+        result = next(checks)
+        if isinstance(result, Exception):
+            raise result
+        return result
+
+    restored = []
+
+    async def restore(*_args, **_kwargs):
+        restored.append(True)
+
+    monkeypatch.setattr("orchestrator.hosted_backup.verify_volume_unchanged", verify)
+    monkeypatch.setattr("orchestrator.hosted_backup.restore_volume", restore)
+    record = dict(_base(), phase="target_quiesce_intent", backup_receipt={"verified": True})
+
+    class Journal:
+        def __init__(self): self.writes = []
+        def write(self, value): self.writes.append(dict(value))
+
+    journal = Journal()
+    assert await _ensure_rollback_home(record, object(), journal) == verified
+    assert restored == [True]
+    assert any(item["phase"] == "restore_intent" for item in journal.writes)
+    assert record["rollback_home_receipt"] == verified
+
+
+@pytest.mark.asyncio
+async def test_rollback_never_restores_for_unclassified_backup_failure(monkeypatch):
+    """Missing or corrupt evidence stays fenced before any writable helper."""
+    from unittest.mock import AsyncMock
+    from orchestrator.hosted_backup import HostedBackupError
+
+    async def verify(*_args, **_kwargs):
+        raise HostedBackupError("backup archive does not match its verified receipt")
+
+    restore = AsyncMock()
+    monkeypatch.setattr("orchestrator.hosted_backup.verify_volume_unchanged", verify)
+    monkeypatch.setattr("orchestrator.hosted_backup.restore_volume", restore)
+    record = dict(_base(), phase="target_quiesce_intent", backup_receipt={"verified": True})
+    journal = type("Journal", (), {"write": lambda *_: None})()
+
+    with pytest.raises(HostedBackupError, match="archive"):
+        await _ensure_rollback_home(record, object(), journal)
+    restore.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_missing_held_target_cannot_bypass_home_restore_before_old_resumes(monkeypatch):
+    """A vanished drifted target must not let recovery unpause changed home."""
+    from orchestrator.hosted_backup import HostedBackupError
+
+    restored = False
+    checks = 0
+    record = dict(
+        _base(),
+        phase="target_quiesce_intent",
+        target_id="new",
+        backup_receipt={"verified": True},
+        row_persistence_volume=None,
+    )
+    old = _Container("old", status="paused", writable_home=True)
+    old.name = "/sbx"
+    old.attrs["Image"] = record["old_image"]
+
+    def unpause():
+        assert restored, "old resumed before the shared home was restored"
+        old.unpause_calls += 1
+        old.status = "running"
+
+    old.unpause = unpause
+    row = type("Row", (), {"container_id": "old", "persistence_volume": None})()
+
+    async def current(*_args, **_kwargs): return row
+    async def missing_target(*_args, **_kwargs): return None
+    async def no_writer(*_args, **_kwargs): return None
+    async def get_old(*_args, **_kwargs): return old
+    async def no_disconnect(*_args, **_kwargs): return None
+    async def ready(*_args, **_kwargs): return True
+    async def cleanup(*_args, **_kwargs): return None
+
+    async def verify(*_args, **_kwargs):
+        nonlocal checks
+        checks += 1
+        if checks == 1:
+            raise HostedBackupError("shared home manifest changed while migration target was held")
+        return {"manifest_sha256": "restored"}
+
+    async def restore(*_args, **_kwargs):
+        nonlocal restored
+        restored = True
+
+    monkeypatch.setattr("orchestrator.hosted_runtime._current", current)
+    monkeypatch.setattr("orchestrator.hosted_runtime._target", missing_target)
+    monkeypatch.setattr("orchestrator.hosted_runtime._assert_no_unowned_home_writer", no_writer)
+    monkeypatch.setattr("orchestrator.hosted_runtime._get", get_old)
+    monkeypatch.setattr("orchestrator.hosted_runtime._resolve_disconnect_intent", no_disconnect)
+    monkeypatch.setattr("orchestrator.hosted_runtime._reconnect_paused_source", no_disconnect)
+    monkeypatch.setattr("orchestrator.hosted_runtime._ready", ready)
+    monkeypatch.setattr("orchestrator.hosted_runtime._cleanup", cleanup)
+    monkeypatch.setattr("orchestrator.hosted_backup._volume_identity", lambda *_: record["source_identity"])
+    monkeypatch.setattr("orchestrator.hosted_backup.verify_volume_unchanged", verify)
+    monkeypatch.setattr("orchestrator.hosted_backup.restore_volume", restore)
+
+    volume = type("Volume", (), {"attrs": {}})()
+    client = type("Client", (), {"volumes": type("Volumes", (), {"get": lambda *_: volume})()})()
+
+    class Journal:
+        def __init__(self): self.writes = []
+        def write(self, value): self.writes.append(dict(value))
+
+    result = await recover_hosted_migration(
+        record,
+        store=object(),
+        client=client,
+        journal=Journal(),
+        locked=True,
+    )
+    assert result == {"status": "recovered", "sandbox_id": "sbx"}
+    assert restored and checks == 2 and old.unpause_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_unpausable_target_remains_fenced_before_manifest_or_remove():
     """Break caught: recovery continued after Docker failed to pause a live target."""
     class Unpausable(_Container):
@@ -472,6 +604,15 @@ async def test_recovery_refuses_a_running_sibling_writer_before_restore():
     client = type("Client", (), {"containers": _ContainerList([sibling])})()
     with pytest.raises(HostedMigrationStateError, match="another running container"):
         await _assert_no_unowned_home_writer(client, _base(), allowed_ids={"old", "new"})
+
+
+@pytest.mark.asyncio
+async def test_pre_admission_sibling_writer_is_actionable_busy_control_flow():
+    """A safe shared-home refusal is not a red unknown migration failure."""
+    sibling = _Container("sibling", status="running", writable_home=True)
+    client = type("Client", (), {"containers": _ContainerList([sibling])})()
+    with pytest.raises(HostedMigrationBusyError, match="stop that sandbox"):
+        await _assert_migration_home_exclusive(client, _base(), allowed_ids={"old"})
 
 
 def test_missing_hosted_journal_fails_closed(monkeypatch):

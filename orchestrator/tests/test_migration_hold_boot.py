@@ -9,6 +9,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[2]
 PREPARE = ROOT / "sandbox-image/scripts/prepare-agent-home.sh"
 LAYOUT = ROOT / "sandbox-image/scripts/ensure-layout.sh"
+GIT_CREDENTIALS = ROOT / "sandbox-image/scripts/configure-git-credentials.sh"
+LOCAL_ENTRYPOINT = ROOT / "sandbox-local/scripts/entrypoint-local.sh"
+CORE_ENTRYPOINT = ROOT / "sandbox-image/scripts/entrypoint.sh"
+SLIM_ENTRYPOINT = ROOT / "sandbox-image/scripts/entrypoint-slim.sh"
+AIDREAM_ENTRYPOINT = ROOT / "sandbox-image/scripts/entrypoint-aidream.sh"
 
 
 def _script_with_test_marker(script: Path, marker: Path, tmp_path: Path) -> Path:
@@ -35,7 +40,7 @@ def test_hold_refuses_home_preparation_or_layout_writes_before_marker(tmp_path: 
         "MATRX_MIGRATION_HOLD": "1",
         "ADMIN_KEYS_PATH": str(tmp_path / "not-read"),
     }
-    for script in (PREPARE, LAYOUT):
+    for script in (PREPARE, LAYOUT, GIT_CREDENTIALS):
         result = subprocess.run(
             ["bash", str(_script_with_test_marker(script, marker, tmp_path))],
             env=env,
@@ -49,6 +54,22 @@ def test_hold_refuses_home_preparation_or_layout_writes_before_marker(tmp_path: 
     assert retained.stat().st_uid == before.st_uid
     assert not (home / ".ssh").exists()
     assert not (home / ".matrx").exists()
+
+
+def test_every_image_entrypoint_holds_before_home_mutation():
+    """Every migratable image must enter its health-only hold before boot writes."""
+    cases = {
+        LOCAL_ENTRYPOINT: ('chown -R agent:agent "$HOT_PATH"', 'cat > /home/agent/.sandbox_env'),
+        CORE_ENTRYPOINT: ('/opt/sandbox/scripts/hot-sync.sh down', 'cat > /home/agent/.sandbox_env'),
+        SLIM_ENTRYPOINT: ('cat > /home/agent/.sandbox_env', '/opt/sandbox/scripts/configure-git-credentials.sh'),
+        AIDREAM_ENTRYPOINT: ('/usr/bin/sudo -E /bin/cp -a', 'retarget_editables'),
+    }
+    for path, mutations in cases.items():
+        source = path.read_text()
+        hold = source.index('if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]')
+        wait = source.index('while [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]')
+        for mutation in mutations:
+            assert hold < wait < source.index(mutation)
 
 
 def test_commit_marker_reenables_normal_layout_creation(tmp_path: Path):

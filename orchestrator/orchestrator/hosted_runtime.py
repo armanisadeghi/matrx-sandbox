@@ -26,6 +26,10 @@ class HostedMigrationBusyError(HostedMigrationStateError):
     """Expected pre-admission activity refusal, safe to retry unchanged."""
 
 
+class HostedHomeWriterError(HostedMigrationStateError):
+    """Another live container can mutate the migration's persistent home."""
+
+
 def _migration_failure_status(exc: Exception, *, admitted: bool) -> str:
     """Classify only a proven activity refusal as expected busy control flow."""
     if admitted:
@@ -451,9 +455,20 @@ async def _assert_no_unowned_home_writer(client, record, *, allowed_ids):
             for mount in container.attrs.get('Mounts', [])
         )
         if container.status not in {"created", "exited", "dead"} and writes_volume:
-            raise HostedMigrationStateError(
+            raise HostedHomeWriterError(
                 "another running container can write this home during recovery"
             )
+
+
+async def _assert_migration_home_exclusive(client, record, *, allowed_ids):
+    """Translate a safe pre-admission sibling refusal into actionable control flow."""
+    try:
+        await _assert_no_unowned_home_writer(client, record, allowed_ids=allowed_ids)
+    except HostedHomeWriterError as exc:
+        raise HostedMigrationBusyError(
+            "another running sandbox shares this persistent home; stop that "
+            "sandbox, then retry the image update; no container or file was changed"
+        ) from exc
 
 
 async def _quiesce_target(target, record):
@@ -462,6 +477,46 @@ async def _quiesce_target(target, record):
     # ``force=True`` is SIGKILL/removal, not an image entrypoint shutdown.  A
     # graceful stop would itself be a user-home write for these images.
     await _docker(target.remove, force=True)
+
+
+async def _ensure_rollback_home(record, client, journal):
+    """Return a verified rollback receipt, restoring only proven target drift.
+
+    A held replacement is not trusted to leave the shared home untouched. If
+    it changed that home, rollback must use the already-verified backup rather
+    than strand both containers paused forever. Corrupt/missing backup evidence
+    still fails closed before the restore helper can mount the home writable.
+    """
+    from orchestrator.hosted_backup import (
+        HostedBackupError,
+        restore_volume,
+        verify_volume_unchanged,
+    )
+
+    try:
+        receipt = await _finish(verify_volume_unchanged(
+            client,
+            receipt=record["backup_receipt"],
+            image=record["helper_image"],
+        ))
+    except HostedBackupError as exc:
+        if str(exc) != "shared home manifest changed while migration target was held":
+            raise
+        restored = transition(record, "restore_intent")
+        record.clear(); record.update(restored); journal.write(record)
+        await _finish(restore_volume(
+            client,
+            receipt=record["backup_receipt"],
+            image=record["helper_image"],
+        ))
+        receipt = await _finish(verify_volume_unchanged(
+            client,
+            receipt=record["backup_receipt"],
+            image=record["helper_image"],
+        ))
+    record["rollback_home_receipt"] = receipt
+    journal.write(record)
+    return receipt
 
 
 async def _ready(container, record, *, target):
@@ -707,13 +762,12 @@ async def recover_hosted_migration(record, *, store, client, journal, locked=Fal
         await _resolve_disconnect_intent(record, old, client, journal)
         if target is not None:
             await _pause_target_for_rollback(record, target, journal)
-            if not _promotion(record):
-                from orchestrator.hosted_backup import verify_volume_unchanged
-                rollback_receipt = await _finish(verify_volume_unchanged(
-                    client, receipt=record["backup_receipt"], image=record["helper_image"]
-                ))
-                record["rollback_home_receipt"] = rollback_receipt
-                journal.write(record)
+        # The held target may have disappeared after mutating the shared home.
+        # Verify (and, for the one proven drift failure, restore) independently
+        # of target existence, before the original process can resume.
+        if not _promotion(record):
+            await _ensure_rollback_home(record, client, journal)
+        if target is not None:
             await _quiesce_target(target, record)
         # A concurrent row deletion/change must never cause resurrection.
         if (await _current(record, store)).container_id != record["old_id"]:
@@ -802,7 +856,11 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
                     or (not promotion and not _home(old, volume))
                     or (promotion and row.persistence_volume)):
                 raise HostedMigrationStateError("original runtime no longer matches routing")
-            await _assert_no_unowned_home_writer(client, {"source_volume": volume}, allowed_ids={old.id})
+            await _assert_migration_home_exclusive(
+                client,
+                {"source_volume": volume},
+                allowed_ids={old.id},
+            )
             image = await _docker(client.images.get, target)
             if not re.fullmatch(r"sha256:[0-9a-f]{64}", image.id):
                 raise HostedMigrationStateError("target image identity is not immutable")

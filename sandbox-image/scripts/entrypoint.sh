@@ -21,7 +21,7 @@ done
 
 MATRX_MIGRATION_COMMIT_MARKER="/tmp/.matrx-migration-committed"
 MATRX_MIGRATION_ACTIVATED_MARKER="/tmp/.matrx-migration-activated"
-AGENT_API_STARTED=0
+AGENT_API_STARTED="${MATRX_AGENT_API_STARTED:-0}"
 
 start_agent_api() {
     echo "[hold] Starting Sandbox API Daemon..."

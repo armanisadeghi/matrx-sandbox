@@ -13,6 +13,24 @@ set -uo pipefail
 # the seeding/downstream chain as well.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
+MATRX_MIGRATION_COMMIT_MARKER="/tmp/.matrx-migration-committed"
+MATRX_MIGRATION_ACTIVATED_MARKER="/tmp/.matrx-migration-activated"
+
+# This wrapper normally seeds the durable aidream checkout before handing off
+# to the tier entrypoint. A migration target must do none of that before CAS;
+# expose only the immutable health API, then resume this wrapper after commit.
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ] && [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; then
+    rm -f "$MATRX_MIGRATION_ACTIVATED_MARKER"
+    export PYTHONDONTWRITEBYTECODE=1
+    log_hold() { echo "[entrypoint-aidream] $*"; }
+    log_hold "Migration hold active: API health only; aidream home boot is deferred until commit marker."
+    PYTHONDONTWRITEBYTECODE=1 sudo -E -u agent bash -c "cd /home/agent && PYTHONDONTWRITEBYTECODE=1 python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
+    export MATRX_AGENT_API_STARTED=1
+    touch /tmp/.sandbox_ready
+    while [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; do sleep 1; done
+    log_hold "Migration commit marker observed; activating aidream boot."
+fi
+
 TEMPLATE_DIR="/opt/aidream-template"
 WORK_DIR="/home/agent/aidream"
 

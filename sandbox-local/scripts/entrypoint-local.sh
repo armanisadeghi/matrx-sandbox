@@ -11,6 +11,29 @@ echo "  Sandbox ID: ${SANDBOX_ID:-unknown}"
 echo "  Time:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "=========================================="
 
+MATRX_MIGRATION_COMMIT_MARKER="/tmp/.matrx-migration-committed"
+MATRX_MIGRATION_ACTIVATED_MARKER="/tmp/.matrx-migration-activated"
+AGENT_API_STARTED="${MATRX_AGENT_API_STARTED:-0}"
+
+start_agent_api() {
+    echo "[hold] Starting Sandbox API Daemon..."
+    PYTHONDONTWRITEBYTECODE=1 sudo -E -u agent bash -c "cd /home/agent && PYTHONDONTWRITEBYTECODE=1 python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
+    AGENT_API_STARTED=1
+}
+
+# Migration targets must expose health while remaining completely inert with
+# respect to the mounted user home. Durable routing CAS creates the marker;
+# only then may normal boot, credentials, sync, ttyd, or layout code run.
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ] && [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; then
+    rm -f "$MATRX_MIGRATION_ACTIVATED_MARKER"
+    export PYTHONDONTWRITEBYTECODE=1
+    echo "Migration hold active: API health only; home boot is deferred until commit marker."
+    start_agent_api
+    touch /tmp/.sandbox_ready
+    while [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; do sleep 1; done
+    echo "Migration commit marker observed; activating normal boot."
+fi
+
 # ─── Step 1: Skip S3 in local mode ──────────────────────────────────────────
 echo "[1/5] S3 sync skipped (local mode — using Docker volumes)"
 
@@ -125,7 +148,9 @@ echo "[4c] Starting Sandbox API Daemon..."
 # USER_ID, MATRX_TIER, MATRX_HOT_PREFIX, etc.) — without it sudo strips
 # them and the persistence module can't tell who/what it is, so the
 # manifest ends up with "user_id: unknown".
-sudo -E -u agent bash -c "cd /home/agent && python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
+if [ "$AGENT_API_STARTED" = "0" ]; then
+    start_agent_api
+fi
 echo "[4c] Sandbox API Daemon running on port 8000."
 
 # ─── Step 4d: Pull AI Dream cloud_files into ~/cloud-files/ ──────────────────
@@ -139,6 +164,9 @@ echo "[4d] cloud_files sync complete."
 # ─── Step 5: Signal readiness ────────────────────────────────────────────────
 echo "[5/5] Sandbox is READY."
 touch /tmp/.sandbox_ready
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
+    touch "$MATRX_MIGRATION_ACTIVATED_MARKER"
+fi
 
 # ─── Shutdown handler ────────────────────────────────────────────────────────
 # Delegates to /opt/sandbox/scripts/shutdown-local.sh so the persistence module
