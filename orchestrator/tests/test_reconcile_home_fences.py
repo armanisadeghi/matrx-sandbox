@@ -42,8 +42,12 @@ def _exclusive_try(root: str, key: str, queue) -> None:
 
 
 def _exclusive_result(journal: HostedMigrationJournal, volume: str) -> str:
-    queue = multiprocessing.Queue()
-    process = multiprocessing.Process(
+    # Docker calls run in executor threads. Forking from such a thread inherits
+    # CPython's executor shutdown state on Linux (child exits 1 even after the
+    # lock probe succeeds). Spawn is also independent of inherited flock FDs.
+    context = multiprocessing.get_context("spawn")
+    queue = context.Queue()
+    process = context.Process(
         target=_exclusive_try, args=(str(journal.root), f"volume-{volume}", queue),
     )
     process.start()
