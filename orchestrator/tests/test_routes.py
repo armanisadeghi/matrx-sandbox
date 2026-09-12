@@ -77,6 +77,70 @@ def mock_health_sandbox_manager():
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("busy_signal", "reason"),
+    [
+        ("inflight", "box has in-flight tool calls; defer migration to an idle gap"),
+        ("session", "box has an open interactive session (PTY/watch); defer until it closes"),
+    ],
+)
+async def test_migrate_route_returns_structured_conflict_without_touching_busy_sandbox(
+    mock_sandbox_manager, monkeypatch, busy_signal, reason
+):
+    """Break caught: an active sandbox migration was emitted as an opaque 502."""
+    from orchestrator import activity
+    from orchestrator import sandbox_manager as manager_module
+
+    sandbox_id = "sbx-route-busy"
+    mock_sandbox_manager._get_store.return_value = object()
+    monkeypatch.setattr(
+        activity,
+        "inflight_count",
+        lambda received_id: int(busy_signal == "inflight" and received_id == sandbox_id),
+    )
+    monkeypatch.setattr(
+        activity,
+        "open_session_count",
+        lambda received_id: int(busy_signal == "session" and received_id == sandbox_id),
+    )
+
+    def docker_lookup_must_not_run():
+        raise AssertionError("the idle refusal must occur before any Docker lookup")
+
+    monkeypatch.setattr(manager_module, "_get_docker_client", docker_lookup_must_not_run)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(f"/sandboxes/{sandbox_id}/migrate")
+
+    assert response.status_code == 409
+    assert response.json() == {
+        "detail": {
+            "status": "busy_deferred",
+            "sandbox_id": sandbox_id,
+            "reason": reason,
+        }
+    }
+
+
+@pytest.mark.asyncio
+async def test_migrate_route_keeps_unknown_migration_failure_loud(mock_sandbox_manager, monkeypatch):
+    """Break caught: non-idle migration failures must not be downgraded to deferrals."""
+    from orchestrator import migrate
+
+    mock_sandbox_manager._get_store.return_value = object()
+    failure = {"status": "recovery_required", "sandbox_id": "sbx-route-failure", "reason": "journal uncertain"}
+    monkeypatch.setattr(migrate, "migrate_sandbox", AsyncMock(return_value=failure))
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post("/sandboxes/sbx-route-failure/migrate")
+
+    assert response.status_code == 502
+    assert response.json() == {"detail": failure}
+
+
+@pytest.mark.asyncio
 async def test_post_sandboxes_invalid_user_id(mock_sandbox_manager, mock_storage):
     """POST /sandboxes with an invalid user_id should return 422."""
     transport = ASGITransport(app=app)

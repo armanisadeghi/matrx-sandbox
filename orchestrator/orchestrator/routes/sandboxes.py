@@ -670,6 +670,8 @@ async def migrate_sandbox_route(sandbox_id: str, target_image: str | None = None
     result = await migrate_sandbox(sandbox_id, store=store, target_image=target_image, require_idle=True)
     if result["status"] in ("migrated", "already_current"):
         return result
+    if result["status"] == "busy_deferred":
+        raise HTTPException(status_code=409, detail=result)
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
     # failed — the OLD box is still running; surface loudly (502, not 500, so the
