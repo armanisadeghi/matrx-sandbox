@@ -39,6 +39,29 @@ class SandboxStore(ABC):
     async def save(self, sandbox: SandboxResponse) -> None:
         """Save or update a sandbox record."""
 
+    async def replace_container_if_current(
+        self,
+        sandbox_id: str,
+        old_container_id: str,
+        new_container_id: str,
+        template_version: str | None,
+    ) -> SandboxResponse | None:
+        """Commit a migration only if the live row still routes to ``old_container_id``.
+
+        A ``None`` result is a conflict, deleted row, or non-live row.  Callers
+        must retain both containers and enter recovery; an unconditional save
+        here can overwrite a concurrent resume or lifecycle change.
+        """
+        sandbox = await self.get(sandbox_id)
+        if sandbox is None or sandbox.container_id != old_container_id:
+            return None
+        if getattr(sandbox.status, "value", sandbox.status) not in {"ready", "running", "starting"}:
+            return None
+        sandbox.container_id = new_container_id
+        sandbox.template_version = template_version
+        await self.save(sandbox)
+        return await self.get(sandbox_id)
+
     @abstractmethod
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
         """Get a sandbox by ID. Returns None if not found."""
@@ -520,6 +543,30 @@ class PostgresSandboxStore(SandboxStore):
                 json.dumps(sandbox.labels) if sandbox.labels else None,
                 sandbox.persistence_volume,
             )
+
+    async def replace_container_if_current(
+        self,
+        sandbox_id: str,
+        old_container_id: str,
+        new_container_id: str,
+        template_version: str | None,
+    ) -> SandboxResponse | None:
+        """Atomic migration cutover guard for the shared durable registry."""
+        async def _do() -> SandboxResponse | None:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchrow(
+                    """UPDATE sandbox_instances
+                       SET container_id = $3, template_version = $4, updated_at = NOW()
+                       WHERE sandbox_id = $1
+                         AND container_id = $2
+                         AND deleted_at IS NULL
+                         AND status IN ('ready', 'running', 'starting')
+                       RETURNING *""",
+                    sandbox_id, old_container_id, new_container_id, template_version,
+                )
+                return _row_to_sandbox(row) if row else None
+        return await self._execute_with_retry(_do)
 
     async def get(self, sandbox_id: str) -> SandboxResponse | None:
         async def _do() -> SandboxResponse | None:

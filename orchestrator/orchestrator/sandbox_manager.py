@@ -1107,6 +1107,10 @@ async def destroy_sandbox(
     distinguishable from user-stopped ones (both keep their volume and are
     resumable). Leave it ``None`` for the normal stop path.
     """
+    from orchestrator import activity
+    if activity.is_migrating(sandbox_id):
+        logger.warning("Refusing lifecycle destroy for journaled migration %s", sandbox_id)
+        return False
     store = _get_store()
     sandbox = await store.get(sandbox_id)
     if not sandbox:

@@ -75,7 +75,18 @@ def open_session_count(sandbox_id: str) -> int:
 
 
 def is_migrating(sandbox_id: str) -> bool:
-    return sandbox_id in _migrating
+    if sandbox_id in _migrating:
+        return True
+    # Process-local state disappears on deploy. A non-terminal host journal is
+    # therefore also a routing fence. Migration admission itself verifies the
+    # mount; ordinary tools are not globally disabled merely because no hosted
+    # migration has ever created the state directory.
+    try:
+        from orchestrator.hosted_migration import HostedMigrationJournal
+        journal = HostedMigrationJournal()
+        return journal.inflight(sandbox_id) if journal.root.exists() else False
+    except Exception:
+        return True
 
 
 def inflight_count(sandbox_id: str) -> int:

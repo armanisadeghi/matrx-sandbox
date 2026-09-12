@@ -82,7 +82,15 @@ async def _reconcile_boot_state(store: object) -> None:
     mint fail during a hosted deploy.  In-memory mode has no durable source and
     therefore remains synchronous at startup (see ``lifespan``).
     """
+    from orchestrator.migrate import recover_hosted_migrations
     from orchestrator.reconcile import reconcile_from_docker, reconcile_liveness
+
+    # Recovery owns journaled old/new containers. Do this before ordinary
+    # Docker reconciliation so it cannot adopt or reap a half-cut-over pair.
+    recovery = await recover_hosted_migrations(store=store)
+    if recovery["recovered"] or recovery["failed"]:
+        _logger.warning("Hosted migration boot recovery: recovered=%s failed=%s",
+                        recovery["recovered"], recovery["failed"])
 
     try:
         summary = await reconcile_from_docker(store)

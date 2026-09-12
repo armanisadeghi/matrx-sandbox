@@ -324,6 +324,8 @@ async def destroy_sandbox(sandbox_id: str, graceful: bool = True, purge: bool = 
     every default list immediately ("delete" in user-facing UIs). The
     per-user volume is preserved either way.
     """
+    if activity.is_migrating(sandbox_id):
+        raise _migrating_503(sandbox_id)
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -352,6 +354,8 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
     in-memory store generates a new id). Callers must swap their cached
     reference to the returned sandbox.
     """
+    if activity.is_migrating(sandbox_id):
+        raise _migrating_503(sandbox_id)
     old = await sandbox_manager.get_sandbox(sandbox_id)
     if not old:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -429,6 +433,8 @@ async def resume_sandbox(sandbox_id: str):
     ``user_id``, not ``sandbox_id``. Callers must swap their cached reference
     to the returned sandbox. The old row is left as audit history.
     """
+    if activity.is_migrating(sandbox_id):
+        raise _migrating_503(sandbox_id)
     old = await sandbox_manager.get_sandbox(sandbox_id)
     if not old:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")

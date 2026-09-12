@@ -42,6 +42,16 @@ from orchestrator.store import SandboxStore
 
 logger = logging.getLogger(__name__)
 
+
+def _migration_fenced(sandbox_id: str) -> bool:
+    """Never let a normal reconcile/reaper adopt a journaled cutover artifact."""
+    try:
+        from orchestrator.hosted_migration import HostedMigrationJournal
+        journal = HostedMigrationJournal()
+        return journal.inflight(sandbox_id) if journal.root.exists() else False
+    except Exception:
+        return True
+
 # A row in one of these statuses reflects a deliberate end-of-life. If a
 # container for such a row is still alive, that's an orphan ("system says
 # done but it's still running"), not something to resurrect to 'running'.
@@ -146,6 +156,9 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
             user_id = labels.get("matrx.user_id")
 
             if not sandbox_id or not user_id:
+                summary["skipped"] += 1
+                continue
+            if _migration_fenced(sandbox_id):
                 summary["skipped"] += 1
                 continue
 
@@ -347,6 +360,8 @@ async def reap_zombie_containers(store: SandboxStore) -> list[str]:
             labels = ((container.attrs or {}).get("Config", {}) or {}).get("Labels") or {}
             sandbox_id = labels.get("matrx.sandbox_id")
             if not sandbox_id:
+                continue
+            if _migration_fenced(sandbox_id):
                 continue
             tier = labels.get("matrx.tier") or host_tier
             if host_tier and tier and tier != host_tier:

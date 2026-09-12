@@ -9,6 +9,13 @@
 > Keep both migration gates disabled. Do not use this document to authorize a
 > user-container replacement or to re-enable automatic migration.
 
+**Hosted repair in review (2026-09-12):** `orchestrator/hosted_migration.py`
+adds host-owned, fsync-backed journal state and volume backup primitives, and
+the hosted migration path now refuses if that state mount is unavailable. This
+is source-level recovery work, not authorization to migrate a user: no hosted
+positive/failure canary has independently verified the Docker metadata round
+trip, crash recovery, or retained test identity yet. Keep both gates disabled.
+
 ---
 
 ## The mental model in one paragraph
@@ -56,14 +63,13 @@ Detection is **tier-scoped by construction**: each orchestrator only sees its ow
 
 `orchestrator/migrate.py::migrate_sandbox(sandbox_id)`:
 
-1. **Mark migrating** (whole window). From here every new tool call to the box is refused with a **retryable `503`** (`{"detail":{"status":"migrating"}}` + `Retry-After`). The agent's tool proxy waits it out and lands on the new container — no `404`, no error.
-2. **Build** the new container on the current image, mounting the **same volume**, copying the old container's env/labels (minus the stale `MATRX_IMAGE_VERSION`), with `SANDBOX_MIGRATION=1` so the entrypoint skips the cloud-files down-sync (data's already on the volume — this is the biggest time saver).
-3. **Verify** readiness (`/tmp/.sandbox_ready`) **and** that the box reports the expected baked version (`/etc/sandbox-image-version`).
-4. **Drain** any calls that were in-flight when we locked (never cut over mid-tool-execution).
-5. **Atomic cutover**: stop + rename old → `<id>-old-<ts>`, rename new → `<id>`, remove old.
-6. **Release** the lock — the new container now answers as `sandbox_id`; calls resume.
+1. **Fence + drain** tool calls. A nonterminal host journal is also a restart-safe routing/reconcile fence.
+2. **Stop and verify** the old container before the target can mount its home. Capture a host-controlled backup volume with numeric ownership, mode, link, xattr, ACL and sparse-file tar metadata.
+3. **Build and verify** the target, then rename it only while the retained old container and backup still exist.
+4. **CAS and read back** the durable row from old container ID to new ID. A conflict is recovery-required, never success.
+5. **Only after commit/readback** remove the old container. Pre-commit failure restores the backup before restarting old; failed recovery leaves journal and artifacts visible.
 
-**Failure is safe at every step.** If the new box doesn't come up healthy/correct, it's removed and the **old box keeps running untouched** (loud `MIGRATE FAILED` alarm). If cutover itself fails, it rolls back to the old container. Data is in the volume throughout, so nothing is ever at risk.
+**Failure is fail-closed, not yet canary-certified.** A pre-commit failure restores the host backup before old restart; a restore, journal, or restart failure leaves both artifacts and a nonterminal recovery record rather than claiming success. No data-preservation claim becomes operational fact until the independent hosted canary passes.
 
 Endpoints:
 - **`POST /sandboxes/{id}/migrate`** — migrate one box (master-key). `?target_image=` to force a specific image. `502` (with the old box intact) on failure; `200` with `{status: migrated|already_current|busy_deferred}`.
