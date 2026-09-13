@@ -26,7 +26,8 @@ _LIBEXEC = "/usr/local/libexec/matrx-ec2-home-copy"
 _ID = re.compile(r"^[0-9a-f]{64}$")
 _OP_KEYS = frozenset(("schema_version", "operation", "source_container_id", "source_image", "source_pid", "source_started_at", "source_overlay_identity", "target_volume", "target_created_at"))
 _JOURNAL_DIR = "/var/lib/matrx-sandbox/hosted-migrations"
-_COPY_LOCK = re.compile(r"^copy-[A-Za-z0-9][A-Za-z0-9_.-]{0,200}\.lock$")
+_OPERATION = re.compile(r"^[0-9a-f-]{16,64}$")
+_COPY_LOCK = re.compile(r"^copy-[0-9a-f-]{16,64}\.lock$")
 
 
 class Ec2HomeCopyError(RuntimeError):
@@ -35,6 +36,62 @@ class Ec2HomeCopyError(RuntimeError):
 
 def _fail(message: str) -> None:
     raise Ec2HomeCopyError(message)
+
+
+def _open_journal(
+    root: str,
+    *,
+    expected_uid: int | None = None,
+    expected_gid: int | None = None,
+) -> tuple[int, os.stat_result]:
+    """Pin and validate the canonical service-owned journal directory."""
+    try:
+        directory_fd = os.open(
+            root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+        )
+    except OSError as exc:
+        raise Ec2HomeCopyError(f"cannot open migration journal directory: {exc}") from exc
+    try:
+        opened = os.fstat(directory_fd)
+        named = os.stat(root, follow_symlinks=False)
+        if (
+            not stat.S_ISDIR(opened.st_mode)
+            or not stat.S_ISDIR(named.st_mode)
+            or (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino)
+        ):
+            _fail("migration journal directory identity is invalid")
+        if stat.S_IMODE(opened.st_mode) != 0o700:
+            _fail("migration journal directory mode is invalid")
+        if opened.st_uid == 0 or opened.st_gid == 0:
+            _fail("migration journal directory must belong to the service identity")
+        if expected_uid is not None and opened.st_uid != expected_uid:
+            _fail("migration journal directory user is not the expected service user")
+        if expected_gid is not None and opened.st_gid != expected_gid:
+            _fail("migration journal directory group is not the expected service group")
+        return directory_fd, opened
+    except BaseException:
+        os.close(directory_fd)
+        raise
+
+
+def _validate_named_journal(
+    root: str, directory_fd: int, directory: os.stat_result
+) -> None:
+    """Prove the pinned journal is still the canonical service directory."""
+    opened = os.fstat(directory_fd)
+    named = os.stat(root, follow_symlinks=False)
+    expected_identity = (directory.st_dev, directory.st_ino)
+    if (
+        (opened.st_dev, opened.st_ino) != expected_identity
+        or (named.st_dev, named.st_ino) != expected_identity
+        or not stat.S_ISDIR(opened.st_mode)
+        or not stat.S_ISDIR(named.st_mode)
+        or stat.S_IMODE(opened.st_mode) != 0o700
+        or stat.S_IMODE(named.st_mode) != 0o700
+        or (opened.st_uid, opened.st_gid) != (directory.st_uid, directory.st_gid)
+        or (named.st_uid, named.st_gid) != (directory.st_uid, directory.st_gid)
+    ):
+        _fail("migration journal directory changed during normalization")
 
 
 def _normalize_copy_lock(fd: int, directory: os.stat_result, name: str) -> None:
@@ -53,26 +110,71 @@ def _normalize_copy_lock(fd: int, directory: os.stat_result, name: str) -> None:
     owner = (value.st_uid, value.st_gid)
     if owner == (0, 0) and owner != expected:
         os.fchown(fd, *expected)
+        os.fsync(fd)
     elif owner != expected:
         _fail(f"copy lock has incompatible owner: {name}")
+    updated = os.fstat(fd)
+    if (
+        (updated.st_dev, updated.st_ino, updated.st_size)
+        != (value.st_dev, value.st_ino, value.st_size)
+        or (updated.st_uid, updated.st_gid) != expected
+        or stat.S_IMODE(updated.st_mode) != 0o600
+        or not stat.S_ISREG(updated.st_mode)
+        or updated.st_nlink != 1
+    ):
+        _fail(f"copy lock changed during ownership normalization: {name}")
 
 
-def normalize_copy_locks(root: str = _JOURNAL_DIR) -> None:
+def _validate_named_copy_lock(
+    directory_fd: int,
+    name: str,
+    fd: int,
+    directory: os.stat_result,
+) -> None:
+    """Prove the normalized descriptor remains the canonical named lock."""
+    opened = os.fstat(fd)
+    named = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+    expected_owner = (directory.st_uid, directory.st_gid)
+    if (opened.st_dev, opened.st_ino, opened.st_size) != (
+        named.st_dev,
+        named.st_ino,
+        named.st_size,
+    ):
+        _fail(f"copy lock name changed during normalization: {name}")
+    for value in (opened, named):
+        if not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
+            _fail(f"copy lock is not one safe regular inode: {name}")
+        if stat.S_IMODE(value.st_mode) != 0o600:
+            _fail(f"copy lock has incompatible mode: {name}")
+        if (value.st_uid, value.st_gid) != expected_owner:
+            _fail(f"copy lock has incompatible owner: {name}")
+
+
+def normalize_copy_locks(
+    root: str = _JOURNAL_DIR,
+    *,
+    expected_uid: int | None = None,
+    expected_gid: int | None = None,
+) -> None:
     """Repair only canonical root-helper lock ownership before release admission."""
-    directory_fd = os.open(
-        root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    directory_fd, directory = _open_journal(
+        root, expected_uid=expected_uid, expected_gid=expected_gid
     )
     try:
-        directory = os.fstat(directory_fd)
         with os.scandir(directory_fd) as entries:
             for entry in entries:
                 if not _COPY_LOCK.fullmatch(entry.name):
                     continue
-                fd = os.open(
-                    entry.name,
-                    os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
-                    dir_fd=directory_fd,
-                )
+                try:
+                    fd = os.open(
+                        entry.name,
+                        os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                        dir_fd=directory_fd,
+                    )
+                except OSError as exc:
+                    raise Ec2HomeCopyError(
+                        f"cannot safely open copy lock {entry.name}: {exc}"
+                    ) from exc
                 try:
                     named = os.stat(
                         entry.name, dir_fd=directory_fd, follow_symlinks=False
@@ -81,8 +183,12 @@ def normalize_copy_locks(root: str = _JOURNAL_DIR) -> None:
                     if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
                         _fail(f"copy lock changed while opening: {entry.name}")
                     _normalize_copy_lock(fd, directory, entry.name)
+                    _validate_named_copy_lock(
+                        directory_fd, entry.name, fd, directory
+                    )
                 finally:
                     os.close(fd)
+        _validate_named_journal(root, directory_fd, directory)
     finally:
         os.close(directory_fd)
 
@@ -94,7 +200,7 @@ def _canon(value: Any) -> str:
 def _operation(value: Any) -> dict[str, Any]:
     if not isinstance(value, dict) or set(value) != _OP_KEYS or value.get("schema_version") != 1:
         _fail("operation has missing or unexpected fields")
-    if not isinstance(value["operation"], str) or not re.fullmatch(r"[0-9a-f-]{16,64}", value["operation"]):
+    if not isinstance(value["operation"], str) or not _OPERATION.fullmatch(value["operation"]):
         _fail("operation identity is invalid")
     if not isinstance(value["source_container_id"], str) or not _ID.fullmatch(value["source_container_id"]):
         _fail("source container ID must be a full Docker ID")
@@ -287,15 +393,29 @@ def perform_copy(value: Any) -> dict[str, Any]:
     # Survives an orchestrator process crash. Recovery takes the same lock
     # before it may unpause the source or clean the isolated target volume.
     lock_name = "copy-" + op["operation"] + ".lock"
-    fd = os.open(_JOURNAL_DIR + "/" + lock_name,
-                 os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
+    directory_fd, directory = _open_journal(_JOURNAL_DIR)
     try:
-        directory = os.stat(_JOURNAL_DIR, follow_symlinks=False)
-        _normalize_copy_lock(fd, directory, lock_name)
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        return _perform_copy_locked(op)
+        fd = os.open(
+            lock_name,
+            os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            named = os.stat(lock_name, dir_fd=directory_fd, follow_symlinks=False)
+            opened = os.fstat(fd)
+            if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+                _fail(f"copy lock changed while opening: {lock_name}")
+            _normalize_copy_lock(fd, directory, lock_name)
+            _validate_named_copy_lock(directory_fd, lock_name, fd, directory)
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+            _validate_named_copy_lock(directory_fd, lock_name, fd, directory)
+            _validate_named_journal(_JOURNAL_DIR, directory_fd, directory)
+            return _perform_copy_locked(op)
+        finally:
+            os.close(fd)
     finally:
-        os.close(fd)
+        os.close(directory_fd)
 
 
 def _perform_copy_locked(value: Any) -> dict[str, Any]:
@@ -410,10 +530,18 @@ async def run_root_copy(operation: dict[str, Any], *, artifact_sha256: str) -> d
 
 
 def main() -> int:
-    if sys.argv[1:] == ["--preflight"]:
+    if sys.argv[1:2] == ["--preflight"]:
         if os.geteuid() != 0:
             _fail("home-copy helper must run as root")
-        normalize_copy_locks()
+        if len(sys.argv) != 4:
+            _fail("preflight requires the exact service user and group")
+        try:
+            service_uid, service_gid = int(sys.argv[2]), int(sys.argv[3])
+        except ValueError:
+            _fail("service identity must be numeric")
+        if service_uid <= 0 or service_gid <= 0:
+            _fail("service identity must be unprivileged")
+        normalize_copy_locks(expected_uid=service_uid, expected_gid=service_gid)
         for command in (["/usr/bin/tar", "--version"], ["/usr/bin/getfacl", "--version"], [_DOCKER, "version", "--format", "{{.Server.Version}}"]):
             subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         print("EC2_HOME_COPY_READY")

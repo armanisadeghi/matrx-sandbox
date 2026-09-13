@@ -4,6 +4,7 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
 from pathlib import Path
 
 from orchestrator.ec2_home_copy import (
@@ -22,6 +23,7 @@ async def preflight_helper():
     process = await asyncio.create_subprocess_exec(
         "/usr/bin/sudo", "-n", "/usr/bin/env", "-i", "PATH=/usr/bin:/bin",
         "/usr/bin/python3.11", "-I", path, "--preflight",
+        str(os.geteuid()), str(os.getegid()),
         stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.DEVNULL,
     )
     try:

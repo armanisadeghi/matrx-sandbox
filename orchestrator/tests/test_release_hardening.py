@@ -411,6 +411,7 @@ def test_aidream_build_proves_agent_cannot_mutate_certified_runtime():
     assert "--tmpfs /var/log/sandbox:rw,nosuid,nodev,mode=0775,uid=1000,gid=1000" in builder
     assert "MATRX_TEMP_DIR=/tmp/aidream-managed LOG_DIR=/var/log/aidream" in builder
     assert "runpy.run_path" in builder
+    assert 'sys.path.insert(0, \\"/opt/aidream-template\\")' in builder
 
 
 def test_aidream_autostart_cannot_source_malicious_agent_profiles():

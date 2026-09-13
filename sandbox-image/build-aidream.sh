@@ -227,7 +227,7 @@ docker run --rm --read-only \
         /opt/aidream-template/.venv/bin/python -I -c "import sys; assert sys.flags.isolated and sys.flags.no_user_site" \
     && sudo -u agent env -i HOME=/run/aidream-managed-home PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
         MATRX_TEMP_DIR=/tmp/aidream-managed LOG_DIR=/var/log/aidream \
-        /opt/aidream-template/.venv/bin/python -I -c "import os, runpy; os.chdir(\"/opt/aidream-template\"); runpy.run_path(\"/opt/aidream-template/run.py\"); runpy.run_path(\"/opt/aidream-template/config/settings.py\"); runpy.run_path(\"/opt/aidream-template/aidream/settings/__init__.py\")" \
+        /opt/aidream-template/.venv/bin/python -I -c "import os, runpy, sys; os.chdir(\"/opt/aidream-template\"); sys.path.insert(0, \"/opt/aidream-template\"); runpy.run_path(\"/opt/aidream-template/run.py\"); runpy.run_path(\"/opt/aidream-template/config/settings.py\"); runpy.run_path(\"/opt/aidream-template/aidream/settings/__init__.py\")" \
     && test -d /tmp/aidream-managed/reports \
     && test -d /tmp/aidream-managed/logs \
     && test -d /var/log/aidream \

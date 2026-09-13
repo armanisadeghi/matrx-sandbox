@@ -202,6 +202,7 @@ cmp "$CANDIDATE_DIR/orchestrator/ec2_home_copy.py" "$HELPER" \
   || fail "home-copy helper differs from approved candidate"
 sudo -u ec2-user sudo -n env -i PATH=/usr/bin:/bin \
   /usr/bin/python3.11 -I "$HELPER" --preflight \
+  "$(/usr/bin/id -u ec2-user)" "$(/usr/bin/id -g ec2-user)" \
   || fail "home-copy helper is unavailable to actual service user"
 docker image inspect "$ECR_REPO-orchestrator:$TARGET_SHA" --format '{{.Id}}' \
   > "$CANDIDATE_DIR/.migration-helper-image"
