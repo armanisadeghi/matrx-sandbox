@@ -579,6 +579,16 @@ def test_deploy_scripts_revalidate_immutable_approval_not_moving_main():
         assert "release_guard_fetch_current_main" not in script
 
 
+def test_deployment_scripts_never_bulk_prune_containers():
+    """A deploy must not delete stopped containers that retain sandbox homes."""
+    forbidden = re.compile(r"^\s*docker\s+(?:system|container)\s+prune\b", re.MULTILINE)
+    violations = {
+        script.relative_to(REPO_ROOT): forbidden.findall(script.read_text(encoding="utf-8"))
+        for script in sorted((REPO_ROOT / "scripts").glob("deploy-*.sh"))
+    }
+    assert all(not matches for matches in violations.values()), violations
+
+
 def test_ec2_release_requires_the_private_aidream_replica_before_and_after_swap():
     script = (REPO_ROOT / "scripts" / "deploy-ec2.sh").read_text(encoding="utf-8")
     expected = 'EXPECTED_AIDREAM_URL="http://aidream.internal.matrxserver.com"'
