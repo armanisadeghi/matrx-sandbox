@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import asyncio
+import time
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -489,6 +491,27 @@ async def test_get_health_returns_healthy(mock_health_sandbox_manager):
     assert data["status"] == "healthy"
     assert "active_sandboxes" in data
     assert "uptime_seconds" in data
+
+
+@pytest.mark.asyncio
+async def test_health_stays_within_liveness_budget_when_store_pool_is_busy(
+    mock_health_sandbox_manager, monkeypatch
+):
+    """A busy store must not make Docker drop the live service from Traefik."""
+    never_ready = asyncio.Event()
+    mock_health_sandbox_manager.list_sandboxes = AsyncMock(side_effect=never_ready.wait)
+    monkeypatch.setattr("orchestrator.routes.health._HEALTH_STORE_TIMEOUT_SECONDS", 0.05)
+    monkeypatch.setattr("orchestrator.routes.health._last_active_sandbox_count", 17)
+
+    started = time.monotonic()
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get("/health")
+    elapsed = time.monotonic() - started
+
+    assert response.status_code == 200
+    assert response.json()["active_sandboxes"] == 17
+    assert elapsed < 0.3, f"health probe stalled for {elapsed:.2f}s"
 
 
 def test_system_counts_exclude_only_unclaimed_warm_pool_containers():

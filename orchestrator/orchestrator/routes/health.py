@@ -24,6 +24,8 @@ from orchestrator.store import PostgresSandboxStore
 router = APIRouter(tags=["health"])
 
 _start_time = time.time()
+_HEALTH_STORE_TIMEOUT_SECONDS = 1.0
+_last_active_sandbox_count = 0
 
 
 def _sandboxes_for_this_host(sandboxes):
@@ -41,15 +43,34 @@ def _sandboxes_for_this_host(sandboxes):
 
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
-    """Health check for the orchestrator service."""
-    sandboxes = _sandboxes_for_this_host(await sandbox_manager.list_sandboxes())
-    active = [s for s in sandboxes if s.status in ("ready", "running", "starting")]
+    """Health check for the orchestrator service.
+
+    This is the container liveness probe, so a fleet reconciliation that is
+    temporarily occupying the small Postgres pool must not make Docker declare
+    the otherwise-live process unhealthy and remove it from Traefik.
+    """
+    global _last_active_sandbox_count
+    try:
+        sandboxes = _sandboxes_for_this_host(
+            await asyncio.wait_for(
+                sandbox_manager.list_sandboxes(),
+                timeout=_HEALTH_STORE_TIMEOUT_SECONDS,
+            )
+        )
+        _last_active_sandbox_count = sum(
+            1 for sandbox in sandboxes if sandbox.status in ("ready", "running", "starting")
+        )
+    except TimeoutError:
+        # Active count is advisory on this liveness route. Keep serving the last
+        # successful count while the store is briefly busy; /system performs the
+        # full operational query for authenticated diagnostics.
+        pass
     backend = (
         "postgres" if isinstance(sandbox_manager._get_store(), PostgresSandboxStore) else "memory"
     )
     return HealthResponse(
         status="healthy",
-        active_sandboxes=len(active),
+        active_sandboxes=_last_active_sandbox_count,
         uptime_seconds=round(time.time() - _start_time, 1),
         store_backend=backend,
         durable_storage=backend == "postgres",
