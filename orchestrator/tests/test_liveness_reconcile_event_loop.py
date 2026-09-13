@@ -19,6 +19,7 @@ from types import SimpleNamespace
 import pytest
 
 from orchestrator.hosted_migration import HostedMigrationJournal
+from orchestrator.hosted_runtime import recover_hosted_migrations
 from orchestrator.reconcile import reconcile_from_docker, reconcile_liveness
 from orchestrator.store import InMemorySandboxStore
 
@@ -48,6 +49,28 @@ class _Store:
                         include_sandbox_ids=None):
         self.called = (tier, exclude_sandbox_ids, include_sandbox_ids)
         return {"stopped": [], "refreshed": len(include_sandbox_ids or ())}
+
+
+@pytest.mark.asyncio
+async def test_boot_recovery_reads_large_journals_without_stalling_health(monkeypatch, tmp_path):
+    """A large durable migration receipt must be parsed off the event loop."""
+    journal = HostedMigrationJournal(tmp_path)
+    monkeypatch.setattr("orchestrator.hosted_runtime.HostedMigrationJournal", lambda: journal)
+    monkeypatch.setattr("orchestrator.config.settings.host_tier", "hosted")
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: object())
+
+    def slow_records():
+        time.sleep(0.5)
+        return []
+
+    monkeypatch.setattr(journal, "records", slow_records)
+    result, stalls = await _max_stall_while(recover_hosted_migrations(store=_Store()))
+
+    assert result == {"recovered": [], "failed": []}
+    assert stalls
+    assert max(stalls) < MAX_LOOP_STALL_SECONDS, (
+        f"event loop stalled {max(stalls):.2f}s while reading migration journals"
+    )
 
 
 @pytest.mark.asyncio

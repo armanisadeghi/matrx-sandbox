@@ -188,8 +188,8 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
     if settings.host_tier in {"hosted", "ec2"}:
         try:
             from orchestrator.hosted_migration import HostedMigrationJournal
-            journal = HostedMigrationJournal(); journal.ensure_ready()
-            retained_container_ids = journal.retained_container_ids()
+            journal = HostedMigrationJournal()
+            retained_container_ids = await asyncio.to_thread(journal.retained_container_ids)
         except Exception as exc:
             logger.error("Reconcile denied: hosted migration state unavailable: %s", exc)
             summary["skipped"] = len(containers)

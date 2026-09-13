@@ -1218,9 +1218,12 @@ async def recover_hosted_migrations(*, store):
     if settings.host_tier not in {"hosted", "ec2"}:
         return result
     journal = HostedMigrationJournal()
-    journal.ensure_ready()
     client = _get_docker_client()
-    for record in journal.records():
+    # Journal validation reads and parses durable receipts that can be tens of
+    # megabytes after a real home snapshot. Keep that blocking filesystem/JSON
+    # work off the event loop that serves the container's /health probe.
+    records = await asyncio.to_thread(journal.records)
+    for record in records:
         if record.get("cleanup_complete"):
             continue
         from orchestrator.migration_operations import run_owned_operation
