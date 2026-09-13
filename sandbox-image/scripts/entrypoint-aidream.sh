@@ -132,6 +132,8 @@ if [ "${MATRX_TIER:-}" = "hosted" ]; then
         AIDREAM_WORK_DIR="$TEMPLATE_DIR" \
         AIDREAM_TEMPLATE_DIR="$TEMPLATE_DIR" \
         AIDREAM_IMAGE_SHA_FILE=/etc/aidream-image-sha \
+        MATRX_TEMP_DIR=/tmp/aidream-managed \
+        LOG_DIR=/var/log/aidream \
         PYTHONNOUSERSITE=1 \
         PYTHONDONTWRITEBYTECODE=1 \
         /bin/bash --noprofile --norc -p \

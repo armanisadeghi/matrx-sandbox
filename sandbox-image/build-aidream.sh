@@ -198,6 +198,7 @@ docker run --rm --read-only \
     --tmpfs /home/agent:rw,nosuid,nodev,mode=0700,uid=1000,gid=1000 \
     --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
     --tmpfs /run:rw,nosuid,nodev,mode=1777 \
+    --tmpfs /var/log/sandbox:rw,nosuid,nodev,mode=0775,uid=1000,gid=1000 \
     --tmpfs /var/log/aidream:rw,nosuid,nodev,mode=0775,uid=1000,gid=1000 \
     --entrypoint /bin/sh "$TAG" -c \
     'set -eu \
@@ -224,6 +225,12 @@ docker run --rm --read-only \
         /bin/bash --noprofile --norc -p /opt/sandbox/scripts/aidream-helpers.sh verify-release \
     && sudo -u agent env -i HOME=/run/aidream-managed-home PYTHONNOUSERSITE=1 \
         /opt/aidream-template/.venv/bin/python -I -c "import sys; assert sys.flags.isolated and sys.flags.no_user_site" \
+    && sudo -u agent env -i HOME=/run/aidream-managed-home PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+        MATRX_TEMP_DIR=/tmp/aidream-managed LOG_DIR=/var/log/aidream \
+        /opt/aidream-template/.venv/bin/python -I -c "import os, runpy; os.chdir(\"/opt/aidream-template\"); runpy.run_path(\"/opt/aidream-template/run.py\"); runpy.run_path(\"/opt/aidream-template/config/settings.py\"); runpy.run_path(\"/opt/aidream-template/aidream/settings/__init__.py\")" \
+    && test -d /tmp/aidream-managed/reports \
+    && test -d /tmp/aidream-managed/logs \
+    && test -d /var/log/aidream \
     && test ! -e /tmp/sitecustomize-ran \
     && test ! -e /tmp/gitconfig-ran \
     && test -z "$(find /tmp -maxdepth 1 -name 'shim-*-ran' -print -quit)" \

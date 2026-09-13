@@ -345,6 +345,8 @@ def test_aidream_autostart_uses_immutable_template_without_resetting_user_work()
     assert "AIDREAM_IMAGE_SHA_FILE=/etc/aidream-image-sha" in autostart
     assert "HOME=/run/aidream-managed-home" in autostart
     assert "GIT_CONFIG_GLOBAL=/dev/null" in autostart
+    assert "MATRX_TEMP_DIR=/tmp/aidream-managed" in autostart
+    assert "LOG_DIR=/var/log/aidream" in autostart
     assert "PYTHONNOUSERSITE=1" in autostart
     assert "PYTHONDONTWRITEBYTECODE=1" in autostart
     assert "template_mount_is_read_only" in entrypoint
@@ -388,6 +390,9 @@ def test_aidream_build_proves_agent_cannot_mutate_certified_runtime():
     assert "test ! -e /tmp/gitconfig-ran" in builder
     assert "for shim in findmnt sudo env sleep bash" in builder
     assert "find /tmp -maxdepth 1 -name 'shim-*-ran'" in builder
+    assert "--tmpfs /var/log/sandbox:rw,nosuid,nodev,mode=0775,uid=1000,gid=1000" in builder
+    assert "MATRX_TEMP_DIR=/tmp/aidream-managed LOG_DIR=/var/log/aidream" in builder
+    assert "runpy.run_path" in builder
 
 
 def test_aidream_autostart_cannot_source_malicious_agent_profiles():
