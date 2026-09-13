@@ -115,11 +115,6 @@ for leaked in $LEAKED; do
 done
 docker image prune -f >/dev/null 2>&1 || true
 docker builder prune -f >/dev/null 2>&1 || true
-# Tagged images from unrelated retired releases are not removed by image prune,
-# yet can consume the whole EC2 root volume before this release begins. Docker
-# only prunes stopped containers, unused networks, dangling build cache, and
-# images unused by a running container here; active service images remain.
-docker system prune -af >/dev/null 2>&1 || true
 
 REQUIRED_FREE_KB=$((10 * 1024 * 1024))   # 10 GiB — the three pulls land ~5 GiB
 # Ask Docker where its data actually lives, and never let the guard itself be
