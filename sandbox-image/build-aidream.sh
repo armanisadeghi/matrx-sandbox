@@ -228,6 +228,8 @@ docker run --rm --read-only \
     && sudo -u agent env -i HOME=/run/aidream-managed-home PYTHONNOUSERSITE=1 \
         /opt/aidream-template/.venv/bin/python -I -c "import sys; assert sys.flags.isolated and sys.flags.no_user_site" \
     && sudo -u agent env -i HOME=/run/aidream-managed-home PYTHONNOUSERSITE=1 \
+        /opt/aidream-template/.venv/bin/python -I -B -c "from datetime import datetime, timedelta; from zoneinfo import ZoneInfo; utc = ZoneInfo(\"UTC\"); los_angeles = ZoneInfo(\"America/Los_Angeles\"); assert datetime(2026, 1, 15, tzinfo=utc).utcoffset() == timedelta(0); assert datetime(2026, 1, 15, tzinfo=los_angeles).utcoffset() == timedelta(hours=-8); assert datetime(2026, 7, 15, tzinfo=los_angeles).utcoffset() == timedelta(hours=-7)" \
+    && sudo -u agent env -i HOME=/run/aidream-managed-home PYTHONNOUSERSITE=1 \
         MATRX_TEMP_DIR=/tmp/aidream-managed LOG_DIR=/var/log/aidream \
         /opt/aidream-template/.venv/bin/python -I -B /opt/sandbox/scripts/aidream-managed-bootstrap.py --verify-imports \
     && test -d /tmp/aidream-managed/reports \

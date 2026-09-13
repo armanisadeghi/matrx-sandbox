@@ -46,7 +46,7 @@ RUN echo "aidream" > /etc/sandbox-image-tag \
 # let uv install its own Python 3.13 below.
 USER root
 RUN apt-get update \
-    && apt-get install -y --no-install-recommends \
+    && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
     build-essential \
     portaudio19-dev \
     libasound2-dev \
@@ -56,6 +56,7 @@ RUN apt-get update \
     libmagic1 \
     libpq-dev \
     tesseract-ocr \
+    tzdata \
     bubblewrap \
     socat \
     && rm -rf /var/lib/apt/lists/*
