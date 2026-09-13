@@ -112,11 +112,11 @@ async def _wait_container_ready(
                 return False
             readiness = (
                 "test -f /tmp/.sandbox_ready"
-                " && curl -fsS http://127.0.0.1:8000/health >/dev/null"
+                " && curl -fsS --max-time 3 http://127.0.0.1:8000/health >/dev/null"
             )
             if template == "aidream":
                 if stage == "active":
-                    readiness += " && curl -fsS http://127.0.0.1:8001/api/health/ready >/dev/null"
+                    readiness += " && curl -fsS --max-time 3 http://127.0.0.1:8001/api/health/ready >/dev/null"
                 if stage != "rollback":
                     readiness += (
                     " && AIDREAM_WORK_DIR=/opt/aidream-template"
@@ -125,7 +125,9 @@ async def _wait_container_ready(
                     " /bin/bash --noprofile --norc -p"
                     " /opt/sandbox/scripts/aidream-helpers.sh verify-release >/dev/null"
                     )
-            code, _ = await asyncio.to_thread(container.exec_run, readiness)
+            code, _ = await asyncio.to_thread(
+                container.exec_run, ["/bin/sh", "-ec", readiness]
+            )
             if code == 0:
                 return True
         except (NotFound, APIError) as exc:

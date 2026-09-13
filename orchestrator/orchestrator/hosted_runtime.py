@@ -694,7 +694,10 @@ async def _template_service_ready(container, template: str | None) -> bool | Non
         return None
     result = await _docker(
         container.exec_run,
-        "curl -fsS --max-time 3 http://127.0.0.1:8001/api/health/ready >/dev/null",
+        [
+            "curl", "-fsS", "--max-time", "3",
+            "http://127.0.0.1:8001/api/health/ready",
+        ],
     )
     code = getattr(result, "exit_code", result[0] if isinstance(result, tuple) else None)
     return code == 0

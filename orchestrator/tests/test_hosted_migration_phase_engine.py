@@ -422,15 +422,17 @@ async def test_aidream_held_readiness_does_not_require_post_commit_managed_api()
 
         def exec_run(self, command):
             self.commands.append(command)
-            if "127.0.0.1:8001" in command:
+            script = command[-1] if isinstance(command, list) else command
+            if "127.0.0.1:8001" in script:
                 return 1, b"managed API intentionally held"
             return 0, b""
 
     target = HeldAidream()
     assert await _wait_container_ready(target, 1, "aidream", stage="held")
-    assert "127.0.0.1:8000/health" in target.commands[0]
-    assert "aidream-helpers.sh verify-release" in target.commands[0]
-    assert "127.0.0.1:8001" not in target.commands[0]
+    assert target.commands[0][:2] == ["/bin/sh", "-ec"]
+    assert "127.0.0.1:8000/health" in target.commands[0][2]
+    assert "aidream-helpers.sh verify-release" in target.commands[0][2]
+    assert "127.0.0.1:8001" not in target.commands[0][2]
 
 
 @pytest.mark.asyncio
@@ -443,7 +445,8 @@ async def test_aidream_active_readiness_still_requires_managed_api():
             return None
 
         def exec_run(self, command):
-            return (1, b"managed API unavailable") if "127.0.0.1:8001" in command else (0, b"")
+            script = command[-1] if isinstance(command, list) else command
+            return (1, b"managed API unavailable") if "127.0.0.1:8001" in script else (0, b"")
 
     assert not await _wait_container_ready(DegradedAidream(), 1, "aidream", stage="active")
 
@@ -464,8 +467,29 @@ async def test_aidream_rollback_readiness_restores_core_without_claiming_managed
 
     old = BaselineDegradedAidream()
     assert await _wait_container_ready(old, 1, "aidream", stage="rollback")
-    assert "127.0.0.1:8000/health" in old.commands[0]
-    assert "127.0.0.1:8001" not in old.commands[0]
+    assert old.commands[0][:2] == ["/bin/sh", "-ec"]
+    assert "127.0.0.1:8000/health" in old.commands[0][2]
+    assert "127.0.0.1:8001" not in old.commands[0][2]
+
+
+@pytest.mark.asyncio
+async def test_aidream_template_probe_uses_explicit_shell_for_redirection():
+    """Break caught: docker-py split `>/dev/null` into a literal curl argument."""
+    from orchestrator.hosted_runtime import _template_service_ready
+
+    class Probe:
+        command = None
+
+        def exec_run(self, command):
+            self.command = command
+            return (0, b"") if isinstance(command, list) else (2, b"curl: bad argument")
+
+    container = Probe()
+    assert await _template_service_ready(container, "aidream") is True
+    assert container.command == [
+        "curl", "-fsS", "--max-time", "3",
+        "http://127.0.0.1:8001/api/health/ready",
+    ]
 
 
 @pytest.mark.asyncio
