@@ -53,10 +53,10 @@ def record(**extra):
 
 @pytest.mark.parametrize("committed", [True, False])
 def test_cleanup_removes_exact_operation_tag_for_commit_and_rollback(committed):
-    """Regression: an in-use helper digest permits its verified operation tag to be removed."""
+    """Regression: a verified helper alias is removed without force on either cleanup path."""
     images, journal, state = Images(), Journal(), record()
     asyncio.run(_cleanup(state, client(images), journal, committed=committed))
-    assert images.removed == [(PIN, True)]
+    assert images.removed == [(PIN, False)]
     assert any(w["cleanup_receipt"].get("helper_image_pin_removal_intent") == {"pin": PIN, "image": IMAGE}
                for w in journal.writes)
     assert state["cleanup_receipt"]["helper_image_pin_removed"] == PIN

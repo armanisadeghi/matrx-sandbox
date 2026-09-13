@@ -714,7 +714,7 @@ async def _cleanup(record, client, journal, *, committed):
                     client.images.remove,
                     helper_pin,
                     noprune=True,
-                    force=len(tags) > 1,
+                    force=False,
                 )
                 receipts["helper_image_pin_removed"] = helper_pin
         journal.write(record)
