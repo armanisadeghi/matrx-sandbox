@@ -22,6 +22,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import math
 import os
 import time
 
@@ -133,7 +134,8 @@ async def _wait_container_ready(
                 container.exec_run,
                 [
                     "/usr/bin/timeout", "--signal=TERM", "--kill-after=0.1s",
-                    f"{remaining:.3f}s", "/bin/sh", "-ec", readiness,
+                    f"{math.ceil(remaining * 1000) / 1000:.3f}s",
+                    "/bin/sh", "-ec", readiness,
                 ],
             )
             if code == 0:

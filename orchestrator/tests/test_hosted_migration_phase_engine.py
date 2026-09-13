@@ -521,6 +521,28 @@ async def test_readiness_timeout_is_a_wall_clock_deadline(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_positive_submillisecond_readiness_budget_never_disables_gnu_timeout(monkeypatch):
+    """Break caught: formatting a positive deadline as 0.000s disabled GNU timeout."""
+    from orchestrator import migrate
+
+    class Immediate:
+        status = "running"
+        command = None
+
+        def reload(self):
+            return None
+
+        def exec_run(self, command):
+            self.command = command
+            return 0, b""
+
+    monkeypatch.setattr(migrate.time, "monotonic", lambda: 10.0)
+    container = Immediate()
+    assert await _wait_container_ready(container, 0.0004, stage="held")
+    assert container.command[3] == "0.001s"
+
+
+@pytest.mark.asyncio
 async def test_live_shape_target_start_recovery_quiesces_then_resumes_baseline_degraded_old(
     monkeypatch,
 ):
