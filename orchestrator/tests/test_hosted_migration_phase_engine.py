@@ -521,8 +521,8 @@ async def test_readiness_timeout_is_a_wall_clock_deadline(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_positive_submillisecond_readiness_budget_never_disables_gnu_timeout(monkeypatch):
-    """Break caught: formatting a positive deadline as 0.000s disabled GNU timeout."""
+async def test_submillisecond_readiness_budget_stops_before_gnu_timeout_zero(monkeypatch):
+    """Break caught: GNU timeout 0.000s disables its timeout instead of expiring."""
     from orchestrator import migrate
 
     class Immediate:
@@ -538,8 +538,53 @@ async def test_positive_submillisecond_readiness_budget_never_disables_gnu_timeo
 
     monkeypatch.setattr(migrate.time, "monotonic", lambda: 10.0)
     container = Immediate()
-    assert await _wait_container_ready(container, 0.0004, stage="held")
-    assert container.command[3] == "0.001s"
+    assert not await _wait_container_ready(container, 0.0004, stage="held")
+    assert container.command is None
+
+
+@pytest.mark.asyncio
+async def test_reload_that_exhausts_readiness_deadline_never_starts_probe(monkeypatch):
+    """Break caught: the probe reused a stale pre-reload remaining-time budget."""
+    from orchestrator import migrate
+
+    clock = [20.0]
+
+    class SlowReload:
+        status = "running"
+        probe_calls = 0
+
+        def reload(self):
+            clock[0] += 1.1
+
+        def exec_run(self, _command):
+            self.probe_calls += 1
+            return 0, b""
+
+    monkeypatch.setattr(migrate.time, "monotonic", lambda: clock[0])
+    container = SlowReload()
+    assert not await _wait_container_ready(container, 1, stage="held")
+    assert container.probe_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_probe_success_after_readiness_deadline_is_not_accepted(monkeypatch):
+    """Break caught: a successful but late probe crossed the declared safety deadline."""
+    from orchestrator import migrate
+
+    clock = [30.0]
+
+    class LateSuccess:
+        status = "running"
+
+        def reload(self):
+            return None
+
+        def exec_run(self, _command):
+            clock[0] += 1.1
+            return 0, b""
+
+    monkeypatch.setattr(migrate.time, "monotonic", lambda: clock[0])
+    assert not await _wait_container_ready(LateSuccess(), 1, stage="held")
 
 
 @pytest.mark.asyncio

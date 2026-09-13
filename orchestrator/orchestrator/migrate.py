@@ -40,6 +40,8 @@ from orchestrator.hosted_runtime import (
 
 logger = logging.getLogger(__name__)
 
+_MIN_READINESS_PROBE_SECONDS = 0.001
+
 
 def _refresh_platform_environment(existing: list[str]) -> tuple[list[str], int]:
     """Replace orchestrator-owned passthrough values without touching user env.
@@ -109,11 +111,14 @@ async def _wait_container_ready(
     deadline = time.monotonic() + timeout
     while True:
         remaining = deadline - time.monotonic()
-        if remaining <= 0:
+        if remaining < _MIN_READINESS_PROBE_SECONDS:
             return False
         try:
             await asyncio.to_thread(container.reload)
             if container.status == "exited":
+                return False
+            remaining = deadline - time.monotonic()
+            if remaining < _MIN_READINESS_PROBE_SECONDS:
                 return False
             readiness = (
                 "test -f /tmp/.sandbox_ready"
@@ -134,12 +139,12 @@ async def _wait_container_ready(
                 container.exec_run,
                 [
                     "/usr/bin/timeout", "--signal=TERM", "--kill-after=0.1s",
-                    f"{math.ceil(remaining * 1000) / 1000:.3f}s",
+                    f"{math.floor(remaining * 1000) / 1000:.3f}s",
                     "/bin/sh", "-ec", readiness,
                 ],
             )
             if code == 0:
-                return True
+                return time.monotonic() <= deadline
         except (NotFound, APIError) as exc:
             logger.warning("migrate: readiness poll error: %s", exc)
             return False
