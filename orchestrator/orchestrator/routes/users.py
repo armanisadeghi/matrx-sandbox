@@ -45,8 +45,9 @@ async def get_user_persistence(user_id: str) -> dict[str, Any]:
     """
     location = resolve_user_storage(user_id, tier=settings.host_tier or None)
 
-    # Volume size only meaningful on hosted tier; EC2 tier persistence is in S3
-    # and surfaced via aidream's cloud_sync system, not by this orchestrator.
+    # This aggregate reports only the hosted per-user volume. EC2 durable homes
+    # are retained per sandbox and are managed through that sandbox's exact
+    # lifecycle/persistence actions, not through this user-volume endpoint.
     volume_bytes: int | None = None
     if location.tier == "hosted" and location.volume_name:
         volume_bytes = await sandbox_manager.get_user_volume_size(user_id)
@@ -85,7 +86,8 @@ async def delete_user_volume(user_id: str) -> None:
             status_code=400,
             detail=(
                 "Volume deletion only applies to the hosted tier. "
-                "EC2-tier user data lives in S3 and is managed via cloud_sync."
+                "EC2 durable homes are retained per sandbox; manage or wipe "
+                "them through that sandbox's lifecycle actions."
             ),
         )
 
