@@ -1088,6 +1088,13 @@ async def _cleanup(record, client, journal, *, committed):
     record["cleanup_complete"] = True
     record.pop("last_error", None)
     journal.write(record)
+    journal.write_operation_receipt({
+        "schema_version": 1,
+        "sandbox_id": record["sandbox_id"],
+        "operation_id": record["operation_label"],
+        "outcome": "migrated" if committed else "rolled_back",
+        "phase": record["phase"],
+    })
 
 
 async def recover_hosted_migration(record, *, store, client, journal, locked=False, copy_locked=False):
@@ -1222,7 +1229,7 @@ async def recover_hosted_migrations(*, store):
     # Journal validation reads and parses durable receipts that can be tens of
     # megabytes after a real home snapshot. Keep that blocking filesystem/JSON
     # work off the event loop that serves the container's /health probe.
-    records = await asyncio.to_thread(journal.records)
+    records = await asyncio.to_thread(journal.recovery_records)
     for record in records:
         if record.get("cleanup_complete"):
             continue
@@ -1302,7 +1309,7 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
             for key in sorted({source_key, volume}):
                 locks.enter_context(journal.lock("volume-" + key))
             if any((r["sandbox_id"] == sandbox_id or r["source_volume"] == volume)
-                   and not r.get("cleanup_complete") for r in journal.records()):
+                   for r in journal.recovery_records()):
                 raise HostedMigrationStateError("an earlier migration still requires recovery")
             previous_record = journal.read(sandbox_id)
             retained_helper_receipts = _retained_helper_receipts(previous_record)

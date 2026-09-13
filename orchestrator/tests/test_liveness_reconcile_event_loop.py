@@ -63,7 +63,7 @@ async def test_boot_recovery_reads_large_journals_without_stalling_health(monkey
         time.sleep(0.5)
         return []
 
-    monkeypatch.setattr(journal, "records", slow_records)
+    monkeypatch.setattr(journal, "recovery_records", slow_records)
     result, stalls = await _max_stall_while(recover_hosted_migrations(store=_Store()))
 
     assert result == {"recovered": [], "failed": []}

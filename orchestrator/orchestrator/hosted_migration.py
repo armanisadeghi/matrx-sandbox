@@ -483,10 +483,26 @@ class HostedMigrationJournal:
         return [record for path in self.root.glob("*.json")
                 if (record := self.read(path.stem))]
 
+    def recovery_records(self) -> list[dict[str, Any]]:
+        """Read only journals that do not have a verified terminal receipt.
+
+        Completed journals retain detailed evidence and may include a large
+        home manifest. The small atomic receipt is sufficient to exclude them
+        from boot recovery without parsing that evidence on every restart.
+        """
+        self.ensure_ready()
+        records: list[dict[str, Any]] = []
+        for path in self.root.glob("*.json"):
+            if self.read_operation_receipt(path.stem) is not None:
+                continue
+            if record := self.read(path.stem):
+                records.append(record)
+        return records
+
     def retained_container_ids(self) -> set[str]:
         """Return only recovery-owned artifacts, never the usable current runtime."""
         retained: set[str] = set()
-        for record in self.records():
+        for record in self.recovery_records():
             if record.get("cleanup_complete"):
                 continue
             phase = record["phase"]

@@ -172,7 +172,7 @@ async def test_startup_recovery_is_registered_as_recovering(monkeypatch):
         def ensure_ready(self):
             return None
 
-        def records(self):
+        def recovery_records(self):
             return [value]
 
     observed = []
@@ -260,6 +260,26 @@ async def test_noop_terminal_receipt_survives_registry_completion(tmp_path):
         "phase": "already_current",
     }
     assert (await migration_status("sbx", "6" * 32, journal=journal))["outcome"] == "idle"
+
+
+def test_terminal_receipt_retires_large_journal_from_boot_recovery(monkeypatch, tmp_path):
+    """Completed evidence stays available without being reparsed during every boot."""
+    journal = HostedMigrationJournal(tmp_path)
+    operation_id = "7" * 32
+    journal.write(record(operation_id=operation_id, phase="committed", cleanup_complete=True))
+    journal.write_operation_receipt({
+        "schema_version": 1,
+        "sandbox_id": "sbx",
+        "operation_id": operation_id,
+        "outcome": "migrated",
+        "phase": "committed",
+    })
+
+    def reject_full_journal_parse(_sandbox_id):
+        raise AssertionError("terminal full journal was parsed during boot recovery")
+
+    monkeypatch.setattr(journal, "read", reject_full_journal_parse)
+    assert journal.recovery_records() == []
 
 
 @pytest.mark.asyncio

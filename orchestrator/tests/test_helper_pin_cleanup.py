@@ -13,12 +13,14 @@ from orchestrator.hosted_runtime import _cleanup
 
 
 IMAGE = "sha256:" + "d" * 64
-PIN = "matrx-migration-helper:op-123"
+OPERATION = "a" * 32
+PIN = f"matrx-migration-helper:{OPERATION}"
 
 
 class Journal:
-    def __init__(self): self.writes = []
+    def __init__(self): self.writes, self.receipts = [], []
     def write(self, record): self.writes.append(copy.deepcopy(record))
+    def write_operation_receipt(self, receipt): self.receipts.append(copy.deepcopy(receipt))
 
 
 class Images:
@@ -46,9 +48,9 @@ def client(images, references=None):
 
 
 def record(**extra):
-    return {"old_id": None, "target_id": None, "backup_name": None,
+    return {"sandbox_id": "sbx", "old_id": None, "target_id": None, "backup_name": None,
             "helper_image": IMAGE, "helper_image_pin": PIN,
-            "operation_label": "op-123", "cleanup_receipt": {}, **extra}
+            "operation_label": OPERATION, "phase": "recovered", "cleanup_receipt": {}, **extra}
 
 
 @pytest.mark.parametrize("committed", [True, False])
@@ -60,6 +62,13 @@ def test_cleanup_removes_exact_operation_tag_for_commit_and_rollback(committed):
     assert any(w["cleanup_receipt"].get("helper_image_pin_removal_intent") == {"pin": PIN, "image": IMAGE}
                for w in journal.writes)
     assert state["cleanup_receipt"]["helper_image_pin_removed"] == PIN
+    assert journal.receipts == [{
+        "schema_version": 1,
+        "sandbox_id": "sbx",
+        "operation_id": OPERATION,
+        "outcome": "migrated" if committed else "rolled_back",
+        "phase": "recovered",
+    }]
 
 
 def test_successful_cleanup_clears_stale_recovery_error():

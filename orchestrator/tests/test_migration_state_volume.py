@@ -191,7 +191,12 @@ async def test_creation_intent_recovers_lost_ack_without_orphaning_state_or_pin(
         "state_volume_creation_intent": {"name": name, "sandbox_id": sandbox_id},
         "old_state_volume": None,
     }
-    await _cleanup(record, client, SimpleNamespace(write=lambda value: writes.append(dict(value))), committed=False)
+    receipts = []
+    record.update(operation_label="a" * 32, phase="recovered")
+    await _cleanup(record, client, SimpleNamespace(
+        write=lambda value: writes.append(dict(value)),
+        write_operation_receipt=lambda value: receipts.append(dict(value)),
+    ), committed=False)
     assert volume.removed is True
     assert record["cleanup_receipt"]["helper_image_pin_never_created"] == helper_pin
     assert record["cleanup_receipt"]["migration_state_volume_removed"] == name
@@ -222,8 +227,13 @@ async def test_helper_pin_creation_intent_recovers_successful_tag_with_lost_rece
         "helper_image_pin_creation_intent": {"pin": helper_pin, "image": helper_image},
     }
 
+    receipts = []
+    record.update(operation_label="a" * 32, phase="recovered")
     await _cleanup(
-        record, client, SimpleNamespace(write=lambda value: writes.append(dict(value))),
+        record, client, SimpleNamespace(
+            write=lambda value: writes.append(dict(value)),
+            write_operation_receipt=lambda value: receipts.append(dict(value)),
+        ),
         committed=False,
     )
 
