@@ -17,6 +17,15 @@ HOSTED_DEPLOY = REPO_ROOT / "scripts" / "deploy-hosted.sh"
 AIDREAM_BUILDER = REPO_ROOT / "sandbox-image" / "build-aidream.sh"
 AIDREAM_HELPER = REPO_ROOT / "sandbox-image" / "scripts" / "aidream-helpers.sh"
 AIDREAM_ENTRYPOINT = REPO_ROOT / "sandbox-image" / "scripts" / "entrypoint-aidream.sh"
+AIDREAM_MANAGED_BOOTSTRAP_TEST = (
+    REPO_ROOT / "sandbox-image" / "scripts" / "test-aidream-managed-bootstrap.sh"
+)
+AIDREAM_MANAGED_BOOTSTRAP = (
+    REPO_ROOT / "sandbox-image" / "scripts" / "aidream-managed-bootstrap.py"
+)
+AIDREAM_MANAGED_HOME_TEST = (
+    REPO_ROOT / "sandbox-image" / "scripts" / "test-prepare-aidream-managed-home.sh"
+)
 AIDREAM_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile.aidream"
 SANDBOX_ROUTES = REPO_ROOT / "orchestrator" / "orchestrator" / "routes" / "sandboxes.py"
 CORE_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile"
@@ -389,8 +398,10 @@ def test_aidream_autostart_uses_immutable_template_without_resetting_user_work()
 
 def test_aidream_build_proves_agent_cannot_mutate_certified_runtime():
     builder = AIDREAM_BUILDER.read_text(encoding="utf-8")
+    bootstrap = AIDREAM_MANAGED_BOOTSTRAP.read_text(encoding="utf-8")
 
     assert "docker run --rm --read-only" in builder
+    assert "--user root" in builder
     assert "findmnt -n -o OPTIONS -T /opt/aidream-template" in builder
     assert "test ! -w /opt/aidream-template" in builder
     assert "test ! -w /opt/aidream-template/pyproject.toml" in builder
@@ -408,10 +419,13 @@ def test_aidream_build_proves_agent_cannot_mutate_certified_runtime():
     assert "test ! -e /tmp/gitconfig-ran" in builder
     assert "for shim in findmnt sudo env sleep bash" in builder
     assert "find /tmp -maxdepth 1 -name 'shim-*-ran'" in builder
-    assert "--tmpfs /var/log/sandbox:rw,nosuid,nodev,mode=0775,uid=1000,gid=1000" in builder
+    assert "--tmpfs /run:rw,nosuid,nodev,mode=1777" in builder
+    assert "prepare-aidream-managed-home.py" in builder
     assert "MATRX_TEMP_DIR=/tmp/aidream-managed LOG_DIR=/var/log/aidream" in builder
-    assert "runpy.run_path" in builder
-    assert 'sys.path.insert(0, \\"/opt/aidream-template\\")' in builder
+    assert "/opt/sandbox/scripts/aidream-managed-bootstrap.py" in builder
+    assert "--verify-imports" in builder
+    assert "runpy.run_path" in bootstrap
+    assert 'sys.path.insert(0, os.fspath(TEMPLATE_ROOT))' in bootstrap
 
 
 def test_aidream_autostart_cannot_source_malicious_agent_profiles():
@@ -434,10 +448,31 @@ def test_aidream_autostart_cannot_source_malicious_agent_profiles():
 
 def test_managed_aidream_uses_fixed_venv_without_uv_mutation():
     helper = AIDREAM_HELPER.read_text(encoding="utf-8")
+    managed_branch = helper[
+        helper.index('if [ "$require_image_source" -eq 1 ]; then') : helper.index(
+            "    else", helper.index('if [ "$require_image_source" -eq 1 ]; then')
+        )
+    ]
 
     assert 'if [ "$require_image_source" -eq 1 ]' in helper
-    assert 'nohup "$WORK_DIR/.venv/bin/python" -I run.py' in helper
-    assert "PYTHONDONTWRITEBYTECODE=1" in helper
+    assert 'nohup "$MANAGED_TEMPLATE_DIR/.venv/bin/python" -I -B "$MANAGED_BOOTSTRAP"' in managed_branch
+    assert "uv run" not in managed_branch
+
+
+def test_managed_aidream_bootstrap_executes_isolated_real_import_chain():
+    completed = subprocess.run(
+        ["bash", str(AIDREAM_MANAGED_BOOTSTRAP_TEST)],
+        text=True,
+        capture_output=True,
+    )
+    assert completed.returncode == 0, completed.stderr
+
+
+def test_managed_aidream_home_rejects_unsafe_existing_paths():
+    completed = subprocess.run(
+        ["bash", str(AIDREAM_MANAGED_HOME_TEST)], text=True, capture_output=True
+    )
+    assert completed.returncode == 0, completed.stderr
 
 
 def test_exact_release_verifier_rejects_untracked_tampering():

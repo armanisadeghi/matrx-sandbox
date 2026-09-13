@@ -22,6 +22,8 @@ PID_FILE="$LOG_DIR/aidream-server.pid"
 LOG_FILE="$LOG_DIR/aidream-server.log"
 SERVE_PORT="${AIDREAM_SERVE_PORT:-8001}"
 IMAGE_SHA_FILE="${AIDREAM_IMAGE_SHA_FILE:-/etc/aidream-image-sha}"
+MANAGED_TEMPLATE_DIR="/opt/aidream-template"
+MANAGED_BOOTSTRAP="/opt/sandbox/scripts/aidream-managed-bootstrap.py"
 
 cmd="${1:-}"
 shift || true
@@ -76,6 +78,18 @@ verify_release_source() {
     echo "source_state=exact expected=$expected actual=$actual"
 }
 
+verify_managed_release_source() {
+    # Never allow the managed service to choose its source through an
+    # environment variable.  The entrypoint separately verifies this fixed
+    # root is a read-only mount before it reaches this helper.
+    local saved_work_dir="$WORK_DIR"
+    WORK_DIR="$MANAGED_TEMPLATE_DIR"
+    verify_release_source
+    local status=$?
+    WORK_DIR="$saved_work_dir"
+    return "$status"
+}
+
 cmd_update() {
     require_workdir
     cd "$WORK_DIR" || exit 1
@@ -118,7 +132,7 @@ cmd_serve() {
         esac
     done
     if [ "$require_image_source" -eq 1 ]; then
-        verify_release_source || {
+        verify_managed_release_source || {
             echo "[mtx aidream] refusing managed autostart from stale or modified source" >&2
             exit 1
         }
@@ -144,8 +158,8 @@ cmd_serve() {
         # The managed image already contains a fully resolved venv. Execute
         # its fixed interpreter directly so startup cannot mutate the
         # root-owned template or redirect uv through user-controlled config.
-        PORT="$port" PYTHONDONTWRITEBYTECODE=1 \
-            nohup "$WORK_DIR/.venv/bin/python" -I run.py >"$LOG_FILE" 2>&1 &
+        PORT="$port" \
+            nohup "$MANAGED_TEMPLATE_DIR/.venv/bin/python" -I -B "$MANAGED_BOOTSTRAP" >"$LOG_FILE" 2>&1 &
     else
         PORT="$port" nohup uv run python run.py >"$LOG_FILE" 2>&1 &
     fi

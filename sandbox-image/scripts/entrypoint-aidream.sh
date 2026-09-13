@@ -118,9 +118,13 @@ if [ "${MATRX_TIER:-}" = "hosted" ]; then
         log "ERROR: refusing managed aidream autostart: $TEMPLATE_DIR is not on a read-only mount"
         exit 1
     fi
-    /usr/bin/mkdir -p /run/aidream-managed-home
-    /usr/bin/chown root:root /run/aidream-managed-home
-    /usr/bin/chmod 0555 /run/aidream-managed-home
+    # The image declares USER agent. The privileged helper uses openat with
+    # no-follow semantics and refuses a writable /run parent before repairing
+    # the old agent-owned directory, so no user-controlled symlink is touched.
+    if ! /usr/bin/sudo -n /opt/sandbox/scripts/prepare-aidream-managed-home.py; then
+        log "ERROR: refusing managed aidream autostart: cannot establish root-owned /run/aidream-managed-home"
+        exit 1
+    fi
     /usr/bin/sudo -u agent -E -H /usr/bin/env \
         -u BASH_ENV -u ENV -u PYTHONHOME -u PYTHONPATH -u PYTHONSTARTUP \
         -u LD_PRELOAD -u LD_LIBRARY_PATH \

@@ -135,7 +135,9 @@ RUN uv sync --frozen --no-dev \
 # Lives at /opt/sandbox/scripts/aidream-helpers.sh — sourced by the mtx
 # subcommand wrapper installed below.
 COPY --chown=root:root ./scripts/aidream-helpers.sh /opt/sandbox/scripts/aidream-helpers.sh
-RUN chmod +x /opt/sandbox/scripts/aidream-helpers.sh
+COPY --chown=root:root ./scripts/aidream-managed-bootstrap.py /opt/sandbox/scripts/aidream-managed-bootstrap.py
+COPY --chown=root:root ./scripts/prepare-aidream-managed-home.py /opt/sandbox/scripts/prepare-aidream-managed-home.py
+RUN chmod 0555 /opt/sandbox/scripts/aidream-helpers.sh /opt/sandbox/scripts/aidream-managed-bootstrap.py /opt/sandbox/scripts/prepare-aidream-managed-home.py
 
 # Wrap `mtx aidream <subcommand>` → /opt/sandbox/scripts/aidream-helpers.sh.
 # The base mtx CLI dispatches `mtx aidream` to this script.

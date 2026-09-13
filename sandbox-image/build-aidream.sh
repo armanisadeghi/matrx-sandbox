@@ -195,6 +195,7 @@ docker run --rm --entrypoint /bin/sh "$TAG" -c \
 
 echo "[build-aidream] verifying immutable managed source as the runtime user"
 docker run --rm --read-only \
+    --user root \
     --tmpfs /home/agent:rw,nosuid,nodev,mode=0700,uid=1000,gid=1000 \
     --tmpfs /tmp:rw,nosuid,nodev,mode=1777 \
     --tmpfs /run:rw,nosuid,nodev,mode=1777 \
@@ -202,13 +203,14 @@ docker run --rm --read-only \
     --tmpfs /var/log/aidream:rw,nosuid,nodev,mode=0775,uid=1000,gid=1000 \
     --entrypoint /bin/sh "$TAG" -c \
     'set -eu \
-    && mkdir -p /home/agent/.local/lib/python3.13/site-packages /run/aidream-managed-home \
+    && mkdir -p /home/agent/.local/lib/python3.13/site-packages \
     && printf "%s\n" "open(\"/tmp/sitecustomize-ran\", \"w\").write(\"bad\")" > /home/agent/.local/lib/python3.13/site-packages/sitecustomize.py \
     && printf "%s\n" "[core]" "  fsmonitor = !touch /tmp/gitconfig-ran #" > /home/agent/.gitconfig \
     && mkdir -p /home/agent/aidream/.venv/bin \
     && for shim in findmnt sudo env sleep bash; do printf "%s\n" "#!/bin/sh" "touch /tmp/shim-$shim-ran" "exit 99" > "/home/agent/aidream/.venv/bin/$shim"; chmod +x "/home/agent/aidream/.venv/bin/$shim"; done \
     && chown -R agent:agent /home/agent \
-    && chmod 0555 /run/aidream-managed-home \
+    && sudo -u agent sudo -n /opt/sandbox/scripts/prepare-aidream-managed-home.py \
+    && test "$(stat -c "%U:%G:%a" /run/aidream-managed-home)" = "root:root:555" \
     && findmnt -n -o OPTIONS -T /opt/aidream-template | grep -Eq "(^|,)ro(,|$)" \
     && test ! -w /opt/aidream-template \
     && test ! -w /opt/aidream-template/pyproject.toml \
@@ -225,9 +227,9 @@ docker run --rm --read-only \
         /bin/bash --noprofile --norc -p /opt/sandbox/scripts/aidream-helpers.sh verify-release \
     && sudo -u agent env -i HOME=/run/aidream-managed-home PYTHONNOUSERSITE=1 \
         /opt/aidream-template/.venv/bin/python -I -c "import sys; assert sys.flags.isolated and sys.flags.no_user_site" \
-    && sudo -u agent env -i HOME=/run/aidream-managed-home PYTHONNOUSERSITE=1 PYTHONDONTWRITEBYTECODE=1 \
+    && sudo -u agent env -i HOME=/run/aidream-managed-home PYTHONNOUSERSITE=1 \
         MATRX_TEMP_DIR=/tmp/aidream-managed LOG_DIR=/var/log/aidream \
-        /opt/aidream-template/.venv/bin/python -I -c "import os, runpy, sys; os.chdir(\"/opt/aidream-template\"); sys.path.insert(0, \"/opt/aidream-template\"); runpy.run_path(\"/opt/aidream-template/run.py\"); runpy.run_path(\"/opt/aidream-template/config/settings.py\"); runpy.run_path(\"/opt/aidream-template/aidream/settings/__init__.py\")" \
+        /opt/aidream-template/.venv/bin/python -I -B /opt/sandbox/scripts/aidream-managed-bootstrap.py --verify-imports \
     && test -d /tmp/aidream-managed/reports \
     && test -d /tmp/aidream-managed/logs \
     && test -d /var/log/aidream \
