@@ -155,7 +155,9 @@ async def test_confirmed_manual_migration_fences_new_work_and_allows_attached_se
     finally:
         await proxy
 
-    assert result == {"status": "migrated", "sandbox_id": sid}
+    assert result["status"] == "migrated"
+    assert result["sandbox_id"] == sid
+    assert len(result["operation_id"]) == 32
     assert hosted.await_args.kwargs["interrupt_attached_sessions"] is True
     assert activity.is_migrating(sid) is False
 

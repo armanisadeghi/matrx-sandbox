@@ -1120,14 +1120,36 @@ async def recover_hosted_migrations(*, store):
     for record in journal.records():
         if record.get("cleanup_complete"):
             continue
-        outcome = await recover_hosted_migration(record, store=store, client=client, journal=journal)
-        result["failed" if outcome["status"] == "recovery_required" else "recovered"].append(record["sandbox_id"])
+        from orchestrator.migration_operations import run_owned_operation
+        outcome = await run_owned_operation(
+            record["sandbox_id"],
+            record["operation_label"],
+            lambda record=record: recover_hosted_migration(
+                record, store=store, client=client, journal=journal,
+            ),
+            kind="recovering",
+        )
+        result[
+            "failed"
+            if outcome["status"] in {"recovery_required", "busy_deferred"}
+            else "recovered"
+        ].append(record["sandbox_id"])
     return result
+
+
+async def _recover_admitted_interruption(
+    record, *, store, client, journal, interruption: Exception,
+):
+    """Record one admitted failure and finish exact recovery despite cancellation."""
+    _record_error(record, journal, interruption)
+    return await _finish(recover_hosted_migration(
+        record, store=store, client=client, journal=journal, locked=True,
+    ))
 
 
 async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
                          cur, store, verify_timeout, platform_env_changes,
-                         interrupt_attached_sessions=False):
+                         interrupt_attached_sessions=False, operation_id=None):
     """Stop, snapshot, replace, prove routing, then retire exact old artifacts."""
     from orchestrator import activity
     from orchestrator.config import settings
@@ -1147,7 +1169,7 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
         promotion = settings.host_tier == "ec2" and not homes and labels.get("matrx.template") in {"slim", "bare"}
         if not promotion and (len(homes) != 1 or homes[0].get("Type") != "volume" or not homes[0].get("RW")):
             raise HostedMigrationStateError("home must be one writable named Docker volume")
-        operation = uuid.uuid4().hex
+        operation = operation_id or uuid.uuid4().hex
         from orchestrator.storage_layout import ec2_home_volume_name
         volume = ec2_home_volume_name(sandbox_id) if promotion else homes[0]["Name"]
         source_key = "layer-" + sandbox_id if promotion else volume
@@ -1364,9 +1386,26 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
                 await _activate_promoted_target(record, target=new, store=store, client=client, journal=journal)
                 return {"status": "migrated", "sandbox_id": sandbox_id, "to_image": image.id,
                         "to_version": version, "platform_env_changed": platform_env_changes}
+            except asyncio.CancelledError:
+                cancellation = HostedMigrationStateError(
+                    "migration execution was cancelled after durable admission"
+                )
+                # The HTTP operation registry prevents ordinary client
+                # disconnects from reaching this branch. Process shutdown or
+                # explicit task cancellation still must leave the exact old
+                # or committed target runtime recovered before releasing the
+                # host/volume locks. Preserve cancellation semantics only
+                # after the durable recovery task has finished.
+                await _recover_admitted_interruption(
+                    record, store=store, client=client, journal=journal,
+                    interruption=cancellation,
+                )
+                raise
             except Exception as exc:
-                _record_error(record, journal, exc)
-                outcome = await recover_hosted_migration(record, store=store, client=client, journal=journal, locked=True)
+                outcome = await _recover_admitted_interruption(
+                    record, store=store, client=client, journal=journal,
+                    interruption=exc,
+                )
                 return {**outcome, "reason": type(exc).__name__,
                         "status": "migrated" if outcome["status"] == "committed" else outcome["status"]}
     except Exception as exc:

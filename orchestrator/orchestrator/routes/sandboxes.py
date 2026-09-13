@@ -8,6 +8,7 @@ import logging
 import re
 from datetime import datetime, timezone
 from typing import Any
+from uuid import UUID, uuid4
 
 from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
@@ -657,6 +658,7 @@ async def migrate_sandbox_route(
     sandbox_id: str,
     target_image: str | None = None,
     interrupt_attached_sessions: bool = False,
+    operation_id: UUID | None = None,
 ):
     """Zero-drift migration: swap this box onto the current image for its
     template, keeping the SAME sandbox_id and per-user volume (data intact).
@@ -672,15 +674,26 @@ async def migrate_sandbox_route(
     from orchestrator.migrate import migrate_sandbox
 
     store = sandbox_manager._get_store()
+    canonical_operation = (operation_id or uuid4()).hex
     result = await migrate_sandbox(
         sandbox_id,
         store=store,
         target_image=target_image,
         require_idle=True,
         interrupt_attached_sessions=interrupt_attached_sessions,
+        operation_id=canonical_operation,
     )
+    result.setdefault("operation_id", canonical_operation)
     if result["status"] in ("migrated", "already_current"):
-        return result
+        return {
+            "sandbox_id": sandbox_id,
+            "operation_id": canonical_operation,
+            "outcome": "migrated",
+            "execution_state": "complete",
+            "phase": (
+                "committed" if result["status"] == "migrated" else "already_current"
+            ),
+        }
     if result["status"] == "busy_deferred":
         raise HTTPException(status_code=409, detail=result)
     if result["status"] == "not_found":
@@ -688,6 +701,20 @@ async def migrate_sandbox_route(
     # failed — the OLD box is still running; surface loudly (502, not 500, so the
     # caller knows the box is intact and it can keep using the old version).
     raise HTTPException(status_code=502, detail=result)
+
+
+@router.get("/{sandbox_id}/migration")
+async def migration_status_route(
+    sandbox_id: str,
+    operation_id: UUID | None = None,
+):
+    """Return exact durable-operation status without exposing its host journal."""
+    from orchestrator.migration_operations import migration_status
+
+    return await migration_status(
+        sandbox_id,
+        operation_id.hex if operation_id is not None else None,
+    )
 
 
 @router.post("/{sandbox_id}/refresh-platform-env")

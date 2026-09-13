@@ -132,12 +132,13 @@ async def test_migrate_route_returns_structured_conflict_without_touching_busy_s
         response = await client.post(f"/sandboxes/{sandbox_id}/migrate")
 
     assert response.status_code == 409
-    assert response.json() == {
-        "detail": {
-            "status": "busy_deferred",
-            "sandbox_id": sandbox_id,
-            "reason": reason,
-        }
+    detail = response.json()["detail"]
+    operation_id = detail.pop("operation_id")
+    assert len(operation_id) == 32
+    assert detail == {
+        "status": "busy_deferred",
+        "sandbox_id": sandbox_id,
+        "reason": reason,
     }
 
 
@@ -178,13 +179,109 @@ async def test_migrate_route_forwards_confirmed_session_interruption(
         )
 
     assert response.status_code == 200
-    migrate_call.assert_awaited_once_with(
-        "sbx-confirmed",
+    migrate_call.assert_awaited_once()
+    args, kwargs = migrate_call.await_args
+    assert args == ("sbx-confirmed",)
+    operation_id = kwargs.pop("operation_id")
+    assert len(operation_id) == 32
+    assert response.json() == {
+        "sandbox_id": "sbx-confirmed",
+        "operation_id": operation_id,
+        "outcome": "migrated",
+        "execution_state": "complete",
+        "phase": "committed",
+    }
+    assert kwargs == dict(
         store=mock_sandbox_manager._get_store.return_value,
         target_image=None,
         require_idle=True,
         interrupt_attached_sessions=True,
     )
+
+
+@pytest.mark.asyncio
+async def test_migrate_route_canonicalizes_explicit_operation_identity(
+    mock_sandbox_manager, monkeypatch
+):
+    """A reconnect token is canonical before any durable operation is admitted."""
+    from orchestrator import migrate
+
+    mock_sandbox_manager._get_store.return_value = object()
+    migrate_call = AsyncMock(
+        return_value={"status": "migrated", "sandbox_id": "sbx-operation"}
+    )
+    monkeypatch.setattr(migrate, "migrate_sandbox", migrate_call)
+    dashed = "11111111-2222-4333-8444-555555555555"
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/sandboxes/sbx-operation/migrate?operation_id={dashed}"
+        )
+
+    assert response.status_code == 200
+    expected = "11111111222243338444555555555555"
+    assert response.json() == {
+        "sandbox_id": "sbx-operation",
+        "operation_id": expected,
+        "outcome": "migrated",
+        "execution_state": "complete",
+        "phase": "committed",
+    }
+    assert migrate_call.await_args.kwargs["operation_id"] == expected
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("method", ["post", "get"])
+async def test_migration_routes_reject_malformed_operation_identity_before_work(
+    mock_sandbox_manager, monkeypatch, method
+):
+    """Malformed correlation cannot mint, mutate, or inspect another operation."""
+    from orchestrator import migrate
+    from orchestrator import migration_operations
+
+    migrate_call = AsyncMock()
+    status_call = AsyncMock()
+    monkeypatch.setattr(migrate, "migrate_sandbox", migrate_call)
+    monkeypatch.setattr(migration_operations, "migration_status", status_call)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await getattr(client, method)(
+            "/sandboxes/sbx-operation/"
+            + ("migrate" if method == "post" else "migration")
+            + "?operation_id=not-an-operation"
+        )
+
+    assert response.status_code == 422
+    migrate_call.assert_not_awaited()
+    status_call.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_migration_status_route_projects_only_the_exact_operation(monkeypatch):
+    from orchestrator import migration_operations
+
+    operation_id = "1" * 32
+    projected = {
+        "sandbox_id": "sbx-operation",
+        "operation_id": operation_id,
+        "outcome": "in_progress",
+        "execution_state": "running",
+        "phase": "target_start_intent",
+    }
+    status_call = AsyncMock(return_value=projected)
+    monkeypatch.setattr(migration_operations, "migration_status", status_call)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.get(
+            f"/sandboxes/sbx-operation/migration?operation_id={operation_id}"
+        )
+
+    assert response.status_code == 200
+    assert response.json() == projected
+    status_call.assert_awaited_once_with("sbx-operation", operation_id)
 
 
 @pytest.mark.asyncio

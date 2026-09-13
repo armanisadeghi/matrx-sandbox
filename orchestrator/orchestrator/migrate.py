@@ -25,6 +25,7 @@ import logging
 import math
 import os
 import time
+import uuid
 
 from docker.errors import APIError, NotFound
 
@@ -191,7 +192,8 @@ def _has_recent_heartbeat(sbx, window_seconds: int) -> bool:
 async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = None,
                           verify_timeout: int = 90, require_idle: bool = False,
                           refresh_platform_env: bool = False,
-                          interrupt_attached_sessions: bool = False) -> dict:
+                          interrupt_attached_sessions: bool = False,
+                          operation_id: str | None = None) -> dict:
     """Migrate one box to the current image (or an explicit target_image).
     Returns a status dict; never raises.
 
@@ -278,13 +280,21 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     env.append("SANDBOX_MIGRATION=1")
     volumes = _binds_to_volumes(host)
     tmp_name = f"{sandbox_id}-mig"
+    canonical_operation = uuid.UUID(operation_id).hex if operation_id else uuid.uuid4().hex
+    from orchestrator.migration_operations import run_owned_operation
 
     if settings.host_tier == "ec2" and template in {"slim", "bare"}:
-        return await _migrate_hosted_with_admission(
-            sandbox_id, old=old, target=target, env=env, volumes=volumes,
-            labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
-            platform_env_changes=platform_env_changes,
-            interrupt_attached_sessions=interrupt_attached_sessions)
+        return await run_owned_operation(
+            sandbox_id,
+            canonical_operation,
+            lambda: _migrate_hosted_with_admission(
+                sandbox_id, old=old, target=target, env=env, volumes=volumes,
+                labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
+                platform_env_changes=platform_env_changes,
+                interrupt_attached_sessions=interrupt_attached_sessions,
+                operation_id=canonical_operation,
+            ),
+        )
 
     # ── DATA-SAFETY GUARD ─────────────────────────────────────────────────────
     # The proven-safe swap relies on the new container mounting the SAME
@@ -314,16 +324,27 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
                            "infrastructure.sandbox.enable_s3_migrate setting only after "
                            "validating it end-to-end"),
             }
-        return await _migrate_s3_ordered(
-            sandbox_id, old=old, target=target, env=env, volumes=volumes,
-            labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
-            interrupt_attached_sessions=interrupt_attached_sessions,
+        return await run_owned_operation(
+            sandbox_id,
+            canonical_operation,
+            lambda: _migrate_s3_ordered(
+                sandbox_id, old=old, target=target, env=env, volumes=volumes,
+                labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
+                interrupt_attached_sessions=interrupt_attached_sessions,
+            ),
         )
 
-    return await _migrate_hosted_with_admission(sandbox_id, old=old, target=target, env=env, volumes=volumes,
-        labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
-        platform_env_changes=platform_env_changes,
-        interrupt_attached_sessions=interrupt_attached_sessions)
+    return await run_owned_operation(
+        sandbox_id,
+        canonical_operation,
+        lambda: _migrate_hosted_with_admission(
+            sandbox_id, old=old, target=target, env=env, volumes=volumes,
+            labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
+            platform_env_changes=platform_env_changes,
+            interrupt_attached_sessions=interrupt_attached_sessions,
+            operation_id=canonical_operation,
+        ),
+    )
 
 
 async def _migrate_hosted_with_admission(sandbox_id: str, **kwargs) -> dict:
