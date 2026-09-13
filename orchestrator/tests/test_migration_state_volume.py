@@ -35,6 +35,7 @@ def test_activation_marker_writer_uses_pinned_python_and_refuses_symlink(tmp_pat
     command = _activation_marker_command("a" * 32)
     assert command[0] == "/usr/bin/python3"
     assert command[1:3] == ["-I", "-S"]
+    assert "if created:" in _ACTIVATION_MARKER_WRITER
     state = tmp_path / "state"
     state.mkdir(mode=0o755)
     marker = "a" * 32 + ".committed"

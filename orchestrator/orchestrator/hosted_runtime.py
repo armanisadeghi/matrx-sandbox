@@ -47,6 +47,7 @@ try:
     ):
         raise RuntimeError("migration state directory ownership/mode is unsafe")
     try:
+        created = True
         marker_fd = os.open(
             name,
             os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
@@ -54,9 +55,14 @@ try:
             dir_fd=directory_fd,
         )
     except FileExistsError:
+        created = False
         marker_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
     try:
-        os.fchmod(marker_fd, 0o444)
+        # Reapplying mode on an existing read-only descriptor fails on Linux;
+        # recovery validates the immutable marker below instead. A new marker
+        # still gets an exact mode independent of the process umask.
+        if created:
+            os.fchmod(marker_fd, 0o444)
         os.fsync(marker_fd)
         marker = os.fstat(marker_fd)
         if (
