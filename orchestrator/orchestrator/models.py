@@ -234,7 +234,7 @@ class ErrorResponse(BaseModel):
 
 class HealthResponse(BaseModel):
     status: str
-    active_sandboxes: int
+    active_sandboxes: int | None
     uptime_seconds: float
     # Which store backs sandbox_instances, and whether it survives a restart.
     # Surfaced so an in-memory orchestrator is visible to operators/monitors

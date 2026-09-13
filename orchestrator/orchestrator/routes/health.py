@@ -19,13 +19,10 @@ from fastapi import APIRouter
 from orchestrator import sandbox_manager
 from orchestrator.config import settings
 from orchestrator.models import HealthResponse, SystemInfoResponse
-from orchestrator.store import PostgresSandboxStore
 
 router = APIRouter(tags=["health"])
 
 _start_time = time.time()
-_HEALTH_STORE_TIMEOUT_SECONDS = 1.0
-_last_active_sandbox_count = 0
 
 
 def _sandboxes_for_this_host(sandboxes):
@@ -49,28 +46,14 @@ async def health_check():
     temporarily occupying the small Postgres pool must not make Docker declare
     the otherwise-live process unhealthy and remove it from Traefik.
     """
-    global _last_active_sandbox_count
-    try:
-        sandboxes = _sandboxes_for_this_host(
-            await asyncio.wait_for(
-                sandbox_manager.list_sandboxes(),
-                timeout=_HEALTH_STORE_TIMEOUT_SECONDS,
-            )
-        )
-        _last_active_sandbox_count = sum(
-            1 for sandbox in sandboxes if sandbox.status in ("ready", "running", "starting")
-        )
-    except TimeoutError:
-        # Active count is advisory on this liveness route. Keep serving the last
-        # successful count while the store is briefly busy; /system performs the
-        # full operational query for authenticated diagnostics.
-        pass
-    backend = (
-        "postgres" if isinstance(sandbox_manager._get_store(), PostgresSandboxStore) else "memory"
-    )
+    # Do not touch the store here. Even a nominal timeout can remain blocked
+    # while an asyncpg acquisition/query finishes cancellation, which makes the
+    # Docker healthcheck fail and causes Traefik to remove the only backend.
+    # Authenticated /system owns real fleet counts and store diagnostics.
+    backend = settings.resolve_sandbox_store()
     return HealthResponse(
         status="healthy",
-        active_sandboxes=_last_active_sandbox_count,
+        active_sandboxes=None,
         uptime_seconds=round(time.time() - _start_time, 1),
         store_backend=backend,
         durable_storage=backend == "postgres",

@@ -334,7 +334,7 @@ Generates a one-time Ed25519 keypair, injects the public half into the container
 | Endpoint | Auth? | Purpose |
 |---|---|---|
 | `GET /` | **Yes** | Service banner: `{ service, version, source_sha, tier, docs, api_surface }` |
-| `GET /health` | No | `{ status, active_sandboxes, uptime_seconds }` — fast liveness probe |
+| `GET /health` | No | `{ status, active_sandboxes: null, uptime_seconds }` — store-independent liveness probe; use authenticated `/system` for fleet counts |
 | `GET /system` | **Yes** | Full host pressure + container counts — see §11.1 |
 | `GET /api-surface` | **Yes** | Full route list + release contracts (see §0) |
 | `GET /docs` | **Yes** | FastAPI auto-doc (incomplete — missing proxy routes) |
