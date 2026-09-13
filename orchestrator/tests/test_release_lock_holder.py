@@ -8,6 +8,7 @@ import sys
 
 import pytest
 
+from orchestrator import release_lock_holder as holder_module
 from orchestrator.release_lock_holder import (
     LockContentionError,
     LockInventoryError,
@@ -68,7 +69,7 @@ def test_lock_lease_rejects_every_nonregular_lock_entry(tmp_path, kind):
         path.symlink_to(target)
 
     lease = LockLease(tmp_path)
-    with pytest.raises(LockInventoryError, match="not a regular file"):
+    with pytest.raises(LockInventoryError, match="not a regular file|safely pin"):
         lease.acquire(["deployment"], include_existing=True)
     lease.close()
 
@@ -83,10 +84,19 @@ def test_lock_lease_rejects_name_to_inode_replacement(tmp_path, monkeypatch, rep
     lease = LockLease(tmp_path)
     original = lease._open_and_lock
     replaced = False
+    pinned_bytes = []
 
-    def replace_before_descriptor(name, expected):
+    if replacement == "regular":
+        # Force the oracle to ignore every timestamp/size field. The retained
+        # descriptor itself must prevent inode-number reuse and catch the ABA.
+        monkeypatch.setattr(
+            holder_module, "_identity", lambda value: (value.st_dev, value.st_ino)
+        )
+
+    def replace_before_descriptor(name, expected, fd):
         nonlocal replaced
         if name == "sbx-one.lock" and not replaced:
+            pinned_bytes.append(os.pread(fd, 64, 0))
             replaced = True
             path.unlink()
             if replacement == "regular":
@@ -96,12 +106,16 @@ def test_lock_lease_rejects_name_to_inode_replacement(tmp_path, monkeypatch, rep
                 os.mkfifo(path, 0o600)
             else:
                 path.symlink_to(outside)
-        return original(name, expected)
+        return original(name, expected, fd)
 
     monkeypatch.setattr(lease, "_open_and_lock", replace_before_descriptor)
-    with pytest.raises(LockInventoryError, match="changed|safely open|not a regular"):
+    with pytest.raises(
+        LockInventoryError,
+        match="changed|safely open|not a regular|unexpected hard links",
+    ):
         lease.acquire(["deployment"], include_existing=True)
     lease.close()
+    assert pinned_bytes == [b"original"]
     assert outside.read_bytes() == b"outside"
 
 
