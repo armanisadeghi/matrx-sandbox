@@ -44,7 +44,12 @@ logger = logging.getLogger(__name__)
 _MIN_READINESS_PROBE_SECONDS = 0.001
 
 
-def _refresh_platform_environment(existing: list[str]) -> tuple[list[str], int]:
+def _refresh_platform_environment(
+    existing: list[str],
+    template: str | None,
+    *,
+    allow_master_credentials: bool,
+) -> tuple[list[str], int]:
     """Replace orchestrator-owned passthrough values without touching user env.
 
     Docker container environments are immutable.  When the platform database
@@ -52,12 +57,19 @@ def _refresh_platform_environment(existing: list[str]) -> tuple[list[str], int]:
     the old values until they are recreated.  The passthrough name registry is
     the boundary between platform-owned configuration and per-sandbox/user
     configuration: remove those names from the old environment, then append
-    the values currently loaded by the orchestrator.
+    the values the orchestrator would forward to a NEW box of this template
+    (sandbox_manager.platform_passthrough_env — nothing for non-aidream
+    templates, and no master credential unless the operator knob is on). A
+    box that leaked platform env before incident 2026-09-13 is therefore
+    cleaned by its next migration.
 
     Values and key names are deliberately absent from the return metadata so a
     migration response or log cannot disclose secrets.
     """
-    from orchestrator.sandbox_manager import _resolve_passthrough_keys
+    from orchestrator.sandbox_manager import (
+        _resolve_passthrough_keys,
+        platform_passthrough_env,
+    )
 
     platform_keys = set(_resolve_passthrough_keys())
     old_values: dict[str, str] = {}
@@ -69,10 +81,10 @@ def _refresh_platform_environment(existing: list[str]) -> tuple[list[str], int]:
         else:
             preserved.append(item)
 
-    current_values = {
-        key: value for key in sorted(platform_keys)
-        if (value := os.environ.get(key))
-    }
+    current_values, _denied = platform_passthrough_env(
+        template, allow_master_credentials=allow_master_credentials,
+    )
+    current_values = dict(sorted(current_values.items()))
     changed = sum(
         1 for key in platform_keys
         if old_values.get(key) != current_values.get(key)
@@ -294,7 +306,10 @@ async def _migrate_sandbox_once(
     ]
     platform_env_changes = 0
     if refresh_platform_env:
-        env, platform_env_changes = _refresh_platform_environment(env)
+        from orchestrator.sandbox_manager import master_credentials_allowed
+        env, platform_env_changes = _refresh_platform_environment(
+            env, template, allow_master_credentials=await master_credentials_allowed(),
+        )
 
     if (
         not target_image

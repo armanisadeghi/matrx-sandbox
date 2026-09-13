@@ -96,6 +96,35 @@ async def knob_bool(key: str, feature: str = FEATURE) -> bool:
     return bool(await _raw(feature, key))
 
 
+async def security_knob_bool(key: str, feature: str = FEATURE) -> bool:
+    """A boolean knob that OPENS a security boundary when true.
+
+    The one sanctioned departure from "no fallback": a guard that a missing
+    row could open is not a guard, so an unregistered or unreadable row is
+    OFF — loudly, naming the remedy — and never raises into the create path.
+    Unlike :func:`_raw` this does not evict the feature cache on a miss, so a
+    missing security row cannot poison the reads of every other knob.
+    """
+    try:
+        values = await _feature_values(feature)
+    except KnobSourceUnavailableError as exc:
+        values = {}
+        reason: str = str(exc)
+    else:
+        reason = "row not registered"
+    if key in values:
+        return bool(values[key])
+    import logging
+
+    logging.getLogger(__name__).warning(
+        "security knob %s.%s unavailable (%s) — treating as OFF. Seed the "
+        "platform.feature_knob row (aidream db/migrations, the 0636 shape) "
+        "to make it operator-adjustable.",
+        feature, key, reason,
+    )
+    return False
+
+
 __all__ = [
     "FEATURE",
     "KNOB_CACHE_TTL_SECONDS",
@@ -106,4 +135,5 @@ __all__ = [
     "knob_float",
     "knob_int",
     "knob_str",
+    "security_knob_bool",
 ]

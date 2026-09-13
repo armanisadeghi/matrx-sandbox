@@ -46,11 +46,14 @@ def test_platform_environment_refresh_preserves_user_values(monkeypatch):
     monkeypatch.setenv("SUPABASE_MATRIX_HOST", "east.example")
     monkeypatch.setenv("SUPABASE_MATRIX_PASSWORD", "new-secret")
 
+    # The aidream template with the operator knob ON — the only combination
+    # that forwards a master credential (test_platform_env_isolation.py
+    # covers the default-deny and the non-aidream templates).
     refreshed, changed = _refresh_platform_environment([
         "SUPABASE_MATRIX_HOST=west.example",
         "SUPABASE_MATRIX_PASSWORD=old-secret",
         "USER_CHOSEN_VALUE=keep-me",
-    ])
+    ], "aidream", allow_master_credentials=True)
 
     assert "USER_CHOSEN_VALUE=keep-me" in refreshed
     assert "SUPABASE_MATRIX_HOST=east.example" in refreshed
@@ -69,7 +72,7 @@ def test_platform_environment_refresh_removes_retired_platform_key(monkeypatch):
     refreshed, changed = _refresh_platform_environment([
         "RETIRED_PLATFORM_KEY=stale",
         "USER_CHOSEN_VALUE=keep-me",
-    ])
+    ], "aidream", allow_master_credentials=False)
 
     assert refreshed == ["USER_CHOSEN_VALUE=keep-me"]
     assert changed == 1

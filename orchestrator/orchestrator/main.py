@@ -439,12 +439,24 @@ async def migrate_all():
 
 def _aidream_passthrough_status() -> dict:
     import os
-    from orchestrator.sandbox_manager import _resolve_passthrough_keys
+    from orchestrator.sandbox_manager import (
+        MASTER_CREDENTIALS_KNOB,
+        PLATFORM_PASSTHROUGH_TEMPLATES,
+        _resolve_passthrough_keys,
+        is_master_credential_name,
+    )
     keys = _resolve_passthrough_keys()
     set_keys = sorted(k for k in keys if os.environ.get(k))
     missing_keys = sorted(k for k in keys if not os.environ.get(k))
     return {
         "source_file": settings.aidream_passthrough_env_file or None,
+        # Isolation (incident 2026-09-13): only these templates receive any
+        # of this, and names the deny-list catches stay behind the knob.
+        "forwarded_to_templates": sorted(PLATFORM_PASSTHROUGH_TEMPLATES),
+        "master_credential_knob": f"infrastructure.sandbox.{MASTER_CREDENTIALS_KNOB}",
+        "master_credential_names_configured": sorted(
+            k for k in set_keys if is_master_credential_name(k)
+        ),
         "total_keys": len(keys),
         "configured_count": len(set_keys),
         "configured_keys": set_keys,

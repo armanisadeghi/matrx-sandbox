@@ -10,6 +10,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+import re
 from pathlib import Path
 import shlex
 import uuid
@@ -168,6 +169,99 @@ def _parse_env_file_keys(path: str) -> frozenset[str]:
     _env_file_cache[path] = (mtime, frozen)
     logger.info("loaded %d passthrough keys from %s", len(frozen), path)
     return frozen
+
+
+# ── Platform-credential isolation ────────────────────────────────────────────
+# Incident 2026-09-13 (docs/incidents/2026-09-13-platform-env-leak.md): the
+# passthrough loop below used to run for EVERY template, so every user's
+# ``slim`` box carried the platform's database URL, admin tokens, the bridge
+# service token and every provider API key. Two layers now stand in the way:
+#
+#   1. The passthrough registry is consulted ONLY for templates in
+#      :data:`PLATFORM_PASSTHROUGH_TEMPLATES` — the internal "run aidream
+#      itself inside a box" dev case. Every other template's env is the
+#      orchestrator-managed identity/storage vars set explicitly in
+#      ``create_sandbox``, the caller's ``config.env`` and the user's vault
+#      secrets. Nothing from the orchestrator's own process environment.
+#   2. Even for those templates, a name matching a master-credential pattern
+#      is denied unless the ``aidream_template_forwards_master_credentials``
+#      knob (feature ``infrastructure.sandbox``, default OFF) is on. The
+#      deny-list is about the orchestrator's OWN environment: a user's vault
+#      secret or ``config.env`` entry is theirs and is never filtered.
+
+PLATFORM_PASSTHROUGH_TEMPLATES: frozenset[str] = frozenset({"aidream"})
+
+MASTER_CREDENTIALS_KNOB = "aidream_template_forwards_master_credentials"
+
+#: Name patterns (matched against the whole upper-cased name) that identify
+#: a platform master credential. Broad on purpose — a false positive costs
+#: one operator knob turn; a false negative is a leaked secret.
+MASTER_CREDENTIAL_PATTERNS: tuple[str, ...] = (
+    r".*PASSWORD.*",
+    r".*_SECRET.*",
+    r".*SECRET_.*",
+    r".*DATABASE_URL.*",
+    r".*CONNECTION_STRING.*",
+    r".*_SERVICE_TOKEN.*",
+    r"ADMIN_.*TOKEN.*",
+    r".*_API_KEY.*",
+    r".*_API_TOKEN.*",
+    r".*_ACCESS_TOKEN.*",
+    r".*_AUTH_TOKEN.*",
+    r".*_ACCESS_KEY.*",
+    r".*_PRIVATE_KEY.*",
+    r".*CREDENTIALS.*",
+    r".*_PAT$",
+)
+_MASTER_CREDENTIAL_RE = re.compile("|".join(f"(?:{p})" for p in MASTER_CREDENTIAL_PATTERNS))
+
+
+def is_master_credential_name(name: str) -> bool:
+    """True when an env-var NAME looks like a platform master credential."""
+    return bool(_MASTER_CREDENTIAL_RE.fullmatch((name or "").upper()))
+
+
+def template_receives_platform_env(template: str | None) -> bool:
+    return (template or "") in PLATFORM_PASSTHROUGH_TEMPLATES
+
+
+def platform_passthrough_env(
+    template: str | None,
+    *,
+    allow_master_credentials: bool,
+    environ: "os._Environ[str] | dict[str, str] | None" = None,
+) -> tuple[dict[str, str], list[str]]:
+    """The platform env a container of ``template`` may receive from the
+    orchestrator's process environment, and the names denied by the
+    master-credential filter (names only — never log values).
+
+    Non-passthrough templates always get ``({}, [])``: the registry is not
+    even consulted, so a future edit to the registry cannot widen the blast
+    radius by itself.
+    """
+    if not template_receives_platform_env(template):
+        return {}, []
+    source = os.environ if environ is None else environ
+    forwarded: dict[str, str] = {}
+    denied: list[str] = []
+    for key in _resolve_passthrough_keys():
+        val = source.get(key)
+        if not val:
+            continue
+        if not allow_master_credentials and is_master_credential_name(key):
+            denied.append(key)
+            continue
+        forwarded[key] = val
+    return forwarded, sorted(denied)
+
+
+async def master_credentials_allowed() -> bool:
+    """The operator knob, read through the fleet-settings store. Fails CLOSED
+    (knobs.security_knob_bool): a missing row denies and screams the remedy —
+    a guard that a missing setting could open is not a guard."""
+    from orchestrator.knobs import security_knob_bool
+
+    return await security_knob_bool(MASTER_CREDENTIALS_KNOB)
 
 
 def agent_token_for(sandbox_id: str) -> str:
@@ -550,27 +644,50 @@ async def _create_sandbox_unleased(
             env["AWS_DEFAULT_REGION"] = region
             env["AWS_REGION"] = region
 
-        # ── aidream-in-sandbox env passthrough ────────────────────────────────
-        # Forward every env var named in EITHER (a) the file at
+        # ── aidream-in-sandbox env passthrough (aidream template ONLY) ────────
+        # Forward env vars named in EITHER (a) the file at
         # settings.aidream_passthrough_env_file (e.g. /srv/projects/aidream/.env)
         # or (b) the explicit settings.aidream_passthrough_env list, from the
-        # orchestrator's process environment into the spawned container.
-        # Values not present in the orchestrator's environ are silently
-        # skipped (list a superset safely). The file-based mechanism keeps
-        # this auto-synced as aidream adds new required env vars.
-        passthrough_keys = _resolve_passthrough_keys()
-        for key in passthrough_keys:
-            val = os.environ.get(key)
-            if val and key not in env:  # don't clobber already-set vars
-                env[key] = val
+        # orchestrator's process environment — but only into a box of a
+        # template in PLATFORM_PASSTHROUGH_TEMPLATES, and never a name the
+        # master-credential deny-list catches unless the operator knob is on.
+        # Every other template gets NOTHING from the orchestrator's environ
+        # (incident 2026-09-13: this loop used to run for every template).
+        passthrough_denied: list[str] = []
+        if template_receives_platform_env(template):
+            forwarded, passthrough_denied = platform_passthrough_env(
+                template, allow_master_credentials=await master_credentials_allowed(),
+            )
+            for key, val in forwarded.items():
+                if key not in env:  # don't clobber already-set vars
+                    env[key] = val
+            if passthrough_denied:
+                logger.info(
+                    "sandbox %s (template=%s): %d master-credential name(s) withheld "
+                    "by the deny-list (knob %s is off): %s",
+                    sandbox_id, template, len(passthrough_denied),
+                    MASTER_CREDENTIALS_KNOB, ", ".join(passthrough_denied[:20]),
+                )
+        # Stamp the outcome on the persisted row (names only, never values)
+        # so /diagnostics and the admin UI can show what this box carries.
+        platform_env_diag = {
+            "forwarded": template_receives_platform_env(template),
+            "denied_count": len(passthrough_denied),
+            "denied_names": passthrough_denied,
+        }
+        if isinstance(config, dict):
+            config["platform_env"] = platform_env_diag
+        if isinstance(sandbox.config, dict):
+            sandbox.config["platform_env"] = platform_env_diag
 
         # ── Path-shape overrides ──────────────────────────────────────────────
         # /srv/projects/aidream/.env was authored on the maintainer's Mac and
         # ships paths like BASE_DIR=/Users/armanisadeghi/code/aidream. Those
         # paths don't exist inside the sandbox (aidream is at /home/agent/aidream).
         # Override the path-shaped vars so matrx-utils settings + file-handling
-        # code resolves real on-disk locations. Anything else (API keys,
-        # secrets, Supabase connection bits) flows through verbatim.
+        # code resolves real on-disk locations. Anything else the deny-list
+        # let through (non-credential Supabase connection bits etc.) flows
+        # through verbatim.
         if (template or "") == "aidream":
             sandbox_home = "/home/agent"
             sandbox_aidream_root = f"{sandbox_home}/aidream"

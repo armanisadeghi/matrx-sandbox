@@ -1893,12 +1893,25 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
         state = attrs.get("State", {})
         net = attrs.get("NetworkSettings", {}).get("Networks", {})
         net_first = next(iter(net.values()), {}) if net else {}
-        # Sample of which passthrough vars made it (names only, never values)
+        # Which platform vars made it (names only, never values), judged
+        # against what the orchestrator would forward to a NEW box of this
+        # template TODAY: nothing for non-aidream templates, and no master
+        # credential unless the operator knob is on. Any registry name
+        # present beyond that set is a LEAK (a box born before the
+        # 2026-09-13 isolation fix) — recreate or migrate it.
         env_list = attrs.get("Config", {}).get("Env", []) or []
         env_keys_in_container = sorted({e.split("=", 1)[0] for e in env_list if "=" in e})
-        passthrough_keys = sandbox_manager._resolve_passthrough_keys()
-        env_passthrough_landed = sorted(set(env_keys_in_container) & set(passthrough_keys))
-        env_passthrough_missing = sorted(set(passthrough_keys) - set(env_keys_in_container))
+        passthrough_keys = set(sandbox_manager._resolve_passthrough_keys())
+        expected_env, _denied = sandbox_manager.platform_passthrough_env(
+            template,
+            allow_master_credentials=await sandbox_manager.master_credentials_allowed(),
+        )
+        expected_keys = set(expected_env)
+        env_passthrough_landed = sorted(set(env_keys_in_container) & expected_keys)
+        env_passthrough_missing = sorted(expected_keys - set(env_keys_in_container))
+        env_platform_leaked = sorted(
+            (set(env_keys_in_container) & passthrough_keys) - expected_keys
+        )
         container_info = {
             "present": True,
             "running": state.get("Running", False),
@@ -1911,6 +1924,12 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
             "passthrough_landed": env_passthrough_landed,
             "passthrough_missing_count": len(env_passthrough_missing),
             "passthrough_missing_sample": env_passthrough_missing[:10],
+            # Platform names this box carries that a box of its template
+            # would NOT receive today. Non-zero = born before the
+            # 2026-09-13 fix (or the knob was since turned off): recreate
+            # or migrate it, and rotate what it saw.
+            "platform_env_leaked_count": len(env_platform_leaked),
+            "platform_env_leaked_names": env_platform_leaked,
         }
     except Exception as exc:
         container_info["error"] = str(exc)

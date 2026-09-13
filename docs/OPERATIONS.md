@@ -452,6 +452,8 @@ The hosted orchestrator's `docker-compose.yml` (at `/srv/apps/sandbox-orchestrat
 
 The orchestrator never stores values from #2 as typed settings. It reads from `os.environ` at sandbox-create time and forwards every name listed in `MATRX_AIDREAM_PASSTHROUGH_ENV` (default covers Supabase + JWT secret + ~20 AI provider keys + admin identifiers) to the spawned container's environment. This is what makes aidream's FastAPI inside `:aidream` template sandboxes able to validate user JWTs and call AI providers.
 
+🚨 **Isolation (incident 2026-09-13, [incidents/2026-09-13-platform-env-leak.md](incidents/2026-09-13-platform-env-leak.md)):** the passthrough reaches ONLY the `aidream` template — every other template gets nothing from the orchestrator's environment — and even for `aidream`, names that look like master credentials (`*PASSWORD*`, `*_SECRET*`, `*DATABASE_URL*`, `*_SERVICE_TOKEN`, `ADMIN_*TOKEN*`, `*_API_KEY`, …) are withheld unless the knob `infrastructure.sandbox.aidream_template_forwards_master_credentials` is on (default OFF; a missing row is OFF). So with the knob off an `aidream` box validates JWTs only if the JWT secret is provided another way — turn the knob on for a short supervised dev session and rotate afterwards. `GET /sandboxes/{id}/diagnostics` → `platform_env_leaked_count` shows a box still carrying names it should not have (born before the fix): migrate or recreate it.
+
 Verify with:
 ```bash
 curl -s https://orchestrator.dev.codematrx.com/ \
