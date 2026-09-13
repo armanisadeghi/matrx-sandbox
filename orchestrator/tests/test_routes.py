@@ -9,6 +9,7 @@ import pytest
 from httpx import ASGITransport, AsyncClient
 
 from orchestrator.main import app
+from orchestrator.hosted_operation_lease import HostedOperationDenied
 from orchestrator.routes.health import _docker_container_counts
 
 ORG_ID = "22222222-2222-4222-8222-222222222222"
@@ -74,6 +75,23 @@ def mock_health_sandbox_manager():
     with patch("orchestrator.routes.health.sandbox_manager") as mock:
         mock.list_sandboxes = AsyncMock(return_value=[])
         yield mock
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_lock_contention_is_a_retryable_service_refusal(mock_sandbox_manager):
+    """A self-locking lifecycle route must not turn expected contention into HTTP 500."""
+    mock_sandbox_manager.get_sandbox.return_value = SimpleNamespace(sandbox_id="sbx-busy-delete")
+    mock_sandbox_manager.destroy_sandbox.side_effect = HostedOperationDenied(
+        "hosted operation lease unavailable"
+    )
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.delete("/sandboxes/sbx-busy-delete")
+
+    assert response.status_code == 503
+    assert response.headers["retry-after"] == "1"
+    assert response.json() == {"detail": "sandbox operation temporarily unavailable"}
 
 
 @pytest.mark.asyncio

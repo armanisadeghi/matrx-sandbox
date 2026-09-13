@@ -11,12 +11,14 @@ from pathlib import Path
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute, APIWebSocketRoute
+from starlette.responses import JSONResponse
 
 from orchestrator.config import settings
 from orchestrator.logging_config import setup_logging
 from orchestrator.middleware.auth import APIKeyMiddleware
 from orchestrator.middleware.hosted_operation_lease import HostedOperationLeaseMiddleware
 from orchestrator.middleware.request_logging import RequestLoggingMiddleware
+from orchestrator.hosted_operation_lease import HostedOperationDenied
 from orchestrator.models import APISurfaceResponse, RouteInfo
 from orchestrator.routes import health, sandboxes, templates, users
 from orchestrator.sandbox_manager import close_docker_client, close_store
@@ -307,6 +309,16 @@ app = FastAPI(
     version=SERVICE_VERSION,
     lifespan=lifespan,
 )
+
+
+@app.exception_handler(HostedOperationDenied)
+async def hosted_operation_denied_handler(_request, _exc):
+    """Expose lifecycle-fence contention as the retryable refusal it is."""
+    return JSONResponse(
+        status_code=503,
+        content={"detail": "sandbox operation temporarily unavailable"},
+        headers={"Retry-After": "1"},
+    )
 
 # API key authentication middleware
 app.add_middleware(APIKeyMiddleware)
