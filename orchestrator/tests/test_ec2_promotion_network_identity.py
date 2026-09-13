@@ -8,7 +8,7 @@ from types import SimpleNamespace
 import pytest
 
 from orchestrator.hosted_migration import HostedMigrationStateError
-from orchestrator.hosted_runtime import _disconnect_paused_source, _endpoint_matches, _hold_runtime_config, _pin_helper_image, _reconnect_paused_source, _source_reconnect_kwargs, migrate_hosted, replacement_config, source_endpoint_identity
+from orchestrator.hosted_runtime import MIGRATION_STATE_DIR, _disconnect_paused_source, _endpoint_matches, _hold_runtime_config, _pin_helper_image, _reconnect_paused_source, _source_reconnect_kwargs, migrate_hosted, migration_commit_marker, replacement_config, source_endpoint_identity
 
 
 def _old(*, explicit_mac: str = "", binds=None, ipam_config=None):
@@ -41,8 +41,39 @@ def test_hosted_target_create_contract_is_held_even_without_ec2_promotion():
     """Break caught: hosted migration started an image that chowned shared home before CAS."""
     runtime = replacement_config(_old(), image="sha256:" + "b" * 64,
                                  environment=["OLD=1", "MATRX_MIGRATION_HOLD=0"], operation="hosted")
-    _hold_runtime_config(runtime)
-    assert runtime["Env"] == ["OLD=1", "MATRX_MIGRATION_HOLD=1"]
+    operation = "a" * 32
+    _hold_runtime_config(runtime, state_volume="matrx-migration-state-sbx-proof", operation=operation)
+    assert runtime["Env"] == [
+        "OLD=1",
+        "MATRX_MIGRATION_HOLD=1",
+        f"MATRX_MIGRATION_COMMIT_MARKER={migration_commit_marker(operation)}",
+    ]
+    assert runtime["Volumes"][MIGRATION_STATE_DIR] == {}
+
+
+@pytest.mark.parametrize("representation", ["binds", "mounts"])
+def test_replacement_normalizes_private_migration_state_mount(representation):
+    """Binds and structured Mounts both become one new-operation state target."""
+    old = _old()
+    state_volume = "matrx-migration-state-sbx-proof"
+    old.attrs["Config"]["Volumes"] = {MIGRATION_STATE_DIR: {}}
+    old.attrs["Mounts"].append({
+        "Type": "volume", "Name": state_volume,
+        "Destination": MIGRATION_STATE_DIR, "RW": True,
+    })
+    if representation == "binds":
+        old.attrs["HostConfig"]["Binds"].append(f"{state_volume}:{MIGRATION_STATE_DIR}:rw")
+    else:
+        old.attrs["HostConfig"]["Mounts"] = [{
+            "Type": "volume", "Source": state_volume, "Target": MIGRATION_STATE_DIR,
+        }]
+    runtime = replacement_config(
+        old, image="sha256:" + "b" * 64, environment=["NEW=1"], operation="next",
+    )
+    _hold_runtime_config(runtime, state_volume=state_volume, operation="b" * 32)
+    assert runtime["Volumes"][MIGRATION_STATE_DIR] == {}
+    assert runtime["HostConfig"]["Binds"].count(f"{state_volume}:{MIGRATION_STATE_DIR}:rw") == 1
+    assert all(mount.get("Target") != MIGRATION_STATE_DIR for mount in runtime["HostConfig"].get("Mounts", []))
 
 
 def test_reconnect_identity_accepts_reassigned_auto_ip_but_requires_aliases():
@@ -176,10 +207,19 @@ def test_ec2_target_create_is_after_durable_paused_source_disconnect():
     assert "await _docker(old.stop" not in source
 
 
-def test_helper_pin_is_not_created_until_after_ec2_preflight():
-    """Regression: a failing helper preflight must not orphan an unjournalled operation tag."""
+def test_helper_pin_is_not_created_until_after_every_side_effect_free_validation():
+    """Every mount, knob, route, and EC2 check must fail before image tagging."""
     source = inspect.getsource(migrate_hosted)
-    assert source.index("await _finish(preflight_helper())") < source.index("helper_image_pin = await _pin_helper_image")
+    pin = source.index("pinned = await _pin_helper_image")
+    validations = (
+        "await _finish(preflight_helper())",
+        "old_state_volume = _state_volume_mount(old, sandbox_id)",
+        'stop_timeout = await knob_int("shutdown_timeout_seconds")',
+        "await _validate_existing_migration_state_volume",
+        "await _current(record, store)",
+        "journal.write(record)",
+    )
+    assert all(source.index(validation) < pin for validation in validations)
 
 
 def test_pending_operation_pins_exact_helper_digest_before_journal_admission():

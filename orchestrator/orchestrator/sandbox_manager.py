@@ -1329,6 +1329,8 @@ async def _destroy_sandbox_unleased(
         # lifecycle. Explicit volume wipe is a separate, admin-only path
         # (see ``delete_user_volume``).
         tier = getattr(sandbox.tier, "value", sandbox.tier) or settings.host_tier
+        from orchestrator.hosted_runtime import _state_volume_mount, remove_migration_state_volume
+        state_volume = _state_volume_mount(container, sandbox.sandbox_id)
         if tier == "ec2" and not sandbox.persistence_volume:
             logger.warning(
                 "Retained legacy EC2 writable-layer container %s; promotion is required before replacement",
@@ -1336,6 +1338,10 @@ async def _destroy_sandbox_unleased(
             )
         else:
             await _docker(container.remove, force=True)
+            if state_volume:
+                await remove_migration_state_volume(
+                    client, sandbox.sandbox_id, expected_name=state_volume,
+                )
 
         await _finalize_terminal_status(store, sandbox_id, reason, final_status)
 

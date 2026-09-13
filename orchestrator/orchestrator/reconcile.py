@@ -280,7 +280,11 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
                     "soft-deleted" if lifecycle["deleted"] else lifecycle["status"],
                 )
                 try:
+                    from orchestrator.hosted_runtime import _state_volume_mount, remove_migration_state_volume
+                    state_volume = _state_volume_mount(container, sandbox_id)
                     await _docker(container.remove, force=True)
+                    if state_volume:
+                        await remove_migration_state_volume(client, sandbox_id, expected_name=state_volume)
                 except Exception as exc:
                     logger.warning("Reconcile: failed to reap orphan %s: %s", sandbox_id, exc)
                 continue
@@ -436,7 +440,11 @@ async def reap_zombie_containers(store: SandboxStore) -> list[str]:
                     sandbox_id,
                     "soft-deleted" if lifecycle["deleted"] else lifecycle["status"],
                 )
+                from orchestrator.hosted_runtime import _state_volume_mount, remove_migration_state_volume
+                state_volume = _state_volume_mount(container, sandbox_id)
                 await _docker(container.remove, force=True)
+                if state_volume:
+                    await remove_migration_state_volume(client, sandbox_id, expected_name=state_volume)
                 reaped.append(sandbox_id)
         except Exception as exc:
             logger.warning(

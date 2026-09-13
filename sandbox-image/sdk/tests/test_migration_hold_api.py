@@ -108,6 +108,29 @@ def test_hold_retries_transient_activation_without_duplicate_watcher(monkeypatch
         assert watcher.starts == 1
 
 
+def test_committed_restart_does_not_return_to_health_only_hold(monkeypatch, tmp_path):
+    """A tmpfs restart may lose activation readiness, but not the durable commit gate."""
+    marker, activated = tmp_path / "durable-commit", tmp_path / "ephemeral-activated"
+    marker.write_text("committed\n")
+    checkpoint, watcher = _Checkpoint(), _Watcher()
+    monkeypatch.setenv("MATRX_MIGRATION_HOLD", "1")
+    monkeypatch.setattr(api_main, "MIGRATION_COMMIT_MARKER", marker)
+    monkeypatch.setattr(api_main, "MIGRATION_ACTIVATED_MARKER", activated)
+    monkeypatch.setattr(api_main, "_checkpoint", checkpoint)
+    monkeypatch.setattr(api_main, "_cloud_watcher", watcher)
+    monkeypatch.setattr(api_main, "read_prior_manifest", lambda: None)
+    monkeypatch.setattr(api_main, "render_report", lambda _prior: "")
+
+    for restart in range(2):
+        activated.unlink(missing_ok=True)
+        with TestClient(api_main.app) as client:
+            assert client.get("/health").json()["migration_state"] == "activating"
+            assert checkpoint.starts == restart + 1
+            activated.write_text("activated\n")
+            assert client.get("/health").json()["migration_state"] == "active"
+
+
+
 def test_normal_boot_does_not_wait_for_cloud_down_marker(monkeypatch):
     """Break caught: normal daemon readiness blocks on the watcher's marker probe."""
     class SlowWatcher(_Watcher):

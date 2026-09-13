@@ -11,7 +11,7 @@ echo "  Sandbox ID: ${SANDBOX_ID:-unknown}"
 echo "  Time:       $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 echo "=========================================="
 
-MATRX_MIGRATION_COMMIT_MARKER="/tmp/.matrx-migration-committed"
+MATRX_MIGRATION_COMMIT_MARKER="${MATRX_MIGRATION_COMMIT_MARKER:-/var/lib/matrx-migration/committed}"
 MATRX_MIGRATION_ACTIVATED_MARKER="/tmp/.matrx-migration-activated"
 AGENT_API_STARTED="${MATRX_AGENT_API_STARTED:-0}"
 
@@ -21,17 +21,21 @@ start_agent_api() {
     AGENT_API_STARTED=1
 }
 
-# Migration targets must expose health while remaining completely inert with
-# respect to the mounted user home. Durable routing CAS creates the marker;
-# only then may normal boot, credentials, sync, ttyd, or layout code run.
-if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ] && [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; then
-    rm -f "$MATRX_MIGRATION_ACTIVATED_MARKER"
-    export PYTHONDONTWRITEBYTECODE=1
-    echo "Migration hold active: API health only; home boot is deferred until commit marker."
-    start_agent_api
-    touch /tmp/.sandbox_ready
-    while [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; do sleep 1; done
-    echo "Migration commit marker observed; activating normal boot."
+# Migration targets expose health while remaining completely inert with respect
+# to the mounted user home. Durable routing CAS creates the marker; runtime
+# services then start, but normal home bootstrap remains quarantined.
+MATRX_MIGRATION_ACTIVATION=0
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
+    if [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; then
+        rm -f "$MATRX_MIGRATION_ACTIVATED_MARKER"
+        export PYTHONDONTWRITEBYTECODE=1
+        echo "Migration hold active: API health only; home boot is deferred until commit marker."
+        start_agent_api
+        touch /tmp/.sandbox_ready
+        while [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; do sleep 1; done
+    fi
+    MATRX_MIGRATION_ACTIVATION=1
+    echo "Migration commit marker observed; activating services without modifying the mounted home."
 fi
 
 # ─── Step 1: Skip S3 in local mode ──────────────────────────────────────────
@@ -45,6 +49,7 @@ echo "[3/5] Preparing agent environment..."
 
 HOT_PATH="${HOT_PATH:-/home/agent}"
 
+if [ "$MATRX_MIGRATION_ACTIVATION" = "0" ]; then
 chown -R agent:agent "$HOT_PATH" 2>/dev/null || true
 
 # Ensure standard dirs exist
@@ -108,6 +113,9 @@ echo "[3.5/5] Layout ready."
 echo "[3.6/5] Configuring git credential helpers..."
 sudo -H -E -u agent /opt/sandbox/scripts/configure-git-credentials.sh || true
 echo "[3.6/5] Git credential helpers ready."
+else
+    echo "[3-3.6/5] Migration activation — preserving the mounted home exactly."
+fi
 
 # ─── Step 4: Start SSH server ────────────────────────────────────────────────
 echo "[4/5] Starting SSH server..."
@@ -157,9 +165,13 @@ echo "[4c] Sandbox API Daemon running on port 8000."
 # Same hook as production. Bridges user's AI Dream files into the sandbox
 # FS so agents can use shell tools natively. No-op when AI Dream isn't
 # configured — see /opt/sandbox/scripts/cloud-files-sync.sh.
-echo "[4d] Syncing AI Dream cloud_files (if configured)..."
-sudo -E -u agent /opt/sandbox/scripts/cloud-files-sync.sh down || true
-echo "[4d] cloud_files sync complete."
+if [ "$MATRX_MIGRATION_ACTIVATION" = "1" ]; then
+    echo "[4d] Migration activation — skipping cloud_files down-sync."
+else
+    echo "[4d] Syncing AI Dream cloud_files (if configured)..."
+    sudo -E -u agent /opt/sandbox/scripts/cloud-files-sync.sh down || true
+    echo "[4d] cloud_files sync complete."
+fi
 
 # ─── Step 5: Signal readiness ────────────────────────────────────────────────
 echo "[5/5] Sandbox is READY."

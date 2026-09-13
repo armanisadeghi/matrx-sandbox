@@ -22,6 +22,7 @@ def _base():
                             "ipv4_address": "172.17.0.2", "ipv4_address_prefixlen": 16, "mac_address": "02:42:ac:11:00:02"},
         "network_disconnect_receipt": {"old_id": "old", "network": "bridge", "network_id": "network-id", "absent": True},
         "pre_cas_home_receipt": {"manifest_sha256": "digest", "source_volume": {"name": "home"}},
+        "activation_home_preflight_receipt": {"target_id": "new", "agent_lifecycle_paths_writable": True},
     }
 
 
@@ -202,6 +203,73 @@ def test_durable_record_rejects_partial_crash_artifact():
 
 def test_durable_record_accepts_admitted_full_intent():
     validate_record(dict(_base(), phase="admitted"))
+
+
+def test_historical_schema_v1_committed_journal_without_activation_fields_is_readable(tmp_path):
+    """Deployed v1 journals remain recoverable after the v2 writer ships."""
+    record = dict(
+        _base(), phase="committed", target_id="new",
+        backup_receipt={"verified": True}, cleanup_complete=True,
+    )
+    for field in (
+        "activation_home_preflight_receipt", "state_volume_name",
+        "state_volume_creation_intent", "helper_image_pin",
+        "helper_image_pin_creation_intent", "helper_image_pin_created",
+    ):
+        record.pop(field, None)
+    journal = HostedMigrationJournal(tmp_path)
+    journal.write(record)
+    assert journal.read("sbx") == record
+
+
+def test_schema_v2_requires_activation_intents_and_forward_preflight_receipt():
+    record = dict(_base(), schema_version=2, phase="admitted")
+    with pytest.raises(HostedMigrationStateError, match="schema 2 is missing"):
+        validate_record(record)
+
+    record.update(
+        state_volume_name="matrx-migration-state-sbx",
+        state_volume_creation_intent={"name": "matrx-migration-state-sbx", "sandbox_id": "sbx"},
+        helper_image_pin="matrx-migration-helper:op",
+        helper_image_pin_creation_intent={
+            "pin": "matrx-migration-helper:op", "image": "sha256:" + "c" * 64,
+        },
+    )
+    validate_record(record)
+    record.update(
+        phase="activation_intent", target_id="new", backup_receipt={"verified": True},
+    )
+    record.pop("activation_home_preflight_receipt", None)
+    with pytest.raises(HostedMigrationStateError, match="lifecycle-path preflight"):
+        validate_record(record)
+
+
+@pytest.mark.parametrize(
+    ("field", "value", "reason"),
+    [
+        ("state_volume_name", None, "state-volume intent"),
+        ("state_volume_name", "matrx-migration-state-other", "state-volume intent"),
+        ("state_volume_creation_intent", None, "state-volume intent"),
+        ("state_volume_creation_intent", {"name": "wrong", "sandbox_id": "sbx"}, "state-volume intent"),
+        ("helper_image_pin", None, "helper-pin intent"),
+        ("helper_image_pin", "matrx-migration-helper:other", "helper-pin intent"),
+        ("helper_image_pin_creation_intent", None, "helper-pin intent"),
+        ("helper_image_pin_creation_intent", {"pin": "wrong", "image": "sha256:" + "c" * 64}, "helper-pin intent"),
+    ],
+)
+def test_schema_v2_rejects_null_or_unbound_resource_intents(field, value, reason):
+    record = dict(
+        _base(), schema_version=2, phase="admitted",
+        state_volume_name="matrx-migration-state-sbx",
+        state_volume_creation_intent={"name": "matrx-migration-state-sbx", "sandbox_id": "sbx"},
+        helper_image_pin="matrx-migration-helper:op",
+        helper_image_pin_creation_intent={
+            "pin": "matrx-migration-helper:op", "image": "sha256:" + "c" * 64,
+        },
+    )
+    record[field] = value
+    with pytest.raises(HostedMigrationStateError, match=reason):
+        validate_record(record)
 
 
 def test_bind_mount_state_guard_uses_mountinfo_even_when_device_identity_is_shared():
@@ -619,6 +687,19 @@ def test_missing_hosted_journal_fails_closed(monkeypatch):
     monkeypatch.setattr("orchestrator.config.settings.host_tier", "hosted")
     assert hosted_fenced("sbx")
     assert hosted_volume_fenced("matrx-user-u")
+
+
+def test_forward_phase_rejects_false_lifecycle_preflight_receipt():
+    record = dict(_base(), phase="activation_intent", target_id="new", backup_receipt={"verified": True})
+    record["state_volume_name"] = "matrx-migration-state-sbx"
+    record["state_volume_creation_intent"] = {
+        "name": "matrx-migration-state-sbx", "sandbox_id": "sbx",
+    }
+    record["activation_home_preflight_receipt"] = {
+        "target_id": "new", "agent_lifecycle_paths_writable": False,
+    }
+    with pytest.raises(HostedMigrationStateError, match="lifecycle-path preflight"):
+        validate_record(record)
 
 
 def test_ec2_missing_journal_fails_closed(monkeypatch):

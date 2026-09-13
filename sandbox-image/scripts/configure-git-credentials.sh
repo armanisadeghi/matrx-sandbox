@@ -23,9 +23,8 @@ GITHUB_USERNAME_DEFAULT="${GITHUB_USERNAME:-${GITHUB_USER:-x-access-token}}"
 
 export HOME="$AGENT_HOME"
 
-COMMIT_MARKER="/tmp/.matrx-migration-committed"
-if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ] && [ ! -f "$COMMIT_MARKER" ]; then
-    echo "migration hold active; refusing git credential writes" >&2
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
+    echo "migration activation preserves the mounted home; refusing git credential writes" >&2
     exit 0
 fi
 

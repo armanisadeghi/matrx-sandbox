@@ -26,12 +26,17 @@ VALID_PHASES = frozenset({
     "backup_intent", "rename_intent", "rollback_intent", "restore_intent",
     "network_disconnect_intent", "network_disconnected",
 })
-_RECORD_SCHEMA_VERSION = 1
+_RECORD_SCHEMA_VERSION = 2
+_SUPPORTED_RECORD_SCHEMA_VERSIONS = frozenset({1, _RECORD_SCHEMA_VERSION})
 _REQUIRED_RECORD_FIELDS = frozenset({
     "sandbox_id", "old_id", "old_name", "old_image", "source_volume",
     "source_identity", "row_identity", "target_name", "target_image",
     "operation_label", "backup_name", "helper_image", "rollback_name",
     "verify_timeout", "stop_timeout", "phase", "schema_version",
+})
+_V2_REQUIRED_RECORD_FIELDS = frozenset({
+    "state_volume_name", "state_volume_creation_intent",
+    "helper_image_pin", "helper_image_pin_creation_intent",
 })
 
 
@@ -109,6 +114,9 @@ def transition(record: dict[str, Any], phase: str, **fields: Any) -> dict[str, A
     missing = [key for key in required.get(phase, set()) if not next_record.get(key)]
     if missing:
         raise HostedMigrationStateError(f"phase {phase} missing {','.join(sorted(missing))}")
+    if (phase == "target_quiesce_intent" and next_record.get("state_volume_creation_intent")
+            and not next_record.get("activation_home_preflight_receipt")):
+        raise HostedMigrationStateError("phase target_quiesce_intent missing lifecycle-path preflight")
     return next_record
 
 
@@ -120,13 +128,36 @@ def validate_record(record: dict[str, Any]) -> None:
     """Reject partial or stale durable state before it can drive Docker recovery."""
     if not isinstance(record, dict):
         raise HostedMigrationStateError("hosted migration journal record is not an object")
-    if record.get("schema_version") != _RECORD_SCHEMA_VERSION:
+    schema_version = record.get("schema_version")
+    if schema_version not in _SUPPORTED_RECORD_SCHEMA_VERSIONS:
         raise HostedMigrationStateError("hosted migration journal has an unsupported schema")
     missing = _REQUIRED_RECORD_FIELDS.difference(record)
     if missing:
         raise HostedMigrationStateError(
             f"hosted migration journal is missing {','.join(sorted(missing))}"
         )
+    if schema_version == _RECORD_SCHEMA_VERSION:
+        missing = _V2_REQUIRED_RECORD_FIELDS.difference(record)
+        if missing:
+            raise HostedMigrationStateError(
+                f"hosted migration journal schema 2 is missing {','.join(sorted(missing))}"
+            )
+        expected_state_volume = f"matrx-migration-state-{record.get('sandbox_id', '')}"
+        expected_helper_pin = f"matrx-migration-helper:{record.get('operation_label', '')}"
+        if (record.get("state_volume_name") != expected_state_volume
+                or record.get("state_volume_creation_intent") != {
+                    "name": expected_state_volume, "sandbox_id": record.get("sandbox_id"),
+                }):
+            raise HostedMigrationStateError(
+                "hosted migration journal schema 2 has invalid state-volume intent"
+            )
+        if (record.get("helper_image_pin") != expected_helper_pin
+                or record.get("helper_image_pin_creation_intent") != {
+                    "pin": expected_helper_pin, "image": record.get("helper_image"),
+                }):
+            raise HostedMigrationStateError(
+                "hosted migration journal schema 2 has invalid helper-pin intent"
+            )
     if record.get("phase") not in VALID_PHASES:
         raise HostedMigrationStateError("hosted migration journal has an invalid phase")
     for key in ("sandbox_id", "old_id", "old_name", "old_image", "source_volume",
@@ -194,6 +225,34 @@ def validate_record(record: dict[str, Any]) -> None:
     }
     if record["phase"] in target_known and not isinstance(record.get("target_id"), str):
         raise HostedMigrationStateError("hosted migration journal has no target identity")
+    preflight_phases = {
+        "target_quiesce_intent", "postboot_verified", "rename_intent", "names_cut_over",
+        "commit_intent", "activation_intent", "commit_uncertain", "committed",
+    }
+    if record["phase"] in preflight_phases and (
+        schema_version == _RECORD_SCHEMA_VERSION
+        or record.get("state_volume_creation_intent") is not None
+        or record.get("activation_home_preflight_receipt") is not None
+    ):
+        receipt = record.get("activation_home_preflight_receipt")
+        if (not isinstance(receipt, dict)
+                or receipt.get("target_id") != record.get("target_id")
+                or receipt.get("agent_lifecycle_paths_writable") is not True):
+            raise HostedMigrationStateError("migration journal has no valid lifecycle-path preflight")
+    state_intent = record.get("state_volume_creation_intent")
+    if state_intent is not None and (
+        not isinstance(state_intent, dict)
+        or state_intent.get("name") != record.get("state_volume_name")
+        or state_intent.get("sandbox_id") != record.get("sandbox_id")
+    ):
+        raise HostedMigrationStateError("migration journal has invalid state-volume creation intent")
+    pin_intent = record.get("helper_image_pin_creation_intent")
+    if pin_intent is not None and (
+        not isinstance(pin_intent, dict)
+        or pin_intent.get("pin") != record.get("helper_image_pin")
+        or pin_intent.get("image") != record.get("helper_image")
+    ):
+        raise HostedMigrationStateError("migration journal has invalid helper-pin creation intent")
     if record.get("storage_kind") == "ec2_writable_layer":
         postboot_phases = {
             "postboot_verified", "rename_intent", "names_cut_over", "commit_intent",

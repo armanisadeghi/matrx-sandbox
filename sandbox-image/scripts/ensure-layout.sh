@@ -14,10 +14,8 @@ set -uo pipefail
 
 AGENT_HOME="${AGENT_HOME:-/home/agent}"
 AGENT_USER="${AGENT_USER:-agent}"
-COMMIT_MARKER="/tmp/.matrx-migration-committed"
-
-if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ] && [ ! -f "$COMMIT_MARKER" ]; then
-  echo "migration hold active; refusing layout writes" >&2
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
+  echo "migration activation preserves the mounted home; refusing layout writes" >&2
   exit 0
 fi
 

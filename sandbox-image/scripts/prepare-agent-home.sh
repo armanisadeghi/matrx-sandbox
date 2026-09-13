@@ -5,10 +5,8 @@ agent_home="${HOT_PATH:-/home/agent}"
 agent_user="${AGENT_USER:-agent}"
 keys="${agent_home}/.ssh/authorized_keys"
 admin_keys="${ADMIN_KEYS_PATH:-/opt/sandbox/config/admin_authorized_keys}"
-commit_marker="/tmp/.matrx-migration-committed"
-
-if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ] && [ ! -f "$commit_marker" ]; then
-  echo "migration hold active; refusing agent-home preparation" >&2
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
+  echo "migration activation preserves the mounted home; refusing agent-home preparation" >&2
   exit 0
 fi
 

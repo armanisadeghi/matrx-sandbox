@@ -47,7 +47,9 @@ _cloud_watcher = CloudFilesWatcher()
 # health only: no mounted-home path may be created, traversed for persistence,
 # or written.  The marker is intentionally outside /home/agent and survives a
 # daemon restart within the committed replacement container.
-MIGRATION_COMMIT_MARKER = Path("/tmp/.matrx-migration-committed")
+MIGRATION_COMMIT_MARKER = Path(os.environ.get(
+    "MATRX_MIGRATION_COMMIT_MARKER", "/var/lib/matrx-migration/committed",
+))
 MIGRATION_ACTIVATED_MARKER = Path("/tmp/.matrx-migration-activated")
 _background_ready = False
 _activation_task: asyncio.Task | None = None
@@ -120,7 +122,7 @@ async def _activate_background_capabilities(*, strict: bool) -> None:
 
 
 async def _wait_for_migration_commit() -> None:
-    """Poll only /tmp; never touch the mounted home before durable commit."""
+    """Poll only the private state volume; never touch mounted home before commit."""
     while not MIGRATION_COMMIT_MARKER.is_file():
         await asyncio.sleep(0.2)
     while not _background_ready:

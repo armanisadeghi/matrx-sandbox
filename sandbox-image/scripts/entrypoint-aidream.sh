@@ -13,22 +13,27 @@ set -uo pipefail
 # the seeding/downstream chain as well.
 export PATH="/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin"
 
-MATRX_MIGRATION_COMMIT_MARKER="/tmp/.matrx-migration-committed"
+MATRX_MIGRATION_COMMIT_MARKER="${MATRX_MIGRATION_COMMIT_MARKER:-/var/lib/matrx-migration/committed}"
 MATRX_MIGRATION_ACTIVATED_MARKER="/tmp/.matrx-migration-activated"
 
 # This wrapper normally seeds the durable aidream checkout before handing off
-# to the tier entrypoint. A migration target must do none of that before CAS;
-# expose only the immutable health API, then resume this wrapper after commit.
-if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ] && [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; then
-    rm -f "$MATRX_MIGRATION_ACTIVATED_MARKER"
-    export PYTHONDONTWRITEBYTECODE=1
-    log_hold() { echo "[entrypoint-aidream] $*"; }
-    log_hold "Migration hold active: API health only; aidream home boot is deferred until commit marker."
-    PYTHONDONTWRITEBYTECODE=1 sudo -E -u agent bash -c "cd /home/agent && PYTHONDONTWRITEBYTECODE=1 python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
-    export MATRX_AGENT_API_STARTED=1
-    touch /tmp/.sandbox_ready
-    while [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; do sleep 1; done
-    log_hold "Migration commit marker observed; activating aidream boot."
+# to the tier entrypoint. A migration target exposes only the immutable health
+# API before CAS, then starts services after commit without touching the checkout.
+MATRX_MIGRATION_ACTIVATION=0
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
+    if [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; then
+        rm -f "$MATRX_MIGRATION_ACTIVATED_MARKER"
+        export PYTHONDONTWRITEBYTECODE=1
+        log_hold() { echo "[entrypoint-aidream] $*"; }
+        log_hold "Migration hold active: API health only; aidream home boot is deferred until commit marker."
+        PYTHONDONTWRITEBYTECODE=1 sudo -E -u agent bash -c "cd /home/agent && PYTHONDONTWRITEBYTECODE=1 python3 -m uvicorn matrx_agent.api.main:app --host 0.0.0.0 --port 8000 > /var/log/sandbox/api.log 2>&1 &"
+        export MATRX_AGENT_API_STARTED=1
+        touch /tmp/.sandbox_ready
+        while [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; do sleep 1; done
+    fi
+    MATRX_MIGRATION_ACTIVATION=1
+    export MATRX_MIGRATION_ACTIVATION
+    echo "[entrypoint-aidream] Migration commit marker observed; activating services without modifying the mounted home."
 fi
 
 TEMPLATE_DIR="/opt/aidream-template"
@@ -62,27 +67,31 @@ retarget_editables() {
     log "retargeted $count editable .pth file(s) to $WORK_DIR"
 }
 
-if [ ! -d "$WORK_DIR" ] || [ -z "$(/bin/ls -A "$WORK_DIR" 2>/dev/null)" ]; then
-    log "first spawn — seeding $WORK_DIR from $TEMPLATE_DIR"
-    if [ ! -d "$TEMPLATE_DIR" ]; then
-        log "WARNING: template dir $TEMPLATE_DIR missing; aidream will not be available"
+if [ "$MATRX_MIGRATION_ACTIVATION" = "0" ]; then
+    if [ ! -d "$WORK_DIR" ] || [ -z "$(/bin/ls -A "$WORK_DIR" 2>/dev/null)" ]; then
+        log "first spawn — seeding $WORK_DIR from $TEMPLATE_DIR"
+        if [ ! -d "$TEMPLATE_DIR" ]; then
+            log "WARNING: template dir $TEMPLATE_DIR missing; aidream will not be available"
+        else
+            # cp -a preserves permissions and the .venv. uv editable .pth files
+            # still need their absolute paths rewritten to point at $WORK_DIR
+            # (handled below by retarget_editables).
+            /usr/bin/sudo -E /bin/cp -a "$TEMPLATE_DIR/." "$WORK_DIR/" || log "WARN: seed copy failed"
+            /usr/bin/sudo -E /usr/bin/chown -R agent:agent "$WORK_DIR" || true
+            retarget_editables
+            log "seeded $(/usr/bin/du -sh "$WORK_DIR" 2>/dev/null | /usr/bin/cut -f1) into $WORK_DIR"
+        fi
     else
-        # cp -a preserves permissions and the .venv. uv editable .pth files
-        # still need their absolute paths rewritten to point at $WORK_DIR
-        # (handled below by retarget_editables).
-        /usr/bin/sudo -E /bin/cp -a "$TEMPLATE_DIR/." "$WORK_DIR/" || log "WARN: seed copy failed"
-        /usr/bin/sudo -E /usr/bin/chown -R agent:agent "$WORK_DIR" || true
-        retarget_editables
-        log "seeded $(/usr/bin/du -sh "$WORK_DIR" 2>/dev/null | /usr/bin/cut -f1) into $WORK_DIR"
+        log "found existing $WORK_DIR — preserving user state"
+        # Defensive: if the user's .pth files point at the template (because they
+        # were created by an older entrypoint that didn't retarget), fix them now.
+        if /usr/bin/grep -q "$TEMPLATE_DIR" "$WORK_DIR/.venv/lib/python3.13/site-packages"/_editable_impl_*.pth 2>/dev/null; then
+            log "detected stale editable .pth files from older seed — retargeting"
+            retarget_editables
+        fi
     fi
 else
-    log "found existing $WORK_DIR — preserving user state"
-    # Defensive: if the user's .pth files point at the template (because they
-    # were created by an older entrypoint that didn't retarget), fix them now.
-    if /usr/bin/grep -q "$TEMPLATE_DIR" "$WORK_DIR/.venv/lib/python3.13/site-packages"/_editable_impl_*.pth 2>/dev/null; then
-        log "detected stale editable .pth files from older seed — retargeting"
-        retarget_editables
-    fi
+    log "Migration activation — preserving the durable aidream checkout exactly"
 fi
 
 # Auto-start aidream's FastAPI on port 8001 after the standard daemon is up.

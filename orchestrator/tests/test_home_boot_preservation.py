@@ -92,7 +92,7 @@ def test_layout_leaves_existing_user_directory_metadata_untouched(tmp_path: Path
 def test_core_migration_boot_branches_before_hot_download(tmp_path: Path):
     """Migration mode must select the no-download branch before any initial sync call."""
     script = CORE.read_text()
-    start = script.index('if [ "${SANDBOX_MIGRATION:-}" = "1" ]; then')
+    start = script.index('if [ "${SANDBOX_MIGRATION:-}" = "1" ] || [ "$MATRX_MIGRATION_ACTIVATION" = "1" ]; then')
     end = script.index('# ─── Step 2:', start)
     block = script[start:end]
     # Execute the production block with a real command seam: an accidental hot

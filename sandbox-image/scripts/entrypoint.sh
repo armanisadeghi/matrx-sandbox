@@ -19,7 +19,7 @@ for var in SANDBOX_ID USER_ID S3_BUCKET; do
     fi
 done
 
-MATRX_MIGRATION_COMMIT_MARKER="/tmp/.matrx-migration-committed"
+MATRX_MIGRATION_COMMIT_MARKER="${MATRX_MIGRATION_COMMIT_MARKER:-/var/lib/matrx-migration/committed}"
 MATRX_MIGRATION_ACTIVATED_MARKER="/tmp/.matrx-migration-activated"
 AGENT_API_STARTED="${MATRX_AGENT_API_STARTED:-0}"
 
@@ -31,18 +31,22 @@ start_agent_api() {
     AGENT_API_STARTED=1
 }
 
-if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ] && [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; then
-    rm -f "$MATRX_MIGRATION_ACTIVATED_MARKER"
-    export PYTHONDONTWRITEBYTECODE=1
-    echo "Migration hold active: API health only; home boot is deferred until commit marker."
-    start_agent_api
-    touch /tmp/.sandbox_ready
-    while [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; do sleep 1; done
-    echo "Migration commit marker observed; activating normal boot."
+MATRX_MIGRATION_ACTIVATION=0
+if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
+    if [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; then
+        rm -f "$MATRX_MIGRATION_ACTIVATED_MARKER"
+        export PYTHONDONTWRITEBYTECODE=1
+        echo "Migration hold active: API health only; home boot is deferred until commit marker."
+        start_agent_api
+        touch /tmp/.sandbox_ready
+        while [ ! -f "$MATRX_MIGRATION_COMMIT_MARKER" ]; do sleep 1; done
+    fi
+    MATRX_MIGRATION_ACTIVATION=1
+    echo "Migration commit marker observed; activating services without modifying the mounted home."
 fi
 
 # ─── Step 1: Sync hot storage from S3 ────────────────────────────────────────
-if [ "${SANDBOX_MIGRATION:-}" = "1" ]; then
+if [ "${SANDBOX_MIGRATION:-}" = "1" ] || [ "$MATRX_MIGRATION_ACTIVATION" = "1" ]; then
     echo "[1/5] Migration boot — skipping hot storage download."
 else
     echo "[1/5] Syncing hot storage from S3..."
@@ -58,6 +62,7 @@ echo "[2/5] Cold storage mounted."
 # ─── Step 3: Set up environment for agent ─────────────────────────────────────
 echo "[3/5] Preparing agent environment..."
 
+if [ "$MATRX_MIGRATION_ACTIVATION" = "0" ]; then
 /opt/sandbox/scripts/prepare-agent-home.sh
 
 # Write a small env file the agent can source
@@ -91,6 +96,9 @@ echo "[3.5/5] Layout ready."
 echo "[3.6/5] Configuring git credential helpers..."
 sudo -H -E -u agent /opt/sandbox/scripts/configure-git-credentials.sh || true
 echo "[3.6/5] Git credential helpers ready."
+else
+    echo "[3-3.6/5] Migration activation — preserving the mounted home exactly."
+fi
 
 # ─── Step 4: Start SSH server ────────────────────────────────────────────────
 echo "[4/5] Starting SSH server..."
@@ -110,7 +118,7 @@ echo "[4.5/5] Sandbox API Daemon running on port 8000."
 # Bridges the user's AI Dream uploads into the sandbox filesystem so agents
 # can use `cat`, `grep`, `find`, etc. natively. No-op if AI Dream env vars
 # aren't set.
-if [ "${SANDBOX_MIGRATION:-}" = "1" ]; then
+if [ "${SANDBOX_MIGRATION:-}" = "1" ] || [ "$MATRX_MIGRATION_ACTIVATION" = "1" ]; then
     # Zero-drift migration boot: the per-user volume already holds the data
     # (we're swapping the image under the SAME volume), so re-pulling cloud_files
     # is wasteful and is the single biggest contributor to migration time. Skip.

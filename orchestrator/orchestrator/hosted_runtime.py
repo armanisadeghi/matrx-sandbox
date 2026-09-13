@@ -21,6 +21,96 @@ from docker.errors import NotFound
 
 from orchestrator.hosted_migration import HostedMigrationJournal, HostedMigrationStateError, recovery_action, transition
 
+MIGRATION_STATE_DIR = "/var/lib/matrx-migration"
+
+
+def migration_state_volume_name(sandbox_id: str) -> str:
+    """Return the exact orchestrator-owned restart gate volume for one sandbox."""
+    if not re.fullmatch(r"sbx-[0-9a-z]+", sandbox_id):
+        raise HostedMigrationStateError("sandbox id cannot name migration state volume")
+    return f"matrx-migration-state-{sandbox_id}"
+
+
+def migration_commit_marker(operation: str) -> str:
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", operation):
+        raise HostedMigrationStateError("migration operation cannot name commit marker")
+    return f"{MIGRATION_STATE_DIR}/{operation}.committed"
+
+
+def _state_volume_mount(container, sandbox_id: str) -> str | None:
+    """Return only the exact private state mount; ambiguous mounts fail closed."""
+    attrs = getattr(container, "attrs", None) or {}
+    mounts = [mount for mount in (attrs.get("Mounts") or [])
+              if mount.get("Destination") == MIGRATION_STATE_DIR]
+    if not mounts:
+        return None
+    expected = migration_state_volume_name(sandbox_id)
+    if (len(mounts) != 1 or mounts[0].get("Type") != "volume"
+            or mounts[0].get("Name") != expected or not mounts[0].get("RW")):
+        raise HostedMigrationStateError("migration state mount identity is ambiguous")
+    return expected
+
+
+async def _ensure_migration_state_volume(client, record) -> bool:
+    """Create or verify the sandbox-private restart gate without user storage."""
+    name = record["state_volume_name"]
+    labels = {
+        "matrx.owner": "orchestrator",
+        "matrx.kind": "migration-state",
+        "matrx.sandbox_id": record["sandbox_id"],
+    }
+    try:
+        volume = await _docker(client.volumes.get, name)
+        created = False
+    except NotFound:
+        volume = await _docker(client.volumes.create, name, driver="local", labels=labels)
+        created = True
+    await _docker(volume.reload)
+    attrs = volume.attrs or {}
+    actual_labels = attrs.get("Labels") or {}
+    if attrs.get("Driver") != "local" or any(actual_labels.get(k) != v for k, v in labels.items()):
+        raise HostedMigrationStateError("migration state volume ownership mismatch")
+    return created
+
+
+async def _validate_existing_migration_state_volume(client, record) -> None:
+    """Reject a colliding or substituted stable state volume before image pinning."""
+    try:
+        volume = await _docker(client.volumes.get, record["state_volume_name"])
+    except NotFound:
+        return
+    await _docker(volume.reload)
+    attrs = volume.attrs or {}
+    labels = attrs.get("Labels") or {}
+    if (attrs.get("Driver") != "local"
+            or labels.get("matrx.owner") != "orchestrator"
+            or labels.get("matrx.kind") != "migration-state"
+            or labels.get("matrx.sandbox_id") != record["sandbox_id"]):
+        raise HostedMigrationStateError("migration state volume ownership mismatch")
+
+
+async def remove_migration_state_volume(client, sandbox_id: str, *, expected_name: str | None = None) -> bool:
+    """Remove only an unmounted, exactly labelled private migration-state volume."""
+    name = migration_state_volume_name(sandbox_id)
+    if expected_name is not None and expected_name != name:
+        raise HostedMigrationStateError("migration state cleanup identity mismatch")
+    try:
+        volume = await _docker(client.volumes.get, name)
+    except NotFound:
+        return False
+    await _docker(volume.reload)
+    labels = (volume.attrs or {}).get("Labels") or {}
+    if ((volume.attrs or {}).get("Driver") != "local"
+            or labels.get("matrx.owner") != "orchestrator"
+            or labels.get("matrx.kind") != "migration-state"
+            or labels.get("matrx.sandbox_id") != sandbox_id):
+        raise HostedMigrationStateError("migration state cleanup ownership mismatch")
+    consumers = await _docker(client.containers.list, all=True, filters={"volume": name})
+    if consumers:
+        raise HostedMigrationStateError("migration state volume still has a container consumer")
+    await _docker(volume.remove)
+    return True
+
 
 class HostedMigrationBusyError(HostedMigrationStateError):
     """Expected pre-admission activity refusal, safe to retry unchanged."""
@@ -96,6 +186,13 @@ def replacement_config(old, *, image, environment, operation):
     if not declared.issubset(mounted):
         raise HostedMigrationStateError("unresolved anonymous volume in runtime config")
     for mount in old.attrs.get("Mounts", []):
+        if mount.get("Destination") == MIGRATION_STATE_DIR:
+            if mount.get("Type") != "volume" or not mount.get("RW"):
+                raise HostedMigrationStateError("migration state mount is not a writable Docker volume")
+            # This is a container-private anonymous volume. Never clone its
+            # commit receipt into the next replacement; _hold_runtime_config
+            # declares a fresh empty volume for the new operation.
+            continue
         if mount.get("RW") and mount.get("Destination") != "/home/agent":
             raise HostedMigrationStateError("writable mount outside the backed-up home is unsupported")
         if mount.get("Type") == "volume" and not any(
@@ -118,10 +215,36 @@ def replacement_config(old, *, image, environment, operation):
     return config
 
 
-def _hold_runtime_config(runtime):
-    """Make every pre-CAS replacement inert, independent of storage layout."""
-    held_env = [item for item in runtime.get("Env", []) if not item.startswith("MATRX_MIGRATION_HOLD=")]
-    runtime["Env"] = [*held_env, "MATRX_MIGRATION_HOLD=1"]
+def _hold_runtime_config(runtime, *, state_volume: str, operation: str):
+    """Make every pre-CAS replacement inert with a restart-durable private gate."""
+    held_env = [item for item in runtime.get("Env", []) if not item.startswith((
+        "MATRX_MIGRATION_HOLD=", "MATRX_MIGRATION_COMMIT_MARKER=",
+    ))]
+    runtime["Env"] = [
+        *held_env,
+        "MATRX_MIGRATION_HOLD=1",
+        f"MATRX_MIGRATION_COMMIT_MARKER={migration_commit_marker(operation)}",
+    ]
+    runtime.setdefault("Volumes", {})[MIGRATION_STATE_DIR] = {}
+    host = runtime.setdefault("HostConfig", {})
+    binds = []
+    for bind in host.get("Binds") or []:
+        parts = bind.split(":", 2)
+        if parts[1:2] == [MIGRATION_STATE_DIR]:
+            if parts[0] != state_volume:
+                raise HostedMigrationStateError("migration state bind identity mismatch")
+            continue
+        binds.append(bind)
+    mounts = []
+    for mount in host.get("Mounts") or []:
+        if mount.get("Target") == MIGRATION_STATE_DIR:
+            if mount.get("Type") != "volume" or mount.get("Source") != state_volume:
+                raise HostedMigrationStateError("migration state mount contract mismatch")
+            continue
+        mounts.append(mount)
+    host["Binds"] = [*binds, f"{state_volume}:{MIGRATION_STATE_DIR}:rw"]
+    if "Mounts" in host:
+        host["Mounts"] = mounts
     return runtime
 
 
@@ -589,6 +712,82 @@ async def _wait_migration_state(container, expected, timeout):
     raise HostedMigrationStateError(f"EC2 target did not attest {expected} before activation deadline{detail}")
 
 
+_ACTIVATION_HOME_PREFLIGHT = r'''
+set -eu
+reject_symlink_chain() {
+  path="$1"; current=""
+  old_ifs="$IFS"; IFS=/
+  for part in ${path#/}; do
+    [ -n "$part" ] || continue
+    current="$current/$part"
+    [ ! -L "$current" ] || {
+      echo "required lifecycle path contains a symlink: $current" >&2; IFS="$old_ifs"; exit 45;
+    }
+  done
+  IFS="$old_ifs"
+}
+can_create_under() {
+  parent="$1"
+  while [ ! -e "$parent" ]; do parent="${parent%/*}"; [ -n "$parent" ] || parent=/; done
+  [ -d "$parent" ] && [ -w "$parent" ] && [ -x "$parent" ]
+}
+require_dir_writer() {
+  path="$1"
+  reject_symlink_chain "$path"
+  if [ -e "$path" ]; then
+    [ -d "$path" ] && [ -w "$path" ] && [ -x "$path" ] || {
+      echo "required runtime directory is not agent-writable: $path" >&2; exit 41;
+    }
+  else
+    can_create_under "${path%/*}" || {
+      echo "required runtime directory cannot be created by agent: $path" >&2; exit 42;
+    }
+  fi
+}
+require_file_writer() {
+  path="$1"
+  reject_symlink_chain "$path"
+  if [ -e "$path" ]; then
+    [ -f "$path" ] && [ -w "$path" ] || {
+      echo "required lifecycle file is not agent-writable: $path" >&2; exit 43;
+    }
+  else
+    can_create_under "${path%/*}" || {
+      echo "required lifecycle file cannot be created by agent: $path" >&2; exit 44;
+    }
+  fi
+}
+[ -d /home/agent ] && [ -x /home/agent ] || {
+  echo "mounted agent home is unavailable" >&2; exit 40;
+}
+require_dir_writer /home/agent/.matrx
+require_file_writer /home/agent/.matrx/session-report.md
+require_dir_writer /home/agent/.matrx/locks
+require_dir_writer /home/agent/.matrx/runtime
+if [ -n "${MATRX_AIDREAM_URL:-}" ] && [ -n "${MATRX_AIDREAM_SERVICE_TOKEN:-}" ] \
+   && [ -n "${USER_ID:-}" ] && [ -n "${ORGANIZATION_ID:-}" ]; then
+  require_dir_writer /home/agent/cloud-files
+fi
+'''
+
+
+async def _preflight_activation_home(target) -> dict:
+    """Prove required agent-owned lifecycle paths before irreversible CAS."""
+    result = await _docker(
+        target.exec_run, ["/bin/sh", "-ec", _ACTIVATION_HOME_PREFLIGHT], user="agent",
+    )
+    code = getattr(result, "exit_code", result[0] if isinstance(result, tuple) else None)
+    output = getattr(result, "output", result[1] if isinstance(result, tuple) and len(result) > 1 else b"")
+    if code != 0:
+        reason = output.decode(errors="replace") if isinstance(output, bytes) else str(output or "")
+        reason = " ".join(reason.strip().split())[:500] or "agent write preflight failed"
+        raise HostedMigrationStateError(
+            f"replacement cannot activate required persistence safely: {reason}; "
+            "the original sandbox is unchanged"
+        )
+    return {"target_id": target.id, "agent_lifecycle_paths_writable": True}
+
+
 async def _activate_promoted_target(record, *, target, store, client, journal):
     """Release a post-CAS held target only after its durable pre-CAS proof."""
     if _promotion(record):
@@ -596,6 +795,10 @@ async def _activate_promoted_target(record, *, target, store, client, journal):
             raise HostedMigrationStateError("cannot activate EC2 target without durable postboot verification")
     elif not isinstance(record.get("pre_cas_home_receipt"), dict):
         raise HostedMigrationStateError("cannot activate hosted target without held-home verification")
+    preflight = record.get("activation_home_preflight_receipt")
+    if (not isinstance(preflight, dict) or preflight.get("target_id") != target.id
+            or preflight.get("agent_lifecycle_paths_writable") is not True):
+        raise HostedMigrationStateError("cannot activate target without durable lifecycle-path preflight")
     current = await _current(record, store)
     if current.container_id != target.id:
         raise HostedMigrationStateError("routing changed before target activation")
@@ -615,7 +818,12 @@ async def _activate_promoted_target(record, *, target, store, client, journal):
     await _docker(target.reload)
     if target.status != "running":
         raise HostedMigrationStateError("target did not resume for activation")
-    activated = await _docker(target.exec_run, ["/bin/sh", "-ec", "touch /tmp/.matrx-migration-committed"])
+    activated = await _docker(target.exec_run, [
+        "/bin/sh", "-ec",
+        f"install -d -m 0711 {MIGRATION_STATE_DIR} && "
+        f"touch {migration_commit_marker(record['operation_label'])} && "
+        f"chmod 0444 {migration_commit_marker(record['operation_label'])}",
+    ])
     code = getattr(activated, "exit_code", activated[0] if isinstance(activated, tuple) else None)
     if code != 0:
         raise HostedMigrationStateError("target activation marker could not be written")
@@ -672,51 +880,47 @@ async def _cleanup(record, client, journal, *, committed):
             try:
                 pinned = await _docker(client.images.get, helper_pin)
             except NotFound as exc:
-                raise HostedMigrationStateError("helper pin is absent before durable removal intent") from exc
-            if pinned.id != record["helper_image"]:
-                raise HostedMigrationStateError("helper pin no longer binds the journal helper image")
-            receipts["helper_image_pin_removal_intent"] = expected_intent
-            journal.write(record)
+                creation_intent = record.get("helper_image_pin_creation_intent")
+                if (creation_intent != expected_intent
+                        or isinstance(record.get("helper_image_pin_created"), dict)):
+                    raise HostedMigrationStateError("helper pin is absent before durable removal intent") from exc
+                receipts["helper_image_pin_never_created"] = helper_pin
+                helper_pin = None
+                journal.write(record)
+            if helper_pin:
+                if pinned.id != record["helper_image"]:
+                    raise HostedMigrationStateError("helper pin no longer binds the journal helper image")
+                receipts["helper_image_pin_removal_intent"] = expected_intent
+                journal.write(record)
         elif intent != expected_intent:
             raise HostedMigrationStateError("helper pin removal intent does not bind the journal helper image")
-        try:
-            pinned = await _docker(client.images.get, helper_pin)
-        except NotFound:
-            # A process can die after Docker removes the tag but before it
-            # writes the receipt.  The earlier durable intent is the fence.
-            if receipts.get("helper_image_pin_removal_intent") != expected_intent:
-                raise HostedMigrationStateError("helper pin is absent without durable removal intent")
-            receipts["helper_image_pin_removed"] = helper_pin
-        else:
-            if pinned.id != record["helper_image"]:
-                raise HostedMigrationStateError("helper pin no longer binds the journal helper image")
-            tags = set(getattr(pinned, "tags", None) or (pinned.attrs or {}).get("RepoTags") or ())
-            if helper_pin not in tags:
-                raise HostedMigrationStateError("helper pin is not present in its image tag inventory")
-            references = []
-            if tags == {helper_pin}:
-                references = await _docker(
-                    client.containers.list, all=True, filters={"ancestor": pinned.id},
-                )
-            if references:
-                # Removing the last tag of an in-use image with force can make
-                # the exact image unavailable for a container restart.  Keeping
-                # the operation tag is intentional retention, not failed
-                # cleanup; a later image GC can remove it after the last
-                # container reference disappears.
-                receipts["helper_image_pin_retained"] = {
-                    "pin": helper_pin,
-                    "image": pinned.id,
-                    "reason": "last_tag_in_use",
-                }
-            else:
-                await _docker(
-                    client.images.remove,
-                    helper_pin,
-                    noprune=True,
-                    force=False,
-                )
+        if helper_pin:
+            try:
+                pinned = await _docker(client.images.get, helper_pin)
+            except NotFound:
+                # A process can die after Docker removes the tag but before it
+                # writes the receipt.  The earlier durable intent is the fence.
+                if receipts.get("helper_image_pin_removal_intent") != expected_intent:
+                    raise HostedMigrationStateError("helper pin is absent without durable removal intent")
                 receipts["helper_image_pin_removed"] = helper_pin
+            else:
+                if pinned.id != record["helper_image"]:
+                    raise HostedMigrationStateError("helper pin no longer binds the journal helper image")
+                tags = set(getattr(pinned, "tags", None) or (pinned.attrs or {}).get("RepoTags") or ())
+                if helper_pin not in tags:
+                    raise HostedMigrationStateError("helper pin is not present in its image tag inventory")
+                references = []
+                if tags == {helper_pin}:
+                    references = await _docker(
+                        client.containers.list, all=True, filters={"ancestor": pinned.id},
+                    )
+                if references:
+                    receipts["helper_image_pin_retained"] = {
+                        "pin": helper_pin, "image": pinned.id, "reason": "last_tag_in_use",
+                    }
+                else:
+                    await _docker(client.images.remove, helper_pin, noprune=True, force=False)
+                    receipts["helper_image_pin_removed"] = helper_pin
         journal.write(record)
     if _promotion(record) and not committed:
         try:
@@ -728,6 +932,14 @@ async def _cleanup(record, client, journal, *, committed):
                 raise HostedMigrationStateError("promoted home cleanup ownership mismatch")
             await _docker(volume.remove)
         receipts["promoted_home_removed"] = record["source_volume"]
+    state_intent = record.get("state_volume_creation_intent")
+    if (not committed and isinstance(state_intent, dict)
+            and state_intent.get("name") == record.get("state_volume_name")
+            and not record.get("old_state_volume")):
+        await remove_migration_state_volume(
+            client, record["sandbox_id"], expected_name=record["state_volume_name"],
+        )
+        receipts["migration_state_volume_removed"] = record["state_volume_name"]
     record["cleanup_complete"] = True
     record.pop("last_error", None)
     journal.write(record)
@@ -939,13 +1151,16 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
             else:
                 source = await _docker(client.volumes.get, volume)
                 source_identity = _volume_identity(source)
-            _hold_runtime_config(runtime)
-            # Pin only after every preflight has passed.  Before admission there
-            # is no durable owner/recovery record, so a failed preflight must
-            # never leave an operation tag behind.
-            helper_image_pin = await _pin_helper_image(client, helper_image, operation)
+            state_volume_name = migration_state_volume_name(sandbox_id)
+            old_state_volume = _state_volume_mount(old, sandbox_id)
+            _hold_runtime_config(runtime, state_volume=state_volume_name, operation=operation)
+            stop_timeout = await knob_int("shutdown_timeout_seconds")
+            await _validate_existing_migration_state_volume(client, {
+                "sandbox_id": sandbox_id, "state_volume_name": state_volume_name,
+            })
+            helper_image_pin = f"matrx-migration-helper:{operation}"
             record = {
-                "schema_version": 1, "sandbox_id": sandbox_id, "row_identity": _identity(row),
+                "schema_version": 2, "sandbox_id": sandbox_id, "row_identity": _identity(row),
                 "old_id": old.id, "old_image": old.attrs["Image"], "old_name": old.name.lstrip("/"),
                 "old_process_identity": {"pid": old.attrs["State"]["Pid"], "started_at": old.attrs["State"]["StartedAt"]},
                 "source_volume": volume, "source_identity": source_identity,
@@ -953,9 +1168,17 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
                 "target_version": _version_from_image_attrs(image.attrs), "operation_label": operation,
                 "backup_name": f"matrx-migration-backup-{operation}", "helper_image": helper_image,
                 "helper_image_pin": helper_image_pin,
+                "helper_image_pin_creation_intent": {
+                    "pin": helper_image_pin, "image": helper_image,
+                },
                 "rollback_name": f"{sandbox_id}-old-{operation}", "template": labels.get("matrx.template"),
-                "verify_timeout": verify_timeout, "stop_timeout": await knob_int("shutdown_timeout_seconds"),
+                "verify_timeout": verify_timeout, "stop_timeout": stop_timeout,
                 "source_endpoint": source_endpoint, "row_persistence_volume": row.persistence_volume,
+                "state_volume_name": state_volume_name,
+                "old_state_volume": old_state_volume,
+                "state_volume_creation_intent": {
+                    "name": state_volume_name, "sandbox_id": sandbox_id,
+                },
                 "phase": "admitted",
             }
             if promotion:
@@ -972,6 +1195,15 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
                     pass
             journal.write(record)
             try:
+                record["state_volume_created"] = await _ensure_migration_state_volume(client, record)
+                journal.write(record)
+                pinned = await _pin_helper_image(client, helper_image, operation)
+                if pinned != helper_image_pin:
+                    raise HostedMigrationStateError("helper image pin name differs from durable intent")
+                record["helper_image_pin_created"] = {
+                    "pin": pinned, "image": helper_image,
+                }
+                journal.write(record)
                 await _docker(old.pause)
                 await _docker(old.reload)
                 if old.status != "paused":
@@ -1036,6 +1268,8 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
                 # image is holding user work.  Both storage classes must attest
                 # held before the target is paused and CAS becomes possible.
                 await _wait_migration_state(new, "held", verify_timeout)
+                record["activation_home_preflight_receipt"] = await _preflight_activation_home(new)
+                journal.write(record)
                 record = transition(record, "target_quiesce_intent"); journal.write(record)
                 await _docker(new.pause)
                 await _docker(new.reload)
