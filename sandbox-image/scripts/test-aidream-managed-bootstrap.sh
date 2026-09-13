@@ -10,7 +10,7 @@ scratch="$(cd "$scratch" && pwd -P)"
 trap 'rm -rf "$scratch"' EXIT
 
 template="$scratch/template"
-mkdir -p "$template/aidream" "$scratch/home" "$scratch/cwd"
+mkdir -p "$template/aidream/settings" "$template/config" "$scratch/home" "$scratch/cwd"
 printf 'SENTINEL = "immutable-import"
 ' > "$template/aidream/__init__.py"
 cat > "$template/run.py" <<'PY'
@@ -19,9 +19,29 @@ import os
 import sys
 from pathlib import Path
 
-assert __name__ == "__main__"
+if os.getenv("EXPECT_MAIN"):
+    assert __name__ == "__main__"
 assert sys.path[0] == os.getcwd()
+temp = Path(os.environ["MATRX_TEMP_DIR"])
+for directory in (Path(os.environ["LOG_DIR"]), temp, temp / "reports"):
+    directory.mkdir(parents=True, exist_ok=True)
 Path(os.environ["PROBE_OUT"]).write_text(aidream.SENTINEL, encoding="utf-8")
+PY
+cat > "$template/config/settings.py" <<'PY'
+import os
+from pathlib import Path
+
+temp = Path(os.environ["MATRX_TEMP_DIR"])
+temp.joinpath("logs").mkdir(parents=True, exist_ok=True)
+temp.joinpath("reports").mkdir(parents=True, exist_ok=True)
+Path(os.environ["IMPORT_TRACE"]).open("a", encoding="utf-8").write("config\n")
+PY
+cat > "$template/aidream/settings/__init__.py" <<'PY'
+import os
+from pathlib import Path
+
+Path(os.environ["MATRX_TEMP_DIR"], "logs").mkdir(parents=True, exist_ok=True)
+Path(os.environ["IMPORT_TRACE"]).open("a", encoding="utf-8").write("settings\n")
 PY
 printf 'raise RuntimeError("hostile sitecustomize ran")
 ' > "$scratch/home/sitecustomize.py"
@@ -40,9 +60,44 @@ sed -i.bak \
 rm -f "$bootstrap_copy.bak"
 chmod 0555 "$bootstrap_copy"
 
-PROBE_OUT="$scratch/positive" HOME="$scratch/home" PYTHONPATH="$scratch/cwd" \
+PROBE_OUT="$scratch/positive" MATRX_TEMP_DIR="$scratch/default-temp" LOG_DIR="$scratch/default-log" \
+    EXPECT_MAIN=1 HOME="$scratch/home" PYTHONPATH="$scratch/cwd" \
     "$PYTHON" -I -B "$bootstrap_copy"
 test "$(cat "$scratch/positive")" = "immutable-import"
+
+# Reproduce the released guard gap in an isolated bootstrap copy: run.py alone
+# writes reports but not the temp logs that the two settings writers create.
+old_bootstrap="$scratch/old-bootstrap.py"
+sed 's/for import_file in VERIFY_IMPORT_FILES:/for import_file in ():/g' "$bootstrap_copy" > "$old_bootstrap"
+if PROBE_OUT="$scratch/old-positive" IMPORT_TRACE="$scratch/old-trace" \
+    MATRX_TEMP_DIR="$scratch/old-temp" LOG_DIR="$scratch/old-log" HOME="$scratch/home" PYTHONPATH="$scratch/cwd" \
+    "$PYTHON" -I -B "$old_bootstrap" --verify-imports; then
+    test -d "$scratch/old-temp/reports"
+    test -d "$scratch/old-log"
+    test ! -d "$scratch/old-temp/logs"
+else
+    echo "released run.py-only import check unexpectedly failed" >&2
+    exit 1
+fi
+
+IMPORT_TRACE="$scratch/trace" MATRX_TEMP_DIR="$scratch/temp" LOG_DIR="$scratch/log" HOME="$scratch/home" \
+    PYTHONPATH="$scratch/cwd" PROBE_OUT="$scratch/verify-positive" \
+    "$PYTHON" -I -B "$bootstrap_copy" --verify-imports
+test -d "$scratch/temp/logs"
+test -d "$scratch/temp/reports"
+test -d "$scratch/log"
+test "$(cat "$scratch/trace")" = $'config\nsettings'
+
+# Omit one canonical writer in a scratch copy: the trace forces the guard red.
+omit_bootstrap="$scratch/omit-bootstrap.py"
+sed 's/for import_file in VERIFY_IMPORT_FILES:/for import_file in ():/g' "$bootstrap_copy" > "$omit_bootstrap"
+IMPORT_TRACE="$scratch/omit-trace" MATRX_TEMP_DIR="$scratch/omit-temp" LOG_DIR="$scratch/omit-log" HOME="$scratch/home" \
+    PYTHONPATH="$scratch/cwd" PROBE_OUT="$scratch/omit-positive" \
+    "$PYTHON" -I -B "$omit_bootstrap" --verify-imports
+if [ "$(cat "$scratch/omit-trace" 2>/dev/null || true)" = $'config\nsettings' ]; then
+    echo "expected omitted startup writers to fail trace guard" >&2
+    exit 1
+fi
 
 # A symlinked root must be refused even though it points at the same fixture.
 ln -s "$template" "$scratch/template-link"

@@ -18,6 +18,10 @@ from pathlib import Path
 
 TEMPLATE_ROOT = Path("/opt/aidream-template")
 RUN_FILE = TEMPLATE_ROOT / "run.py"
+VERIFY_IMPORT_FILES = (
+    TEMPLATE_ROOT / "config" / "settings.py",
+    TEMPLATE_ROOT / "aidream" / "settings" / "__init__.py",
+)
 
 
 def _refuse(message: str) -> None:
@@ -60,6 +64,9 @@ def main() -> None:
     _require_plain_directory(Path("/opt"))
     _require_plain_directory(TEMPLATE_ROOT)
     _require_plain_file(RUN_FILE)
+    if sys.argv[1:] == ["--verify-imports"]:
+        for import_file in VERIFY_IMPORT_FILES:
+            _require_plain_file(import_file)
     _require_read_only_root()
     if TEMPLATE_ROOT.resolve(strict=True) != TEMPLATE_ROOT:
         _refuse(f"trusted root resolves elsewhere: {TEMPLATE_ROOT}")
@@ -69,10 +76,12 @@ def main() -> None:
     os.chdir(TEMPLATE_ROOT)
     sys.path.insert(0, os.fspath(TEMPLATE_ROOT))
     if sys.argv[1:] == ["--verify-imports"]:
-        # Build-time forcing guard: execute the real run.py import chain, but
-        # do not bind a server or require deployment credentials in docker
-        # build verification.  The production invocation below keeps __main__.
+        # Build-time forcing guard: execute all three startup writers without
+        # binding a server or requiring deployment credentials. The production
+        # invocation below keeps run.py's __main__ semantics.
         runpy.run_path(os.fspath(RUN_FILE))
+        for import_file in VERIFY_IMPORT_FILES:
+            runpy.run_path(os.fspath(import_file))
         return
     if len(sys.argv) != 1:
         _refuse("unsupported arguments")
