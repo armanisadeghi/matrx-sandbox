@@ -686,16 +686,37 @@ async def _cleanup(record, client, journal, *, committed):
             # writes the receipt.  The earlier durable intent is the fence.
             if receipts.get("helper_image_pin_removal_intent") != expected_intent:
                 raise HostedMigrationStateError("helper pin is absent without durable removal intent")
+            receipts["helper_image_pin_removed"] = helper_pin
         else:
             if pinned.id != record["helper_image"]:
                 raise HostedMigrationStateError("helper pin no longer binds the journal helper image")
-            # The operation-scoped tag may resolve to the same immutable image
-            # that is running the orchestrator.  At this point the exact tag,
-            # digest, and durable removal intent have all been verified.  Force
-            # is therefore required only to untag this alias; Docker retains the
-            # image layers while a running container still references them.
-            await _docker(client.images.remove, helper_pin, noprune=True, force=True)
-        receipts["helper_image_pin_removed"] = helper_pin
+            tags = set(getattr(pinned, "tags", None) or (pinned.attrs or {}).get("RepoTags") or ())
+            if helper_pin not in tags:
+                raise HostedMigrationStateError("helper pin is not present in its image tag inventory")
+            references = []
+            if tags == {helper_pin}:
+                references = await _docker(
+                    client.containers.list, all=True, filters={"ancestor": pinned.id},
+                )
+            if references:
+                # Removing the last tag of an in-use image with force can make
+                # the exact image unavailable for a container restart.  Keeping
+                # the operation tag is intentional retention, not failed
+                # cleanup; a later image GC can remove it after the last
+                # container reference disappears.
+                receipts["helper_image_pin_retained"] = {
+                    "pin": helper_pin,
+                    "image": pinned.id,
+                    "reason": "last_tag_in_use",
+                }
+            else:
+                await _docker(
+                    client.images.remove,
+                    helper_pin,
+                    noprune=True,
+                    force=len(tags) > 1,
+                )
+                receipts["helper_image_pin_removed"] = helper_pin
         journal.write(record)
     if _promotion(record) and not committed:
         try:
