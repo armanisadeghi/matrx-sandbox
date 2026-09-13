@@ -6,6 +6,7 @@ import os
 import shutil
 import subprocess
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -120,3 +121,24 @@ def test_root_artifact_hash_verification_rejects_mutation(monkeypatch, tmp_path)
     digest = hashlib.sha256(artifact.read_bytes()).hexdigest()
     with pytest.raises(copy.Ec2HomeCopyError, match="root owned"):
         copy.verify_root_artifact(str(artifact), digest)
+
+
+def test_root_copy_lock_is_reowned_to_journal_identity(monkeypatch):
+    changed = []
+    directory = SimpleNamespace(st_uid=1000, st_gid=1000)
+    root_lock = SimpleNamespace(st_mode=0o100600, st_nlink=1, st_uid=0, st_gid=0)
+    monkeypatch.setattr(copy.os, "fstat", lambda _fd: root_lock)
+    monkeypatch.setattr(copy.os, "fchown", lambda fd, uid, gid: changed.append((fd, uid, gid)))
+
+    copy._normalize_copy_lock(17, directory, "copy-operation.lock")
+
+    assert changed == [(17, 1000, 1000)]
+
+
+def test_copy_lock_rejects_unrelated_owner(monkeypatch):
+    directory = SimpleNamespace(st_uid=1000, st_gid=1000)
+    foreign = SimpleNamespace(st_mode=0o100600, st_nlink=1, st_uid=2000, st_gid=2000)
+    monkeypatch.setattr(copy.os, "fstat", lambda _fd: foreign)
+
+    with pytest.raises(copy.Ec2HomeCopyError, match="incompatible owner"):
+        copy._normalize_copy_lock(17, directory, "copy-operation.lock")

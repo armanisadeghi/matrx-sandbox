@@ -25,6 +25,8 @@ _ENV = "/usr/bin/env"
 _LIBEXEC = "/usr/local/libexec/matrx-ec2-home-copy"
 _ID = re.compile(r"^[0-9a-f]{64}$")
 _OP_KEYS = frozenset(("schema_version", "operation", "source_container_id", "source_image", "source_pid", "source_started_at", "source_overlay_identity", "target_volume", "target_created_at"))
+_JOURNAL_DIR = "/var/lib/matrx-sandbox/hosted-migrations"
+_COPY_LOCK = re.compile(r"^copy-[A-Za-z0-9][A-Za-z0-9_.-]{0,200}\.lock$")
 
 
 class Ec2HomeCopyError(RuntimeError):
@@ -33,6 +35,56 @@ class Ec2HomeCopyError(RuntimeError):
 
 def _fail(message: str) -> None:
     raise Ec2HomeCopyError(message)
+
+
+def _normalize_copy_lock(fd: int, directory: os.stat_result, name: str) -> None:
+    """Make a root-helper lock readable by the service identity, safely.
+
+    The root-only copy helper and the unprivileged orchestrator share this lock
+    namespace. Root may create the inode, but ownership must match the journal
+    directory before the service or release holder can reopen it.
+    """
+    value = os.fstat(fd)
+    if not stat.S_ISREG(value.st_mode) or value.st_nlink != 1:
+        _fail(f"copy lock is not one safe regular inode: {name}")
+    if stat.S_IMODE(value.st_mode) != 0o600:
+        _fail(f"copy lock has incompatible mode: {name}")
+    expected = (directory.st_uid, directory.st_gid)
+    owner = (value.st_uid, value.st_gid)
+    if owner == (0, 0) and owner != expected:
+        os.fchown(fd, *expected)
+    elif owner != expected:
+        _fail(f"copy lock has incompatible owner: {name}")
+
+
+def normalize_copy_locks(root: str = _JOURNAL_DIR) -> None:
+    """Repair only canonical root-helper lock ownership before release admission."""
+    directory_fd = os.open(
+        root, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_NONBLOCK
+    )
+    try:
+        directory = os.fstat(directory_fd)
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                if not _COPY_LOCK.fullmatch(entry.name):
+                    continue
+                fd = os.open(
+                    entry.name,
+                    os.O_RDWR | os.O_NOFOLLOW | os.O_NONBLOCK,
+                    dir_fd=directory_fd,
+                )
+                try:
+                    named = os.stat(
+                        entry.name, dir_fd=directory_fd, follow_symlinks=False
+                    )
+                    opened = os.fstat(fd)
+                    if (opened.st_dev, opened.st_ino) != (named.st_dev, named.st_ino):
+                        _fail(f"copy lock changed while opening: {entry.name}")
+                    _normalize_copy_lock(fd, directory, entry.name)
+                finally:
+                    os.close(fd)
+    finally:
+        os.close(directory_fd)
 
 
 def _canon(value: Any) -> str:
@@ -234,9 +286,12 @@ def perform_copy(value: Any) -> dict[str, Any]:
     op = _operation(value)
     # Survives an orchestrator process crash. Recovery takes the same lock
     # before it may unpause the source or clean the isolated target volume.
-    fd = os.open("/var/lib/matrx-sandbox/hosted-migrations/copy-" + op["operation"] + ".lock",
+    lock_name = "copy-" + op["operation"] + ".lock"
+    fd = os.open(_JOURNAL_DIR + "/" + lock_name,
                  os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o600)
     try:
+        directory = os.stat(_JOURNAL_DIR, follow_symlinks=False)
+        _normalize_copy_lock(fd, directory, lock_name)
         fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
         return _perform_copy_locked(op)
     finally:
@@ -358,6 +413,7 @@ def main() -> int:
     if sys.argv[1:] == ["--preflight"]:
         if os.geteuid() != 0:
             _fail("home-copy helper must run as root")
+        normalize_copy_locks()
         for command in (["/usr/bin/tar", "--version"], ["/usr/bin/getfacl", "--version"], [_DOCKER, "version", "--format", "{{.Server.Version}}"]):
             subprocess.run(command, stdin=subprocess.DEVNULL, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, check=True)
         print("EC2_HOME_COPY_READY")
