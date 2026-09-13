@@ -8,8 +8,11 @@ import pytest
 
 from orchestrator.hosted_migration import HostedMigrationStateError
 from orchestrator.hosted_runtime import (
+    _ACTIVATION_MARKER_WRITER,
     MIGRATION_STATE_DIR,
     _ACTIVATION_HOME_PREFLIGHT,
+    _activation_marker_command,
+    _bounded_exec_failure,
     _cleanup,
     _preflight_activation_home,
     migration_state_volume_name,
@@ -25,6 +28,63 @@ def test_restart_gate_is_outside_every_aidream_tmpfs():
         MIGRATION_STATE_DIR != mount and not MIGRATION_STATE_DIR.startswith(mount.rstrip("/") + "/")
         for mount in tmpfs
     )
+
+
+def test_activation_marker_writer_uses_pinned_python_and_refuses_symlink(tmp_path):
+    """Root control write cannot load agent PATH/PYTHONPATH or follow a marker symlink."""
+    command = _activation_marker_command("a" * 32)
+    assert command[0] == "/usr/bin/python3"
+    assert command[1:3] == ["-I", "-S"]
+    state = tmp_path / "state"
+    state.mkdir(mode=0o755)
+    marker = "a" * 32 + ".committed"
+    injected = tmp_path / "sitecustomize.py"
+    injected_receipt = tmp_path / "sitecustomize-ran"
+    injected.write_text(
+        "from pathlib import Path\n"
+        f"Path({str(injected_receipt)!r}).write_text('root startup code ran')\n"
+    )
+    isolated_environment = {
+        "PATH": str(tmp_path),
+        "PYTHONPATH": str(tmp_path),
+        "PYTHONHOME": str(tmp_path / "fake-python-home"),
+    }
+    result = subprocess.run(
+        [__import__("sys").executable, *command[1:3], "-c", _ACTIVATION_MARKER_WRITER, str(state), marker],
+        env=isolated_environment,
+        text=True,
+        capture_output=True,
+    )
+    assert result.returncode == 0, result.stderr
+    assert injected_receipt.exists() is False
+    assert (state / marker).stat().st_mode & 0o777 == 0o444
+    # The exact regular marker is idempotent for recovery after a lost ack.
+    assert subprocess.run(
+        [__import__("sys").executable, *command[1:3], "-c", _ACTIVATION_MARKER_WRITER, str(state), marker],
+        env=isolated_environment,
+        capture_output=True,
+    ).returncode == 0
+
+    (state / marker).unlink()
+    protected = tmp_path / "protected"
+    protected.write_text("unchanged\n")
+    (state / marker).symlink_to(protected)
+    refused = subprocess.run(
+        [__import__("sys").executable, *command[1:3], "-c", _ACTIVATION_MARKER_WRITER, str(state), marker],
+        env=isolated_environment,
+        text=True,
+        capture_output=True,
+    )
+    assert refused.returncode != 0
+    assert protected.read_text() == "unchanged\n"
+
+
+def test_activation_marker_failure_preserves_bounded_stderr_or_exit_code():
+    assert _bounded_exec_failure((47, b" permission denied\nfor state volume "), 47) == (
+        "permission denied for state volume"
+    )
+    assert _bounded_exec_failure((52, b""), 52) == "exit code 52"
+    assert len(_bounded_exec_failure((1, b"x" * 600), 1)) == 500
 
 
 def test_activation_preflight_rejects_symlink_to_protected_content(tmp_path):

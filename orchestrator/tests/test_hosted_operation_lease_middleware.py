@@ -3,10 +3,12 @@ from __future__ import annotations
 
 import asyncio
 import multiprocessing
+from contextlib import ExitStack
 from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
+from httpx import ASGITransport, AsyncClient
 
 from orchestrator.hosted_migration import HostedMigrationJournal, HostedMigrationStateError
 from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease
@@ -284,3 +286,102 @@ async def test_legacy_null_volume_derives_authoritative_user_home(hosted, monkey
     _wire(monkeypatch, hosted, rows)
     async def good(scope, receive, send): await send({"type": "http.response.start", "status": 200, "headers": []})
     assert (await _call(HostedOperationLeaseMiddleware(good), {"type": "http", "path": "/sandboxes/box/exec"}))[0]["status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_authenticated_migration_status_observes_active_operation_without_unlocking_tools(
+    hosted,
+    monkeypatch,
+):
+    """Status observes the operation whose process and filesystem fences deny tools."""
+    from orchestrator import activity, migration_operations
+    from orchestrator.main import app
+
+    sandbox_id = "sbx-status-observer"
+    operation_id = "1" * 32
+    api_key = "status-observer-master-key"
+    row = SimpleNamespace(
+        sandbox_id=sandbox_id,
+        persistence_volume="home-status-observer",
+        user_id="11111111-1111-4111-8111-111111111111",
+        tier="hosted",
+    )
+
+    async def store_get(received_id):
+        return row if received_id == sandbox_id else None
+
+    monkeypatch.setattr(middleware_module, "_get_store", lambda: SimpleNamespace(get=store_get))
+    monkeypatch.setattr(middleware_module.settings, "host_tier", "hosted")
+    monkeypatch.setattr(middleware_module.settings, "api_key", api_key)
+    monkeypatch.setattr(
+        "orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: hosted,
+    )
+    monkeypatch.setattr(migration_operations, "HostedMigrationJournal", lambda: hosted)
+
+    record = _record(sandbox_id, "home-status-observer")
+    record.update(operation_label=operation_id)
+    hosted.write(record)
+
+    entered = asyncio.Event()
+    release = asyncio.Event()
+
+    async def held_operation():
+        assert await activity.mark_migrating(sandbox_id) is True
+        try:
+            with ExitStack() as locks:
+                locks.enter_context(hosted.lock(sandbox_id))
+                locks.enter_context(hosted.lock("volume-home-status-observer"))
+                entered.set()
+                await release.wait()
+            return {"status": "migrated", "sandbox_id": sandbox_id}
+        finally:
+            await activity.release_migration(sandbox_id)
+
+    owner = asyncio.create_task(
+        migration_operations.run_owned_operation(
+            sandbox_id, operation_id, held_operation,
+        )
+    )
+    await entered.wait()
+    transport = ASGITransport(app=app)
+    try:
+        async with AsyncClient(transport=transport, base_url="http://test") as client:
+            status = await client.get(
+                f"/sandboxes/{sandbox_id}/migration?operation_id={operation_id}",
+                headers={"X-API-Key": api_key},
+            )
+            wrong_operation = await client.get(
+                f"/sandboxes/{sandbox_id}/migration?operation_id={'2' * 32}",
+                headers={"X-API-Key": api_key},
+            )
+            unauthenticated = await client.get(
+                f"/sandboxes/{sandbox_id}/migration?operation_id={operation_id}",
+            )
+            tool = await client.post(
+                f"/sandboxes/{sandbox_id}/exec",
+                headers={"X-API-Key": api_key},
+                json={"command": "true"},
+            )
+
+        assert status.status_code == 200
+        assert status.json() == {
+            "sandbox_id": sandbox_id,
+            "operation_id": operation_id,
+            "outcome": "in_progress",
+            "execution_state": "running",
+            "phase": "admitted",
+        }
+        assert wrong_operation.status_code == 200
+        assert wrong_operation.json() == {
+            "sandbox_id": sandbox_id,
+            "operation_id": "2" * 32,
+            "outcome": "idle",
+            "execution_state": "none",
+            "phase": "idle",
+        }
+        assert unauthenticated.status_code == 401
+        assert tool.status_code == 503
+        assert tool.headers["retry-after"] == "1"
+    finally:
+        release.set()
+        await owner

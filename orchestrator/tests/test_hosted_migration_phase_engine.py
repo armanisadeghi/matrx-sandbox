@@ -1000,32 +1000,41 @@ async def test_promoted_activation_waits_for_active_attestation_and_advances_sha
     """Break caught: a held HTTP-200 target was committed/cleaned before its daemon activated."""
     journal = HostedMigrationJournal(tmp_path)
     store = InMemorySandboxStore()
+    sandbox_id = "sbx-activation"
     user_id = "00000000-0000-4000-8000-000000000001"
     organization_id = "22222222-2222-4222-8222-222222222222"
     row = SandboxResponse(
-        sandbox_id="sbx", user_id=user_id, organization_id=organization_id, status=SandboxStatus.READY,
-        container_id="new", persistence_volume="matrx-ec2-home-sbx", created_at=datetime.now(timezone.utc),
+        sandbox_id=sandbox_id, user_id=user_id, organization_id=organization_id, status=SandboxStatus.READY,
+        container_id="new", persistence_volume=f"matrx-ec2-home-{sandbox_id}", created_at=datetime.now(timezone.utc),
     )
     await store.save(row)
     record = dict(
         _base(), phase="commit_intent", target_id="new", backup_receipt={"verified": True, "manifest_sha256": "digest"},
-        storage_kind="ec2_writable_layer", source_home_key="layer-sbx", source_graph_driver={},
-        source_volume="matrx-ec2-home-sbx", source_identity={"name": "matrx-ec2-home-sbx"},
+        sandbox_id=sandbox_id, old_name=sandbox_id,
+        storage_kind="ec2_writable_layer", source_home_key=f"layer-{sandbox_id}", source_graph_driver={},
+        source_volume=f"matrx-ec2-home-{sandbox_id}", source_identity={"name": f"matrx-ec2-home-{sandbox_id}"},
         postboot_verified_receipt={
             "ok": True, "operation": "op", "target_id": "new",
             "target_image": "sha256:" + "b" * 64, "manifest_sha256": "digest",
         }, verify_timeout=2,
     )
-    record["row_identity"] = {"sandbox_id": "sbx", "user_id": user_id, "organization_id": organization_id, "created_at": str(row.created_at)}
+    record["row_identity"] = {"sandbox_id": sandbox_id, "user_id": user_id, "organization_id": organization_id, "created_at": str(row.created_at)}
+    record["state_volume_name"] = f"matrx-migration-state-{sandbox_id}"
     journal.write(record)
 
+    marker_calls = []
     class Target:
         id = "new"
         status = "paused"
-        attrs = {"Mounts": [{"Type": "volume", "Name": "matrx-ec2-home-sbx", "Destination": "/home/agent", "RW": True}]}
+        attrs = {"Mounts": [
+            {"Type": "volume", "Name": f"matrx-ec2-home-{sandbox_id}", "Destination": "/home/agent", "RW": True},
+            {"Type": "volume", "Name": f"matrx-migration-state-{sandbox_id}", "Destination": "/var/lib/matrx-migration", "RW": True},
+        ]}
         def reload(self): pass
         def unpause(self): self.status = "running"
-        def exec_run(self, _command): return (0, b"")
+        def exec_run(self, command, **kwargs):
+            marker_calls.append((command, kwargs))
+            return (0, b"")
 
     states = iter(["held", "held", "active"])
     async def state(_target): return next(states)
@@ -1038,8 +1047,9 @@ async def test_promoted_activation_waits_for_active_attestation_and_advances_sha
     await _activate_promoted_target(record, target=Target(), store=store, client=object(), journal=journal)
     assert record["phase"] == "committed"
     assert record["activation_receipt"] == {"target_id": "new", "migration_state": "active"}
+    assert marker_calls[0][1] == {"user": "root"}
     _record_error(record, journal, RuntimeError("after activation"))
-    assert journal.read("sbx")["phase"] == "committed"
+    assert journal.read(sandbox_id)["phase"] == "committed"
 
 
 @pytest.mark.asyncio
@@ -1056,6 +1066,7 @@ async def test_promoted_activation_refuses_conflicting_persisted_home_before_unp
                 "target_image": "sha256:" + "b" * 64, "manifest_sha256": "digest"})
     record["row_identity"] = {"sandbox_id": "sbx", "user_id": row.user_id,
                               "organization_id": row.organization_id, "created_at": str(row.created_at)}
+    record["state_volume_name"] = "matrx-migration-state-sbx"
     class Target:
         id, status, unpause_calls = "new", "paused", 0
         def reload(self): pass
@@ -1070,20 +1081,29 @@ async def test_promoted_activation_refuses_conflicting_persisted_home_before_unp
 async def test_hosted_activation_preserves_legacy_null_row_home_while_validating_named_mount(monkeypatch, tmp_path):
     """Break caught: hosted CAS rewrote legacy NULL persistence_volume to a physical Docker volume."""
     journal, store = HostedMigrationJournal(tmp_path), InMemorySandboxStore()
-    row = SandboxResponse(sandbox_id="sbx", user_id="00000000-0000-4000-8000-000000000001", organization_id="22222222-2222-4222-8222-222222222222", status=SandboxStatus.READY,
+    sandbox_id = "sbx-activation"
+    row = SandboxResponse(sandbox_id=sandbox_id, user_id="00000000-0000-4000-8000-000000000001", organization_id="22222222-2222-4222-8222-222222222222", status=SandboxStatus.READY,
         container_id="new", persistence_volume=None, created_at=datetime.now(timezone.utc))
     await store.save(row)
-    record = dict(_base(), phase="commit_intent", target_id="new", backup_receipt={"verified": True},
+    record = dict(_base(), sandbox_id=sandbox_id, old_name=sandbox_id,
+                  phase="commit_intent", target_id="new", backup_receipt={"verified": True},
                   source_volume="matrx-user-physical", source_identity={"name": "matrx-user-physical"},
                   row_persistence_volume=None)
-    record["row_identity"] = {"sandbox_id": "sbx", "user_id": row.user_id,
+    record["row_identity"] = {"sandbox_id": sandbox_id, "user_id": row.user_id,
                               "organization_id": row.organization_id, "created_at": str(row.created_at)}
+    record["state_volume_name"] = f"matrx-migration-state-{sandbox_id}"
+    marker_calls = []
     class Target:
         id, status = "new", "paused"
-        attrs = {"Mounts": [{"Type": "volume", "Name": "matrx-user-physical", "Destination": "/home/agent", "RW": True}]}
+        attrs = {"Mounts": [
+            {"Type": "volume", "Name": "matrx-user-physical", "Destination": "/home/agent", "RW": True},
+            {"Type": "volume", "Name": f"matrx-migration-state-{sandbox_id}", "Destination": "/var/lib/matrx-migration", "RW": True},
+        ]}
         def reload(self): pass
         def unpause(self): self.status = "running"
-        def exec_run(self, _): return (0, b"")
+        def exec_run(self, command, **kwargs):
+            marker_calls.append((command, kwargs))
+            return (0, b"")
     async def ready(*_args, **_kwargs): return True
     async def state(_target): return "active"
     async def cleanup(*_args, **_kwargs): return None
@@ -1091,7 +1111,8 @@ async def test_hosted_activation_preserves_legacy_null_row_home_while_validating
     monkeypatch.setattr("orchestrator.hosted_runtime._migration_state", state)
     monkeypatch.setattr("orchestrator.hosted_runtime._cleanup", cleanup)
     await _activate_promoted_target(record, target=Target(), store=store, client=object(), journal=journal)
-    assert (await store.get("sbx")).persistence_volume is None
+    assert (await store.get(sandbox_id)).persistence_volume is None
+    assert marker_calls[0][1] == {"user": "root"}
 
 
 @pytest.mark.asyncio

@@ -30,6 +30,51 @@ from orchestrator.hosted_migration import (
 
 MIGRATION_STATE_DIR = "/var/lib/matrx-migration"
 
+_ACTIVATION_MARKER_WRITER = r"""
+import os
+import stat
+import sys
+
+directory, name = sys.argv[1:]
+directory_fd = os.open(directory, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+try:
+    root = os.fstat(directory_fd)
+    if (
+        not stat.S_ISDIR(root.st_mode)
+        or root.st_uid != os.geteuid()
+        or root.st_gid != os.getegid()
+        or stat.S_IMODE(root.st_mode) & 0o022
+    ):
+        raise RuntimeError("migration state directory ownership/mode is unsafe")
+    try:
+        marker_fd = os.open(
+            name,
+            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+            0o444,
+            dir_fd=directory_fd,
+        )
+    except FileExistsError:
+        marker_fd = os.open(name, os.O_RDONLY | os.O_NOFOLLOW, dir_fd=directory_fd)
+    try:
+        os.fchmod(marker_fd, 0o444)
+        os.fsync(marker_fd)
+        marker = os.fstat(marker_fd)
+        if (
+            not stat.S_ISREG(marker.st_mode)
+            or marker.st_uid != os.geteuid()
+            or marker.st_gid != os.getegid()
+            or stat.S_IMODE(marker.st_mode) != 0o444
+            or marker.st_nlink != 1
+            or marker.st_size != 0
+        ):
+            raise RuntimeError("migration activation marker identity is unsafe")
+    finally:
+        os.close(marker_fd)
+    os.fsync(directory_fd)
+finally:
+    os.close(directory_fd)
+"""
+
 
 def migration_state_volume_name(sandbox_id: str) -> str:
     """Return the exact orchestrator-owned restart gate volume for one sandbox."""
@@ -42,6 +87,29 @@ def migration_commit_marker(operation: str) -> str:
     if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,127}", operation):
         raise HostedMigrationStateError("migration operation cannot name commit marker")
     return f"{MIGRATION_STATE_DIR}/{operation}.committed"
+
+
+def _activation_marker_command(operation: str) -> list[str]:
+    marker = Path(migration_commit_marker(operation)).name
+    return [
+        "/usr/bin/python3",
+        "-I",
+        "-S",
+        "-c",
+        _ACTIVATION_MARKER_WRITER,
+        MIGRATION_STATE_DIR,
+        marker,
+    ]
+
+
+def _bounded_exec_failure(result, code) -> str:
+    output = getattr(
+        result,
+        "output",
+        result[1] if isinstance(result, tuple) and len(result) > 1 else b"",
+    )
+    reason = output.decode(errors="replace") if isinstance(output, bytes) else str(output or "")
+    return " ".join(reason.strip().split())[:500] or f"exit code {code}"
 
 
 def _state_volume_mount(container, sandbox_id: str) -> str | None:
@@ -874,6 +942,12 @@ async def _activate_promoted_target(record, *, target, store, client, journal):
         record.update(next_record)
         journal.write(record)
     await _docker(target.reload)
+    expected_state_volume = record.get("state_volume_name")
+    if (
+        not isinstance(expected_state_volume, str)
+        or _state_volume_mount(target, record["sandbox_id"]) != expected_state_volume
+    ):
+        raise HostedMigrationStateError("target migration state mount identity is unavailable")
     if target.status == "paused":
         await _docker(target.unpause)
     elif target.status != "running":
@@ -881,15 +955,17 @@ async def _activate_promoted_target(record, *, target, store, client, journal):
     await _docker(target.reload)
     if target.status != "running":
         raise HostedMigrationStateError("target did not resume for activation")
-    activated = await _docker(target.exec_run, [
-        "/bin/sh", "-ec",
-        f"install -d -m 0711 {MIGRATION_STATE_DIR} && "
-        f"touch {migration_commit_marker(record['operation_label'])} && "
-        f"chmod 0444 {migration_commit_marker(record['operation_label'])}",
-    ])
+    activated = await _docker(
+        target.exec_run,
+        _activation_marker_command(record["operation_label"]),
+        user="root",
+    )
     code = getattr(activated, "exit_code", activated[0] if isinstance(activated, tuple) else None)
     if code != 0:
-        raise HostedMigrationStateError("target activation marker could not be written")
+        raise HostedMigrationStateError(
+            "target activation marker could not be written: "
+            f"{_bounded_exec_failure(activated, code)}"
+        )
     if not await _ready(target, record, target=True):
         raise HostedMigrationStateError("target did not become ready after activation")
     await _wait_migration_state(target, "active", record["verify_timeout"])

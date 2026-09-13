@@ -26,6 +26,18 @@ def _sandbox_id(scope: dict) -> str | None:
     # These endpoints acquire the migration's exclusive locks themselves.
     if scope.get("method") == "DELETE":
         return None
+    # The correlated status projection is the one per-sandbox observation
+    # endpoint that must remain reachable while this exact migration owns the
+    # process-local reservation and exclusive filesystem locks. It reads the
+    # atomically replaced journal without touching the sandbox runtime/home.
+    # Keep this method and path exact: tool, stream, and mutation routes still
+    # participate in the migration fence, and auth remains downstream.
+    if (
+        scope.get("method") == "GET"
+        and len(parts) == 4
+        and parts[3] == "migration"
+    ):
+        return None
     if len(parts) >= 4 and parts[3] in _SELF_LOCKING_ACTIONS:
         return None
     return parts[2]
