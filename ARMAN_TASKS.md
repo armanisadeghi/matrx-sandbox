@@ -1,4 +1,6 @@
-# Arman's Tasks
+# Historical setup worksheet
+
+**Historical material, not an active task list or operational runbook.** September 13, 2026 — restoration root: the commands and inventory below describe earlier setup and must not be executed as current instructions. Public TCP8000 is closed; the retired database project must never receive writes; broad Docker pruning can erase retained user data. Current operations are in [docs/OPERATIONS.md](docs/OPERATIONS.md), and current routing, preservation and remaining work are in [sandbox STATE](../common-docs/systems/infrastructure/sandboxes/STATE.md) and [REGISTER](../common-docs/systems/infrastructure/sandboxes/REGISTER.md). No task in this historical worksheet is being assigned to Arman.
 
 ## Completed
 

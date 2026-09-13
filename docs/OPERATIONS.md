@@ -2,16 +2,18 @@
 
 Operational runbook for the two sandbox tiers. For architecture (storage tiers, lifecycle, deploy pipeline) see [ARCHITECTURE.md](ARCHITECTURE.md). For the HTTP API see [SANDBOX_CLIENT_GUIDE.md](../SANDBOX_CLIENT_GUIDE.md).
 
+Current cross-repository routing and preservation contract: [sandbox STATE](../../common-docs/systems/infrastructure/sandboxes/STATE.md). September 13, 2026 — restoration root corrected public transport, storage and unsafe cleanup guidance. Use the approved deployment path; never restart a control process around an active image-update operation or bypass its deployment lock.
+
 ---
 
 ## The two tiers
 
 | | EC2 tier | Hosted tier |
 |---|---|---|
-| Orchestrator URL | `http://54.144.86.132:8000` | `https://orchestrator.dev.codematrx.com` |
-| Code | `/srv/projects/matrx-sandbox/orchestrator/` (same repo, same code) | same |
+| Orchestrator URL | `https://sandbox-orchestrator.matrxserver.com` | `https://orchestrator.dev.codematrx.com` |
+| Code | `/home/ec2-user/orchestrator/` (native systemd service) | `/srv/projects/matrx-sandbox/orchestrator/` (container build source) |
 | Where it lives | EC2 instance, single host | This server (`/srv/apps/sandbox-orchestrator/`) |
-| Sandbox storage | S3 hot-sync + FUSE cold | Docker named volumes per sandbox |
+| Sandbox storage | Template-specific retained homes; S3/FUSE only where the actual template provides it | Per-user Docker named volumes shared by that user's hosted sandboxes |
 | Sandbox image | `matrx-sandbox:latest` (production build, no ttyd) | `matrx-sandbox:local` (adds ttyd for browser shells) |
 | Metadata store | Supabase Postgres (`sandbox_instances` table, RLS per user) | Supabase Postgres — the SAME shared `sandbox_instances` table as EC2 (tier-scoped). State survives restarts. |
 | Default TTL | 7200 s (2 h), auto-shutdown | 7200 s (extendable; sessions can stay alive indefinitely if pinged) |
@@ -148,7 +150,7 @@ docker exec sandbox-1 netstat -tlnp | grep :8000
 docker exec sandbox-1 curl -sS http://127.0.0.1:8000/docs | head -5
 ```
 
-Existing dynamically-spawned sandboxes (`sbx-*`) keep their old image until destroyed and recreated — this is by design so in-flight user sessions aren't disrupted. Force a refresh by destroying them via the API.
+Existing dynamically-spawned sandboxes (`sbx-*`) keep their old image during normal deployment. Use the explicit image-update path with its preservation and interruption checks only after the target release passes independent acceptance; consult the current sandbox STATE for open gates. Destroying a sandbox is not a safe image-refresh substitute. Never upgrade the user fleet or interrupt a shared-home sibling to clear drift.
 
 ### Killing a zombie sandbox
 
@@ -162,11 +164,9 @@ docker ps -a --filter name=$SANDBOX_ID
 curl -X DELETE -H "X-API-Key: $KEY" \
   "https://orchestrator.dev.codematrx.com/sandboxes/$SANDBOX_ID?graceful=false"
 
-# 3. If the orchestrator is unhappy, kill the container directly.
-#    NOTE: zombie containers (row terminal, container alive) are auto-reaped
-#    by the orchestrator every 60s sweep — manual removal is only needed if
-#    the orchestrator itself is down.
-docker rm -f $SANDBOX_ID
+# 3. If the orchestrator is unavailable, inspect its health and recovery state.
+#    Do not bypass lifecycle/migration locks with direct container removal.
+#    Retained containers may hold the only copy of user home data.
 
 # 4. Restarting the orchestrator does NOT lose state (Postgres-backed store;
 #    boot reconcile + zombie reap resync it against docker ps).
@@ -236,8 +236,8 @@ The pipeline:
 ### Verify EC2 has the latest code
 
 ```bash
-curl -H "X-API-Key: $KEY" http://54.144.86.132:8000/            # source_sha + version
-curl -H "X-API-Key: $KEY" http://54.144.86.132:8000/api-surface # exact contract
+curl -H "X-API-Key: $KEY" https://sandbox-orchestrator.matrxserver.com/            # source_sha + version
+curl -H "X-API-Key: $KEY" https://sandbox-orchestrator.matrxserver.com/api-surface # exact contract
 ```
 
 If `version` is older than the latest tag in `git log --oneline`, the pipeline either failed or didn't trigger. Check:
@@ -315,7 +315,7 @@ User data persists across sandbox lifecycle. Two storage backends, depending on 
 
 | Tier | Backend | Path |
 |---|---|---|
-| EC2 | S3 prefix per user | `s3://matrx-sandbox-storage-prod-2024/users/{user_id}/{hot,cold}/` |
+| EC2 | Template-specific retained home | Inspect the exact sandbox mounts; a tier label or S3 bucket is not proof of home backup |
 | Hosted | Per-user Docker volume | `matrx-user-<uid>` mounted at `/home/agent` |
 
 Both tiers also run an in-container persistence module that:
@@ -327,7 +327,7 @@ Both tiers also run an in-container persistence module that:
 ```bash
 # Hosted tier — Docker
 docker volume ls --filter label=matrx.user_id=<uuid>
-docker run --rm -v matrx-user-<uuid>:/home/agent alpine du -sh /home/agent
+docker run --rm -v matrx-user-<uuid>:/home/agent:ro alpine du -sh /home/agent
 
 # Either tier (via orchestrator API)
 curl -H "X-API-Key: $KEY" https://<orch>/users/<uuid>/persistence | jq
@@ -335,9 +335,9 @@ curl -H "X-API-Key: $KEY" https://<orch>/users/<uuid>/persistence | jq
 
 **Wiping a user's data (destructive):**
 ```bash
-# Hosted tier only — refuses if any sandbox of theirs is running
+# Hosted tier only — refuses if any container still mounts the volume, even stopped
 curl -X DELETE -H "X-API-Key: $KEY" https://<orch>/users/<uuid>/volume
-# EC2 tier — manual aws s3 rm against users/<uuid>/ prefix
+# EC2 has no user-volume wipe endpoint; use the exact sandbox's supported lifecycle action.
 ```
 
 **Inside a sandbox** (the user's own POV):
@@ -362,9 +362,9 @@ Symptom: GHA log shows `failed to register layer: ... no space left on device` p
 Recovery via Session Manager (no SSH needed):
 1. EC2 console → find the instance by IP → **Connect** → **Session Manager** tab.
 2. `df -h /` (confirm > 90% Use%).
-3. `sudo docker system prune -af --volumes`.
-4. `df -h /` (confirm space freed).
-5. Re-trigger: `gh workflow run deploy.yml --repo armanisadeghi/matrx-sandbox` (run from anywhere with `gh` auth).
+3. Inventory exact containers, mounts, image consumers, rollback tags and migration journals. Stopped containers may contain the only copy of a user's files.
+4. Reclaim only individually verified unreferenced artifacts; never use broad system/container/volume pruning or delete migration locks/journals to make deployment pass.
+5. Confirm free space and let the existing deployment owner resume the approved release path.
 
 The deploy pipeline prunes dangling images before each pull and removes pulled candidate aliases after a verified release. If disk pressure persists, investigate the SSM output and ECR/Docker retention instead of deleting live or rollback tags.
 
@@ -419,7 +419,7 @@ CLI alternatives if the frontend is down:
 ```bash
 # Per-tier disk + memory + container counts
 curl -H "X-API-Key: $KEY" https://orchestrator.dev.codematrx.com/system | jq
-curl -H "X-API-Key: $EC2_KEY" http://54.144.86.132:8000/system | jq
+curl -H "X-API-Key: $EC2_KEY" https://sandbox-orchestrator.matrxserver.com/system | jq
 
 # Latest deploys
 gh run list --workflow=deploy.yml --repo armanisadeghi/matrx-sandbox --limit 5

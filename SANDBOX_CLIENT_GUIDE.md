@@ -2,6 +2,14 @@
 
 This is the authoritative reference for the orchestrator HTTP API as of orchestrator v0.2.0. It documents every route the orchestrator serves, including the proxy routes that **do not appear in `/openapi.json`** (FastAPI omits broad path catchalls from the auto-generated schema). Use [`GET /api-surface`](#0-discovering-the-surface) for machine-readable discovery — it is the source of truth.
 
+Current cross-repository routing, storage-preservation rules and acceptance status live in [sandbox STATE](../common-docs/systems/infrastructure/sandboxes/STATE.md). September 13, 2026 — restoration root corrected the tier URLs and persistence description below; older version-specific examples are not proof of current deployment or implemented capability.
+
+### Image-update client contract (September 2026 source)
+
+The implemented update routes are master-key-only `POST /sandboxes/{sandbox_id}/migrate` and `GET /sandboxes/{sandbox_id}/migration`. Their deployment acceptance is tracked in STATE; this source description is not a live-certification claim. Supply one UUID `operation_id` as a **query parameter** and retain it across reconnects. `target_image` and the opt-in `interrupt_attached_sessions=true` are also query parameters, not JSON body fields. The default is idle-only; the opt-in requires an interruption warning and never authorizes stopping a shared-home sibling.
+
+After a lost response, poll GET with that same operation ID and render its `outcome`, `execution_state` and `phase` truthfully. A timeout or unknown status is not success, rollback or permission to issue another update. Do not substitute destroy/recreate for image update; retain the sandbox identity, protected home metadata and recovery artifacts until canonical completion.
+
 > **History note (Apr 2026):** The cloud editor team's earlier audit of `http://54.144.86.132:8000/openapi.json` reported "only 8 endpoints exist." That was correct for the EC2 deploy at the time (which lagged the wishlist commit by 73 days), but the code on disk had already implemented the rich surface. After the v0.2.0 deploy, EC2 also exposes everything below.
 
 ---
@@ -36,8 +44,8 @@ Returns:
 
 | Tier | URL | Backed by | Best for |
 |---|---|---|---|
-| `ec2` | `http://54.144.86.132:8000` | EC2 single host, S3 hot+cold, Supabase Postgres | Ephemeral agent runs, quick tasks, public-internet-only work |
-| `hosted` | `https://orchestrator.dev.codematrx.com` | This dev server, Docker volumes, internal Postgres | Long-lived editor sessions, larger workloads, access to internal Matrx services |
+| `ec2` | `https://sandbox-orchestrator.matrxserver.com` | EC2 host; template-specific retained homes; shared platform Postgres | AWS-hosted agent work; S3 capability depends on the actual template |
+| `hosted` | `https://orchestrator.dev.codematrx.com` | `/srv` host; per-user Docker volumes; shared platform Postgres | Hosted editor and agent sessions with a shared per-user home |
 
 Each orchestrator advertises its tier via `GET /` and `GET /api-surface` (`tier` field). Frontends should:
 
@@ -381,7 +389,7 @@ GET /users/{user_id}/persistence
 DELETE /users/{user_id}/volume    → 204
 ```
 
-DELETE is hosted-tier only (EC2 tier data lives in S3 and is managed via aidream's `cloud_sync`). Refuses with HTTP 409 if any sandbox is still using the volume.
+DELETE is hosted-tier only. EC2 durable homes are retained per sandbox and are managed through that sandbox's lifecycle/persistence actions, not a user-wide S3 wipe. The hosted endpoint refuses with HTTP 409 if any container still uses the volume, including a stopped container. Unknown `volume_bytes` is `null`, not zero; counts are independent of whether byte size is known.
 
 ---
 
