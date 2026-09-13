@@ -328,9 +328,30 @@ def _safe_component(value: str) -> None:
 class HostedMigrationJournal:
     def __init__(self, root: Path = STATE_DIR):
         self.root = root
+        self._probe_held = 0
+
+    @contextmanager
+    def probed(self) -> Iterator[None]:
+        """Prove the state root writable ONCE for a bounded burst of calls.
+
+        ``ensure_ready`` writes and ``fsync``s a probe file, so calling it for
+        every lock in one lease acquisition cost five disk syncs per sandbox and
+        nothing in safety: the same root, microseconds apart. Inside this scope
+        the first probe is authoritative and the rest are skipped. The scope is
+        deliberately narrow — one acquisition — so a migration that runs for
+        minutes still re-proves the mount at every fresh step.
+        """
+        self.ensure_ready()
+        self._probe_held += 1
+        try:
+            yield
+        finally:
+            self._probe_held -= 1
 
     def ensure_ready(self) -> None:
         """Require real mounted state in production; tests use an injected root."""
+        if self._probe_held:
+            return
         if self.root == STATE_DIR and not _has_required_state_mount(self.root):
             raise HostedMigrationStateError("hosted migration state mount is absent")
         try:

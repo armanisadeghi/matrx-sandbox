@@ -33,7 +33,7 @@ expire path.
 from __future__ import annotations
 
 import asyncio
-from contextlib import AsyncExitStack
+from contextlib import AsyncExitStack, ExitStack
 import logging
 from datetime import datetime, timezone
 
@@ -458,6 +458,39 @@ async def reap_zombie_containers(store: SandboxStore) -> list[str]:
     return reaped
 
 
+def _lease_fleet(
+    targets: list[tuple[str, str]],
+) -> tuple[ExitStack, set[str], set[str]]:
+    """Take one deployment-shared lease per sandbox. Blocking — worker thread only.
+
+    Reads the migration journal's pending set ONCE for the whole sweep instead of
+    once per sandbox: same durable state, one glob + one probe rather than one
+    per box. A denial still excludes exactly that sandbox, never the fleet.
+    """
+    from orchestrator.hosted_operation_lease import (
+        HostedOperationDenied, hosted_operation_lease_sync, new_journal,
+    )
+
+    journal = new_journal()
+    pending = journal.pending()
+    stack = ExitStack()
+    blocked: set[str] = set()
+    leased: set[str] = set()
+    try:
+        for sandbox_id, volume in targets:
+            try:
+                stack.enter_context(hosted_operation_lease_sync(
+                    sandbox_id, volume, journal=journal, deployment=True, pending=pending,
+                ))
+                leased.add(sandbox_id)
+            except HostedOperationDenied:
+                blocked.add(sandbox_id)
+    except BaseException:
+        stack.close()
+        raise
+    return stack, blocked, leased
+
+
 async def reconcile_liveness(store: SandboxStore) -> dict:
     """Tier-scoped liveness sweep: stop rows whose container vanished, refresh
     rows whose container is alive.
@@ -471,13 +504,11 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
 
     excluded: frozenset[str] = frozenset()
     included: frozenset[str] | None = None
-    lease_stack: AsyncExitStack | None = None
+    lease_stack: ExitStack | None = None
     if settings.host_tier in {"hosted", "ec2"}:
         try:
-            from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease
-            lease_stack = AsyncExitStack()
-            blocked: set[str] = set()
-            leased: set[str] = set()
+            targets: list[tuple[str, str | None]] = []
+            unresolved: set[str] = set()
             for sandbox in await store.list():
                 from orchestrator.home_identity import home_key
                 volume = home_key(sandbox)
@@ -490,20 +521,20 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
                         from orchestrator.storage_layout import user_volume_name
                         volume = user_volume_name(user_id)
                     else:
-                        blocked.add(sandbox_id)
+                        unresolved.add(sandbox_id)
                         continue
-                try:
-                    await lease_stack.enter_async_context(
-                        hosted_operation_lease(sandbox_id, volume, deployment=True)
-                    )
-                    leased.add(sandbox_id)
-                except HostedOperationDenied:
-                    blocked.add(sandbox_id)
-            excluded = frozenset(blocked)
+                targets.append((sandbox_id, volume))
+            # Leasing the whole fleet is blocking filesystem work — one flock
+            # set and one journal probe per sandbox. Run it on a worker thread:
+            # on the event loop it starved /health for minutes, the container
+            # healthcheck failed, and Traefik dropped the only orchestrator
+            # server from the edge while the process was alive and fine.
+            lease_stack, blocked, leased = await asyncio.to_thread(_lease_fleet, targets)
+            excluded = frozenset(blocked | unresolved)
             included = frozenset(leased)
         except Exception:
             if lease_stack:
-                await lease_stack.aclose()
+                await asyncio.to_thread(lease_stack.close)
             logger.error("Liveness reconcile deferred: hosted migration state unavailable")
             return summary
 
@@ -544,7 +575,7 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
             return summary
     finally:
         if lease_stack:
-            await lease_stack.aclose()
+            await asyncio.to_thread(lease_stack.close)
 
 
 __all__ = ["reconcile_from_docker", "reconcile_liveness", "reap_zombie_containers"]
