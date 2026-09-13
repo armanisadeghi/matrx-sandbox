@@ -19,7 +19,8 @@ from types import SimpleNamespace
 import pytest
 
 from orchestrator.hosted_migration import HostedMigrationJournal
-from orchestrator.reconcile import reconcile_liveness
+from orchestrator.reconcile import reconcile_from_docker, reconcile_liveness
+from orchestrator.store import InMemorySandboxStore
 
 FLEET = 120
 # Every lock acquisition costs this much wall time — the real condition on a
@@ -102,4 +103,90 @@ async def test_liveness_reconcile_leases_the_fleet_without_stalling_health(monke
         f"event loop stalled {max(stalls):.2f}s during the fleet lease sweep — "
         "the container healthcheck would fail and Traefik would drop the only "
         "orchestrator server from the edge"
+    )
+
+
+USER = "11111111-1111-4111-8111-111111111111"
+ORG = "22222222-2222-4222-8222-222222222222"
+
+
+# The discovery sweep already yields between containers, so its exposure is one
+# container's worth of blocking work at a time — smaller fleet, slower locks.
+DISCOVERY_FLEET = 8
+DISCOVERY_LOCK_SECONDS = 0.1
+
+
+def _container(index: int):
+    return SimpleNamespace(
+        id=f"runtime-{index:04d}",
+        attrs={
+            "Config": {"Labels": {
+                "matrx.sandbox_id": f"sbx-{index:04d}", "matrx.user_id": USER,
+                "matrx.organization_id": ORG, "matrx.tier": "hosted",
+            }},
+            "State": {"Running": True, "Status": "running"},
+            "Mounts": [{"Type": "volume", "Name": f"home-{index:04d}",
+                        "Destination": "/home/agent"}],
+            "NetworkSettings": {"Ports": {}},
+        },
+        reload=lambda: None,
+    )
+
+
+async def _max_stall_while(coro):
+    """Run ``coro`` and return the longest gap between event-loop ticks."""
+    stalls: list[float] = []
+
+    async def heartbeat() -> None:
+        last = time.monotonic()
+        while True:
+            await asyncio.sleep(0.005)
+            now = time.monotonic()
+            stalls.append(now - last)
+            last = now
+
+    beat = asyncio.create_task(heartbeat())
+    try:
+        result = await coro
+    finally:
+        beat.cancel()
+    return result, stalls
+
+
+@pytest.mark.asyncio
+async def test_discovery_reconcile_leases_each_container_without_stalling_health(monkeypatch, tmp_path):
+    """Break caught: the discovery sweep's per-container lease back on the loop.
+
+    Same class as the liveness sweep: discovery takes a home lease and reads the
+    migration fence for every container it finds. Both are blocking journal I/O.
+    """
+    journal = HostedMigrationJournal(tmp_path)
+    monkeypatch.setattr("orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: journal)
+    monkeypatch.setattr("orchestrator.hosted_migration.HostedMigrationJournal", lambda: journal)
+    monkeypatch.setattr("orchestrator.reconcile.settings.host_tier", "hosted")
+    monkeypatch.setattr("orchestrator.hosted_operation_lease.settings.host_tier", "hosted")
+
+    containers = [_container(i) for i in range(DISCOVERY_FLEET)]
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client",
+                        lambda: SimpleNamespace(
+                            containers=SimpleNamespace(list=lambda **_: containers)))
+
+    real_lock = HostedMigrationJournal.lock
+
+    def slow_lock(self, key, *, shared=False):
+        time.sleep(DISCOVERY_LOCK_SECONDS)
+        return real_lock(self, key, shared=shared)
+
+    monkeypatch.setattr(HostedMigrationJournal, "lock", slow_lock)
+
+    store = InMemorySandboxStore()
+    summary, stalls = await _max_stall_while(reconcile_from_docker(store))
+
+    assert summary["reconciled"] == DISCOVERY_FLEET, summary
+    assert stalls, (
+        "the event loop never ticked once during the discovery sweep — /health "
+        "would time out and Traefik would drop the only orchestrator server"
+    )
+    assert max(stalls) < MAX_LOOP_STALL_SECONDS, (
+        f"event loop stalled {max(stalls):.2f}s during the discovery sweep"
     )

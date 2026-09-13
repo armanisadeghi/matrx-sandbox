@@ -76,10 +76,18 @@ apart, so the extra syncs bought nothing; a long migration still re-proves the
 mount at every fresh acquisition. Lease semantics, exclusions and denials are
 unchanged.
 
-Guard: `orchestrator/tests/test_liveness_reconcile_event_loop.py` leases a
+The same class was censused across the file and closed in its two siblings: the
+discovery sweep (`reconcile_from_docker`) and the zombie reap take a per-container
+lease and read the migration fence for every container they find — both now run
+off the loop. They already awaited between containers, so their exposure was one
+container's blocking work at a time rather than a fleet's, but with a slow disk
+that is still ~1 s of dead air per container.
+
+Guards: `orchestrator/tests/test_liveness_reconcile_event_loop.py` leases a
 120-sandbox fleet with realistically slow locks and asserts the event loop keeps
 ticking. On the pre-fix code the heartbeat gets **zero** ticks for the whole
-sweep; after the fix it never stalls beyond 300 ms.
+sweep; after the fix it never stalls beyond 300 ms. A second guard does the same
+for the discovery sweep (pre-fix: a 0.97 s stall).
 
 ## What is still true and worth knowing
 

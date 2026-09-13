@@ -113,7 +113,7 @@ async def _lease_discovered_container(stack, container, store, sandbox_id):
     """Fence discovery by its actual home, then revalidate routing under lock."""
     if settings.host_tier not in {"hosted", "ec2"}:
         return
-    from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease
+    from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease_sync
     from orchestrator.storage_layout import user_volume_name
     attrs = container.attrs or {}
     row = await store.get(sandbox_id)
@@ -132,8 +132,13 @@ async def _lease_discovered_container(stack, container, store, sandbox_id):
         else:
             volume = ("layer-" + sandbox_id if settings.host_tier == "ec2"
                       else user_volume_name(user_id))
-    await stack.enter_async_context(
-        hosted_operation_lease(sandbox_id, volume, deployment=True)
+    # Taking the lease is blocking filesystem work (flocks + an fsync-ing
+    # journal probe). Off the event loop it stays invisible to /health; on it,
+    # a slow disk turns every discovered container into dead air for the
+    # healthcheck — and an unhealthy container is one Traefik stops routing to.
+    await asyncio.to_thread(
+        stack.enter_context,
+        hosted_operation_lease_sync(sandbox_id, volume, deployment=True),
     )
     fresh = await store.get(sandbox_id)
     if fresh and fresh.container_id and fresh.container_id != container.id:
@@ -207,7 +212,7 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
                 summary["skipped"] += 1
                 continue
             await _lease_discovered_container(operation_lease, container, store, sandbox_id)
-            if _migration_fenced(sandbox_id):
+            if await asyncio.to_thread(_migration_fenced, sandbox_id):
                 summary["skipped"] += 1
                 continue
 
@@ -418,7 +423,7 @@ async def reap_zombie_containers(store: SandboxStore) -> list[str]:
             if not sandbox_id:
                 continue
             await _lease_discovered_container(operation_lease, container, store, sandbox_id)
-            if _migration_fenced(sandbox_id):
+            if await asyncio.to_thread(_migration_fenced, sandbox_id):
                 continue
             tier = labels.get("matrx.tier") or host_tier
             if host_tier and tier and tier != host_tier:
