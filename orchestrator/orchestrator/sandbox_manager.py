@@ -1428,7 +1428,19 @@ async def _destroy_sandbox_unleased(
         if graceful:
             try:
                 from orchestrator.memory_sync import capture_memory_from_container
-                await capture_memory_from_container(container, sandbox.user_id, store)
+                # Memory capture is best-effort and must fit inside the same
+                # bounded shutdown budget.  Otherwise a dead Docker archive
+                # stream retains lifecycle/deployment locks indefinitely and
+                # prevents the next orchestrator release from promoting.
+                await asyncio.wait_for(
+                    capture_memory_from_container(container, sandbox.user_id, store),
+                    timeout=await knob_int("shutdown_timeout_seconds"),
+                )
+            except TimeoutError:
+                logger.warning(
+                    "Memory capture timed out for %s; continuing graceful teardown",
+                    sandbox_id,
+                )
             except Exception as exc:
                 logger.warning("Memory capture skipped for %s: %s", sandbox_id, exc)
 

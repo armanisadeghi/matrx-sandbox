@@ -124,17 +124,24 @@ async def capture_memory_from_container(container, user_id: str, store) -> int:
     Returns the number of files captured. Best-effort; never raises. Runs
     BEFORE the container is stopped (the dir must still be readable).
     """
+    def read_archive() -> io.BytesIO:
+        # docker-py returns a lazy response iterator.  Creating that iterator in
+        # a worker thread is insufficient: consuming it performs the blocking
+        # socket reads.  Keep the complete Docker transfer off the event loop so
+        # one slow/stuck sandbox cannot take /health and every hosted route down.
+        bits, _ = container.get_archive(MEMORY_ABS)
+        archive = io.BytesIO()
+        for chunk in bits:
+            archive.write(chunk)
+        archive.seek(0)
+        return archive
+
     try:
-        bits, _ = await asyncio.to_thread(container.get_archive, MEMORY_ABS)
+        raw = await asyncio.to_thread(read_archive)
     except Exception as exc:
         # NotFound just means the box never created/used memory — not an error.
         logger.debug("memory capture: get_archive(%s) for %s: %s", MEMORY_ABS, user_id, exc)
         return 0
-
-    raw = io.BytesIO()
-    for chunk in bits:
-        raw.write(chunk)
-    raw.seek(0)
 
     captured = 0
     total = 0
