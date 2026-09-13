@@ -689,7 +689,12 @@ async def _cleanup(record, client, journal, *, committed):
         else:
             if pinned.id != record["helper_image"]:
                 raise HostedMigrationStateError("helper pin no longer binds the journal helper image")
-            await _docker(client.images.remove, helper_pin, noprune=True)
+            # The operation-scoped tag may resolve to the same immutable image
+            # that is running the orchestrator.  At this point the exact tag,
+            # digest, and durable removal intent have all been verified.  Force
+            # is therefore required only to untag this alias; Docker retains the
+            # image layers while a running container still references them.
+            await _docker(client.images.remove, helper_pin, noprune=True, force=True)
         receipts["helper_image_pin_removed"] = helper_pin
         journal.write(record)
     if _promotion(record) and not committed:
@@ -703,6 +708,7 @@ async def _cleanup(record, client, journal, *, committed):
             await _docker(volume.remove)
         receipts["promoted_home_removed"] = record["source_volume"]
     record["cleanup_complete"] = True
+    record.pop("last_error", None)
     journal.write(record)
 
 

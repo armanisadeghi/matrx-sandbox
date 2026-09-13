@@ -28,8 +28,8 @@ class Images:
     def get(self, name):
         if not self.present: raise NotFound("missing")
         return SimpleNamespace(id=self.image)
-    def remove(self, name, noprune=False):
-        assert name == PIN and noprune is True
+    def remove(self, name, noprune=False, force=False):
+        assert name == PIN and noprune is True and force is True
         self.removed.append(name); self.present = False
 
 
@@ -41,13 +41,23 @@ def record(**extra):
 
 @pytest.mark.parametrize("committed", [True, False])
 def test_cleanup_removes_exact_operation_tag_for_commit_and_rollback(committed):
-    """Regression: helper digest stays pinned until either cleanup path is durable."""
+    """Regression: an in-use helper digest permits its verified operation tag to be removed."""
     images, journal, state = Images(), Journal(), record()
     asyncio.run(_cleanup(state, SimpleNamespace(images=images), journal, committed=committed))
     assert images.removed == [PIN]
     assert any(w["cleanup_receipt"].get("helper_image_pin_removal_intent") == {"pin": PIN, "image": IMAGE}
                for w in journal.writes)
     assert state["cleanup_receipt"]["helper_image_pin_removed"] == PIN
+
+
+def test_successful_cleanup_clears_stale_recovery_error():
+    """A recovered journal must not retain the cleanup failure that recovery resolved."""
+    images, journal = Images(), Journal()
+    state = record(last_error="APIError: helper tag is in use")
+    asyncio.run(_cleanup(state, SimpleNamespace(images=images), journal, committed=True))
+    assert state["cleanup_complete"] is True
+    assert "last_error" not in state
+    assert "last_error" not in journal.writes[-1]
 
 
 def test_cleanup_refuses_missing_pin_without_durable_intent():
