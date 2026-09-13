@@ -97,3 +97,38 @@ for the discovery sweep (pre-fix: a 0.97 s stall).
 - The reconcile still does real per-sandbox filesystem work; it is now merely
   invisible to HTTP. If a sweep starts outlasting its 60s tick again, that is the
   next thing to fix, not the healthcheck budget.
+
+## Why the sweep got worse after 07:25, and why the fix could not be deployed
+
+At 07:25:51 a hosted migration for user sandbox `sbx-7a395dcdd163` stalled at
+phase `activation_intent` and wrote a **32 MB** journal record (it carries a full
+backup manifest). `_pending_conflict` re-read the whole journal directory for
+**every** sandbox, so from that moment each 60-second sweep parsed ~7 GB of JSON:
+sweeps stretched to 18–20 minutes (complete at 07:47:58, 08:07:12, 08:24:57,
+08:43:45, 09:02:44, 09:21:58, 09:42:18) and the orchestrator was effectively
+sweeping continuously. Measured on the live edge at 5-second intervals from
+08:46:41 to 10:02:38 UTC: **317 of 867 samples returned 200 (37%)**, with
+unavailable runs of 377 s, 333 s, 330 s, 330 s and 323 s. Reading the pending set
+once per sweep cuts that work by ~214×.
+
+That stalled record also wedged the release gate, so the fix above is committed,
+CI-approved onto `deploy/hosted` (0a7f5d6) and **not yet live**:
+
+- Five consecutive poller runs failed at promotion and rolled back (06:54:09,
+  07:58:05, 08:36:17, 09:26:49, and the 09:28 run). Two distinct refusals:
+  `active sandbox migration deferred hosted promotion` (the nonterminal record)
+  and `old-source migration/recovery lock contention deferred hosted promotion`
+  (the sweep holds the shared `deployment` lock ~18 of every 19 minutes, so the
+  gate's non-blocking exclusive acquisition essentially never wins).
+- When the starved orchestrator fails the gate's contract probe, the gate takes
+  the bootstrap path, which `docker pause`s the live orchestrator *before* it
+  knows it can seize the locks — a paused orchestrator cannot release them, so
+  that path is guaranteed to fail here, and it takes the edge down for the
+  attempt (08:36:17 and 09:26:49 both logged
+  `failed to resume exact pre-promotion orchestrator`).
+
+**The deadlock is self-referential: the defect holds the lock the release gate
+needs to deploy the fix for it.** Breaking it needs one of two decisions that
+were outside this task's scope: recovering the stuck `sbx-7a395dcdd163` migration
+(a user sandbox), or changing the release gate's lock semantics (a bounded wait
+on the safe path, and never pausing the live orchestrator before the seize).
