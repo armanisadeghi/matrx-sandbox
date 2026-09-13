@@ -86,3 +86,43 @@ async def test_shutdown_cancels_background_boot_reconcile_immediately() -> None:
 
     assert cancelled.is_set()
     assert task.cancelled()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_drains_shielded_migration_before_returning() -> None:
+    """The store cannot close while a cancellation-shielded operation still uses it."""
+    from orchestrator.migration_operations import run_owned_operation
+
+    started = asyncio.Event()
+    release = asyncio.Event()
+    finished = asyncio.Event()
+
+    async def recovery():
+        started.set()
+        await release.wait()
+        finished.set()
+        return {"status": "recovered", "sandbox_id": "sbx"}
+
+    async def boot():
+        await run_owned_operation("sbx", "8" * 32, recovery, kind="migrating")
+
+    task = asyncio.create_task(boot())
+    await started.wait()
+    shutdown = asyncio.create_task(_cancel_boot_reconciliation(task))
+    await asyncio.sleep(0)
+    assert not shutdown.done() and not finished.is_set()
+    release.set()
+    await shutdown
+    assert finished.is_set()
+
+
+@pytest.mark.asyncio
+async def test_shutdown_retrieves_completed_boot_failure(caplog) -> None:
+    """A background boot exception is classified instead of disappearing."""
+    async def failed():
+        raise RuntimeError("boot recovery exploded")
+
+    task = asyncio.create_task(failed())
+    await asyncio.sleep(0)
+    await _cancel_boot_reconciliation(task)
+    assert "Boot reconciliation shutdown errored: boot recovery exploded" in caplog.text

@@ -185,6 +185,7 @@ async def test_migrate_route_forwards_confirmed_session_interruption(
     operation_id = kwargs.pop("operation_id")
     assert len(operation_id) == 32
     assert response.json() == {
+        "status": "migrated",
         "sandbox_id": "sbx-confirmed",
         "operation_id": operation_id,
         "outcome": "migrated",
@@ -222,6 +223,7 @@ async def test_migrate_route_canonicalizes_explicit_operation_identity(
     assert response.status_code == 200
     expected = "11111111222243338444555555555555"
     assert response.json() == {
+        "status": "migrated",
         "sandbox_id": "sbx-operation",
         "operation_id": expected,
         "outcome": "migrated",
@@ -282,6 +284,38 @@ async def test_migration_status_route_projects_only_the_exact_operation(monkeypa
     assert response.status_code == 200
     assert response.json() == projected
     status_call.assert_awaited_once_with("sbx-operation", operation_id)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("outcome", "phase", "expected_status"),
+    [("migrated", "committed", 200), ("rolled_back", "recovered", 409)],
+)
+async def test_migrate_route_replays_exact_terminal_operation_without_new_work(
+    mock_sandbox_manager, monkeypatch, outcome, phase, expected_status
+):
+    from orchestrator import migrate, migration_operations
+
+    operation_id = "3" * 32
+    status_call = AsyncMock(return_value={
+        "sandbox_id": "sbx-replay", "operation_id": operation_id,
+        "outcome": outcome, "execution_state": "complete", "phase": phase,
+    })
+    migrate_call = AsyncMock()
+    monkeypatch.setattr(migration_operations, "migration_status", status_call)
+    monkeypatch.setattr(migrate, "migrate_sandbox", migrate_call)
+
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        response = await client.post(
+            f"/sandboxes/sbx-replay/migrate?operation_id={operation_id}"
+        )
+
+    assert response.status_code == expected_status
+    payload = response.json()
+    exact = payload if expected_status == 200 else payload["detail"]
+    assert exact["operation_id"] == operation_id and exact["outcome"] == outcome
+    migrate_call.assert_not_awaited()
 
 
 @pytest.mark.asyncio
@@ -579,3 +613,4 @@ async def test_api_surface_exposes_revision_and_filesystem_contract(mock_api_key
     assert response.status_code == 200
     assert response.json()["source_sha"]
     assert response.json()["contracts"]["filesystem"] == 2
+    assert response.json()["contracts"]["deployment_migration_barrier"] == 1

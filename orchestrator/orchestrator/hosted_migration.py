@@ -82,7 +82,18 @@ def recovery_action(record: dict[str, Any], *, db_container_id: str | None,
     if db_container_id not in {record.get("old_id"), record.get("target_id")} or db_container_id is None:
         return "preserve_fenced"
     if record.get("target_id") and db_container_id == record["target_id"]:
-        return "finalize_committed" if target_exists_ready else "preserve_fenced"
+        activation = record.get("activation_receipt")
+        activation_proven = (
+            phase == "committed"
+            and isinstance(activation, dict)
+            and activation.get("target_id") == record.get("target_id")
+            and activation.get("migration_state") == "active"
+        )
+        return (
+            "finalize_committed"
+            if target_exists_ready and activation_proven
+            else "preserve_fenced"
+        )
     if phase in {"admitted", "old_stopped", "backup_intent"} and not record.get("backup_receipt"):
         return "resume_pre_copy_source"
     if phase in {"backup_verified",
@@ -163,6 +174,29 @@ def validate_record(record: dict[str, Any]) -> None:
             )
     if record.get("phase") not in VALID_PHASES:
         raise HostedMigrationStateError("hosted migration journal has an invalid phase")
+    retained_helpers = record.get("retained_helper_receipts", [])
+    if not isinstance(retained_helpers, list):
+        raise HostedMigrationStateError("hosted migration journal has invalid retained helper receipts")
+    retained_operations: set[str] = set()
+    for receipt in retained_helpers:
+        if (
+            not isinstance(receipt, dict)
+            or set(receipt) != {"operation", "pin", "image", "reason"}
+            or not isinstance(receipt.get("operation"), str)
+            or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9_.-]{0,200}", receipt["operation"])
+            or receipt.get("pin") != f"matrx-migration-helper:{receipt['operation']}"
+            or not isinstance(receipt.get("image"), str)
+            or not re.fullmatch(r"sha256:[0-9a-f]{64}", receipt["image"])
+            or receipt.get("reason") != "last_tag_in_use"
+        ):
+            raise HostedMigrationStateError(
+                "hosted migration journal has invalid retained helper receipt"
+            )
+        if receipt["operation"] in retained_operations:
+            raise HostedMigrationStateError(
+                "hosted migration journal has duplicate retained helper receipt"
+            )
+        retained_operations.add(receipt["operation"])
     for key in ("sandbox_id", "old_id", "old_name", "old_image", "source_volume",
                 "target_name", "target_image", "operation_label", "backup_name",
                 "helper_image", "rollback_name"):
@@ -273,11 +307,17 @@ def validate_record(record: dict[str, Any]) -> None:
                     or receipt.get("target_image") != record["target_image"]
                     or receipt.get("manifest_sha256") != backup.get("manifest_sha256")):
                 raise HostedMigrationStateError("EC2 postboot verification receipt does not bind copied target")
-        if record["phase"] == "committed":
-            activation = record.get("activation_receipt")
-            if (not isinstance(activation, dict) or activation.get("target_id") != record.get("target_id")
-                    or activation.get("migration_state") != "active"):
-                raise HostedMigrationStateError("EC2 promotion has no durable active-target receipt")
+    if (
+        record["phase"] == "committed"
+        and (
+            schema_version == _RECORD_SCHEMA_VERSION
+            or record.get("storage_kind") == "ec2_writable_layer"
+        )
+    ):
+        activation = record.get("activation_receipt")
+        if (not isinstance(activation, dict) or activation.get("target_id") != record.get("target_id")
+                or activation.get("migration_state") != "active"):
+            raise HostedMigrationStateError("migration has no durable active-target receipt")
 
 
 def _safe_component(value: str) -> None:
@@ -311,6 +351,57 @@ class HostedMigrationJournal:
     def _path(self, sandbox_id: str) -> Path:
         _safe_component(sandbox_id)
         return self.root / f"{sandbox_id}.json"
+
+    def _receipt_path(self, sandbox_id: str) -> Path:
+        _safe_component(sandbox_id)
+        return self.root / f"{sandbox_id}.receipt"
+
+    def read_operation_receipt(self, sandbox_id: str) -> dict[str, Any] | None:
+        try:
+            value = json.loads(self._receipt_path(sandbox_id).read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            raise HostedMigrationStateError("migration operation receipt is corrupt") from exc
+        if (
+            not isinstance(value, dict)
+            or value.get("schema_version") != 1
+            or value.get("sandbox_id") != sandbox_id
+            or not isinstance(value.get("operation_id"), str)
+            or not re.fullmatch(r"[0-9a-f]{32}", value["operation_id"])
+            or value.get("outcome") not in {"migrated", "rolled_back"}
+            or not isinstance(value.get("phase"), str)
+        ):
+            raise HostedMigrationStateError("migration operation receipt has invalid identity/outcome")
+        return value
+
+    def write_operation_receipt(self, receipt: dict[str, Any]) -> None:
+        sandbox_id = str(receipt.get("sandbox_id") or "")
+        operation_id = receipt.get("operation_id")
+        if (
+            receipt.get("schema_version") != 1
+            or not isinstance(operation_id, str)
+            or not re.fullmatch(r"[0-9a-f]{32}", operation_id)
+            or receipt.get("outcome") not in {"migrated", "rolled_back"}
+            or not isinstance(receipt.get("phase"), str)
+        ):
+            raise HostedMigrationStateError("migration operation receipt has invalid identity/outcome")
+        path = self._receipt_path(sandbox_id)
+        fd, temporary = tempfile.mkstemp(prefix=f".{sandbox_id}.receipt.", dir=self.root)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb", closefd=False) as output:
+                output.write(json.dumps(receipt, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+                output.flush()
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, path)
+        directory = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
 
     def read(self, sandbox_id: str) -> dict[str, Any] | None:
         try:

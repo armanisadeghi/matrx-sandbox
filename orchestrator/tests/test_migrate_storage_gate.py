@@ -28,8 +28,8 @@ async def test_noncore_without_shared_home_never_enters_s3_migration(monkeypatch
 
 
 @pytest.mark.asyncio
-async def test_confirmed_session_interrupt_contract_reaches_ec2_s3_path(monkeypatch):
-    """The same confirmed Code-page contract applies to enabled core EC2 migration."""
+async def test_correlated_core_s3_migration_refuses_without_durable_status(monkeypatch):
+    """A lost HTTP response must not make an S3 cutover outcome unknowable."""
     old = SimpleNamespace(
         labels={"matrx.template": "core", "matrx.tier": "ec2"},
         attrs={
@@ -52,11 +52,8 @@ async def test_confirmed_session_interrupt_contract_reaches_ec2_s3_path(monkeypa
     from tests.conftest import seed_sandbox_knobs
 
     seed_sandbox_knobs({"enable_s3_migrate": True})
-    captured = {}
-
-    async def s3_path(*args, **kwargs):
-        captured.update(kwargs)
-        return {"status": "migrated", "sandbox_id": args[0]}
+    async def s3_path(*_args, **_kwargs):
+        pytest.fail("S3 migration ran without a durable exact-operation journal")
 
     monkeypatch.setattr(migrate, "_migrate_s3_ordered", s3_path)
     result = await migrate.migrate_sandbox(
@@ -65,5 +62,5 @@ async def test_confirmed_session_interrupt_contract_reaches_ec2_s3_path(monkeypa
         interrupt_attached_sessions=True,
     )
 
-    assert result["status"] == "migrated"
-    assert captured["interrupt_attached_sessions"] is True
+    assert result["status"] == "unsupported_storage"
+    assert "durable exact-operation journal" in result["reason"]

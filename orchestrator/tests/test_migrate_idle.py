@@ -163,6 +163,49 @@ async def test_confirmed_manual_migration_fences_new_work_and_allows_attached_se
 
 
 @pytest.mark.asyncio
+async def test_already_current_operation_is_durable_before_success(monkeypatch):
+    """A lost no-op POST can still reconnect to its exact terminal receipt."""
+    from orchestrator import migrate, migration_operations
+
+    image = "sha256:" + "a" * 64
+    old = SimpleNamespace(
+        labels={"matrx.template": "bare"},
+        attrs={
+            "Image": image,
+            "Config": {"Env": []},
+            "HostConfig": {"Binds": ["home-volume:/home/agent:rw"]},
+            "Mounts": [{
+                "Type": "volume", "Name": "home-volume",
+                "Destination": "/home/agent", "RW": True,
+            }],
+        },
+    )
+    client = SimpleNamespace(containers=SimpleNamespace(get=lambda _sid: old))
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: client)
+    monkeypatch.setattr(migrate.settings, "host_tier", "hosted")
+    monkeypatch.setattr(
+        migrate, "current_image",
+        lambda *_: SimpleNamespace(tag="matrx-sandbox:bare", image_id=image, version="v1"),
+    )
+    receipt = AsyncMock()
+    monkeypatch.setattr(migration_operations, "record_terminal_operation", receipt)
+    operation_id = "4" * 32
+
+    result = await migrate.migrate_sandbox(
+        "sbx-current", store=object(), operation_id=operation_id,
+    )
+
+    assert result == {
+        "status": "already_current", "sandbox_id": "sbx-current",
+        "version": "v1", "platform_env_changed": 0,
+        "operation_id": operation_id,
+    }
+    receipt.assert_awaited_once_with(
+        "sbx-current", operation_id, outcome="migrated", phase="already_current",
+    )
+
+
+@pytest.mark.asyncio
 async def test_confirmed_manual_migration_waits_for_attached_proxy_lease_release(
     monkeypatch,
 ):

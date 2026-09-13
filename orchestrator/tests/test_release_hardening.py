@@ -309,6 +309,24 @@ def test_hosted_deploy_pins_aidream_source_before_long_build():
     assert 'archive --format=tar "$SOURCE_REF"' in builder
 
 
+def test_hosted_aidream_freshness_never_falls_back_to_tracking_ref():
+    deploy = HOSTED_DEPLOY.read_text(encoding="utf-8")
+    resolver = deploy[
+        deploy.index("resolve_aidream_source_sha()") : deploy.index("aidream_stale()")
+    ]
+    stale = deploy[
+        deploy.index("aidream_stale()") : deploy.index(
+            "# ── Resolve OLD/NEW commit", deploy.index("aidream_stale()")
+        )
+    ]
+
+    assert "ls-remote origin refs/heads/main" in resolver
+    assert "refs/remotes/origin/main" not in resolver
+    assert "refusing a stale tracking-ref fallback" in stale
+    assert 'if [ -z "$remote" ]' in stale
+    assert "return 0" in stale
+
+
 def test_aidream_builder_and_autostart_require_exact_full_source_sha():
     builder = AIDREAM_BUILDER.read_text(encoding="utf-8")
     entrypoint = AIDREAM_ENTRYPOINT.read_text(encoding="utf-8")
@@ -608,7 +626,7 @@ def test_ec2_release_requires_the_private_aidream_replica_before_and_after_swap(
     assert "never the public app_server" in script
     live_gate_at = script.index(live_gate)
     post_swap = script[live_gate_at : script.index("trap - ERR INT TERM", live_gate_at)]
-    assert post_swap.count("rollback") == 2
+    assert post_swap.count("\n  rollback\n") == 2
     assert "|| fail" not in post_swap
 
 
@@ -625,3 +643,35 @@ def test_hosted_noop_requires_every_live_release_alias():
     ):
         assert image in complete
     assert "if ! hosted_release_complete" in script
+
+
+def test_hosted_promotion_holds_exclusive_peer_of_migration_lock():
+    """A release cannot stop the orchestrator during backup/CAS/recovery."""
+    script = (REPO_ROOT / "scripts" / "deploy-hosted.sh").read_text(encoding="utf-8")
+    acquire = script.index("start_migration_lock_holder named deployment")
+    stop = script.index("docker compose stop", acquire)
+    audit = script.index('audit_migration_release_state "$AUDIT_IMAGE"', acquire)
+    verified = script.index('log "release contract verified', stop)
+    release = script.index("release_migration_lock_holder", verified)
+    assert acquire < audit < stop < verified < release
+
+    bootstrap = script.index("# Bootstrap from lockless 474", acquire)
+    pause = script.index('docker pause "$BOOTSTRAP_OLD_ID"', bootstrap)
+    old_locks = script.index("acquire_frozen_old_locks", pause)
+    bootstrap_audit = script.index(
+        'audit_migration_release_state "$AUDIT_IMAGE"', old_locks
+    )
+    fatal = script.index('docker kill --signal KILL "$BOOTSTRAP_OLD_ID"', bootstrap_audit)
+    promote = script.index('for index in "${!LIVE_TAGS[@]}"', fatal)
+    assert pause < old_locks < bootstrap_audit < fatal < promote
+    lock_helper = (
+        REPO_ROOT / "orchestrator/orchestrator/release_lock_holder.py"
+    ).read_text(encoding="utf-8")
+    assert "os.O_NOFOLLOW | os.O_NONBLOCK" in lock_helper
+    assert "fcntl.LOCK_EX | fcntl.LOCK_NB" in lock_helper
+    assert "deployment_migration_barrier" in script
+
+    runtime = (REPO_ROOT / "orchestrator/orchestrator/hosted_runtime.py").read_text(
+        encoding="utf-8"
+    )
+    assert runtime.count('journal.lock("deployment", shared=True)') == 2

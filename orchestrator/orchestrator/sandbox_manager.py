@@ -1247,7 +1247,7 @@ async def destroy_sandbox(
         # Legacy EC2 homes live in the writable layer.  Keeping the stopped
         # container is the only non-lossy lifecycle until promotion completes.
         from orchestrator.hosted_operation_lease import hosted_operation_lease
-        async with hosted_operation_lease(sandbox_id, f"layer-{sandbox_id}"):
+        async with hosted_operation_lease(sandbox_id, f"layer-{sandbox_id}", lifecycle=True):
             return await _destroy_sandbox_unleased(sandbox_id, graceful, reason, final_status)
     if not volume and getattr(sandbox, "user_id", None):
         volume = user_volume_name(sandbox.user_id)
@@ -1536,7 +1536,7 @@ async def delete_user_volume(user_id: str) -> bool:
 
     from orchestrator.hosted_operation_lease import hosted_operation_lease
     operation_id = f"volume-delete-{user_id}"
-    async with hosted_operation_lease(operation_id, name):
+    async with hosted_operation_lease(operation_id, name, lifecycle=True):
         task = asyncio.create_task(remove_under_lease())
         try:
             return await asyncio.shield(task)

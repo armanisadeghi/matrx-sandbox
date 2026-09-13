@@ -31,12 +31,17 @@ async def hosted_operation_lease(
     *,
     journal: HostedMigrationJournal | None = None,
     lifecycle: bool = False,
+    deployment: bool = False,
 ):
     """Hold shared sandbox and home locks through one hosted operation.
 
     Both deployed tiers require a durable journal. EC2 writable-layer homes
     have logical layer keys until promoted to named storage. Missing/corrupt
-    state never becomes permission to race a migration.
+    state never becomes permission to race a migration. Bounded lifecycle
+    mutations also hold the deployment peer first, so graceful promotion
+    cannot terminate a Docker/home mutation between validation and commit.
+    Long-lived proxy, PTY, watch, and read-only reconcile leases deliberately
+    omit that global peer.
     """
     if settings.host_tier not in {"hosted", "ec2"}:
         yield
@@ -46,6 +51,8 @@ async def hosted_operation_lease(
     state = journal or HostedMigrationJournal()
     try:
         with ExitStack() as locks:
+            if lifecycle or deployment:
+                locks.enter_context(state.lock("deployment", shared=True))
             # Every operation participates in the lifecycle key: long-lived
             # proxy/PTY work holds it shared; create/destroy/reaper use the
             # exclusive mode.  This is the single compatibility boundary.

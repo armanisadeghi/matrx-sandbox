@@ -224,8 +224,8 @@ async def test_claim_collection_path_reaches_create_router_without_fabricated_id
 
 
 def test_migration_actions_bypass_shared_middleware_lease_to_acquire_exclusive_lock():
-    assert middleware_module._sandbox_id({"path": "/sandboxes/box/migrate"}) is None
-    assert middleware_module._sandbox_id({"path": "/sandboxes/box/refresh-platform-env"}) is None
+    for action in ("migrate", "refresh-platform-env", "complete", "error"):
+        assert middleware_module._sandbox_id({"path": f"/sandboxes/box/{action}"}) is None
 
 
 @pytest.mark.asyncio
@@ -239,6 +239,27 @@ async def test_refresh_route_can_acquire_exclusive_home_lock_without_self_deadlo
             acquired = True
         await send({"type": "http.response.start", "status": 200, "headers": []})
     sent = await _call(HostedOperationLeaseMiddleware(refresh_handler), {"type": "http", "path": "/sandboxes/box/refresh-platform-env"})
+    assert acquired is True and sent[0]["status"] == 200
+
+
+@pytest.mark.asyncio
+async def test_complete_route_can_enter_lifecycle_lease_without_self_deadlock(hosted, monkeypatch):
+    """Completion/error destroy internally and must bypass the outer shared lease."""
+    _wire(monkeypatch, hosted, {"box": SimpleNamespace(persistence_volume="home")})
+    acquired = False
+
+    async def complete_handler(scope, receive, send):
+        nonlocal acquired
+        async with hosted_operation_lease(
+            "box", "home", journal=hosted, lifecycle=True
+        ):
+            acquired = True
+        await send({"type": "http.response.start", "status": 200, "headers": []})
+
+    sent = await _call(
+        HostedOperationLeaseMiddleware(complete_handler),
+        {"type": "http", "path": "/sandboxes/box/complete"},
+    )
     assert acquired is True and sent[0]["status"] == 200
 
 

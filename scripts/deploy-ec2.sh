@@ -52,6 +52,10 @@ validate_release_authority() {
   fi
 }
 validate_release_authority
+# Keep the pre-promotion source identity for rollback proof.  The barrier is
+# entered before any source/drop-in mutation, so bootstrap deferral leaves it
+# untouched; rollback additionally verifies it after restarting the old unit.
+ORIGINAL_SOURCE_SHA="${DEPLOYED_SHA:-}"
 
 resolve_setting() {
   local name="$1" value
@@ -201,8 +205,6 @@ sudo -u ec2-user sudo -n env -i PATH=/usr/bin:/bin \
   || fail "home-copy helper is unavailable to actual service user"
 docker image inspect "$ECR_REPO-orchestrator:$TARGET_SHA" --format '{{.Id}}' \
   > "$CANDIDATE_DIR/.migration-helper-image"
-# Keep the exact helper image reachable after release-candidate tag cleanup.
-docker tag "$ECR_REPO-orchestrator:$TARGET_SHA" matrx-orchestrator:home-helper
 chown ec2-user:ec2-user "$CANDIDATE_DIR/.migration-helper-image"
 systemd-run --quiet --wait --pipe --collect \
   --unit="matrx-home-preflight-$TARGET_SHA" \
@@ -216,6 +218,247 @@ validate_release_authority
 sudo -u ec2-user env MATRX_DATABASE_URL="$DB_URL" \
   "$CANDIDATE_DIR/.venv/bin/python" -m orchestrator.migrate_runner
 validate_release_authority
+
+DEPLOYMENT_LOCK="$JOURNAL_DIR/deployment.lock"
+RUNTIME_DROPIN_DIR="/run/systemd/system/${UNIT}.service.d"
+RUNTIME_DROPIN="$RUNTIME_DROPIN_DIR/matrx-deployment-bootstrap.conf"
+CGROUP_ROOT="${CGROUP_ROOT:-/sys/fs/cgroup}"
+BOOTSTRAP_ACTIVE=0
+BOOTSTRAP_STOPPED=0
+BOOTSTRAP_KILLED=0
+BOOTSTRAP_CGROUP=""
+BOOTSTRAP_PID=""
+BOOTSTRAP_PROCS=""
+MIGRATION_LOCK_HOLDER_PID=""
+MIGRATION_LOCK_HOLDER_INPUT_FD=""
+MIGRATION_LOCK_HOLDER_OUTPUT_FD=""
+
+release_migration_lock_holder() {
+  local status=0
+  if [ -n "$MIGRATION_LOCK_HOLDER_INPUT_FD" ]; then
+    eval "exec ${MIGRATION_LOCK_HOLDER_INPUT_FD}>&-" || status=1
+    MIGRATION_LOCK_HOLDER_INPUT_FD=""
+  fi
+  if [ -n "$MIGRATION_LOCK_HOLDER_OUTPUT_FD" ]; then
+    eval "exec ${MIGRATION_LOCK_HOLDER_OUTPUT_FD}<&-" || status=1
+    MIGRATION_LOCK_HOLDER_OUTPUT_FD=""
+  fi
+  if [ -n "$MIGRATION_LOCK_HOLDER_PID" ]; then
+    wait "$MIGRATION_LOCK_HOLDER_PID" || status=1
+    MIGRATION_LOCK_HOLDER_PID=""
+  fi
+  return "$status"
+}
+
+start_migration_lock_holder() {
+  local scope="$1" receipt status
+  shift
+  local -a options=()
+  [ "$scope" = all ] && options+=(--all-existing)
+  [ -z "$MIGRATION_LOCK_HOLDER_PID" ] || return 76
+  coproc {
+    sudo -u ec2-user "$CANDIDATE_DIR/.venv/bin/python" \
+      "$CANDIDATE_DIR/orchestrator/release_lock_holder.py" \
+      "${options[@]}" "$JOURNAL_DIR" "$@"
+  }
+  MIGRATION_LOCK_HOLDER_PID=$COPROC_PID
+  MIGRATION_LOCK_HOLDER_OUTPUT_FD=${COPROC[0]}
+  MIGRATION_LOCK_HOLDER_INPUT_FD=${COPROC[1]}
+  if ! IFS= read -r receipt <&"$MIGRATION_LOCK_HOLDER_OUTPUT_FD"; then
+    if wait "$MIGRATION_LOCK_HOLDER_PID"; then status=0; else status=$?; fi
+    MIGRATION_LOCK_HOLDER_PID=""
+    eval "exec ${MIGRATION_LOCK_HOLDER_OUTPUT_FD}<&-" || true
+    eval "exec ${MIGRATION_LOCK_HOLDER_INPUT_FD}>&-" || true
+    MIGRATION_LOCK_HOLDER_OUTPUT_FD=""
+    MIGRATION_LOCK_HOLDER_INPUT_FD=""
+    return "$status"
+  fi
+  printf '%s' "$receipt" | "$CANDIDATE_DIR/.venv/bin/python" -c \
+    'import json,sys; d=json.load(sys.stdin); assert d.get("status")=="ready" and isinstance(d.get("uid"),int) and isinstance(d.get("gid"),int)' \
+    || { release_migration_lock_holder || true; return 76; }
+  eval "exec ${MIGRATION_LOCK_HOLDER_OUTPUT_FD}<&-"
+  MIGRATION_LOCK_HOLDER_OUTPUT_FD=""
+}
+
+release_barrier_audit() {
+  # The candidate owns record parsing/census. This is deliberately read-only:
+  # deploy must not decide from filenames or terminal phases alone.
+  systemd-run --quiet --wait --pipe --collect \
+    --unit="matrx-release-barrier-audit-${TARGET_SHA:0:12}-$$" \
+    -p User=ec2-user -p "BindPaths=$JOURNAL_DIR" -p "WorkingDirectory=$CANDIDATE_DIR" \
+    "$CANDIDATE_DIR/.venv/bin/python" -m orchestrator.release_barrier audit
+}
+
+release_barrier_lock_keys() {
+  systemd-run --quiet --wait --pipe --collect \
+    --unit="matrx-release-barrier-locks-${TARGET_SHA:0:12}-$$" \
+    -p User=ec2-user -p "BindPaths=$JOURNAL_DIR" -p "WorkingDirectory=$CANDIDATE_DIR" \
+    "$CANDIDATE_DIR/.venv/bin/python" -m orchestrator.release_barrier lock-keys
+}
+
+bootstrap_fail() {
+  # `fail` exits directly, which does not invoke Bash's ERR trap. Once this
+  # bootstrap has changed the live unit, restore its exact pre-stop runtime
+  # before reporting a deferred/integrity outcome.
+  if [ "$BOOTSTRAP_KILLED" = 1 ]; then
+    # The old cgroup is dead. Returning non-zero lets the ERR trap enter the
+    # full rollback path; it must never thaw/revive a dead bootstrap runtime.
+    log "EC2 bootstrap post-kill integrity failure: $*"
+    return 1
+  fi
+  if ! restore_bootstrap_runtime; then
+    log "ERROR: EC2 bootstrap could not fully restore the frozen old runtime: $*"
+  fi
+  log "EC2 bootstrap refused promotion: $*"
+  return 1
+}
+
+restore_bootstrap_runtime() {
+  local restore_failed=0 observed=0
+  if [ "$BOOTSTRAP_ACTIVE" != 1 ]; then return; fi
+  rm -f "$RUNTIME_DROPIN" || restore_failed=1
+  systemctl daemon-reload || restore_failed=1
+  # The frozen old operation may be waiting on one of these exact locks.
+  # Restore its lock ownership before thawing Python execution.
+  release_migration_lock_holder || restore_failed=1
+  if [ -n "$BOOTSTRAP_CGROUP" ] && [ -w "$BOOTSTRAP_CGROUP/cgroup.freeze" ]; then
+    printf '0\n' > "$BOOTSTRAP_CGROUP/cgroup.freeze" || restore_failed=1
+    for _ in $(seq 1 20); do
+      grep -qx 'frozen 0' "$BOOTSTRAP_CGROUP/cgroup.events" && { observed=1; break; }
+      sleep 0.1
+    done
+    [ "$observed" = 1 ] || restore_failed=1
+  else
+    restore_failed=1
+  fi
+  if [ -n "$BOOTSTRAP_PID" ]; then
+    kill -0 "$BOOTSTRAP_PID" 2>/dev/null || restore_failed=1
+    systemctl is-active --quiet "$UNIT" || restore_failed=1
+  else
+    restore_failed=1
+  fi
+  [ "$restore_failed" = 0 ] && BOOTSTRAP_ACTIVE=0
+  [ "$restore_failed" = 0 ]
+}
+
+restore_bootstrap_policy_after_kill() {
+  local failed=0
+  [ "$BOOTSTRAP_KILLED" = 1 ] || return 0
+  rm -f "$RUNTIME_DROPIN" || failed=1
+  systemctl reset-failed "$UNIT" || true
+  systemctl daemon-reload || failed=1
+  BOOTSTRAP_ACTIVE=0
+  [ "$failed" = 0 ]
+}
+
+bootstrap_old_lock_census() {
+  local key derived status
+  local -a keys=(deployment)
+  if ! derived=$(release_barrier_lock_keys); then
+    bootstrap_fail "EC2 barrier could not derive record lock keys"
+    return 1
+  fi
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    keys+=("$key")
+  done <<< "$derived"
+  if start_migration_lock_holder all "${keys[@]}"; then return 0; else status=$?; fi
+  if [ "$status" = 75 ]; then
+    bootstrap_fail "EC2 deployment deferred: old migration lock contention"
+  else
+    bootstrap_fail "EC2 deployment integrity failure: migration lock inventory refused"
+  fi
+}
+
+bootstrap_stop_old_orchestrator() {
+  local control_group restart_after pid_after
+  control_group=$(systemctl show "$UNIT" -p ControlGroup --value) \
+    || fail "EC2 bootstrap could not resolve unit cgroup"
+  [ -n "$control_group" ] && [ "$control_group" != / ] \
+    || fail "EC2 bootstrap refused root/empty unit cgroup"
+  BOOTSTRAP_CGROUP="${CGROUP_ROOT}${control_group}"
+  [ -d "$BOOTSTRAP_CGROUP" ] && [ -w "$BOOTSTRAP_CGROUP/cgroup.freeze" ] && [ -w "$BOOTSTRAP_CGROUP/cgroup.kill" ] \
+    || fail "EC2 bootstrap requires writable cgroup-v2 freeze/kill controls"
+  BOOTSTRAP_PID=$(systemctl show "$UNIT" -p MainPID --value)
+  [ "$BOOTSTRAP_PID" -gt 0 ] || fail "EC2 bootstrap found no live orchestrator PID"
+  BOOTSTRAP_PROCS=$(cat "$BOOTSTRAP_CGROUP/cgroup.procs") || fail "EC2 bootstrap could not read cgroup membership"
+  BOOTSTRAP_ACTIVE=1
+  install -d -m 0755 "$RUNTIME_DROPIN_DIR"
+  printf '[Service]\nRestart=no\n' > "$RUNTIME_DROPIN"
+  systemctl daemon-reload
+  restart_after=$(systemctl show "$UNIT" -p Restart --value)
+  pid_after=$(systemctl show "$UNIT" -p MainPID --value)
+  if [ "$restart_after" != no ] || [ "$pid_after" != "$BOOTSTRAP_PID" ]; then
+    bootstrap_fail "EC2 bootstrap runtime Restart=no did not apply without PID change"
+    return 1
+  fi
+  printf '1\n' > "$BOOTSTRAP_CGROUP/cgroup.freeze"
+  local observed=0
+  for _ in $(seq 1 20); do
+    grep -qx 'frozen 1' "$BOOTSTRAP_CGROUP/cgroup.events" && { observed=1; break; }
+    sleep 0.1
+  done
+  if [ "$observed" != 1 ]; then
+    bootstrap_fail "EC2 bootstrap cgroup did not freeze"
+    return 1
+  fi
+  if [ "$(systemctl show "$UNIT" -p MainPID --value)" != "$BOOTSTRAP_PID" ] \
+    || [ "$(cat "$BOOTSTRAP_CGROUP/cgroup.procs")" != "$BOOTSTRAP_PROCS" ]; then
+    bootstrap_fail "EC2 bootstrap PID/cgroup membership changed while frozen"
+    return 1
+  fi
+  if ! bootstrap_old_lock_census; then return 1; fi
+  if ! release_barrier_audit; then
+    bootstrap_fail "EC2 deployment migration barrier integrity audit failed"
+    return 1
+  fi
+  # Do not use systemctl stop: systemd v252 thaws before its stop kill path.
+  printf '1\n' > "$BOOTSTRAP_CGROUP/cgroup.kill"
+  BOOTSTRAP_KILLED=1
+  observed=0
+  for _ in $(seq 1 50); do
+    if ! kill -0 "$BOOTSTRAP_PID" 2>/dev/null \
+      && [ -z "$(cat "$BOOTSTRAP_CGROUP/cgroup.procs")" ] \
+      && ! systemctl is-active --quiet "$UNIT"; then
+      observed=1; break
+    fi
+    sleep 0.1
+  done
+  if [ "$observed" != 1 ]; then
+    bootstrap_fail "EC2 bootstrap cgroup.kill did not converge to dead/inactive old runtime"
+    return 1
+  fi
+  release_migration_lock_holder \
+    || { bootstrap_fail "EC2 bootstrap lock holder did not exit cleanly"; return 1; }
+  rm -f "$RUNTIME_DROPIN"
+  systemctl reset-failed "$UNIT" || true
+  systemctl daemon-reload
+  BOOTSTRAP_ACTIVE=0
+  BOOTSTRAP_STOPPED=1
+}
+
+enter_deployment_migration_barrier() {
+  local live_contract lock_status
+  live_contract=$(curl -fsS --max-time 5 -H "X-API-Key: $API_KEY" http://localhost:8000/api-surface 2>/dev/null \
+    | EXPECTED_SHA="$ORIGINAL_SOURCE_SHA" /usr/bin/python3.11 -c 'import json,os,sys; d=json.load(sys.stdin); print(1 if d.get("source_sha")==os.environ["EXPECTED_SHA"] and d.get("contracts",{}).get("deployment_migration_barrier")==1 else 0)' \
+    || echo 0)
+  if [ "$live_contract" = 1 ]; then
+    if start_migration_lock_holder named deployment; then lock_status=0; else lock_status=$?; fi
+    if [ "$lock_status" = 75 ]; then
+      fail "EC2 deployment deferred: active migration owns deployment barrier"
+    elif [ "$lock_status" != 0 ]; then
+      fail "EC2 deployment migration lock inventory is invalid"
+    fi
+    release_barrier_audit || fail "EC2 deployment migration barrier integrity audit failed"
+  else
+    bootstrap_stop_old_orchestrator
+  fi
+}
+
+leave_deployment_migration_barrier() {
+  restore_bootstrap_runtime
+  release_migration_lock_holder
+}
 
 rollback() {
   trap - ERR INT TERM
@@ -251,10 +494,53 @@ rollback() {
       docker image rm matrx-sandbox:development >/dev/null 2>&1 || true
     fi
   fi
-  systemctl start "$UNIT" || true
+  if [ "${HOME_HELPER_PROMOTED:-0}" = 1 ]; then
+    if [ "${HOME_HELPER_HAD_LIVE:-0}" = 1 ]; then
+      docker tag matrx-orchestrator:home-helper-rollback matrx-orchestrator:home-helper
+    else
+      docker image rm matrx-orchestrator:home-helper >/dev/null 2>&1 || true
+    fi
+  fi
   # Never leave the per-SHA candidates behind: a failed release that keeps
   # them is what filled the root volume and blocked the next three deploys.
   cleanup_candidate_images
+  # Restore every bootstrap-only unit mutation before the one final old-unit
+  # start.  Keep deployment EX ownership through exact rollback health.
+  if [ "$BOOTSTRAP_KILLED" = 1 ]; then
+    restore_bootstrap_policy_after_kill \
+      || log "ERROR: rollback could not restore the old unit restart policy"
+  else
+    restore_bootstrap_runtime \
+      || log "ERROR: rollback could not restore the live bootstrap runtime"
+  fi
+  systemctl start "$UNIT" || true
+  rollback_verified=0
+  if [ -n "$ORIGINAL_SOURCE_SHA" ]; then
+    for _ in $(seq 1 30); do
+      rollback_source=$(tr -d '[:space:]' < "$LIVE_DIR/.source-sha" 2>/dev/null || true)
+      rollback_payload=$(curl -fsS --max-time 5 -H "X-API-Key: $API_KEY" http://localhost:8000/api-surface 2>/dev/null || true)
+      if [ "$rollback_source" = "$ORIGINAL_SOURCE_SHA" ] \
+        && RELEASE_PAYLOAD="$rollback_payload" EXPECTED_SHA="$ORIGINAL_SOURCE_SHA" /usr/bin/python3.11 - <<'PY'
+import json, os
+d=json.loads(os.environ["RELEASE_PAYLOAD"])
+paths={r["path"] for r in d.get("routes", [])}
+assert d.get("source_sha") == os.environ["EXPECTED_SHA"]
+assert d.get("contracts", {}).get("filesystem") == 2
+assert {"/sandboxes/{sandbox_id}/fs/{path:path}", "/sandboxes/{sandbox_id}/fs/watch"} <= paths
+PY
+      then rollback_verified=1; break; fi
+      sleep 2
+    done
+  fi
+  rollback_aidream_url=$(resolve_setting MATRX_AIDREAM_URL)
+  [ "$rollback_aidream_url" = "$EXPECTED_AIDREAM_URL" ] \
+    || log "ERROR: rollback EC2 route is '${rollback_aidream_url:-unset}', expected $EXPECTED_AIDREAM_URL"
+  curl -fsS --max-time 15 "$EXPECTED_AIDREAM_URL/health/version" >/dev/null \
+    || log "ERROR: rollback orchestrator cannot reach AWS-local AI Dream"
+  [ "$rollback_verified" = 1 ] \
+    || log "ERROR: rollback exact source/API/filesystem health did not recover"
+  # Releasing admission is the only operation after the final old-unit start.
+  release_migration_lock_holder
   # EXIT, do not return. This handler starts with `trap - ERR` + `set +e`, so
   # returning resumed the script right after the failing statement with -e
   # disabled: it walked into the success epilogue, deleted the failed-release
@@ -268,7 +554,21 @@ trap 'rollback' ERR INT TERM
 
 log "promoting candidates"
 # Freeze creates while the default + per-template tags move together.
-systemctl stop "$UNIT"
+enter_deployment_migration_barrier
+# Keep the exact helper image reachable after release-candidate tag cleanup.
+# This is a live tag mutation, so it happens only after the deployment barrier.
+HOME_HELPER_HAD_LIVE=0
+if docker image inspect matrx-orchestrator:home-helper >/dev/null 2>&1; then
+  HOME_HELPER_HAD_LIVE=1
+  docker tag matrx-orchestrator:home-helper matrx-orchestrator:home-helper-rollback
+else
+  docker image rm matrx-orchestrator:home-helper-rollback >/dev/null 2>&1 || true
+fi
+docker tag "$ECR_REPO-orchestrator:$TARGET_SHA" matrx-orchestrator:home-helper
+HOME_HELPER_PROMOTED=1
+if [ "$BOOTSTRAP_STOPPED" != 1 ]; then
+  systemctl stop "$UNIT"
+fi
 CORE_HAD_LIVE=0
 SLIM_HAD_LIVE=0
 DEVELOPMENT_HAD_LIVE=0
@@ -343,6 +643,7 @@ paths = {r["path"] for r in d.get("routes", [])}
 required = {"/sandboxes/{sandbox_id}/fs/{path:path}", "/sandboxes/{sandbox_id}/fs/watch"}
 assert d.get("source_sha") == os.environ["EXPECTED_SHA"]
 assert d.get("contracts", {}).get("filesystem") == 2
+assert d.get("contracts", {}).get("deployment_migration_barrier") == 1
 assert required <= paths
 PY
   then verified=1; break; fi
@@ -380,6 +681,9 @@ fi
 # Image migration requires separate lifecycle/persistence proof and approval,
 # including for a development worker with a persistent home mount.
 log "sandbox image migration NOT run; existing user containers are retained"
+
+docker image rm matrx-orchestrator:home-helper-rollback >/dev/null 2>&1 || true
+leave_deployment_migration_barrier
 
 trap - ERR INT TERM
 rm -rf "$FAILED_DIR" "$DROPIN_BACKUP"

@@ -6,6 +6,7 @@ import pytest
 from orchestrator.migration_operations import (
     active_operation,
     migration_status,
+    record_terminal_operation,
     reset_operation_registry_for_tests,
     run_owned_operation,
 )
@@ -81,6 +82,36 @@ async def test_same_operation_reconnects_to_one_task_and_echoes_identity():
     assert await first == await second == {
         "status": "migrated", "sandbox_id": "sbx", "operation_id": "b" * 32,
     }
+
+
+@pytest.mark.asyncio
+async def test_migrate_entrypoint_joins_same_id_before_runtime_prechecks(monkeypatch):
+    """Reconnect after rename cannot fall into a second Docker lookup/not-found path."""
+    from orchestrator import migrate
+
+    calls = 0
+    started = asyncio.Event()
+    release = asyncio.Event()
+
+    async def once(*_args, **_kwargs):
+        nonlocal calls
+        calls += 1
+        started.set()
+        await release.wait()
+        return {"status": "migrated", "sandbox_id": "sbx"}
+
+    monkeypatch.setattr(migrate, "_migrate_sandbox_once", once)
+    first = asyncio.create_task(migrate.migrate_sandbox(
+        "sbx", store=object(), operation_id="5" * 32,
+    ))
+    await started.wait()
+    second = asyncio.create_task(migrate.migrate_sandbox(
+        "sbx", store=object(), operation_id="5" * 32,
+    ))
+    await asyncio.sleep(0)
+    assert calls == 1
+    release.set()
+    assert await first == await second
 
 
 @pytest.mark.asyncio
@@ -196,6 +227,8 @@ async def test_admitted_interruption_finishes_recovery_before_propagating_cancel
     await started.wait()
     task.cancel()
     await asyncio.sleep(0)
+    task.cancel()
+    await asyncio.sleep(0)
     assert not task.done() and not recovered.is_set()
     release.set()
     with pytest.raises(asyncio.CancelledError):
@@ -214,6 +247,44 @@ async def test_exact_terminal_status_never_becomes_unrelated_current_success(tmp
 
 
 @pytest.mark.asyncio
+async def test_noop_terminal_receipt_survives_registry_completion(tmp_path):
+    journal = HostedMigrationJournal(tmp_path)
+    operation_id = "7" * 32
+    await record_terminal_operation(
+        "sbx", operation_id, outcome="migrated", phase="already_current",
+        journal=journal,
+    )
+    assert await migration_status("sbx", operation_id, journal=journal) == {
+        "sandbox_id": "sbx", "operation_id": operation_id,
+        "outcome": "migrated", "execution_state": "complete",
+        "phase": "already_current",
+    }
+    assert (await migration_status("sbx", "6" * 32, journal=journal))["outcome"] == "idle"
+
+
+@pytest.mark.asyncio
+async def test_no_id_status_never_combines_active_operation_with_old_journal(tmp_path):
+    journal = HostedMigrationJournal(tmp_path)
+    journal.write(record(operation_id="1" * 32, phase="committed", cleanup_complete=True))
+    release = asyncio.Event()
+
+    async def work():
+        await release.wait()
+        return {"status": "migrated", "sandbox_id": "sbx"}
+
+    waiter = asyncio.create_task(run_owned_operation("sbx", "2" * 32, work))
+    await asyncio.sleep(0)
+    status = await migration_status("sbx", journal=journal)
+    assert status == {
+        "sandbox_id": "sbx", "operation_id": "2" * 32,
+        "outcome": "in_progress", "execution_state": "running",
+        "phase": "admitting",
+    }
+    release.set()
+    await waiter
+
+
+@pytest.mark.asyncio
 async def test_unowned_nonterminal_journal_requires_recovery_without_raw_error(tmp_path):
     journal = HostedMigrationJournal(tmp_path)
     value = record()
@@ -227,6 +298,16 @@ async def test_unowned_nonterminal_journal_requires_recovery_without_raw_error(t
         "reason": "The update outcome requires orchestrator recovery. Do not start another update.",
     }
     assert "/srv/private" not in str(status)
+
+
+@pytest.mark.asyncio
+async def test_cleanup_incomplete_terminal_phase_is_not_hidden_as_idle(tmp_path):
+    journal = HostedMigrationJournal(tmp_path)
+    value = record(phase="recovered", cleanup_complete=False)
+    journal.write(value)
+    status = await migration_status("sbx", journal=journal)
+    assert status["outcome"] == "recovery_required"
+    assert status["phase"] == "recovered"
 
 
 @pytest.mark.asyncio

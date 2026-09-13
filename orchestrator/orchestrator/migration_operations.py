@@ -69,7 +69,12 @@ async def migration_status(
         # Journal writes use atomic replace. A status request must not wait for
         # the long-lived migration lock or block the event loop on a large
         # verified-home manifest.
-        record = await asyncio.to_thread(state.read, sandbox_id)
+        record, receipt = await asyncio.to_thread(
+            lambda: (
+                state.read(sandbox_id),
+                state.read_operation_receipt(sandbox_id),
+            )
+        )
     except HostedMigrationStateError:
         return {
             "sandbox_id": sandbox_id,
@@ -86,15 +91,41 @@ async def migration_status(
             active = None
         if record is not None and record.get("operation_label") != operation_id:
             record = None
+        if receipt is not None and receipt.get("operation_id") != operation_id:
+            receipt = None
 
     if active is not None:
+        active_record = (
+            record
+            if record is not None
+            and record.get("operation_label") == active.operation_id
+            else None
+        )
         return {
             "sandbox_id": sandbox_id,
             "operation_id": active.operation_id,
             "outcome": "recovering" if active.kind == "recovering" else "in_progress",
             "execution_state": "running",
-            "phase": record.get("phase", "admitting") if record else "admitting",
+            "phase": (
+                active_record.get("phase", "admitting")
+                if active_record is not None
+                else "admitting"
+            ),
         }
+
+    if record is None and receipt is not None:
+        outcome = receipt["outcome"]
+        response = {
+            "sandbox_id": sandbox_id,
+            "operation_id": receipt["operation_id"],
+            "outcome": outcome,
+            "execution_state": "complete",
+            "phase": receipt["phase"],
+        }
+        reason = _status_reason(outcome)
+        if reason:
+            response["reason"] = reason
+        return response
 
     if record is None:
         return {
@@ -105,7 +136,11 @@ async def migration_status(
             "phase": "idle",
         }
 
-    if operation_id is None and record.get("phase") in {"committed", "recovered"}:
+    if (
+        operation_id is None
+        and record.get("phase") in {"committed", "recovered"}
+        and record.get("cleanup_complete") is True
+    ):
         return {
             "sandbox_id": sandbox_id,
             "operation_id": None,
@@ -143,6 +178,31 @@ async def migration_status(
             elif receipt.get("baseline_template_service_ready") is None:
                 response["baseline_unknown"] = True
     return response
+
+
+async def record_terminal_operation(
+    sandbox_id: str,
+    operation_id: str,
+    *,
+    outcome: Literal["migrated", "rolled_back"],
+    phase: str,
+    journal: HostedMigrationJournal | None = None,
+) -> None:
+    """Persist an exact terminal result that has no full phase-engine record."""
+    state = journal or HostedMigrationJournal()
+
+    def write() -> None:
+        state.ensure_ready()
+        with state.lock(sandbox_id):
+            state.write_operation_receipt({
+                "schema_version": 1,
+                "sandbox_id": sandbox_id,
+                "operation_id": operation_id,
+                "outcome": outcome,
+                "phase": phase,
+            })
+
+    await asyncio.to_thread(write)
 
 
 async def run_owned_operation(
@@ -193,3 +253,16 @@ def reset_operation_registry_for_tests() -> None:
     _operations.clear()
     _registry_lock = None
     _registry_loop = None
+
+
+async def drain_owned_operations(*, kind: OperationKind | None = None) -> None:
+    """Finish shielded children before their Docker/store resources close."""
+    while True:
+        tasks = [
+            entry.task
+            for entry in tuple(_operations.values())
+            if not entry.task.done() and (kind is None or entry.kind == kind)
+        ]
+        if not tasks:
+            return
+        await asyncio.gather(*(asyncio.shield(task) for task in tasks), return_exceptions=True)

@@ -67,6 +67,17 @@ async def test_held_exclusive_home_lock_denies_delete_before_docker(hosted, monk
 
 
 @pytest.mark.asyncio
+async def test_release_exclusive_lock_denies_volume_delete_before_docker(hosted, monkeypatch):
+    """A deployment cannot terminate deletion after its attachment check."""
+    from orchestrator import sandbox_manager
+    client = _client(); monkeypatch.setattr(sandbox_manager, "_get_docker_client", lambda: client)
+    with hosted.lock("deployment"):
+        with pytest.raises(RuntimeError, match="lease unavailable"):
+            await sandbox_manager.delete_user_volume(USER)
+    client.containers.list.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_delete_refuses_attached_volume(hosted, monkeypatch):
     from orchestrator import sandbox_manager
     client = _client(in_use=True); monkeypatch.setattr(sandbox_manager, "_get_docker_client", lambda: client)

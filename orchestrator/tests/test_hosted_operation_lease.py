@@ -83,6 +83,34 @@ async def test_unrelated_home_can_operate_while_other_home_is_exclusive(hosted):
 
 
 @pytest.mark.asyncio
+async def test_bounded_lifecycle_holds_shared_deployment_peer(hosted):
+    """Release EX must wait for a Docker/home mutation to finish."""
+    queue = multiprocessing.Queue()
+    async with hosted_operation_lease(
+        "box-a", "home-a", journal=hosted, lifecycle=True
+    ):
+        process = multiprocessing.Process(
+            target=_exclusive_try,
+            args=(str(hosted.root), "deployment", queue),
+        )
+        process.start(); process.join(5)
+        assert queue.get(timeout=1) == "blocked"
+
+
+@pytest.mark.asyncio
+async def test_long_lived_ordinary_operation_omits_global_deployment_peer(hosted):
+    """PTY/watch work must not indefinitely prevent a steady-state release."""
+    queue = multiprocessing.Queue()
+    async with hosted_operation_lease("box-a", "home-a", journal=hosted):
+        process = multiprocessing.Process(
+            target=_exclusive_try,
+            args=(str(hosted.root), "deployment", queue),
+        )
+        process.start(); process.join(5)
+        assert queue.get(timeout=1) == "acquired"
+
+
+@pytest.mark.asyncio
 async def test_pending_sibling_home_record_denies_even_when_sandbox_ids_differ(hosted):
     """Break caught: only migrated ID is fenced, allowing a sibling to write its home."""
     hosted.write(_record("box-old", "home-a"))

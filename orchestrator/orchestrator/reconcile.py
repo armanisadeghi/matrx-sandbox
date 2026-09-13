@@ -132,7 +132,9 @@ async def _lease_discovered_container(stack, container, store, sandbox_id):
         else:
             volume = ("layer-" + sandbox_id if settings.host_tier == "ec2"
                       else user_volume_name(user_id))
-    await stack.enter_async_context(hosted_operation_lease(sandbox_id, volume))
+    await stack.enter_async_context(
+        hosted_operation_lease(sandbox_id, volume, deployment=True)
+    )
     fresh = await store.get(sandbox_id)
     if fresh and fresh.container_id and fresh.container_id != container.id:
         raise HostedOperationDenied("discovered runtime is not current routing")
@@ -491,7 +493,9 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
                         blocked.add(sandbox_id)
                         continue
                 try:
-                    await lease_stack.enter_async_context(hosted_operation_lease(sandbox_id, volume))
+                    await lease_stack.enter_async_context(
+                        hosted_operation_lease(sandbox_id, volume, deployment=True)
+                    )
                     leased.add(sandbox_id)
                 except HostedOperationDenied:
                     blocked.add(sandbox_id)

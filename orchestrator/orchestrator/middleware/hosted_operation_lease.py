@@ -10,7 +10,10 @@ from orchestrator.sandbox_manager import _get_store
 from orchestrator.storage_layout import user_volume_name
 
 _COLLECTION_PATHS = frozenset({"claim"})
-_SELF_LOCKING_ACTIONS = frozenset({"migrate", "refresh-platform-env", "reset", "resume", "destroy", "wipe"})
+_SELF_LOCKING_ACTIONS = frozenset({
+    "migrate", "refresh-platform-env", "reset", "resume", "destroy", "wipe",
+    "complete", "error",
+})
 
 
 def _sandbox_id(scope: dict) -> str | None:

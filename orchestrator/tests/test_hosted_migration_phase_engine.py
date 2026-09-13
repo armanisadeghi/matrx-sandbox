@@ -1,7 +1,7 @@
 from orchestrator.hosted_migration import HostedMigrationJournal, _mountinfo_has_mountpoint, recovery_action, transition, HostedMigrationStateError, validate_record
 from orchestrator.hosted_migration import hosted_fenced, hosted_volume_fenced
-from orchestrator.hosted_runtime import HostedMigrationBusyError, _assert_migration_home_exclusive, _assert_no_unowned_home_writer, _migration_failure_status, _pause_target_for_rollback, _quiesce_target, _recover_pre_copy_source, _remove_verified_pre_copy_helper, _require_paused_source, _require_rollback_safe_target
-from orchestrator.hosted_runtime import _activate_promoted_target, _ensure_rollback_home, _record_error, _wait_migration_state, recover_hosted_migration
+from orchestrator.hosted_runtime import HostedMigrationBusyError, _assert_migration_home_exclusive, _assert_no_unowned_home_writer, _migration_failure_status, _pause_target_for_rollback, _quiesce_target, _recover_pre_copy_source, _remove_verified_pre_copy_helper, _require_paused_source, _require_rollback_safe_target, _retained_helper_receipts
+from orchestrator.hosted_runtime import _activate_promoted_target, _current, _ensure_rollback_home, _record_error, _wait_migration_state, recover_hosted_migration
 from orchestrator.migrate import _wait_container_ready
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.store import InMemorySandboxStore
@@ -9,6 +9,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 import pytest
 import asyncio
+import subprocess
+import sys
 
 
 def _base():
@@ -25,6 +27,104 @@ def _base():
         "pre_cas_home_receipt": {"manifest_sha256": "digest", "source_volume": {"name": "home"}},
         "activation_home_preflight_receipt": {"target_id": "new", "agent_lifecycle_paths_writable": True},
     }
+
+
+def test_next_admission_carries_exact_retained_helper_receipt():
+    previous = _base() | {
+        "operation_label": "previous-op",
+        "retained_helper_receipts": [{
+            "operation": "older-op",
+            "pin": "matrx-migration-helper:older-op",
+            "image": "sha256:" + "d" * 64,
+            "reason": "last_tag_in_use",
+        }],
+        "cleanup_receipt": {
+            "helper_image_pin_retained": {
+                "pin": "matrx-migration-helper:previous-op",
+                "image": "sha256:" + "c" * 64,
+                "reason": "last_tag_in_use",
+            }
+        },
+    }
+
+    carried = _retained_helper_receipts(previous)
+
+    assert [receipt["operation"] for receipt in carried] == ["older-op", "previous-op"]
+    assert _retained_helper_receipts(previous | {"retained_helper_receipts": carried}) == carried
+
+
+def test_record_rejects_ambiguous_retained_helper_receipt_history():
+    retained = {
+        "operation": "older-op",
+        "pin": "matrx-migration-helper:older-op",
+        "image": "sha256:" + "d" * 64,
+        "reason": "last_tag_in_use",
+    }
+    with pytest.raises(HostedMigrationStateError, match="duplicate retained helper"):
+        validate_record(
+            _base()
+            | {"phase": "admitted", "retained_helper_receipts": [retained, retained]}
+        )
+
+
+def test_deployment_exclusive_flock_contends_with_real_shared_owner(tmp_path):
+    """Break caught: deploy lock used a different inode/mode than migration."""
+    journal = HostedMigrationJournal(tmp_path)
+    script = """
+import fcntl, os, sys
+fd = os.open(sys.argv[1], os.O_RDWR | os.O_NOFOLLOW)
+try:
+    fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+except BlockingIOError:
+    raise SystemExit(23)
+raise SystemExit(0)
+"""
+
+    with journal.lock("deployment", shared=True):
+        blocked = subprocess.run(
+            [sys.executable, "-c", script, str(tmp_path / "deployment.lock")],
+            check=False,
+        )
+    acquired = subprocess.run(
+        [sys.executable, "-c", script, str(tmp_path / "deployment.lock")],
+        check=False,
+    )
+
+    assert blocked.returncode == 23
+    assert acquired.returncode == 0
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    ("phase", "expected"),
+    [
+        ("committed", {"status": "committed", "sandbox_id": "sbx"}),
+        ("recovered", {"status": "recovered", "sandbox_id": "sbx"}),
+    ],
+)
+async def test_cleanup_complete_terminal_recovery_is_noop_before_lock_docker_or_store(
+    phase, expected,
+):
+    """Break caught: restart repeated terminal cleanup and blocked deploy health."""
+    record = dict(
+        _base(), phase=phase, cleanup_complete=True,
+        backup_receipt={"manifest_sha256": "digest"},
+    )
+    if phase == "committed":
+        record["target_id"] = "new"
+
+    class Forbidden:
+        def __getattr__(self, name):
+            raise AssertionError(f"terminal recovery touched forbidden dependency: {name}")
+
+    result = await recover_hosted_migration(
+        record,
+        store=Forbidden(),
+        client=Forbidden(),
+        journal=Forbidden(),
+    )
+
+    assert result == expected
 
 
 @pytest.mark.parametrize("phase", ["admitted", "old_stopped", "backup_intent"])
@@ -146,7 +246,80 @@ def test_postbackup_precommit_resumes_only_a_paused_source():
 def test_db_target_match_alone_is_not_commit():
     record = dict(_base(), phase="commit_uncertain", target_id="new", backup_receipt={"x": 1})
     assert recovery_action(record, db_container_id="new", target_exists_ready=False) == "preserve_fenced"
+    assert recovery_action(record, db_container_id="new", target_exists_ready=True) == "preserve_fenced"
+    record.update(
+        phase="committed",
+        activation_receipt={"target_id": "new", "migration_state": "active"},
+    )
     assert recovery_action(record, db_container_id="new", target_exists_ready=True) == "finalize_committed"
+
+
+@pytest.mark.parametrize(
+    "phase",
+    [
+        "target_quiesce_intent", "postboot_verified", "rename_intent",
+        "names_cut_over", "commit_intent", "commit_uncertain",
+        "activation_intent",
+    ],
+)
+def test_db_target_route_never_finalizes_an_uncommitted_or_held_phase(phase):
+    """A row CAS alone cannot turn a held target into a committed runtime."""
+    record = dict(
+        _base(), phase=phase, target_id="new", backup_receipt={"verified": True},
+        activation_receipt={"target_id": "new", "migration_state": "active"},
+    )
+    assert recovery_action(
+        record, db_container_id="new", target_exists_ready=True,
+    ) == "preserve_fenced"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("mutation", ["missing", "lifecycle", "deleted", "identity"])
+async def test_post_cas_readback_fails_closed_on_missing_or_malformed_row(mutation):
+    """No absent/unavailable/changed row can authorize resume, activation, or cleanup."""
+    expected = {
+        "sandbox_id": "sbx", "user_id": "user", "organization_id": "org",
+        "created_at": "created",
+    }
+    row = type("Row", (), dict(
+        sandbox_id="other" if mutation == "identity" else "sbx",
+        user_id="user", organization_id="org", created_at="created",
+        container_id="new", persistence_volume="home",
+    ))()
+
+    class Store:
+        async def get(self, _sandbox_id):
+            return None if mutation == "missing" else row
+
+        async def get_lifecycle(self, _sandbox_id):
+            if mutation == "lifecycle":
+                return None
+            return {"status": "ready", "deleted": mutation == "deleted"}
+
+    with pytest.raises(HostedMigrationStateError, match="deleted or changed"):
+        await _current({"sandbox_id": "sbx", "row_identity": expected}, Store())
+
+
+@pytest.mark.asyncio
+async def test_post_cas_third_container_route_is_ambiguous():
+    expected = {
+        "sandbox_id": "sbx", "user_id": "user", "organization_id": "org",
+        "created_at": "created",
+    }
+    row = type("Row", (), dict(
+        **expected, container_id="third", persistence_volume="home",
+    ))()
+
+    class Store:
+        async def get(self, _sandbox_id): return row
+        async def get_lifecycle(self, _sandbox_id): return {"status": "ready"}
+
+    current = await _current({"sandbox_id": "sbx", "row_identity": expected}, Store())
+    assert recovery_action(
+        dict(_base(), target_id="new"),
+        db_container_id=current.container_id,
+        target_exists_ready=True,
+    ) == "preserve_fenced"
 
 
 @pytest.mark.asyncio

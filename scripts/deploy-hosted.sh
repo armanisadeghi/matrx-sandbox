@@ -34,6 +34,7 @@ set -uo pipefail
 REPO_DIR="${MATRX_SANDBOX_DIR:-/srv/projects/matrx-sandbox}"
 ORCH_COMPOSE_DIR="${ORCH_COMPOSE_DIR:-/srv/apps/sandbox-orchestrator}"
 ORCH_HEALTH_URL="${ORCH_HEALTH_URL:-https://orchestrator.dev.codematrx.com/health}"
+HOSTED_MIGRATION_STATE_DIR="$ORCH_COMPOSE_DIR/hosted-migrations"
 ORCH_IMAGE="matrx-orchestrator:latest"
 MAX_IMAGE_AGE_SECONDS="${MAX_IMAGE_AGE_SECONDS:-1209600}" # 14 days; matches Fleet Health
 ORCH_STARTUP_TIMEOUT_SECONDS="${ORCH_STARTUP_TIMEOUT_SECONDS:-300}"
@@ -107,7 +108,7 @@ prepare_hosted_journal() {
   local image="$1" source override state
   source="$REPO_DIR/infra/hosted/docker-compose.override.yml"
   override="$ORCH_COMPOSE_DIR/docker-compose.override.yml"
-  state="$ORCH_COMPOSE_DIR/hosted-migrations"
+  state="${HOSTED_MIGRATION_STATE_DIR:-$ORCH_COMPOSE_DIR/hosted-migrations}"
   [ -f "$source" ] || fail "canonical hosted journal compose overlay is missing"
   # Never overwrite an operator's unrelated override or follow a substituted
   # state/override symlink. An existing journal's permissions are evidence to
@@ -188,21 +189,10 @@ validate_release_authority
 # setup (unit missing HOME) for a day while the check reported "current".
 AIDREAM_SRC_DIR="${AIDREAM_SRC_DIR:-/srv/projects/aidream}"
 resolve_aidream_source_sha() {
-  local remote local_ref
+  local remote
   remote=$(git -C "$AIDREAM_SRC_DIR" ls-remote origin refs/heads/main 2>/dev/null | cut -f1)
   if [[ "$remote" =~ ^[0-9a-f]{40}$ ]]; then
     printf '%s\n' "$remote"
-    return 0
-  fi
-
-  # The hosted fast path may run over SSH without the Manager's GitHub
-  # credential environment. Do not let that unrelated auth boundary strand a
-  # coherent orchestrator release: use the last manager-fetched tracking ref,
-  # then let fleet freshness queue the next aidream rebuild if it moved again.
-  local_ref=$(git -C "$AIDREAM_SRC_DIR" rev-parse refs/remotes/origin/main 2>/dev/null || true)
-  if [[ "$local_ref" =~ ^[0-9a-f]{40}$ ]]; then
-    log "WARNING: aidream remote lookup unavailable; using manager-fetched origin/main ${local_ref:0:9}" >&2
-    printf '%s\n' "$local_ref"
     return 0
   fi
   return 1
@@ -213,8 +203,8 @@ aidream_stale() {
   baked=$(docker image inspect matrx-sandbox:aidream --format '{{index .Config.Labels "com.aimatrx.aidream.sha"}}' 2>/dev/null)
   remote=$(resolve_aidream_source_sha || true)
   if [ -z "$remote" ]; then
-    log "WARNING: aidream freshness UNKNOWN — ls-remote returned nothing (git auth/HOME broken?). Skipping rebuild rather than churning."
-    return 1
+    log "ERROR: aidream freshness UNKNOWN — authoritative origin/main lookup failed; refusing a stale tracking-ref fallback"
+    return 0
   fi
   [ -z "$baked" ] && { log "aidream image is unlabeled (pre-freshness build) — rebuilding to stamp it"; return 0; }
   if [ "$baked" != "$remote" ]; then
@@ -488,9 +478,151 @@ if [ "$ORCH_CHANGED" = 1 ]; then
   validate_release_authority
 fi
 
+ORCH_API_KEY=$(grep '^MATRX_API_KEY=' "$ORCH_COMPOSE_DIR/.env" | head -1 | cut -d= -f2-)
+[ -n "$ORCH_API_KEY" ] || fail "MATRX_API_KEY is not resolved for release verification"
+PREVIOUS_ORCH_CONTAINER_ID=$(cd "$ORCH_COMPOSE_DIR" && docker compose ps -q orchestrator)
+[ -n "$PREVIOUS_ORCH_CONTAINER_ID" ] \
+  || fail "cannot identify the live orchestrator before release"
+PREVIOUS_ORCH_IMAGE_ID=$(docker inspect -f '{{.Image}}' "$PREVIOUS_ORCH_CONTAINER_ID" 2>/dev/null)
+[[ "$PREVIOUS_ORCH_IMAGE_ID" =~ ^sha256:[0-9a-f]{64}$ ]] \
+  || fail "live orchestrator image identity is invalid"
+PREVIOUS_ORCH_SOURCE=$(docker image inspect "$PREVIOUS_ORCH_IMAGE_ID" \
+  --format '{{index .Config.Labels "com.aimatrx.source.sha"}}' 2>/dev/null || true)
+[[ "$PREVIOUS_ORCH_SOURCE" =~ ^[0-9a-f]{40}$ ]] \
+  || fail "live orchestrator source identity is invalid"
+
+orchestrator_contract_matches() {
+  local expected_sha="$1" require_barrier="${2:-1}" payload
+  payload=$(curl -fsS --max-time 5 -H "X-API-Key: $ORCH_API_KEY" \
+    "${ORCH_HEALTH_URL%/health}/api-surface" 2>/dev/null) || return 1
+  RELEASE_PAYLOAD="$payload" EXPECTED_SHA="$expected_sha" \
+    REQUIRE_BARRIER="$require_barrier" python3 - <<'PY'
+import json, os
+d = json.loads(os.environ["RELEASE_PAYLOAD"])
+paths = {r["path"] for r in d.get("routes", [])}
+required = {"/sandboxes/{sandbox_id}/fs/{path:path}", "/sandboxes/{sandbox_id}/fs/watch"}
+assert d.get("source_sha") == os.environ["EXPECTED_SHA"]
+assert d.get("contracts", {}).get("filesystem") == 2
+assert required <= paths
+if os.environ["REQUIRE_BARRIER"] == "1":
+    assert d.get("contracts", {}).get("deployment_migration_barrier") == 1
+PY
+}
+
+wait_for_orchestrator_contract() {
+  local expected_sha="$1" require_barrier="${2:-1}" deadline remaining request_timeout
+  deadline=$((SECONDS + ORCH_STARTUP_TIMEOUT_SECONDS))
+  while (( SECONDS < deadline )); do
+    if orchestrator_contract_matches "$expected_sha" "$require_barrier"; then
+      return 0
+    fi
+    remaining=$((deadline - SECONDS)); (( remaining > 0 )) || break
+    request_timeout=$((remaining < 2 ? remaining : 2))
+    sleep "$request_timeout"
+  done
+  return 1
+}
+
+audit_migration_release_state() {
+  local image="$1" socket_gid
+  socket_gid=$(stat -c '%g' /var/run/docker.sock) \
+    || return 1
+  docker run --rm --network none --group-add "$socket_gid" \
+    --mount "type=bind,src=$HOSTED_MIGRATION_STATE_DIR,dst=/var/lib/matrx-sandbox/hosted-migrations" \
+    --mount type=bind,src=/var/run/docker.sock,dst=/var/run/docker.sock \
+    "$image" python -m orchestrator.release_barrier audit
+}
+
+required_migration_lock_keys() {
+  local image="$1"
+  docker run --rm --network none \
+    --mount "type=bind,src=$HOSTED_MIGRATION_STATE_DIR,dst=/var/lib/matrx-sandbox/hosted-migrations" \
+    "$image" python -m orchestrator.release_barrier lock-keys
+}
+
+MIGRATION_LOCK_HOLDER_PID=""
+MIGRATION_LOCK_HOLDER_INPUT_FD=""
+MIGRATION_LOCK_HOLDER_OUTPUT_FD=""
+
+release_migration_lock_holder() {
+  local status=0
+  if [ -n "$MIGRATION_LOCK_HOLDER_INPUT_FD" ]; then
+    eval "exec ${MIGRATION_LOCK_HOLDER_INPUT_FD}>&-" || status=1
+    MIGRATION_LOCK_HOLDER_INPUT_FD=""
+  fi
+  if [ -n "$MIGRATION_LOCK_HOLDER_OUTPUT_FD" ]; then
+    eval "exec ${MIGRATION_LOCK_HOLDER_OUTPUT_FD}<&-" || status=1
+    MIGRATION_LOCK_HOLDER_OUTPUT_FD=""
+  fi
+  if [ -n "$MIGRATION_LOCK_HOLDER_PID" ]; then
+    wait "$MIGRATION_LOCK_HOLDER_PID" || status=1
+    MIGRATION_LOCK_HOLDER_PID=""
+  fi
+  return "$status"
+}
+
+start_migration_lock_holder() {
+  local scope="$1" receipt status
+  shift
+  local -a options=()
+  [ "$scope" = all ] && options+=(--all-existing)
+  [ -z "$MIGRATION_LOCK_HOLDER_PID" ] || return 76
+  coproc {
+    python3 "$REPO_DIR/orchestrator/orchestrator/release_lock_holder.py" \
+      "${options[@]}" "$HOSTED_MIGRATION_STATE_DIR" "$@"
+  }
+  MIGRATION_LOCK_HOLDER_PID=$COPROC_PID
+  MIGRATION_LOCK_HOLDER_OUTPUT_FD=${COPROC[0]}
+  MIGRATION_LOCK_HOLDER_INPUT_FD=${COPROC[1]}
+  if ! IFS= read -r receipt <&"$MIGRATION_LOCK_HOLDER_OUTPUT_FD"; then
+    if wait "$MIGRATION_LOCK_HOLDER_PID"; then status=0; else status=$?; fi
+    MIGRATION_LOCK_HOLDER_PID=""
+    eval "exec ${MIGRATION_LOCK_HOLDER_OUTPUT_FD}<&-" || true
+    eval "exec ${MIGRATION_LOCK_HOLDER_INPUT_FD}>&-" || true
+    MIGRATION_LOCK_HOLDER_OUTPUT_FD=""
+    MIGRATION_LOCK_HOLDER_INPUT_FD=""
+    return "$status"
+  fi
+  printf '%s' "$receipt" | python3 -c \
+    'import json,sys; d=json.load(sys.stdin); assert d.get("status")=="ready" and isinstance(d.get("uid"),int) and isinstance(d.get("gid"),int)' \
+    || { release_migration_lock_holder || true; return 76; }
+  eval "exec ${MIGRATION_LOCK_HOLDER_OUTPUT_FD}<&-"
+  MIGRATION_LOCK_HOLDER_OUTPUT_FD=""
+}
+
+acquire_frozen_old_locks() {
+  local audit_image="$1" key derived status
+  local -a keys=(deployment)
+  derived=$(required_migration_lock_keys "$audit_image") || return 2
+  while IFS= read -r key; do
+    [ -n "$key" ] || continue
+    if ! [[ "$key" =~ ^[A-Za-z0-9][A-Za-z0-9_.-]{0,200}$ ]]; then
+      return 2
+    fi
+    keys+=("$key")
+  done <<< "$derived"
+  if start_migration_lock_holder all "${keys[@]}"; then return 0; else status=$?; fi
+  [ "$status" = 75 ] && return 1
+  return 2
+}
+
+resume_bootstrap_old() {
+  [ "${BOOTSTRAP_OLD_PAUSED:-0}" = 1 ] || return 0
+  release_migration_lock_holder
+  docker unpause "$BOOTSTRAP_OLD_ID" >/dev/null \
+    || return 1
+  BOOTSTRAP_OLD_PAUSED=0
+  orchestrator_contract_matches "$PREVIOUS_ORCH_SOURCE" 0
+}
+
 rollback_release() {
   log "rolling back all live tags from the failed release"
   local index live
+  if [ "${BOOTSTRAP_OLD_PAUSED:-0}" = 1 ]; then
+    resume_bootstrap_old \
+      || log "ERROR: failed to resume exact pre-promotion orchestrator $BOOTSTRAP_OLD_ID"
+    return
+  fi
   for live in "${PROMOTED_TAGS[@]}"; do
     if docker image inspect "${live}-rollback" >/dev/null 2>&1; then
       docker tag "${live}-rollback" "$live"
@@ -499,18 +631,30 @@ rollback_release() {
     fi
   done
   if [ "$ORCH_CHANGED" = 1 ]; then
-    if docker image inspect matrx-orchestrator:rollback >/dev/null 2>&1; then
+    if [[ "${PREVIOUS_ORCH_IMAGE_ID:-}" =~ ^sha256:[0-9a-f]{64}$ ]]; then
+      docker tag "$PREVIOUS_ORCH_IMAGE_ID" "$ORCH_IMAGE"
+    elif docker image inspect matrx-orchestrator:rollback >/dev/null 2>&1; then
       docker tag matrx-orchestrator:rollback "$ORCH_IMAGE"
     else
       docker image rm "$ORCH_IMAGE" >/dev/null 2>&1 || true
     fi
   fi
-  if [ "${ORCH_STOPPED:-0}" = 1 ]; then
-    ( cd "$ORCH_COMPOSE_DIR" && docker compose up -d --force-recreate ) || true
-  fi
   if [ -n "${LOCAL_CANDIDATE:-}" ] && [ -f "$REPO_DIR/sandbox-local/docker-compose.yml" ]; then
     ( cd "$REPO_DIR/sandbox-local" && docker compose up -d ) || true
   fi
+  # Final mutation on rollback: start the exact previous source.  Nothing
+  # below may signal, retag, recreate, reload configuration, or mutate images.
+  if [ "${ORCH_STOPPED:-0}" = 1 ]; then
+    if ! ( cd "$ORCH_COMPOSE_DIR" && docker compose up -d --force-recreate ); then
+      log "ERROR: rollback could not start the previous orchestrator"
+      release_migration_lock_holder || true
+      return
+    fi
+    if ! wait_for_orchestrator_contract "$PREVIOUS_ORCH_SOURCE" 0; then
+      log "ERROR: rollback source/health verification failed for $PREVIOUS_ORCH_SOURCE"
+    fi
+  fi
+  release_migration_lock_holder || log "ERROR: rollback could not release migration lock holder"
 }
 fail_release() { PROMOTION_ACTIVE=0; rollback_release; fail "$*"; }
 
@@ -519,11 +663,63 @@ PROMOTION_ACTIVE=1
 ORCH_STOPPED=0
 trap 'status=$?; trap - EXIT INT TERM; if [ "${PROMOTION_ACTIVE:-0}" = 1 ]; then PROMOTION_ACTIVE=0; rollback_release; fi; clear_all_build_markers; exit $status' EXIT INT TERM
 if [ "$ORCH_CHANGED" = 1 ] || [ "${#LIVE_TAGS[@]}" -gt 0 ]; then
-  # Prevent the old orchestrator from spawning a box between individual tag
-  # promotions. The service resumes only after the complete tag set is live.
-  ORCH_STOPPED=1
-  ( cd "$ORCH_COMPOSE_DIR" && docker compose stop ) \
-    || fail_release "could not enter the release promotion window"
+  # Migrations/recovery hold a shared lock from durable admission through
+  # terminal cleanup. Promotion takes the exclusive peer before stopping the
+  # orchestrator, closing the check/stop race that previously SIGKILLed a
+  # healthy long-running backup. A failed nonblocking acquisition leaves the
+  # live release untouched; the authoritative poller retries later.
+  AUDIT_IMAGE="${ORCH_CANDIDATE:-$ORCH_IMAGE}"
+  if orchestrator_contract_matches "$PREVIOUS_ORCH_SOURCE" 1; then
+    lock_status=0
+    start_migration_lock_holder named deployment || lock_status=$?
+    if [ "$lock_status" = 75 ]; then
+      fail_release "active sandbox migration deferred hosted promotion"
+    elif [ "$lock_status" != 0 ]; then
+      fail_release "hosted deployment lock inventory is invalid"
+    fi
+    audit_migration_release_state "$AUDIT_IMAGE" \
+      || fail_release "hosted migration journal/artifact census refused promotion"
+    # A barrier-capable source cannot have an admitted operation after EX lock
+    # acquisition, so its normal shutdown has no recovery child to interrupt.
+    ORCH_STOPPED=1
+    ( cd "$ORCH_COMPOSE_DIR" && docker compose stop ) \
+      || fail_release "could not enter the release promotion window"
+  else
+    # Bootstrap from lockless 474: pause the exact old control, seize every
+    # old-source operation lock, then audit before a fatal replacement.
+    BOOTSTRAP_OLD_ID="$PREVIOUS_ORCH_CONTAINER_ID"
+    [ -n "$BOOTSTRAP_OLD_ID" ] \
+      || fail_release "cannot identify the live orchestrator for barrier bootstrap"
+    docker pause "$BOOTSTRAP_OLD_ID" >/dev/null \
+      || fail_release "cannot pause the exact old orchestrator for barrier bootstrap"
+    BOOTSTRAP_OLD_PAUSED=1
+    [ "$(docker inspect -f '{{.State.Status}}' "$BOOTSTRAP_OLD_ID" 2>/dev/null)" = paused ] \
+      || fail_release "exact old orchestrator did not reach paused state"
+    lock_status=0
+    acquire_frozen_old_locks "$AUDIT_IMAGE" || lock_status=$?
+    if [ "$lock_status" = 1 ]; then
+      fail_release "old-source migration/recovery lock contention deferred hosted promotion"
+    elif [ "$lock_status" != 0 ]; then
+      fail_release "old-source migration lock inventory is invalid"
+    fi
+    audit_migration_release_state "$AUDIT_IMAGE" \
+      || fail_release "hosted migration journal/artifact census refused bootstrap"
+    kill_status=0
+    docker kill --signal KILL "$BOOTSTRAP_OLD_ID" >/dev/null || kill_status=$?
+    old_stopped=0
+    for _ in $(seq 1 50); do
+      if [ "$(docker inspect -f '{{.State.Running}}' "$BOOTSTRAP_OLD_ID" 2>/dev/null)" = false ]; then
+        old_stopped=1; break
+      fi
+      sleep 0.1
+    done
+    if [ "$old_stopped" = 1 ]; then
+      BOOTSTRAP_OLD_PAUSED=0
+      ORCH_STOPPED=1
+    fi
+    [ "$kill_status" = 0 ] && [ "$old_stopped" = 1 ] \
+      || fail_release "fatal bootstrap stop did not terminate the exact old orchestrator"
+  fi
 fi
 for index in "${!LIVE_TAGS[@]}"; do
   live="${LIVE_TAGS[$index]}"
@@ -539,8 +735,8 @@ for index in "${!LIVE_TAGS[@]}"; do
 done
 
 if [ "$ORCH_CHANGED" = 1 ]; then
-  if docker image inspect "$ORCH_IMAGE" >/dev/null 2>&1; then
-    docker tag "$ORCH_IMAGE" matrx-orchestrator:rollback
+  if docker image inspect "$PREVIOUS_ORCH_IMAGE_ID" >/dev/null 2>&1; then
+    docker tag "$PREVIOUS_ORCH_IMAGE_ID" matrx-orchestrator:rollback
   else
     docker image rm matrx-orchestrator:rollback >/dev/null 2>&1 || true
   fi
@@ -563,8 +759,6 @@ fi
 # A measured 229-row fleet startup took 157s. Budget elapsed time, not attempts
 # (each curl can consume five seconds); keep exact source/API verification.
 log "waiting for orchestrator release contract (up to ${ORCH_STARTUP_TIMEOUT_SECONDS}s)…"
-ORCH_API_KEY=$(grep '^MATRX_API_KEY=' "$ORCH_COMPOSE_DIR/.env" | head -1 | cut -d= -f2-)
-[ -n "$ORCH_API_KEY" ] || fail_release "MATRX_API_KEY is not resolved for post-deploy verification"
 verified=0
 ORCH_WAIT_STARTED=$SECONDS
 ORCH_WAIT_DEADLINE=$((SECONDS + ORCH_STARTUP_TIMEOUT_SECONDS))
@@ -581,6 +775,7 @@ paths = {r["path"] for r in d.get("routes", [])}
 required = {"/sandboxes/{sandbox_id}/fs/{path:path}", "/sandboxes/{sandbox_id}/fs/watch"}
 assert d.get("source_sha") == os.environ["EXPECTED_SHA"]
 assert d.get("contracts", {}).get("filesystem") == 2
+assert d.get("contracts", {}).get("deployment_migration_barrier") == 1
 assert required <= paths
 PY
   then
@@ -594,6 +789,7 @@ done
 ORCH_WAIT_ELAPSED=$((SECONDS - ORCH_WAIT_STARTED))
 [ "$verified" = 1 ] || fail_release "exact source/API/filesystem contract verification failed after ${ORCH_WAIT_ELAPSED}s (startup budget ${ORCH_STARTUP_TIMEOUT_SECONDS}s)"
 log "release contract verified at $NEW_SHA in ${ORCH_WAIT_ELAPSED}s (budget ${ORCH_STARTUP_TIMEOUT_SECONDS}s) ✓"
+release_migration_lock_holder
 
 # Refresh the out-of-checkout poller and its timeout policy only after this
 # release is healthy. Installing only the runner previously left the live

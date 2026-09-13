@@ -130,15 +130,20 @@ async def _start_boot_reconciliation(store: object) -> asyncio.Task[None] | None
 
 async def _cancel_boot_reconciliation(task: asyncio.Task[None] | None) -> None:
     """Cancel the Docker census before closing its store during shutdown."""
-    if task is None or task.done():
-        return
-    task.cancel()
-    try:
-        await task
-    except asyncio.CancelledError:
-        pass
-    except Exception as exc:  # pragma: no cover — defensive
-        _logger.warning("Boot reconciliation shutdown errored: %s", exc)
+    if task is not None:
+        if not task.done():
+            task.cancel()
+        try:
+            await task
+        except asyncio.CancelledError:
+            pass
+        except Exception as exc:  # pragma: no cover — defensive
+            _logger.warning("Boot reconciliation shutdown errored: %s", exc)
+    # `run_owned_operation` deliberately shields exact recovery from the
+    # canceled outer boot task. Drain that child before lifespan closes its
+    # Postgres store and Docker resources.
+    from orchestrator.migration_operations import drain_owned_operations
+    await drain_owned_operations()
 
 
 @asynccontextmanager
@@ -301,7 +306,7 @@ def _source_sha() -> str:
 
 
 SOURCE_SHA = _source_sha()
-API_CONTRACTS = {"filesystem": 2}
+API_CONTRACTS = {"filesystem": 2, "deployment_migration_barrier": 1}
 
 app = FastAPI(
     title="Matrx Sandbox Orchestrator",

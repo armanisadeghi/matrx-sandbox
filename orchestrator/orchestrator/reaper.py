@@ -94,7 +94,13 @@ async def _reap_once() -> dict:
                 if getattr(sandbox.tier, "value", sandbox.tier) != settings.host_tier:
                     continue
                 try:
-                    await leases.enter_async_context(hosted_operation_lease(sandbox.sandbox_id, home_key(sandbox)))
+                    await leases.enter_async_context(
+                        hosted_operation_lease(
+                            sandbox.sandbox_id,
+                            home_key(sandbox),
+                            deployment=True,
+                        )
+                    )
                     included.add(sandbox.sandbox_id)
                 except HostedOperationDenied:
                     continue

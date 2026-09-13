@@ -672,9 +672,19 @@ async def migrate_sandbox_route(
     verifies readiness + version before cutover and rolls back to the old box on
     failure. Master-key only (global APIKeyMiddleware)."""
     from orchestrator.migrate import migrate_sandbox
+    from orchestrator.migration_operations import migration_status
 
     store = sandbox_manager._get_store()
     canonical_operation = (operation_id or uuid4()).hex
+    existing = await migration_status(sandbox_id, canonical_operation)
+    if existing["outcome"] == "migrated":
+        return {**existing, "status": (
+            "already_current"
+            if existing["phase"] == "already_current"
+            else "migrated"
+        )}
+    if existing["outcome"] in {"rolled_back", "recovery_required"}:
+        raise HTTPException(status_code=409, detail=existing)
     result = await migrate_sandbox(
         sandbox_id,
         store=store,
@@ -686,6 +696,7 @@ async def migrate_sandbox_route(
     result.setdefault("operation_id", canonical_operation)
     if result["status"] in ("migrated", "already_current"):
         return {
+            **result,
             "sandbox_id": sandbox_id,
             "operation_id": canonical_operation,
             "outcome": "migrated",
@@ -698,6 +709,9 @@ async def migrate_sandbox_route(
         raise HTTPException(status_code=409, detail=result)
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    terminal = await migration_status(sandbox_id, canonical_operation)
+    if terminal["outcome"] in {"rolled_back", "recovery_required"}:
+        raise HTTPException(status_code=409, detail=terminal)
     # failed — the OLD box is still running; surface loudly (502, not 500, so the
     # caller knows the box is intact and it can keep using the old version).
     raise HTTPException(status_code=502, detail=result)

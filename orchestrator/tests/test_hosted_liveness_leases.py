@@ -80,6 +80,30 @@ async def test_liveness_excludes_only_migrating_home_while_reconciling_unrelated
 
 
 @pytest.mark.asyncio
+async def test_deployment_exclusivity_defers_then_allows_next_liveness_pass(monkeypatch, tmp_path):
+    """Candidate startup stays healthy without mutating rows inside release EX."""
+    journal = HostedMigrationJournal(tmp_path)
+    _inject_journal(monkeypatch, journal)
+    monkeypatch.setattr("orchestrator.reconcile.settings.host_tier", "hosted")
+    monkeypatch.setattr("orchestrator.reconcile._alive_container_ids", lambda *_: {"live-a"})
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: object())
+
+    class Store:
+        def __init__(self): self.included = []
+        async def list(self):
+            return [SimpleNamespace(sandbox_id="box-a", persistence_volume="home-a", tier="hosted")]
+        async def reconcile(self, _alive, *, include_sandbox_ids, **_kwargs):
+            self.included.append(include_sandbox_ids)
+            return {"stopped": [], "refreshed": len(include_sandbox_ids)}
+
+    store = Store()
+    with journal.lock("deployment"):
+        assert await reconcile_liveness(store) == {"stopped": [], "refreshed": 0}
+    assert await reconcile_liveness(store) == {"stopped": [], "refreshed": 1}
+    assert store.included == [frozenset(), frozenset({"box-a"})]
+
+
+@pytest.mark.asyncio
 async def test_liveness_derives_missing_home_and_releases_lease_on_docker_failure(monkeypatch, tmp_path):
     """A legacy null volume neither bypasses the lease nor leaks it on an early return."""
     from orchestrator.hosted_operation_lease import hosted_operation_lease

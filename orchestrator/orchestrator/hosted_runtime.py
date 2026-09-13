@@ -19,7 +19,14 @@ from pathlib import Path
 
 from docker.errors import NotFound
 
-from orchestrator.hosted_migration import HostedMigrationJournal, HostedMigrationStateError, recovery_action, transition
+from orchestrator.hosted_migration import (
+    TERMINAL_PHASES,
+    HostedMigrationJournal,
+    HostedMigrationStateError,
+    recovery_action,
+    transition,
+    validate_record,
+)
 
 MIGRATION_STATE_DIR = "/var/lib/matrx-migration"
 
@@ -129,29 +136,33 @@ def _migration_failure_status(exc: Exception, *, admitted: bool) -> str:
     return "failed"
 
 
+async def _await_without_cancelling_child(task):
+    """Drain a child through repeated parent cancellation, then propagate it."""
+    cancellation = None
+    while True:
+        try:
+            result = await asyncio.shield(task)
+        except asyncio.CancelledError as exc:
+            if task.cancelled():
+                raise
+            cancellation = exc
+            continue
+        if cancellation is not None:
+            raise cancellation
+        return result
+
+
 async def _docker(function, *args, **kwargs):
     task = asyncio.create_task(asyncio.to_thread(function, *args, **kwargs))
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        # Do not release a host lock while its Docker action still runs in a
-        # worker thread. A process crash is handled by the durable intent.
-        try:
-            await task
-        finally:
-            raise
+    # Do not release a host lock while its Docker action still runs in a
+    # worker thread. A process crash is handled by the durable intent.
+    return await _await_without_cancelling_child(task)
 
 
 async def _finish(awaitable):
     """Keep the volume lock until a noncancellable helper has really stopped."""
     task = asyncio.create_task(awaitable)
-    try:
-        return await asyncio.shield(task)
-    except asyncio.CancelledError:
-        try:
-            await task
-        finally:
-            raise
+    return await _await_without_cancelling_child(task)
 
 
 def replacement_config(old, *, image, environment, operation):
@@ -999,8 +1010,17 @@ async def _cleanup(record, client, journal, *, committed):
 
 async def recover_hosted_migration(record, *, store, client, journal, locked=False, copy_locked=False):
     """Recover only exact journal identities; DB ambiguity never authorizes restore."""
+    # Terminal cleanup is an idempotence boundary.  Check it before the shared
+    # deployment lock and before Docker/store access so startup can become
+    # healthy while a release retains the exclusive peer through verification.
+    validate_record(record)
+    if record.get("cleanup_complete") and record["phase"] in TERMINAL_PHASES:
+        if record["phase"] == "committed":
+            return {"status": "committed", "sandbox_id": record["sandbox_id"]}
+        return _recovered_result(record)
     if not locked:
         with ExitStack() as locks:
+            locks.enter_context(journal.lock("deployment", shared=True))
             locks.enter_context(journal.lock(record["sandbox_id"]))
             for key in sorted({record["source_volume"], record.get("source_home_key", record["source_volume"])}):
                 locks.enter_context(journal.lock("volume-" + key))
@@ -1065,8 +1085,9 @@ async def recover_hosted_migration(record, *, store, client, journal, locked=Fal
         target_ok = target is not None and await _ready(target, record, target=True)
         action = recovery_action(record, db_container_id=current.container_id, target_exists_ready=target_ok)
         if action == "finalize_committed":
-            record["phase"] = "committed"
-            journal.write(record)
+            await _wait_migration_state(
+                target, "active", record["verify_timeout"],
+            )
             await _cleanup(record, client, journal, committed=True)
             return {"status": "committed", "sandbox_id": record["sandbox_id"]}
         if action != "resume_old" or current.container_id != record["old_id"]:
@@ -1147,6 +1168,23 @@ async def _recover_admitted_interruption(
     ))
 
 
+def _retained_helper_receipts(previous_record):
+    """Carry exact still-live helper-pin ownership across journal replacement."""
+    receipts = list((previous_record or {}).get("retained_helper_receipts", []))
+    previous_retained = (
+        (previous_record or {}).get("cleanup_receipt", {})
+        .get("helper_image_pin_retained")
+    )
+    if isinstance(previous_retained, dict):
+        historical = {
+            "operation": previous_record["operation_label"],
+            **previous_retained,
+        }
+        if historical not in receipts:
+            receipts.append(historical)
+    return receipts
+
+
 async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
                          cur, store, verify_timeout, platform_env_changes,
                          interrupt_attached_sessions=False, operation_id=None):
@@ -1174,12 +1212,15 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
         volume = ec2_home_volume_name(sandbox_id) if promotion else homes[0]["Name"]
         source_key = "layer-" + sandbox_id if promotion else volume
         with ExitStack() as locks:
+            locks.enter_context(journal.lock("deployment", shared=True))
             locks.enter_context(journal.lock(sandbox_id))
             for key in sorted({source_key, volume}):
                 locks.enter_context(journal.lock("volume-" + key))
             if any((r["sandbox_id"] == sandbox_id or r["source_volume"] == volume)
                    and not r.get("cleanup_complete") for r in journal.records()):
                 raise HostedMigrationStateError("an earlier migration still requires recovery")
+            previous_record = journal.read(sandbox_id)
+            retained_helper_receipts = _retained_helper_receipts(previous_record)
             if activity.inflight_count(sandbox_id) or (
                 activity.open_session_count(sandbox_id)
                 and not interrupt_attached_sessions
@@ -1255,6 +1296,7 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
                 "state_volume_creation_intent": {
                     "name": state_volume_name, "sandbox_id": sandbox_id,
                 },
+                "retained_helper_receipts": retained_helper_receipts,
                 "phase": "admitted",
             }
             if promotion:

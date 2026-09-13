@@ -203,6 +203,40 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     opt-in: it permits idle PTY/watch attachments and recent presence signals,
     but still fences new work and drains executing tool calls before pausing the
     runtime. Defers instead of interrupting a tool call that cannot drain."""
+    try:
+        canonical_operation = (
+            uuid.UUID(operation_id).hex if operation_id else uuid.uuid4().hex
+        )
+    except (ValueError, AttributeError, TypeError):
+        return {
+            "status": "failed", "sandbox_id": sandbox_id,
+            "reason": "operation_id is not a valid UUID",
+        }
+    from orchestrator.migration_operations import run_owned_operation
+    return await run_owned_operation(
+        sandbox_id,
+        canonical_operation,
+        lambda: _migrate_sandbox_once(
+            sandbox_id,
+            store=store,
+            target_image=target_image,
+            verify_timeout=verify_timeout,
+            require_idle=require_idle,
+            refresh_platform_env=refresh_platform_env,
+            interrupt_attached_sessions=interrupt_attached_sessions,
+            operation_id=canonical_operation,
+        ),
+    )
+
+
+async def _migrate_sandbox_once(
+    sandbox_id: str, *, store, target_image: str | None = None,
+    verify_timeout: int = 90, require_idle: bool = False,
+    refresh_platform_env: bool = False,
+    interrupt_attached_sessions: bool = False,
+    operation_id: str,
+) -> dict:
+    """Execute one already-owned exact migration operation."""
     from orchestrator import activity
     from orchestrator.sandbox_manager import _get_docker_client
 
@@ -270,6 +304,10 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
         and not (settings.host_tier == "ec2" and template in {"slim", "bare"}
                  and not any(m.get("Destination") == "/home/agent" for m in old.attrs.get("Mounts", [])))
     ):
+        from orchestrator.migration_operations import record_terminal_operation
+        await record_terminal_operation(
+            sandbox_id, operation_id, outcome="migrated", phase="already_current",
+        )
         return {
             "status": "already_current", "sandbox_id": sandbox_id,
             "version": cur.version, "platform_env_changed": 0,
@@ -280,20 +318,14 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
     env.append("SANDBOX_MIGRATION=1")
     volumes = _binds_to_volumes(host)
     tmp_name = f"{sandbox_id}-mig"
-    canonical_operation = uuid.UUID(operation_id).hex if operation_id else uuid.uuid4().hex
-    from orchestrator.migration_operations import run_owned_operation
 
     if settings.host_tier == "ec2" and template in {"slim", "bare"}:
-        return await run_owned_operation(
-            sandbox_id,
-            canonical_operation,
-            lambda: _migrate_hosted_with_admission(
-                sandbox_id, old=old, target=target, env=env, volumes=volumes,
-                labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
-                platform_env_changes=platform_env_changes,
-                interrupt_attached_sessions=interrupt_attached_sessions,
-                operation_id=canonical_operation,
-            ),
+        return await _migrate_hosted_with_admission(
+            sandbox_id, old=old, target=target, env=env, volumes=volumes,
+            labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
+            platform_env_changes=platform_env_changes,
+            interrupt_attached_sessions=interrupt_attached_sessions,
+            operation_id=operation_id,
         )
 
     # ── DATA-SAFETY GUARD ─────────────────────────────────────────────────────
@@ -324,26 +356,20 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
                            "infrastructure.sandbox.enable_s3_migrate setting only after "
                            "validating it end-to-end"),
             }
-        return await run_owned_operation(
-            sandbox_id,
-            canonical_operation,
-            lambda: _migrate_s3_ordered(
-                sandbox_id, old=old, target=target, env=env, volumes=volumes,
-                labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
-                interrupt_attached_sessions=interrupt_attached_sessions,
+        return {
+            "status": "unsupported_storage", "sandbox_id": sandbox_id,
+            "reason": (
+                "S3-ordered migration has no durable exact-operation journal; "
+                "refusing a migration whose result could become unknowable after disconnect"
             ),
-        )
+        }
 
-    return await run_owned_operation(
-        sandbox_id,
-        canonical_operation,
-        lambda: _migrate_hosted_with_admission(
-            sandbox_id, old=old, target=target, env=env, volumes=volumes,
-            labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
-            platform_env_changes=platform_env_changes,
-            interrupt_attached_sessions=interrupt_attached_sessions,
-            operation_id=canonical_operation,
-        ),
+    return await _migrate_hosted_with_admission(
+        sandbox_id, old=old, target=target, env=env, volumes=volumes,
+        labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
+        platform_env_changes=platform_env_changes,
+        interrupt_attached_sessions=interrupt_attached_sessions,
+        operation_id=operation_id,
     )
 
 
