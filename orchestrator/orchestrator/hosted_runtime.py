@@ -530,7 +530,10 @@ async def _pause_target_for_rollback(record, target, journal):
     """
     await _docker(target.reload)
     if target.status == "running":
-        next_record = transition(record, "target_quiesce_intent")
+        # Rollback quiescence is not forward activation. A target that failed
+        # before the read-only lifecycle preflight must still be pausable so
+        # the verified backup can restore the exact retained source safely.
+        next_record = transition(record, "rollback_quiesce_intent")
         record.clear(); record.update(next_record); journal.write(record)
         await _docker(target.pause)
         await _docker(target.reload)
@@ -675,9 +678,55 @@ async def _ready(container, record, *, target):
             or container.attrs.get("Image") != expected
             or not (_home(container, record["source_volume"]) if target else _original_home(container, record))):
         return False
-    if not await _wait_container_ready(container, record["verify_timeout"], record["template"]):
+    if not await _wait_container_ready(
+        container,
+        record["verify_timeout"],
+        record["template"],
+        stage="active" if target else "rollback",
+    ):
         return False
     return not target or not record["target_version"] or await _container_version(container) == record["target_version"]
+
+
+async def _template_service_ready(container, template: str | None) -> bool | None:
+    """Probe optional template service health without redefining core recovery."""
+    if template != "aidream":
+        return None
+    result = await _docker(
+        container.exec_run,
+        "curl -fsS --max-time 3 http://127.0.0.1:8001/api/health/ready >/dev/null",
+    )
+    code = getattr(result, "exit_code", result[0] if isinstance(result, tuple) else None)
+    return code == 0
+
+
+async def _verify_recovered_source(record, old, journal) -> dict:
+    """Require the retained core and preserve optional-service baseline truth."""
+    if not await _ready(old, record, target=False):
+        raise HostedMigrationStateError("original runtime did not recover")
+    observed = await _template_service_ready(old, record.get("template"))
+    baseline = record.get("source_template_service_ready")
+    if baseline is True and observed is not True:
+        raise HostedMigrationStateError("original template service did not recover to its admission baseline")
+    receipt = {
+        "core_ready": True,
+        "template_service_ready": observed,
+        "baseline_template_service_ready": baseline,
+    }
+    record["rollback_readiness_receipt"] = receipt
+    journal.write(record)
+    return receipt
+
+
+def _recovered_result(record: dict) -> dict:
+    result = {"status": "recovered", "sandbox_id": record["sandbox_id"]}
+    receipt = record.get("rollback_readiness_receipt") or {}
+    if receipt.get("template_service_ready") is False:
+        if receipt.get("baseline_template_service_ready") is False:
+            result["baseline_degraded"] = True
+        elif receipt.get("baseline_template_service_ready") is None:
+            result["baseline_unknown"] = True
+    return result
 
 
 async def _migration_state(container):
@@ -976,19 +1025,19 @@ async def recover_hosted_migration(record, *, store, client, journal, locked=Fal
             raise HostedMigrationStateError("source volume identity changed")
         if recovery_action(record, db_container_id=current.container_id, target_exists_ready=False) == "resume_pre_copy_source":
             old = await _recover_pre_copy_source(record, store=store, client=client, journal=journal)
-            if not await _ready(old, record, target=False):
-                raise HostedMigrationStateError("pre-copy original did not become ready after resume")
+            await _verify_recovered_source(record, old, journal)
             record["phase"] = "recovered"
             journal.write(record)
             await _cleanup(record, client, journal, committed=False)
-            return {"status": "recovered", "sandbox_id": record["sandbox_id"]}
+            return _recovered_result(record)
         if record["phase"] == "recovered":
             old = await _get(client, record["old_id"])
-            if current.container_id != record["old_id"] or old is None or not await _ready(old, record, target=False):
+            if current.container_id != record["old_id"] or old is None:
                 raise HostedMigrationStateError("recovered runtime no longer matches its cleanup receipt")
+            await _verify_recovered_source(record, old, journal)
             await _assert_no_unowned_home_writer(client, record, allowed_ids={old.id})
             await _cleanup(record, client, journal, committed=False)
-            return {"status": "recovered", "sandbox_id": record["sandbox_id"]}
+            return _recovered_result(record)
         target = await _target(record, client)
         if target is not None and not record.get("target_id"):
             record["target_id"] = target.id
@@ -1047,12 +1096,11 @@ async def recover_hosted_migration(record, *, store, client, journal, locked=Fal
         # exited old source is evidence we cannot safely replay its boot.
         _require_paused_source(old)
         await _docker(old.unpause)
-        if not await _ready(old, record, target=False):
-            raise HostedMigrationStateError("original runtime did not recover")
+        await _verify_recovered_source(record, old, journal)
         record["phase"] = "recovered"
         journal.write(record)
         await _cleanup(record, client, journal, committed=False)
-        return {"status": "recovered", "sandbox_id": record["sandbox_id"]}
+        return _recovered_result(record)
     except Exception as exc:
         return _record_error(record, journal, exc)
 
@@ -1172,6 +1220,9 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
                     "pin": helper_image_pin, "image": helper_image,
                 },
                 "rollback_name": f"{sandbox_id}-old-{operation}", "template": labels.get("matrx.template"),
+                "source_template_service_ready": await _template_service_ready(
+                    old, labels.get("matrx.template")
+                ),
                 "verify_timeout": verify_timeout, "stop_timeout": stop_timeout,
                 "source_endpoint": source_endpoint, "row_persistence_volume": row.persistence_volume,
                 "state_volume_name": state_volume_name,
@@ -1258,7 +1309,9 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
                     raise HostedMigrationStateError("created target cannot be inspected")
                 record = transition(record, "target_start_intent"); journal.write(record)
                 await _docker(new.start)
-                if not await _wait_container_ready(new, verify_timeout, record["template"]):
+                if not await _wait_container_ready(
+                    new, verify_timeout, record["template"], stage="held"
+                ):
                     raise HostedMigrationStateError("target readiness failed")
                 version = await _container_version(new)
                 if record["target_version"] and version != record["target_version"]:

@@ -89,23 +89,42 @@ def _binds_to_volumes(host_config: dict) -> dict:
 
 
 
-async def _wait_container_ready(container, timeout: int, template: str | None = None) -> bool:
+async def _wait_container_ready(
+    container,
+    timeout: int,
+    template: str | None = None,
+    *,
+    stage: str = "active",
+) -> bool:
+    """Wait for the readiness required at one migration boundary.
+
+    A held target cannot expose template services that intentionally start only
+    after the durable activation marker. Rollback proves the retained core
+    process, while successful activation still requires the full template.
+    """
+    if stage not in {"held", "active", "rollback"}:
+        raise ValueError(f"unknown sandbox readiness stage: {stage}")
     elapsed, interval = 0, 2
     while elapsed < timeout:
         try:
             await asyncio.to_thread(container.reload)
             if container.status == "exited":
                 return False
-            readiness = "test -f /tmp/.sandbox_ready"
+            readiness = (
+                "test -f /tmp/.sandbox_ready"
+                " && curl -fsS http://127.0.0.1:8000/health >/dev/null"
+            )
             if template == "aidream":
-                readiness += (
-                    " && curl -fsS http://127.0.0.1:8001/api/health/ready >/dev/null"
+                if stage == "active":
+                    readiness += " && curl -fsS http://127.0.0.1:8001/api/health/ready >/dev/null"
+                if stage != "rollback":
+                    readiness += (
                     " && AIDREAM_WORK_DIR=/opt/aidream-template"
                     " AIDREAM_IMAGE_SHA_FILE=/etc/aidream-image-sha"
                     " GIT_CONFIG_GLOBAL=/dev/null"
                     " /bin/bash --noprofile --norc -p"
                     " /opt/sandbox/scripts/aidream-helpers.sh verify-release >/dev/null"
-                )
+                    )
             code, _ = await asyncio.to_thread(container.exec_run, readiness)
             if code == 0:
                 return True

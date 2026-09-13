@@ -21,6 +21,7 @@ TERMINAL_PHASES = frozenset({"committed", "recovered"})
 VALID_PHASES = frozenset({
     "admitted", "old_stopped", "backup_verified", "target_create_intent",
     "target_created", "target_start_intent", "target_ready", "target_quiesce_intent",
+    "rollback_quiesce_intent",
     "postboot_verified", "names_cut_over", "commit_intent", "activation_intent",
     "commit_uncertain", "committed", "recovered", "recovery_required",
     "backup_intent", "rename_intent", "rollback_intent", "restore_intent",
@@ -87,6 +88,7 @@ def recovery_action(record: dict[str, Any], *, db_container_id: str | None,
     if phase in {"backup_verified",
                  "network_disconnect_intent", "network_disconnected", "target_create_intent",
                  "target_created", "target_start_intent", "target_ready", "target_quiesce_intent",
+                 "rollback_quiesce_intent",
                  "postboot_verified", "rename_intent", "names_cut_over", "commit_intent",
                  "activation_intent", "commit_uncertain", "rollback_intent", "restore_intent"}:
         return "resume_old" if record.get("backup_receipt") else "preserve_fenced"
@@ -105,6 +107,7 @@ def transition(record: dict[str, Any], phase: str, **fields: Any) -> dict[str, A
         "target_created": {"target_id"},
         "target_start_intent": {"target_id"},
         "target_quiesce_intent": {"target_id"},
+        "rollback_quiesce_intent": {"target_id"},
         "postboot_verified": {"target_id", "postboot_verified_receipt"},
         "commit_intent": {"target_id"},
         "activation_intent": {"target_id"},
@@ -187,6 +190,7 @@ def validate_record(record: dict[str, Any]) -> None:
         raise HostedMigrationStateError("unknown migration storage kind")
     if record["phase"] in {"network_disconnect_intent", "network_disconnected", "target_create_intent",
                             "target_created", "target_start_intent", "target_ready", "target_quiesce_intent",
+                            "rollback_quiesce_intent",
                             "postboot_verified", "rename_intent", "names_cut_over", "commit_intent",
                             "activation_intent", "commit_uncertain", "committed", "rollback_intent",
                             "restore_intent"}:
@@ -196,7 +200,7 @@ def validate_record(record: dict[str, Any]) -> None:
                 or not endpoint["network_id"]):
             raise HostedMigrationStateError("migration journal has no source network identity")
     if record["phase"] in {"network_disconnected", "target_create_intent", "target_created",
-                            "target_start_intent", "target_ready", "target_quiesce_intent", "postboot_verified",
+                            "target_start_intent", "target_ready", "target_quiesce_intent", "rollback_quiesce_intent", "postboot_verified",
                             "rename_intent", "names_cut_over", "commit_intent", "activation_intent",
                             "commit_uncertain", "committed", "rollback_intent", "restore_intent"}:
         receipt = record.get("network_disconnect_receipt")
@@ -209,7 +213,7 @@ def validate_record(record: dict[str, Any]) -> None:
         raise HostedMigrationStateError("hosted migration journal has invalid stop timeout")
     post_backup = {
         "backup_verified", "target_create_intent", "target_created", "target_start_intent",
-        "target_ready", "target_quiesce_intent", "postboot_verified", "rename_intent", "names_cut_over", "commit_intent", "activation_intent",
+        "target_ready", "target_quiesce_intent", "rollback_quiesce_intent", "postboot_verified", "rename_intent", "names_cut_over", "commit_intent", "activation_intent",
         "commit_uncertain", "committed", "rollback_intent", "restore_intent",
     }
     if record["phase"] in post_backup and not isinstance(record.get("backup_receipt"), dict):
@@ -220,7 +224,7 @@ def validate_record(record: dict[str, Any]) -> None:
             and not isinstance(record.get("pre_cas_home_receipt"), dict)):
         raise HostedMigrationStateError("hosted migration has no held-target home manifest receipt")
     target_known = {
-        "target_created", "target_start_intent", "target_ready", "target_quiesce_intent",
+        "target_created", "target_start_intent", "target_ready", "target_quiesce_intent", "rollback_quiesce_intent",
         "postboot_verified", "rename_intent", "names_cut_over", "commit_intent", "activation_intent", "commit_uncertain", "committed",
     }
     if record["phase"] in target_known and not isinstance(record.get("target_id"), str):

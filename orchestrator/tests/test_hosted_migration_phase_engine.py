@@ -2,6 +2,7 @@ from orchestrator.hosted_migration import HostedMigrationJournal, _mountinfo_has
 from orchestrator.hosted_migration import hosted_fenced, hosted_volume_fenced
 from orchestrator.hosted_runtime import HostedMigrationBusyError, _assert_migration_home_exclusive, _assert_no_unowned_home_writer, _migration_failure_status, _pause_target_for_rollback, _quiesce_target, _recover_pre_copy_source, _remove_verified_pre_copy_helper, _require_paused_source, _require_rollback_safe_target
 from orchestrator.hosted_runtime import _activate_promoted_target, _ensure_rollback_home, _record_error, _wait_migration_state, recover_hosted_migration
+from orchestrator.migrate import _wait_container_ready
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.store import InMemorySandboxStore
 from datetime import datetime, timezone
@@ -393,10 +394,146 @@ async def test_running_target_is_paused_before_rollback_manifest_or_remove():
         def __init__(self): self.writes = []
         def write(self, record): self.writes.append(dict(record))
     target, journal = _Container("new", status="running"), Journal()
-    record = dict(_base(), phase="target_ready", target_id="new", backup_receipt={"verified": True})
+    record = dict(
+        _base(), schema_version=2, phase="target_start_intent", target_id="new",
+        backup_receipt={"verified": True},
+        state_volume_name="matrx-migration-state-sbx",
+        state_volume_creation_intent={"name": "matrx-migration-state-sbx", "sandbox_id": "sbx"},
+        helper_image_pin="matrx-migration-helper:op",
+        helper_image_pin_creation_intent={
+            "pin": "matrx-migration-helper:op", "image": "sha256:" + "c" * 64,
+        },
+    )
+    record.pop("activation_home_preflight_receipt", None)
     await _pause_target_for_rollback(record, target, journal)
     assert target.pause_calls == 1 and target.status == "paused"
-    assert journal.writes[-1]["phase"] == "target_quiesce_intent"
+    assert journal.writes[-1]["phase"] == "rollback_quiesce_intent"
+
+
+@pytest.mark.asyncio
+async def test_aidream_held_readiness_does_not_require_post_commit_managed_api():
+    """Break caught: Aidream held target waited for :8001, which starts only after commit."""
+    class HeldAidream:
+        status = "running"
+        commands = []
+
+        def reload(self):
+            return None
+
+        def exec_run(self, command):
+            self.commands.append(command)
+            if "127.0.0.1:8001" in command:
+                return 1, b"managed API intentionally held"
+            return 0, b""
+
+    target = HeldAidream()
+    assert await _wait_container_ready(target, 1, "aidream", stage="held")
+    assert "127.0.0.1:8000/health" in target.commands[0]
+    assert "aidream-helpers.sh verify-release" in target.commands[0]
+    assert "127.0.0.1:8001" not in target.commands[0]
+
+
+@pytest.mark.asyncio
+async def test_aidream_active_readiness_still_requires_managed_api():
+    """Break caught: held/core readiness was accidentally reused as post-CAS success."""
+    class DegradedAidream:
+        status = "running"
+
+        def reload(self):
+            return None
+
+        def exec_run(self, command):
+            return (1, b"managed API unavailable") if "127.0.0.1:8001" in command else (0, b"")
+
+    assert not await _wait_container_ready(DegradedAidream(), 1, "aidream", stage="active")
+
+
+@pytest.mark.asyncio
+async def test_aidream_rollback_readiness_restores_core_without_claiming_managed_api():
+    """Break caught: a pre-existing :8001 failure stranded an exactly resumed old process."""
+    class BaselineDegradedAidream:
+        status = "running"
+        commands = []
+
+        def reload(self):
+            return None
+
+        def exec_run(self, command):
+            self.commands.append(command)
+            return 0, b""
+
+    old = BaselineDegradedAidream()
+    assert await _wait_container_ready(old, 1, "aidream", stage="rollback")
+    assert "127.0.0.1:8000/health" in old.commands[0]
+    assert "127.0.0.1:8001" not in old.commands[0]
+
+
+@pytest.mark.asyncio
+async def test_live_shape_target_start_recovery_quiesces_then_resumes_baseline_degraded_old(
+    monkeypatch,
+):
+    """Break caught live: preflight-gated quiesce stranded the paused old Aidream box."""
+    record = dict(
+        _base(), schema_version=2, phase="target_start_intent", target_id="new",
+        template="aidream", backup_receipt={"verified": True}, row_persistence_volume=None,
+        old_process_identity={"pid": 4242, "started_at": "started"},
+        state_volume_name="matrx-migration-state-sbx",
+        state_volume_creation_intent={"name": "matrx-migration-state-sbx", "sandbox_id": "sbx"},
+        helper_image_pin="matrx-migration-helper:op",
+        helper_image_pin_creation_intent={
+            "pin": "matrx-migration-helper:op", "image": "sha256:" + "c" * 64,
+        },
+    )
+    record.pop("activation_home_preflight_receipt", None)
+    old = _Container("old", status="paused", writable_home=True)
+    old.name = "/sbx"
+    old.attrs.update({
+        "Image": record["old_image"],
+        "State": {"Pid": 4242, "StartedAt": "started"},
+    })
+    target = _Container("new", status="running", writable_home=True)
+    row = type("Row", (), {"container_id": "old", "persistence_volume": None})()
+
+    async def current(*_args, **_kwargs): return row
+    async def get_container(_client, identity): return old if identity == "old" else None
+    async def no_op(*_args, **_kwargs): return None
+    async def ready(container, _record, *, target): return container is old and not target
+    async def template_ready(*_args, **_kwargs): return False
+    cleaned = []
+
+    async def cleanup(value, _client, journal, **_kwargs):
+        cleaned.append(True)
+        value["cleanup_complete"] = True
+        journal.write(value)
+
+    monkeypatch.setattr("orchestrator.hosted_runtime._current", current)
+    monkeypatch.setattr("orchestrator.hosted_runtime._target", lambda *_args, **_kwargs: asyncio.sleep(0, result=target))
+    monkeypatch.setattr("orchestrator.hosted_runtime._get", get_container)
+    monkeypatch.setattr("orchestrator.hosted_runtime._assert_no_unowned_home_writer", no_op)
+    monkeypatch.setattr("orchestrator.hosted_runtime._resolve_disconnect_intent", no_op)
+    monkeypatch.setattr("orchestrator.hosted_runtime._reconnect_paused_source", no_op)
+    monkeypatch.setattr("orchestrator.hosted_runtime._ensure_rollback_home", no_op)
+    monkeypatch.setattr("orchestrator.hosted_runtime._ready", ready)
+    monkeypatch.setattr("orchestrator.hosted_runtime._template_service_ready", template_ready)
+    monkeypatch.setattr("orchestrator.hosted_runtime._cleanup", cleanup)
+    monkeypatch.setattr("orchestrator.hosted_backup._volume_identity", lambda *_: record["source_identity"])
+
+    volume = type("Volume", (), {"attrs": {}})()
+    client = type("Client", (), {"volumes": type("Volumes", (), {"get": lambda *_: volume})()})()
+
+    class Journal:
+        def __init__(self): self.writes = []
+        def write(self, value): self.writes.append(dict(value))
+
+    journal = Journal()
+    result = await recover_hosted_migration(
+        record, store=object(), client=client, journal=journal, locked=True,
+    )
+    assert result == {"status": "recovered", "sandbox_id": "sbx", "baseline_unknown": True}
+    assert target.pause_calls == 1 and target.remove_calls == [{"force": True}]
+    assert old.unpause_calls == 1 and cleaned == [True]
+    assert any(item["phase"] == "rollback_quiesce_intent" for item in journal.writes)
+    assert journal.writes[-1]["cleanup_complete"] is True
 
 
 @pytest.mark.asyncio
