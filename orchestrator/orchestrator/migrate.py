@@ -104,8 +104,12 @@ async def _wait_container_ready(
     """
     if stage not in {"held", "active", "rollback"}:
         raise ValueError(f"unknown sandbox readiness stage: {stage}")
-    elapsed, interval = 0, 2
-    while elapsed < timeout:
+    interval = 2
+    deadline = time.monotonic() + timeout
+    while True:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
         try:
             await asyncio.to_thread(container.reload)
             if container.status == "exited":
@@ -126,16 +130,21 @@ async def _wait_container_ready(
                     " /opt/sandbox/scripts/aidream-helpers.sh verify-release >/dev/null"
                     )
             code, _ = await asyncio.to_thread(
-                container.exec_run, ["/bin/sh", "-ec", readiness]
+                container.exec_run,
+                [
+                    "/usr/bin/timeout", "--signal=TERM", "--kill-after=0.1s",
+                    f"{remaining:.3f}s", "/bin/sh", "-ec", readiness,
+                ],
             )
             if code == 0:
                 return True
         except (NotFound, APIError) as exc:
             logger.warning("migrate: readiness poll error: %s", exc)
             return False
-        await asyncio.sleep(interval)
-        elapsed += interval
-    return False
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return False
+        await asyncio.sleep(min(interval, remaining))
 
 
 async def _container_version(container) -> str | None:

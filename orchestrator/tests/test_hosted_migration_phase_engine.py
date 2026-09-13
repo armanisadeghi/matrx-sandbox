@@ -429,10 +429,10 @@ async def test_aidream_held_readiness_does_not_require_post_commit_managed_api()
 
     target = HeldAidream()
     assert await _wait_container_ready(target, 1, "aidream", stage="held")
-    assert target.commands[0][:2] == ["/bin/sh", "-ec"]
-    assert "127.0.0.1:8000/health" in target.commands[0][2]
-    assert "aidream-helpers.sh verify-release" in target.commands[0][2]
-    assert "127.0.0.1:8001" not in target.commands[0][2]
+    assert target.commands[0][-3:-1] == ["/bin/sh", "-ec"]
+    assert "127.0.0.1:8000/health" in target.commands[0][-1]
+    assert "aidream-helpers.sh verify-release" in target.commands[0][-1]
+    assert "127.0.0.1:8001" not in target.commands[0][-1]
 
 
 @pytest.mark.asyncio
@@ -467,9 +467,9 @@ async def test_aidream_rollback_readiness_restores_core_without_claiming_managed
 
     old = BaselineDegradedAidream()
     assert await _wait_container_ready(old, 1, "aidream", stage="rollback")
-    assert old.commands[0][:2] == ["/bin/sh", "-ec"]
-    assert "127.0.0.1:8000/health" in old.commands[0][2]
-    assert "127.0.0.1:8001" not in old.commands[0][2]
+    assert old.commands[0][-3:-1] == ["/bin/sh", "-ec"]
+    assert "127.0.0.1:8000/health" in old.commands[0][-1]
+    assert "127.0.0.1:8001" not in old.commands[0][-1]
 
 
 @pytest.mark.asyncio
@@ -490,6 +490,34 @@ async def test_aidream_template_probe_uses_explicit_shell_for_redirection():
         "curl", "-fsS", "--max-time", "3",
         "http://127.0.0.1:8001/api/health/ready",
     ]
+
+
+@pytest.mark.asyncio
+async def test_readiness_timeout_is_a_wall_clock_deadline(monkeypatch):
+    """Break caught: slow probes were excluded from the configured readiness budget."""
+    from orchestrator import migrate
+
+    clock = [100.0]
+    sleeps = []
+
+    class SlowFailure:
+        status = "running"
+
+        def reload(self):
+            return None
+
+        def exec_run(self, _command):
+            clock[0] += 0.8
+            return 1, b"not ready"
+
+    async def advance(delay):
+        sleeps.append(delay)
+        clock[0] += delay
+
+    monkeypatch.setattr(migrate.time, "monotonic", lambda: clock[0])
+    monkeypatch.setattr(migrate.asyncio, "sleep", advance)
+    assert not await _wait_container_ready(SlowFailure(), 1, "aidream", stage="active")
+    assert sleeps == [pytest.approx(0.2)]
 
 
 @pytest.mark.asyncio
