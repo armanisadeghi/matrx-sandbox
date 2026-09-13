@@ -18,7 +18,13 @@ mkdir "$scratch/run"
 chmod 1777 "$scratch/run"
 
 python3 "$helper_copy"
-test "$(stat -f '%Lp' "$scratch/run/aidream-managed-home")" = 555
+python3 - "$scratch/run/aidream-managed-home" <<'PY'
+import os
+import stat
+import sys
+
+assert stat.S_IMODE(os.stat(sys.argv[1]).st_mode) == 0o555
+PY
 
 rm -rf "$scratch/run/aidream-managed-home"
 mkdir "$scratch/run/aidream-managed-home"

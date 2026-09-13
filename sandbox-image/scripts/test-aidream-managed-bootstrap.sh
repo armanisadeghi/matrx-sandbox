@@ -7,9 +7,11 @@ BOOTSTRAP="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/aidream-managed-bootstr
 PYTHON="${PYTHON:-python3}"
 scratch="$(mktemp -d)"
 scratch="$(cd "$scratch" && pwd -P)"
-trap 'rm -rf "$scratch"' EXIT
+cleanup() { chmod -R u+w "$scratch" 2>/dev/null || true; rm -rf "$scratch"; }
+trap cleanup EXIT
 
-template="$scratch/template"
+trusted_parent="$scratch/trusted-parent"
+template="$trusted_parent/aidream-template"
 mkdir -p "$template/aidream/settings" "$template/config" "$scratch/home" "$scratch/cwd"
 printf 'SENTINEL = "immutable-import"
 ' > "$template/aidream/__init__.py"
@@ -49,7 +51,10 @@ printf 'raise RuntimeError("hostile cwd module ran")
 ' > "$scratch/cwd/aidream.py"
 
 bootstrap_copy="$scratch/bootstrap.py"
-sed "s|Path(\"/opt/aidream-template\")|Path(\"$template\")|" "$BOOTSTRAP" > "$bootstrap_copy"
+sed \
+    -e "s|Path(\"/opt/aidream-template\")|Path(\"$template\")|" \
+    -e "s|Path(\"/opt\")|Path(\"$trusted_parent\")|" \
+    "$BOOTSTRAP" > "$bootstrap_copy"
 # The production image proves root ownership and a read-only mount in
 # build-aidream.sh. This local fixture cannot create either, so retain the
 # executable -I import-chain proof while swapping only those host predicates.
@@ -58,6 +63,7 @@ sed -i.bak \
     -e 's/if not os.statvfs(TEMPLATE_ROOT).f_flag & getattr(os, "ST_RDONLY", 1):/if False:/' \
     "$bootstrap_copy"
 rm -f "$bootstrap_copy.bak"
+chmod -R a-w "$trusted_parent"
 chmod 0555 "$bootstrap_copy"
 
 PROBE_OUT="$scratch/positive" MATRX_TEMP_DIR="$scratch/default-temp" LOG_DIR="$scratch/default-log" \
