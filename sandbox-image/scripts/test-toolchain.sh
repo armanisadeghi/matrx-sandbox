@@ -25,6 +25,18 @@ FAIL=0
 pass() { PASS=$((PASS+1)); echo "  PASS  $1"; }
 fail() { FAIL=$((FAIL+1)); echo "  FAIL  $1: $2"; }
 
+echo "== mtx toolchain ensure (self-service upgrade, must be a safe no-op here) =="
+if out="$(mtx toolchain ensure 2>&1)"; then
+    pass "mtx toolchain ensure -> $(echo "$out" | tail -1)"
+else
+    fail "mtx toolchain ensure" "$(echo "$out" | tail -3)"
+fi
+if mtx toolchain check >/dev/null 2>&1; then
+    pass "mtx toolchain check (every mandated binary present)"
+else
+    fail "mtx toolchain check" "$(mtx toolchain check 2>&1 | tail -3)"
+fi
+
 echo "== toolchain binaries =="
 for bin in uv pnpm gh; do
     if out="$("$bin" --version 2>&1)"; then

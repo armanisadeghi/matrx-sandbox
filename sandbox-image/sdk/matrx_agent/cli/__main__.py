@@ -83,6 +83,25 @@ def main(argv: list[str] | None = None) -> int:
     new_p.add_argument("kind", choices=["python", "node"])
     new_p.add_argument("name", help="Project name (lowercase, e.g. 'scraper')")
 
+    # `mtx toolchain ensure` — the self-service upgrade for a box created from
+    # an older image. Installs uv/pnpm/gh when missing; `mtx new` calls it first
+    # so the sanctioned recipe works on ANY box without a migration.
+    tc_p = sub.add_parser(
+        "toolchain",
+        help="Ensure uv/pnpm/gh are installed on this box (works on old images)",
+    )
+    tc_sub = tc_p.add_subparsers(dest="toolchain_cmd", required=True)
+    for tc_name, tc_help in (
+        ("ensure", "Install any missing toolchain binary (idempotent)"),
+        ("check", "Report which toolchain binaries are present"),
+    ):
+        tc_one = tc_sub.add_parser(tc_name, help=tc_help)
+        tc_one.add_argument(
+            "tools",
+            nargs="*",
+            help="Limit to these tools (default: uv pnpm gh)",
+        )
+
     # `mtx aidream <subcommand> [args...]` — dispatches to a shell helper.
     # Only available on matrx-sandbox:aidream image variants. We use
     # parser.parse_known_args so the subcommand args pass through untouched.
@@ -104,6 +123,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "new":
         from matrx_agent.cli.new import run as new_run
         return new_run(args)
+
+    if args.cmd == "toolchain":
+        from matrx_agent.cli.toolchain import run as toolchain_run
+        return toolchain_run(args)
 
     if args.cmd == "files":
         from matrx_agent.cli.files import run as files_run

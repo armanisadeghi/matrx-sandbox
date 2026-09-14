@@ -19,8 +19,13 @@ Deliberate design choices:
 * **No install at creation time.** Creation is offline and instant; the printed
   next command (``uv run pytest`` / ``pnpm install``) does the network work, so
   a failure is attributable to the right step.
-* **Missing toolchain screams.** If ``uv``/``pnpm`` is absent we say so and name
-  the remedy instead of writing files that cannot be run.
+* **Missing toolchain repairs itself.** ``uv``/``pnpm`` absent used to be a
+  refusal — which on a box created from an older image made the ONE sanctioned
+  recipe unusable and pushed the agent straight into the improvisation its
+  prompt forbids (independent review, 2026-09-14, row ``ca931876``: eight shell
+  calls, eight failures). ``mtx new`` now calls ``mtx toolchain ensure`` first,
+  so it works on any box without a migration. It still refuses loudly — naming
+  the remedy — when the install itself cannot be done.
 """
 
 from __future__ import annotations
@@ -77,14 +82,29 @@ def _module_name(name: str) -> str:
     return name.replace("-", "_")
 
 
+def _ensure_tool(binary: str) -> str | None:
+    """Make ``binary`` runnable, installing it if this box's image predates it.
+
+    Returns None on success, or the refusal message when the install failed.
+    """
+    if shutil.which(binary) is not None:
+        return None
+    from matrx_agent.cli.toolchain import ensure as toolchain_ensure, _MANUAL
+
+    toolchain_ensure([binary])
+    if shutil.which(binary) is not None:
+        return None
+    return (
+        f"{binary} is not on PATH in this sandbox and `mtx toolchain ensure` "
+        f"could not install it (see the errors above), so the project was not "
+        f"created. Install it by hand with: {_MANUAL[binary]}"
+    )
+
+
 def _new_python(name: str) -> int:
-    if shutil.which("uv") is None:
-        return _fail(
-            "uv is not on PATH in this sandbox, so the project could not be "
-            "created. This image is out of date — spawn a new sandbox (every "
-            "current image ships uv, pnpm and gh), or install it with: "
-            "curl -LsSf https://astral.sh/uv/install.sh | sh"
-        )
+    problem = _ensure_tool("uv")
+    if problem:
+        return _fail(problem)
     target, rc = _prepare_dir(name)
     if target is None:
         return rc
@@ -135,13 +155,9 @@ def _new_python(name: str) -> int:
 
 
 def _new_node(name: str) -> int:
-    if shutil.which("pnpm") is None:
-        return _fail(
-            "pnpm is not on PATH in this sandbox, so the project could not be "
-            "created. This image is out of date — spawn a new sandbox (every "
-            "current image ships uv, pnpm and gh), or install it with: "
-            "npm install -g pnpm"
-        )
+    problem = _ensure_tool("pnpm")
+    if problem:
+        return _fail(problem)
     target, rc = _prepare_dir(name)
     if target is None:
         return rc

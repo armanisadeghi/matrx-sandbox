@@ -31,7 +31,7 @@ def projects_root(tmp_path, monkeypatch):
 
 
 def test_python_scaffold_is_flat_and_its_test_passes(projects_root, monkeypatch):
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/uv")
+    monkeypatch.setattr("shutil.which", lambda _n, **kw: "/usr/local/bin/uv")
     assert new_run(_args("python", "demo")) == 0
 
     project = projects_root / "demo"
@@ -59,7 +59,7 @@ def test_python_scaffold_is_flat_and_its_test_passes(projects_root, monkeypatch)
 
 
 def test_python_scaffold_prints_the_next_command(projects_root, monkeypatch, capsys):
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/uv")
+    monkeypatch.setattr("shutil.which", lambda _n, **kw: "/usr/local/bin/uv")
     assert new_run(_args("python", "demo")) == 0
     out = capsys.readouterr().out
     assert "uv run pytest" in out
@@ -69,7 +69,7 @@ def test_python_scaffold_prints_the_next_command(projects_root, monkeypatch, cap
 def test_node_scaffold_is_flat_and_valid_json(projects_root, monkeypatch):
     import json
 
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/pnpm")
+    monkeypatch.setattr("shutil.which", lambda _n, **kw: "/usr/local/bin/pnpm")
     assert new_run(_args("node", "web-demo")) == 0
 
     project = projects_root / "web-demo"
@@ -81,18 +81,61 @@ def test_node_scaffold_is_flat_and_valid_json(projects_root, monkeypatch):
     assert pkg["scripts"]["test"] == "vitest run"
 
 
-def test_missing_uv_refuses_loudly_and_names_the_remedy(projects_root, monkeypatch, capsys):
-    monkeypatch.setattr("shutil.which", lambda _: None)
+def test_missing_uv_is_installed_then_the_scaffold_proceeds(
+    projects_root, monkeypatch, capsys
+):
+    """THE GUARD for row ca931876.
+
+    A box created from an older image has no `uv`. Before 2026-09-14 `mtx new`
+    refused, the Sandbox Specialist's one sanctioned recipe died on command one,
+    and it improvised eight failing shell calls. `mtx new` must now repair the
+    box itself and carry on.
+    """
+    from matrx_agent.cli import toolchain
+
+    state = {"uv": None, "calls": []}
+    monkeypatch.setattr(
+        "shutil.which", lambda name, **kw: state.get(name, "/usr/local/bin/" + name)
+    )
+
+    def fake_ensure(tools=toolchain.REQUIRED_TOOLS, quiet=False):
+        state["calls"].append(list(tools))
+        for t in tools:
+            state[t] = f"/usr/local/bin/{t}"  # the installer really landed it
+        return 0
+
+    monkeypatch.setattr(toolchain, "ensure", fake_ensure)
+
+    assert new_run(_args("python", "demo")) == 0
+    assert state["calls"] == [["uv"]], "mtx new must ensure the toolchain first"
+    project = projects_root / "demo"
+    assert (project / "pyproject.toml").is_file()
+    assert "uv run pytest" in capsys.readouterr().out
+
+
+def test_uv_install_failure_still_refuses_loudly_and_names_the_remedy(
+    projects_root, monkeypatch, capsys
+):
+    from matrx_agent.cli import toolchain
+
+    monkeypatch.setattr("shutil.which", lambda _n, **kw: None)
+    monkeypatch.setattr(toolchain, "ensure", lambda tools=None, quiet=False: 1)
+
     assert new_run(_args("python", "demo")) == 1
     err = capsys.readouterr().err
     assert "uv is not on PATH" in err
+    assert "mtx toolchain ensure" in err
     assert "astral.sh/uv" in err
     # Nothing half-written: a project that cannot be run is never created.
     assert not (projects_root / "demo").exists()
 
 
-def test_missing_pnpm_refuses_loudly(projects_root, monkeypatch, capsys):
-    monkeypatch.setattr("shutil.which", lambda _: None)
+def test_pnpm_install_failure_still_refuses_loudly(projects_root, monkeypatch, capsys):
+    from matrx_agent.cli import toolchain
+
+    monkeypatch.setattr("shutil.which", lambda _n, **kw: None)
+    monkeypatch.setattr(toolchain, "ensure", lambda tools=None, quiet=False: 1)
+
     assert new_run(_args("node", "demo")) == 1
     err = capsys.readouterr().err
     assert "pnpm is not on PATH" in err
@@ -100,14 +143,14 @@ def test_missing_pnpm_refuses_loudly(projects_root, monkeypatch, capsys):
 
 
 def test_rejects_unsafe_names(projects_root, monkeypatch, capsys):
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/uv")
+    monkeypatch.setattr("shutil.which", lambda _n, **kw: "/usr/local/bin/uv")
     for bad in ["../escape", "Demo Project", "9lives", ""]:
         assert new_run(_args("python", bad)) == 1
     assert "not a usable project name" in capsys.readouterr().err
 
 
 def test_refuses_to_clobber_a_non_empty_directory(projects_root, monkeypatch, capsys):
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/uv")
+    monkeypatch.setattr("shutil.which", lambda _n, **kw: "/usr/local/bin/uv")
     existing = projects_root / "demo"
     existing.mkdir(parents=True)
     (existing / "important.py").write_text("# the user's work\n")
@@ -121,7 +164,7 @@ def test_mtx_new_is_reachable_through_the_cli_dispatcher(projects_root, monkeypa
     """`mtx new ...` must actually route here — a module nothing calls is not a fix."""
     from matrx_agent.cli.__main__ import main
 
-    monkeypatch.setattr("shutil.which", lambda _: "/usr/local/bin/uv")
+    monkeypatch.setattr("shutil.which", lambda _n, **kw: "/usr/local/bin/uv")
     assert main(["new", "python", "routed"]) == 0
     assert (projects_root / "routed" / "pyproject.toml").is_file()
     assert "uv run pytest" in capsys.readouterr().out
