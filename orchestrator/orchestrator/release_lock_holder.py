@@ -5,6 +5,14 @@ It creates only explicitly derived locks, validates every lock inode in the
 journal directory, acquires the complete set, and holds the descriptors until
 its stdin is closed.  Keeping the descriptors in one process avoids the
 lstat/open and cross-UID ownership gaps that shell redirections introduce.
+
+Acquisition is non-blocking per attempt, but the caller may set a BOUNDED WAIT
+(``--wait-seconds``).  A single non-blocking attempt made the hosted promotion
+lose roughly 40% of its ticks to the 60-second liveness reconcile sweep, which
+holds the same shared lease for a few hundred milliseconds: the deploy is not
+urgent, the sweep is short, and a bounded retry turns a coin flip into a
+deterministic promotion.  Inventory errors are never retried — a malformed or
+racing lock namespace must still fail closed immediately.
 """
 from __future__ import annotations
 
@@ -15,6 +23,7 @@ import os
 import re
 import stat
 import sys
+import time
 from pathlib import Path
 from typing import BinaryIO
 
@@ -256,16 +265,57 @@ class LockLease:
             self._directory_fd = None
 
 
+RETRY_INTERVAL_SECONDS = 0.25
+
+
+def acquire_with_wait(
+    root: Path,
+    keys: list[str],
+    *,
+    include_existing: bool = False,
+    wait_seconds: float = 0.0,
+    now=time.monotonic,
+    sleep=time.sleep,
+) -> tuple["LockLease", dict[str, object]]:
+    """Acquire the whole lock set, retrying contention until ``wait_seconds``.
+
+    Every attempt uses a FRESH lease so the directory identity, the inode
+    census and the pin set are all re-derived — a retry must never reuse state
+    snapshotted before the competing holder released.  Only contention is
+    retried; ``LockInventoryError`` still fails closed on the first attempt.
+    """
+    if wait_seconds < 0:
+        raise LockInventoryError("wait_seconds must not be negative")
+    deadline = now() + wait_seconds
+    while True:
+        lease = LockLease(root)
+        try:
+            receipt = lease.acquire(keys, include_existing=include_existing)
+        except LockContentionError:
+            lease.close()
+            remaining = deadline - now()
+            if remaining <= 0:
+                raise
+            sleep(min(RETRY_INTERVAL_SECONDS, remaining))
+            continue
+        except BaseException:
+            lease.close()
+            raise
+        return lease, receipt
+
+
 def hold(
     root: Path,
     keys: list[str],
     *,
     include_existing: bool = False,
+    wait_seconds: float = 0.0,
     input_stream: BinaryIO = sys.stdin.buffer,
 ) -> None:
-    lease = LockLease(root)
+    lease, receipt = acquire_with_wait(
+        root, keys, include_existing=include_existing, wait_seconds=wait_seconds
+    )
     try:
-        receipt = lease.acquire(keys, include_existing=include_existing)
         print(json.dumps(receipt, sort_keys=True), flush=True)
         input_stream.read(1)
     finally:
@@ -275,11 +325,25 @@ def hold(
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--all-existing", action="store_true")
+    parser.add_argument(
+        "--wait-seconds",
+        type=float,
+        default=0.0,
+        help="bounded wait for a contended lock set (0 = one non-blocking attempt)",
+    )
     parser.add_argument("journal_dir", type=Path)
     parser.add_argument("keys", nargs="+")
     args = parser.parse_args()
+    if args.wait_seconds < 0:
+        print("--wait-seconds must not be negative", file=sys.stderr)
+        raise SystemExit(76)
     try:
-        hold(args.journal_dir, args.keys, include_existing=args.all_existing)
+        hold(
+            args.journal_dir,
+            args.keys,
+            include_existing=args.all_existing,
+            wait_seconds=args.wait_seconds,
+        )
     except LockContentionError as exc:
         print(str(exc), file=sys.stderr)
         raise SystemExit(75) from exc

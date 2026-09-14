@@ -32,6 +32,9 @@
 #                         rebuilds, seconds (21600 = 6 h default; 0 disables the
 #                         floor). FORCE=1 always ignores it.
 #   AIDREAM_REBUILD_STAMP — path of the epoch stamp that floor reads/writes.
+#   DEPLOY_LOCK_WAIT_SECONDS — bounded wait for the shared `deployment` lease on
+#                         the safe promotion path, 0..3600 (120 default;
+#                         0 = a single non-blocking attempt).
 
 set -uo pipefail
 
@@ -58,6 +61,14 @@ MAX_IMAGE_AGE_SECONDS="${MAX_IMAGE_AGE_SECONDS:-1209600}" # 14 days; matches Fle
 AIDREAM_REBUILD_MIN_INTERVAL_SECONDS="${AIDREAM_REBUILD_MIN_INTERVAL_SECONDS:-21600}" # 6 h
 AIDREAM_REBUILD_STAMP="${AIDREAM_REBUILD_STAMP:-/srv/apps/deploy-state/matrx-sandbox.aidream-build-epoch}"
 ORCH_STARTUP_TIMEOUT_SECONDS="${ORCH_STARTUP_TIMEOUT_SECONDS:-300}"
+# ── The promotion lock wait (a knob, not a constant) ────────────────────────
+# The shared `deployment` lease is also taken, briefly, by the 60-second
+# liveness reconcile sweep and by every admitted sandbox migration. A single
+# non-blocking attempt therefore lost roughly two ticks in five to a sweep that
+# was already finishing, and each loss rolled a fully built, fully verified
+# candidate back and waited for the next poller tick — the deadlock class this
+# knob closes. A deploy is not latency-sensitive; a bounded wait is.
+DEPLOY_LOCK_WAIT_SECONDS="${DEPLOY_LOCK_WAIT_SECONDS:-120}"
 
 # Why a failure file: Fleet Health could see the poller was stuck but not WHY,
 # so its only advice was "ssh in and read journalctl". A 20 h wedge on
@@ -82,6 +93,9 @@ fail() { echo "[deploy-hosted] ERROR: $*" >&2; record_failure "$*"; exit 1; }
   || fail "ORCH_STARTUP_TIMEOUT_SECONDS must be an integer from 30 through 1800"
 [[ "$AIDREAM_REBUILD_MIN_INTERVAL_SECONDS" =~ ^(0|[1-9][0-9]{0,7})$ ]] \
   || fail "AIDREAM_REBUILD_MIN_INTERVAL_SECONDS must be a whole number of seconds (0 disables the floor)"
+[[ "$DEPLOY_LOCK_WAIT_SECONDS" =~ ^(0|[1-9][0-9]{0,3})$ ]] \
+  && (( DEPLOY_LOCK_WAIT_SECONDS <= 3600 )) \
+  || fail "DEPLOY_LOCK_WAIT_SECONDS must be a whole number of seconds from 0 through 3600 (0 = one non-blocking attempt)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/release-guard.sh
 source "$SCRIPT_DIR/lib/release-guard.sh" \
@@ -614,9 +628,9 @@ release_migration_lock_holder() {
 }
 
 start_migration_lock_holder() {
-  local scope="$1" receipt status
-  shift
-  local -a options=()
+  local scope="$1" wait_seconds="$2" receipt status
+  shift 2
+  local -a options=(--wait-seconds "$wait_seconds")
   [ "$scope" = all ] && options+=(--all-existing)
   [ -z "$MIGRATION_LOCK_HOLDER_PID" ] || return 76
   coproc {
@@ -642,8 +656,18 @@ start_migration_lock_holder() {
   MIGRATION_LOCK_HOLDER_OUTPUT_FD=""
 }
 
+# The exact set of lock inodes in the journal directory. The bootstrap seize
+# happens while the old orchestrator still RUNS, so this census is taken at the
+# moment the lease is held and compared again once the old control is frozen:
+# a lockless source that admitted a new operation in that window shows up as a
+# new *.lock name, and the promotion defers instead of cutting it off.
+lock_census() {
+  ( cd "$HOSTED_MIGRATION_STATE_DIR" 2>/dev/null \
+      && ls -1 2>/dev/null | grep '\.lock$' | LC_ALL=C sort | tr '\n' ' ' ) || true
+}
+
 acquire_frozen_old_locks() {
-  local audit_image="$1" key derived status
+  local audit_image="$1" wait_seconds="${2:-0}" key derived status
   local -a keys=(deployment)
   derived=$(required_migration_lock_keys "$audit_image") || return 2
   while IFS= read -r key; do
@@ -653,7 +677,7 @@ acquire_frozen_old_locks() {
     fi
     keys+=("$key")
   done <<< "$derived"
-  if start_migration_lock_holder all "${keys[@]}"; then return 0; else status=$?; fi
+  if start_migration_lock_holder all "$wait_seconds" "${keys[@]}"; then return 0; else status=$?; fi
   [ "$status" = 75 ] && return 1
   return 2
 }
@@ -710,6 +734,49 @@ rollback_release() {
 }
 fail_release() { PROMOTION_ACTIVE=0; rollback_release; fail "$*"; }
 
+bootstrap_barrier_seize() {
+  local lock_status=0 seized_census kill_status old_stopped
+  BOOTSTRAP_OLD_ID="$PREVIOUS_ORCH_CONTAINER_ID"
+  [ -n "$BOOTSTRAP_OLD_ID" ] \
+    || fail_release "cannot identify the live orchestrator for barrier bootstrap"
+  # 1. Seize every old-source operation lock while the old control still runs.
+  #    Nothing about the live service has been touched yet, so any failure here
+  #    defers a promotion instead of costing the edge a paused orchestrator.
+  acquire_frozen_old_locks "$AUDIT_IMAGE" 0 || lock_status=$?
+  if [ "$lock_status" = 1 ]; then
+    fail_release "old-source migration/recovery lock contention deferred hosted promotion (orchestrator untouched)"
+  elif [ "$lock_status" != 0 ]; then
+    fail_release "old-source migration lock inventory is invalid (orchestrator untouched)"
+  fi
+  seized_census="$(lock_census)"
+  # 2. Only now freeze the exact old control.
+  docker pause "$BOOTSTRAP_OLD_ID" >/dev/null \
+    || fail_release "cannot pause the exact old orchestrator for barrier bootstrap"
+  BOOTSTRAP_OLD_PAUSED=1
+  [ "$(docker inspect -f '{{.State.Status}}' "$BOOTSTRAP_OLD_ID" 2>/dev/null)" = paused ] \
+    || fail_release "exact old orchestrator did not reach paused state"
+  # 3. Prove the frozen source admitted nothing between the seize and the pause.
+  [ "$(lock_census)" = "$seized_census" ] \
+    || fail_release "the old orchestrator admitted a new operation during the bootstrap seize window"
+  audit_migration_release_state "$AUDIT_IMAGE" \
+    || fail_release "hosted migration journal/artifact census refused bootstrap"
+  kill_status=0
+  docker kill --signal KILL "$BOOTSTRAP_OLD_ID" >/dev/null || kill_status=$?
+  old_stopped=0
+  for _ in $(seq 1 50); do
+    if [ "$(docker inspect -f '{{.State.Running}}' "$BOOTSTRAP_OLD_ID" 2>/dev/null)" = false ]; then
+      old_stopped=1; break
+    fi
+    sleep 0.1
+  done
+  if [ "$old_stopped" = 1 ]; then
+    BOOTSTRAP_OLD_PAUSED=0
+    ORCH_STOPPED=1
+  fi
+  [ "$kill_status" = 0 ] && [ "$old_stopped" = 1 ] \
+    || fail_release "fatal bootstrap stop did not terminate the exact old orchestrator"
+}
+
 PROMOTED_TAGS=()
 PROMOTION_ACTIVE=1
 ORCH_STOPPED=0
@@ -723,9 +790,10 @@ if [ "$ORCH_CHANGED" = 1 ] || [ "${#LIVE_TAGS[@]}" -gt 0 ]; then
   AUDIT_IMAGE="${ORCH_CANDIDATE:-$ORCH_IMAGE}"
   if orchestrator_contract_matches "$PREVIOUS_ORCH_SOURCE" 1; then
     lock_status=0
-    start_migration_lock_holder named deployment || lock_status=$?
+    start_migration_lock_holder named "$DEPLOY_LOCK_WAIT_SECONDS" deployment \
+      || lock_status=$?
     if [ "$lock_status" = 75 ]; then
-      fail_release "active sandbox migration deferred hosted promotion"
+      fail_release "active sandbox migration deferred hosted promotion after ${DEPLOY_LOCK_WAIT_SECONDS}s of waiting (knob: DEPLOY_LOCK_WAIT_SECONDS)"
     elif [ "$lock_status" != 0 ]; then
       fail_release "hosted deployment lock inventory is invalid"
     fi
@@ -737,40 +805,16 @@ if [ "$ORCH_CHANGED" = 1 ] || [ "${#LIVE_TAGS[@]}" -gt 0 ]; then
     ( cd "$ORCH_COMPOSE_DIR" && docker compose stop ) \
       || fail_release "could not enter the release promotion window"
   else
-    # Bootstrap from lockless 474: pause the exact old control, seize every
-    # old-source operation lock, then audit before a fatal replacement.
-    BOOTSTRAP_OLD_ID="$PREVIOUS_ORCH_CONTAINER_ID"
-    [ -n "$BOOTSTRAP_OLD_ID" ] \
-      || fail_release "cannot identify the live orchestrator for barrier bootstrap"
-    docker pause "$BOOTSTRAP_OLD_ID" >/dev/null \
-      || fail_release "cannot pause the exact old orchestrator for barrier bootstrap"
-    BOOTSTRAP_OLD_PAUSED=1
-    [ "$(docker inspect -f '{{.State.Status}}' "$BOOTSTRAP_OLD_ID" 2>/dev/null)" = paused ] \
-      || fail_release "exact old orchestrator did not reach paused state"
-    lock_status=0
-    acquire_frozen_old_locks "$AUDIT_IMAGE" || lock_status=$?
-    if [ "$lock_status" = 1 ]; then
-      fail_release "old-source migration/recovery lock contention deferred hosted promotion"
-    elif [ "$lock_status" != 0 ]; then
-      fail_release "old-source migration lock inventory is invalid"
-    fi
-    audit_migration_release_state "$AUDIT_IMAGE" \
-      || fail_release "hosted migration journal/artifact census refused bootstrap"
-    kill_status=0
-    docker kill --signal KILL "$BOOTSTRAP_OLD_ID" >/dev/null || kill_status=$?
-    old_stopped=0
-    for _ in $(seq 1 50); do
-      if [ "$(docker inspect -f '{{.State.Running}}' "$BOOTSTRAP_OLD_ID" 2>/dev/null)" = false ]; then
-        old_stopped=1; break
-      fi
-      sleep 0.1
-    done
-    if [ "$old_stopped" = 1 ]; then
-      BOOTSTRAP_OLD_PAUSED=0
-      ORCH_STOPPED=1
-    fi
-    [ "$kill_status" = 0 ] && [ "$old_stopped" = 1 ] \
-      || fail_release "fatal bootstrap stop did not terminate the exact old orchestrator"
+    # Bootstrap from lockless 474 — SEIZE FIRST, PAUSE ONLY AFTER.
+    # The old order paused the exact old control before it knew whether the
+    # locks were free, so a contended seize (or an invalid inventory, or a slow
+    # `lock-keys` container start) froze the LIVE orchestrator for the whole
+    # attempt and then rolled back — the edge paid for a deploy that never
+    # happened. The seize is harmless while the old control runs: on failure we
+    # defer with the orchestrator untouched. What the pause used to buy — no new
+    # operation admitted between the census and the freeze — is bought instead
+    # by re-censusing the lock set once the control IS frozen (lock_census).
+    bootstrap_barrier_seize
   fi
 fi
 for index in "${!LIVE_TAGS[@]}"; do

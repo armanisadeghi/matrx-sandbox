@@ -684,22 +684,31 @@ def test_hosted_noop_requires_every_live_release_alias():
 def test_hosted_promotion_holds_exclusive_peer_of_migration_lock():
     """A release cannot stop the orchestrator during backup/CAS/recovery."""
     script = (REPO_ROOT / "scripts" / "deploy-hosted.sh").read_text(encoding="utf-8")
-    acquire = script.index("start_migration_lock_holder named deployment")
+    acquire = script.index('start_migration_lock_holder named "$DEPLOY_LOCK_WAIT_SECONDS" deployment')
     stop = script.index("docker compose stop", acquire)
     audit = script.index('audit_migration_release_state "$AUDIT_IMAGE"', acquire)
     verified = script.index('log "release contract verified', stop)
     release = script.index("release_migration_lock_holder", verified)
     assert acquire < audit < stop < verified < release
 
-    bootstrap = script.index("# Bootstrap from lockless 474", acquire)
-    pause = script.index('docker pause "$BOOTSTRAP_OLD_ID"', bootstrap)
-    old_locks = script.index("acquire_frozen_old_locks", pause)
-    bootstrap_audit = script.index(
-        'audit_migration_release_state "$AUDIT_IMAGE"', old_locks
-    )
-    fatal = script.index('docker kill --signal KILL "$BOOTSTRAP_OLD_ID"', bootstrap_audit)
-    promote = script.index('for index in "${!LIVE_TAGS[@]}"', fatal)
-    assert pause < old_locks < bootstrap_audit < fatal < promote
+    # THE 2026-09-14 RULING: the bootstrap path must NEVER pause the live
+    # orchestrator before it has SEIZED the locks. Pausing first meant a
+    # contended or invalid seize froze a healthy edge for an attempt that was
+    # then rolled back. Re-censusing the lock set after the freeze replaces what
+    # the earlier pause bought. Behavioural guard (the real bash, faked docker):
+    # tests/test_hosted_promotion_lock_order.py.
+    marker = script.index("# Bootstrap from lockless 474", acquire)
+    assert "bootstrap_barrier_seize" in script[marker : script.index("\nfi\n", marker)]
+    body_start = script.index("bootstrap_barrier_seize() {")
+    body = script[body_start : script.index("\n}\n", body_start)]
+    old_locks = body.index('acquire_frozen_old_locks "$AUDIT_IMAGE"')
+    pause = body.index('docker pause "$BOOTSTRAP_OLD_ID"')
+    census = body.index('[ "$(lock_census)" = "$seized_census" ]')
+    bootstrap_audit = body.index('audit_migration_release_state "$AUDIT_IMAGE"')
+    fatal = body.index('docker kill --signal KILL "$BOOTSTRAP_OLD_ID"')
+    assert old_locks < pause < census < bootstrap_audit < fatal
+    promote = script.index('for index in "${!LIVE_TAGS[@]}"', marker)
+    assert marker < promote
     lock_helper = (
         REPO_ROOT / "orchestrator/orchestrator/release_lock_holder.py"
     ).read_text(encoding="utf-8")

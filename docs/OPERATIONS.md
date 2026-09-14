@@ -100,6 +100,28 @@ freshness-UNKNOWN refusal and `FORCE=1` all ignore the floor; every deferral
 logs the knob name and the remedy. Need the template now? `FORCE=1 bash
 /srv/projects/matrx-sandbox/scripts/deploy-hosted.sh`.
 
+The promotion takes the shared `deployment` lease with a **bounded wait**:
+`DEPLOY_LOCK_WAIT_SECONDS` (default 120, `0` = one non-blocking attempt, the old
+behaviour). The same lease is held for a few hundred milliseconds by the
+60-second liveness reconcile sweep and for the duration of any admitted sandbox
+migration, so a single non-blocking attempt threw away a fully built, fully
+verified candidate on roughly two poller ticks in five — each loss rolled back
+and waited for the next tick. The wait is bounded on purpose: a genuinely long
+migration still defers the promotion, and the deferral message names the knob.
+
+The **bootstrap** path (replacing a pre-barrier orchestrator that predates the
+release barrier) now **seizes the locks first and pauses only after**. It used to
+`docker pause` the exact live orchestrator and only then discover whether the
+seize was possible, so a contended or invalid seize froze a healthy edge for an
+attempt that was immediately rolled back. Seizing first is free — a failure
+defers the promotion with the orchestrator still serving. What the earlier pause
+bought (no new operation admitted between the census and the freeze) is bought
+instead by re-censusing the journal's `*.lock` set once the control IS frozen: a
+new lock name means the old source admitted an operation in the seize window, and
+the promotion defers and unpauses rather than cutting it off. Guards:
+`orchestrator/tests/test_hosted_promotion_lock_order.py` (the real bash, faked
+docker) and `test_release_hardening.py::test_hosted_promotion_holds_exclusive_peer_of_migration_lock`.
+
 The per-release `MATRX_IMAGE_VERSION` stamp is applied after stable dependency
 and source layers in both sandbox Dockerfiles. A new commit SHA therefore does
 not invalidate the expensive apt, Playwright, Node, and Python package cache.
