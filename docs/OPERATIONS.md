@@ -86,6 +86,20 @@ The poller also rebuilds any live sandbox image older than 14 days, even when
 its source path has not changed. That matches Fleet Health's freshness limit,
 so an age warning self-heals instead of remaining permanently actionable.
 
+The **aidream template** image tracks aidream's own `main`, which moves many
+times an hour, so its rebuild cadence is a knob rather than "every tick that
+sees a new commit": `AIDREAM_REBUILD_MIN_INTERVAL_SECONDS` (default 21600 = 6 h,
+`0` disables the floor), measured from `AIDREAM_REBUILD_STAMP`
+(`/srv/apps/deploy-state/matrx-sandbox.aidream-build-epoch`), stamped when a
+build STARTS so a failing build cannot re-fire every two minutes. Without it the
+poller ran ~40 six-gigabyte builds in 12 h on 2026-09-14, and every one that
+finished stopped and recreated the single-replica live orchestrator (8 edge
+interruptions of 2–17 s in that window). A missing or unlabeled image,
+`MAX_IMAGE_AGE_SECONDS` freshness, a matrx-sandbox source change, the
+freshness-UNKNOWN refusal and `FORCE=1` all ignore the floor; every deferral
+logs the knob name and the remedy. Need the template now? `FORCE=1 bash
+/srv/projects/matrx-sandbox/scripts/deploy-hosted.sh`.
+
 The per-release `MATRX_IMAGE_VERSION` stamp is applied after stable dependency
 and source layers in both sandbox Dockerfiles. A new commit SHA therefore does
 not invalidate the expensive apt, Playwright, Node, and Python package cache.

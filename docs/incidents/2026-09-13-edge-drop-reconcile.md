@@ -89,6 +89,41 @@ ticking. On the pre-fix code the heartbeat gets **zero** ticks for the whole
 sweep; after the fix it never stalls beyond 300 ms. A second guard does the same
 for the discovery sweep (pre-fix: a 0.97 s stall).
 
+## 2026-09-14 follow-up — what landed, and what the numbers are now
+
+The reconcile fix is **live**: the hosted orchestrator runs `eff96e4` (its own
+`/app/.source-sha`), the 32 MB `sbx-7a395dcdd163` record was retired to
+`.completed-20260913T2158Z` by `cff52ef`, the release gate is no longer
+deadlocked (8 successful promotions in 12 h), and `/health` answered **200 on
+164/164 samples over 888 s** at 5 s intervals — zero unavailability, against 37 %
+availability during the incident. Note that window contained no orchestrator
+recreation, so it does not prove the edge survives one.
+
+Two things the fix did not close, both measured on 2026-09-14:
+
+- **The I/O load itself.** The poller rebuilt the ~6 GB aidream *template*
+  image on every tick that saw a new aidream commit — ~40 builds in 12 h — and
+  each completed build took the promotion barrier that stops and recreates the
+  single-replica orchestrator (8 times, container down 2–17 s each, median 11 s;
+  Traefik only routes to a `healthy` container, so the edge gap is at least
+  that). Closed by `b0f9764`: the cadence is now the knob
+  `AIDREAM_REBUILD_MIN_INTERVAL_SECONDS` (6 h default). See
+  [OPERATIONS.md](../OPERATIONS.md).
+- **The sweep still outlasts its tick**, exactly as predicted below. Measured
+  from `Liveness reconcile complete` timestamps 07:34–07:57 UTC against the
+  fixed 60 s `REAP_INTERVAL_SECONDS`: **min 44 s, median 164 s, max 170 s** per
+  reap tick. The host carries **215 running sandbox containers, 212 of them
+  created in August**, at load average 8.3 on 8 cores. That fleet — not the
+  reconcile code — is now the cost. `REAP_INTERVAL_SECONDS = 60` is also a
+  hardcoded constant rather than a knob (`orchestrator/reaper.py:54`).
+
+Still open after this pass, and named rather than fixed: the release gate's
+bootstrap path still `docker pause`s the live orchestrator *before* it knows it
+can seize the locks (`scripts/deploy-hosted.sh`, `acquire_frozen_old_locks`),
+which is the unfinished half of the 2026-09-13 ruling; and the safe promotion
+path's deployment-lock acquisition is still non-blocking, so it loses ~40 % of
+ticks to the sweep. Neither fired destructively on 2026-09-14.
+
 ## What is still true and worth knowing
 
 - The hosted orchestrator is a **single replica behind a health-gated router**.
