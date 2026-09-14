@@ -28,6 +28,10 @@
 #   FORCE=1             — rebuild everything regardless of the diff.
 #   MATRX_SANDBOX_DIR / ORCH_COMPOSE_DIR / ORCH_HEALTH_URL — path overrides.
 #   ORCH_STARTUP_TIMEOUT_SECONDS — startup verification budget, 30..1800 (300 default).
+#   AIDREAM_REBUILD_MIN_INTERVAL_SECONDS — floor between aidream TEMPLATE image
+#                         rebuilds, seconds (21600 = 6 h default; 0 disables the
+#                         floor). FORCE=1 always ignores it.
+#   AIDREAM_REBUILD_STAMP — path of the epoch stamp that floor reads/writes.
 
 set -uo pipefail
 
@@ -37,6 +41,22 @@ ORCH_HEALTH_URL="${ORCH_HEALTH_URL:-https://orchestrator.dev.codematrx.com/healt
 HOSTED_MIGRATION_STATE_DIR="$ORCH_COMPOSE_DIR/hosted-migrations"
 ORCH_IMAGE="matrx-orchestrator:latest"
 MAX_IMAGE_AGE_SECONDS="${MAX_IMAGE_AGE_SECONDS:-1209600}" # 14 days; matches Fleet Health
+# ── The aidream TEMPLATE rebuild floor (a knob, not a constant) ─────────────
+# aidream's own main branch moves many times an hour (its deploy train pushes
+# every ~20-30 min, plus agent commits). `aidream_stale` compares the baked
+# label to that remote head, so before this floor existed EVERY 2-minute poller
+# tick that saw a new aidream commit started a ~6 GB, ~3-minute, heavy-I/O
+# template build — ~40 of them in 12 h on 2026-09-14 — and each one that
+# finished took the release promotion barrier, which stops and recreates the
+# single-replica live orchestrator behind a health-gated router. Sustained
+# build I/O is exactly what removed that orchestrator from the edge on
+# 2026-09-13 (docs/incidents/2026-09-13-edge-drop-reconcile.md).
+# Per-commit currency buys a development template nothing, so the cadence is an
+# operator knob with an agent-chosen default. Untouched by this floor: a
+# missing image, MAX_IMAGE_AGE_SECONDS freshness, a matrx-sandbox source change,
+# and FORCE=1.
+AIDREAM_REBUILD_MIN_INTERVAL_SECONDS="${AIDREAM_REBUILD_MIN_INTERVAL_SECONDS:-21600}" # 6 h
+AIDREAM_REBUILD_STAMP="${AIDREAM_REBUILD_STAMP:-/srv/apps/deploy-state/matrx-sandbox.aidream-build-epoch}"
 ORCH_STARTUP_TIMEOUT_SECONDS="${ORCH_STARTUP_TIMEOUT_SECONDS:-300}"
 
 # Why a failure file: Fleet Health could see the poller was stuck but not WHY,
@@ -60,6 +80,8 @@ fail() { echo "[deploy-hosted] ERROR: $*" >&2; record_failure "$*"; exit 1; }
 [[ "$ORCH_STARTUP_TIMEOUT_SECONDS" =~ ^[1-9][0-9]{1,3}$ ]] \
   && (( ORCH_STARTUP_TIMEOUT_SECONDS >= 30 && ORCH_STARTUP_TIMEOUT_SECONDS <= 1800 )) \
   || fail "ORCH_STARTUP_TIMEOUT_SECONDS must be an integer from 30 through 1800"
+[[ "$AIDREAM_REBUILD_MIN_INTERVAL_SECONDS" =~ ^(0|[1-9][0-9]{0,7})$ ]] \
+  || fail "AIDREAM_REBUILD_MIN_INTERVAL_SECONDS must be a whole number of seconds (0 disables the floor)"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # shellcheck source=scripts/lib/release-guard.sh
 source "$SCRIPT_DIR/lib/release-guard.sh" \
@@ -208,10 +230,39 @@ aidream_stale() {
   fi
   [ -z "$baked" ] && { log "aidream image is unlabeled (pre-freshness build) — rebuilding to stamp it"; return 0; }
   if [ "$baked" != "$remote" ]; then
+    local since
+    if since=$(aidream_rebuild_floor_remaining); then
+      log "aidream repo moved: baked ${baked:0:9} → main ${remote:0:9} — rebuild DEFERRED: the last aidream template build started ${since}s ago, under the ${AIDREAM_REBUILD_MIN_INTERVAL_SECONDS}s AIDREAM_REBUILD_MIN_INTERVAL_SECONDS floor. Rebuild now with FORCE=1, or lower/zero the knob."
+      return 1
+    fi
     log "aidream repo moved: baked ${baked:0:9} → main ${remote:0:9} — aidream image rebuild queued"
     return 0
   fi
   return 1
+}
+
+# Succeeds (and prints the age of the last build attempt) ONLY while the floor
+# is still holding a rebuild back. Fails open: no knob, no stamp, an unreadable
+# or corrupt stamp, or a clock that went backwards all mean "rebuild allowed".
+aidream_rebuild_floor_remaining() {
+  local last now age
+  [ "$AIDREAM_REBUILD_MIN_INTERVAL_SECONDS" -gt 0 ] || return 1
+  last=$(cat "$AIDREAM_REBUILD_STAMP" 2>/dev/null) || return 1
+  [[ "$last" =~ ^[0-9]+$ ]] || return 1
+  now=$(date -u +%s)
+  age=$((now - last))
+  [ "$age" -ge 0 ] || return 1
+  [ "$age" -lt "$AIDREAM_REBUILD_MIN_INTERVAL_SECONDS" ] || return 1
+  printf '%s\n' "$age"
+}
+
+# Stamped when a build STARTS, never when it finishes: a template build that
+# fails must not re-fire every 2 minutes, which is the same treadmill.
+stamp_aidream_rebuild() {
+  mkdir -p "$(dirname "$AIDREAM_REBUILD_STAMP")" 2>/dev/null \
+    || { log "WARNING: cannot create $(dirname "$AIDREAM_REBUILD_STAMP") — the aidream rebuild floor will not hold"; return 0; }
+  date -u +%s > "$AIDREAM_REBUILD_STAMP" 2>/dev/null \
+    || log "WARNING: cannot write $AIDREAM_REBUILD_STAMP — the aidream rebuild floor will not hold"
 }
 
 # ── Resolve OLD/NEW commit + change set ─────────────────────────────────────
@@ -441,6 +492,7 @@ if [ "$CORE_REBUILT" = 1 ] || need_img matrx-sandbox:aidream || aidream_stale; t
   [[ "$AIDREAM_SOURCE_SHA" =~ ^[0-9a-f]{40}$ ]] \
     || fail "cannot resolve immutable aidream source SHA"
   AIDREAM_CANDIDATE="matrx-sandbox:aidream-$NEW_SHA-${AIDREAM_SOURCE_SHA:0:12}"
+  stamp_aidream_rebuild
   build_candidate matrx-sandbox:aidream "$AIDREAM_CANDIDATE" \
     env MATRX_IMAGE_VERSION="$NEW_SHA" MATRX_CORE_VERSION="$CORE_BUILD_VERSION" \
       bash build-aidream.sh --tag "$AIDREAM_CANDIDATE" \
