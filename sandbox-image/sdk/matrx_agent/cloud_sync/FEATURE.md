@@ -26,6 +26,18 @@ retired from the durable queue after the one loud error record.
 hashes run through `asyncio.to_thread`. Filesystem observer callbacks hand work
 to the loop with `call_soon_threadsafe` and never perform network I/O.
 
+**The server sets the polling cadence; this box follows it.** Realtime is the primary
+down-direction path and `/api/cloud-files/changes` is the fallback. Every answer from that
+endpoint carries `poll_after_seconds` (mirrored in the `Retry-After` header) — 30 s normally,
+45 s while AI Dream's change feed is shedding — and `downstream.PollingSubscriber` adopts it for
+its next wait, jittered like every other wait here. An instruction outside 5–600 s is refused with
+a warning and the built-in 30 s is kept; an answer with no instruction (an older bridge) changes
+nothing. This is the fleet half of the 2026-09-14 re-sizing: 226 boxes on fixed 30 s timers arrive
+at 7.5 polls/s, which is more than the server's bounded feed can serve — following the hint takes
+the fleet to 5.02/s the moment anyone is shed. Server side:
+`aidream/services/sandboxes/change_feed_admission.py` + knobs `infrastructure.sandbox` /
+`change_feed_*`.
+
 ## Entry points
 
 - `watcher.py::CloudFilesWatcher` — live bidirectional replica and durable event replay.

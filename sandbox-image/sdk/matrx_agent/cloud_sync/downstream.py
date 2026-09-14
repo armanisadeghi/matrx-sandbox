@@ -46,7 +46,21 @@ from matrx_agent.cloud_sync.client import AsyncBridgeClient, BridgeConfig
 
 _logger = logging.getLogger("matrx_agent.cloud_sync.downstream")
 
+#: The cadence used until the server says otherwise. The bridge sends its own
+#: instruction with EVERY answer (``poll_after_seconds``, mirrored in the
+#: ``Retry-After`` header), and the loop follows it — that is how 226 boxes
+#: back off together the moment the feed starts shedding, instead of each one
+#: discovering the congestion by being refused (2026-09-14: 61 polls shed
+#: across 49 users in one minute while every box held a fixed 30 s timer).
+#: Server-side knobs: ``infrastructure.sandbox`` /
+#: ``change_feed_poll_interval_seconds`` and ``…_under_pressure_seconds``.
 POLL_INTERVAL_SECONDS = 30.0
+#: A server instruction is honoured only inside this band: below the floor a
+#: bad value would turn one box into a hammer, above the ceiling it would
+#: silently stop syncing. Outside the band the loop keeps its own cadence and
+#: says so — never a silent clamp to something nobody asked for.
+POLL_INTERVAL_MIN_SECONDS = 5.0
+POLL_INTERVAL_MAX_SECONDS = 600.0
 POLL_BACKOFF_INITIAL = 5.0
 POLL_BACKOFF_MAX = 300.0  # 5 min
 # Every wait is jittered by this fraction so a fleet of sandboxes that started
@@ -90,6 +104,10 @@ class PollingSubscriber:
         self._task: Optional[asyncio.Task] = None
         self._stop = asyncio.Event()
         self._cursor_iso = _now_iso()
+        #: The cadence the server last asked for, or the built-in one until it
+        #: does. Kept on the subscriber so a single instruction survives the
+        #: next cycle rather than being re-learned each round.
+        self._interval_seconds = POLL_INTERVAL_SECONDS
 
     async def start(self, on_change: OnChange) -> None:
         if self._task is not None:
@@ -139,6 +157,7 @@ class PollingSubscriber:
                         _logger.warning("cloud-files: on_change handler raised for %s: %s", rel, e)
 
                 self._cursor_iso = next_cursor
+                self._adopt_server_interval(envelope.get("poll_after_seconds"))
                 backoff = POLL_BACKOFF_INITIAL
             except asyncio.CancelledError:
                 return
@@ -163,11 +182,42 @@ class PollingSubscriber:
 
             try:
                 await asyncio.wait_for(
-                    self._stop.wait(), timeout=_jittered(POLL_INTERVAL_SECONDS)
+                    self._stop.wait(), timeout=_jittered(self._interval_seconds)
                 )
                 return  # stop signal
             except asyncio.TimeoutError:
                 pass
+
+    def _adopt_server_interval(self, raw: Any) -> None:
+        """Take the bridge's ``poll_after_seconds`` instruction, or say why not.
+
+        An answer the server did not annotate (an older bridge) leaves the
+        cadence alone, which is the pre-2026-09-14 behaviour.
+        """
+        if raw is None:
+            return
+        try:
+            asked = float(raw)
+        except (TypeError, ValueError):
+            _logger.warning(
+                "cloud-files: the bridge asked for a poll interval of %r, which is "
+                "not a number — keeping %.0fs.", raw, self._interval_seconds,
+            )
+            return
+        if not (POLL_INTERVAL_MIN_SECONDS <= asked <= POLL_INTERVAL_MAX_SECONDS):
+            _logger.warning(
+                "cloud-files: the bridge asked for a poll interval of %.0fs, outside "
+                "the %.0f-%.0fs this image accepts — keeping %.0fs.",
+                asked, POLL_INTERVAL_MIN_SECONDS, POLL_INTERVAL_MAX_SECONDS,
+                self._interval_seconds,
+            )
+            return
+        if asked != self._interval_seconds:
+            _logger.info(
+                "cloud-files: the bridge asked for a %.0fs poll interval (was %.0fs) — "
+                "following it.", asked, self._interval_seconds,
+            )
+            self._interval_seconds = asked
 
 
 def _jittered(seconds: float) -> float:
