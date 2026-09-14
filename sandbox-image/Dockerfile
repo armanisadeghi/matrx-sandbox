@@ -75,6 +75,41 @@ RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
     # deploy pipelines for a day (2026-07-08) the moment it was published.
     && npm install -g npm@11
 
+# ─── Agent project toolchain: uv, pnpm, gh ───────────────────────────────────
+# Every sandbox ships these — bare/core/node-22/python-3.13 all run this image.
+# Reason (2026-09-14 agent-efficiency-loop ruling): with uv absent, an agent
+# asked to set up a Python project burned 3-4 failed tool calls improvising
+# `uv init` flags before falling back to venv+pip. `mtx new python <name>`
+# (SDK CLI) is the recipe; it refuses to scaffold if these are missing.
+#
+# Pin every version. NEVER @latest here — one unpinned npm@latest broke every
+# image build on both deploy pipelines for a day (2026-07-08); see the npm note
+# above. Bump these ARGs deliberately.
+ARG UV_VERSION=0.10.8
+ARG PNPM_VERSION=10.15.0
+# corepack ships with Node 20 and stays available for repos that declare a
+# `packageManager` field; we install a real pinned pnpm rather than a corepack
+# shim so `pnpm` works offline and without a download prompt.
+ENV COREPACK_ENABLE_DOWNLOAD_PROMPT=0
+RUN curl -LsSf "https://astral.sh/uv/${UV_VERSION}/install.sh" \
+        | env UV_INSTALL_DIR=/usr/local/bin sh \
+    && npm install -g "pnpm@${PNPM_VERSION}" \
+    && corepack enable yarn \
+    && install -d -m 0755 /etc/apt/keyrings \
+    && curl -fsSL https://cli.github.com/packages/githubcli-archive-keyring.gpg \
+        -o /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && chmod go+r /etc/apt/keyrings/githubcli-archive-keyring.gpg \
+    && echo "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/githubcli-archive-keyring.gpg] https://cli.github.com/packages stable main" \
+        > /etc/apt/sources.list.d/github-cli.list \
+    && apt-get update \
+    && apt-get install -y --no-install-recommends gh \
+    && rm -rf /var/lib/apt/lists/* \
+    # Fail the build loudly rather than shipping an image that silently lacks
+    # the toolchain every agent now assumes.
+    && uv --version \
+    && pnpm --version \
+    && gh --version
+
 # ─── AWS CLI v2 (multi-arch) ─────────────────────────────────────────────────
 RUN UARCH=$(uname -m) \
     && curl "https://awscli.amazonaws.com/awscli-exe-linux-${UARCH}.zip" -o "awscliv2.zip" \

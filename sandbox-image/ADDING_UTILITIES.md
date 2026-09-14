@@ -38,6 +38,37 @@ serve uses the template venv's Python in isolated mode. Exact verification
 rejects untracked tampering. Only the user home and explicit runtime tmpfs/log
 paths remain writable.
 
+## The agent project toolchain (already there — don't re-add it)
+
+Every image — `:core` (which backs the `bare`, `node-22` and `python-3.13`
+templates), `:slim`, and `:aidream`/`:development` by inheritance — ships
+**`uv`**, **`pnpm`** and **`gh`**, pinned by the `UV_VERSION` / `PNPM_VERSION`
+build ARGs in `Dockerfile` and `Dockerfile.slim`. The build fails loudly if any
+of the three is missing.
+
+Agents start projects with the SDK CLI, not by improvising flags:
+
+```bash
+mtx new python demo && cd ~/projects/demo && uv run pytest
+mtx new node webdemo && cd ~/projects/webdemo && pnpm install && pnpm test
+```
+
+`mtx new` lays down a **flat** project (module and test at the project root, no
+`src/`, no build backend) with one passing test and prints the next commands.
+Source: `sdk/matrx_agent/cli/new.py`.
+
+The forcing-function check is `scripts/test-toolchain.sh` — it runs the real
+binaries and really executes the scaffolded test suite:
+
+```bash
+docker run --rm -u agent matrx-sandbox:slim bash /opt/sandbox/scripts/test-toolchain.sh
+```
+
+Run it after any change to the toolchain block or to `mtx new`. The unit half
+(layout, refusal-with-remedy, dispatcher wiring) is `sdk/tests/test_cli_new.py`.
+
+---
+
 ## Quick Reference
 
 | Type | Location | Available in Container At |

@@ -46,7 +46,7 @@ echo -e "  HOT_PATH:   ${HOT_PATH:-<not set>}"
 echo -e "  Python:     $(python3 --version 2>&1)"
 
 # Check key binaries
-for bin in rg fdfind git node pdftotext; do
+for bin in rg fdfind git node pdftotext uv pnpm gh; do
     if command -v "$bin" &>/dev/null; then
         pass "$bin is available ($(command -v $bin))"
     else
@@ -58,6 +58,10 @@ for bin in rg fdfind git node pdftotext; do
         fi
     fi
 done
+
+# The agent project toolchain (uv/pnpm/gh + `mtx new`) has its own
+# forcing-function check — run it for a real pass/fail, not just presence:
+#   bash /opt/sandbox/scripts/test-toolchain.sh
 
 # Check Python package import
 if python3 -c "from matrx_tools import TOOL_DEFINITIONS, dispatch, ToolSession; print(f'{len(TOOL_DEFINITIONS)} tools loaded')" 2>&1; then

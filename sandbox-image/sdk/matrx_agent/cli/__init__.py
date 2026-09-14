@@ -5,6 +5,10 @@ work with their AI Dream cloud_files surface. AI agents can do the same
 with no special API knowledge.
 
 Subcommands:
+  mtx new python <name>         → flat Python project at ~/projects/<name>,
+                                  one passing test; then `uv run pytest`
+  mtx new node <name>           → flat Node project at ~/projects/<name>,
+                                  one passing vitest; then `pnpm install && pnpm test`
   mtx files ls                  → list files under the user's cld_files namespace
   mtx files cat <path>          → print one file's content
   mtx files put <local> <path>  → upload a local file

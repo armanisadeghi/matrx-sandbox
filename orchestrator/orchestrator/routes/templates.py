@@ -56,7 +56,11 @@ def _builtin_templates(user_id: str | None = None) -> list[TemplateInfo]:
         TemplateInfo(
             id="bare",
             version="1",
-            description="Default sandbox — Ubuntu 22.04 + Python 3.11 + Node 20 + git + ripgrep + Chromium.",
+            description=(
+                "Default sandbox — Ubuntu 22.04 + Python 3.11 + Node 20 + git + "
+                "ripgrep + Chromium, plus uv, pnpm and gh. Start a project with "
+                "`mtx new python <name>` or `mtx new node <name>`."
+            ),
             image=_img("bare"),
             tier=tier,
             languages=["python", "node", "bash"],
@@ -64,7 +68,11 @@ def _builtin_templates(user_id: str | None = None) -> list[TemplateInfo]:
         TemplateInfo(
             id="node-22",
             version="1",
-            description="Node-focused. Defaults pnpm + corepack; expects projects to use Node 22 LTS.",
+            description=(
+                "Node-focused. pnpm is preinstalled (corepack available); "
+                "expects projects to use Node 22 LTS. `mtx new node <name>` "
+                "scaffolds a runnable project with a passing test."
+            ),
             image=_img("node-22"),
             tier=tier,
             languages=["node", "typescript"],
@@ -72,7 +80,11 @@ def _builtin_templates(user_id: str | None = None) -> list[TemplateInfo]:
         TemplateInfo(
             id="python-3.13",
             version="1",
-            description="Python-focused. Adds uv on top of the bare image; Python 3.13 toolchain.",
+            description=(
+                "Python-focused. uv ships on every image; `mtx new python "
+                "<name>` scaffolds a flat project with a passing test that "
+                "`uv run pytest` executes."
+            ),
             image=_img("python-3.13"),
             tier=tier,
             languages=["python"],
@@ -82,7 +94,8 @@ def _builtin_templates(user_id: str | None = None) -> list[TemplateInfo]:
             version="1",
             description=(
                 "Lightweight coding box — Ubuntu + Python 3.11 + Node 20 + git "
-                "+ ripgrep/fd, NO Chromium/AWS/FUSE. Persistence is git: clone a "
+                "+ ripgrep/fd + uv/pnpm/gh, NO Chromium/AWS/FUSE. Persistence is "
+                "git: clone a "
                 "repo, run tools/tests, push a branch. Fast cold start; ephemeral "
                 "by design (set a short ttl_seconds and let the reaper tear it "
                 "down). Best for agent runs launched from chat + PDF/image jobs."

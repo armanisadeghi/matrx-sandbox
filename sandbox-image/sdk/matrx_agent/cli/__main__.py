@@ -73,6 +73,16 @@ def main(argv: list[str] | None = None) -> int:
     _files_subparser(sub)
     sub.add_parser("whoami", help="Print sandbox identity + AI Dream config")
 
+    # `mtx new python <name>` / `mtx new node <name>` — the canonical project
+    # setup recipe. Scaffolds a flat project at ~/projects/<name> with one
+    # passing test and prints the next commands.
+    new_p = sub.add_parser(
+        "new",
+        help="Scaffold a runnable project at ~/projects/<name> (python | node)",
+    )
+    new_p.add_argument("kind", choices=["python", "node"])
+    new_p.add_argument("name", help="Project name (lowercase, e.g. 'scraper')")
+
     # `mtx aidream <subcommand> [args...]` — dispatches to a shell helper.
     # Only available on matrx-sandbox:aidream image variants. We use
     # parser.parse_known_args so the subcommand args pass through untouched.
@@ -90,6 +100,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "whoami":
         from matrx_agent.cli.whoami import run as whoami_run
         return whoami_run()
+
+    if args.cmd == "new":
+        from matrx_agent.cli.new import run as new_run
+        return new_run(args)
 
     if args.cmd == "files":
         from matrx_agent.cli.files import run as files_run
