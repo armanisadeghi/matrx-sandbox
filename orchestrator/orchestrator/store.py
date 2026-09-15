@@ -165,6 +165,7 @@ class SandboxStore(ABC):
         self, alive_container_ids: set[str], tier: str | None = None,
         exclude_sandbox_ids: frozenset[str] = frozenset(),
         include_sandbox_ids: frozenset[str] | None = None,
+        authoritative_sandbox_ids: set[str] | None = None,
     ) -> dict:
         """Liveness reconcile against the host's actually-alive containers.
 
@@ -255,18 +256,22 @@ class InMemorySandboxStore(SandboxStore):
         async with lock:
             existing = self._sandboxes.get(sandbox.sandbox_id)
             if existing is not None:
-                if existing.user_id != sandbox.user_id or existing.organization_id != sandbox.organization_id:
-                    raise RuntimeError("sandbox id is already reserved by another identity")
+                if (existing.row_id != sandbox.row_id or existing.user_id != sandbox.user_id
+                        or existing.organization_id != sandbox.organization_id
+                        or getattr(existing.status, "value", existing.status) != "creating"
+                        or sandbox.sandbox_id in self._deleted or existing.tier != sandbox.tier
+                        or existing.created_at != sandbox.created_at):
+                    raise RuntimeError("sandbox id replay does not match its immutable creating reservation")
                 return
             try:
-                ceiling = int(self._feature_knobs["infrastructure.sandbox"]["active_sandbox_capacity"])
-            except (KeyError, TypeError, ValueError) as exc:
+                ceiling = self._feature_knobs["infrastructure.sandbox"]["active_sandbox_capacity"]
+            except KeyError as exc:
                 raise KnobSourceUnavailableError(
                     "active sandbox admission requires the platform-locked "
                     "infrastructure.sandbox.active_sandbox_capacity knob"
                 ) from exc
-            if ceiling < 1:
-                raise RuntimeError("active sandbox capacity knob must be positive")
+            if isinstance(ceiling, bool) or not isinstance(ceiling, int) or not 1 <= ceiling <= 100:
+                raise RuntimeError("active sandbox capacity knob must be an integer from 1 through 100")
             active = {"creating", "starting", "ready", "running"}
             occupied_rows = [
                 row for sid, row in self._sandboxes.items()
@@ -563,16 +568,21 @@ class PostgresSandboxStore(SandboxStore):
             async with pool.acquire() as conn:
                 async with conn.transaction():
                     await conn.execute(
-                        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+                        "SELECT pg_advisory_xact_lock(hashtextextended('sandbox-admission:' || $1::text, 0))",
                         str(UUID(sandbox.user_id)),
                     )
                     existing = await conn.fetchrow(
-                        "SELECT user_id, organization_id FROM sandbox_instances WHERE sandbox_id = $1",
+                        "SELECT id, user_id, organization_id, status, deleted_at, tier, created_at FROM sandbox_instances WHERE sandbox_id = $1",
                         sandbox.sandbox_id,
                     )
                     if existing is not None:
-                        if str(existing["user_id"]) != sandbox.user_id or str(existing["organization_id"]) != str(organization_id):
-                            raise RuntimeError("sandbox id is already reserved by another identity")
+                        if (str(existing["id"]) != str(sandbox.row_id)
+                                or str(existing["user_id"]) != sandbox.user_id
+                                or str(existing["organization_id"]) != str(organization_id)
+                                or existing["status"] != "creating" or existing["deleted_at"] is not None
+                                or existing["tier"] != sandbox.tier
+                                or existing["created_at"] != sandbox.created_at):
+                            raise RuntimeError("sandbox id replay does not match its immutable creating reservation")
                         return
                     knob = await conn.fetchrow(
                         "SELECT value FROM platform.feature_knob WHERE feature = $1 AND key = $2",
@@ -583,9 +593,9 @@ class PostgresSandboxStore(SandboxStore):
                             "active sandbox admission requires platform-locked infrastructure.sandbox.active_sandbox_capacity"
                         )
                     value = knob["value"]
-                    ceiling = int(json.loads(value) if isinstance(value, str) else value)
-                    if ceiling < 1:
-                        raise RuntimeError("active sandbox capacity knob must be positive")
+                    ceiling = json.loads(value) if isinstance(value, str) else value
+                    if isinstance(ceiling, bool) or not isinstance(ceiling, int) or not 1 <= ceiling <= 100:
+                        raise RuntimeError("active sandbox capacity knob must be an integer from 1 through 100")
                     if replacement_for is not None:
                         predecessor = await conn.fetchrow(
                             """SELECT sandbox_id FROM sandbox_instances
@@ -876,6 +886,7 @@ class PostgresSandboxStore(SandboxStore):
         self, alive_container_ids: set[str], tier: str | None = None,
         exclude_sandbox_ids: frozenset[str] = frozenset(),
         include_sandbox_ids: frozenset[str] | None = None,
+        authoritative_sandbox_ids: set[str] | None = None,
     ) -> dict:
         """Reconcile DB state against the containers actually alive on this host.
 
@@ -903,7 +914,7 @@ class PostgresSandboxStore(SandboxStore):
                 if tier:
                     active_rows = await conn.fetch(
                         """SELECT sandbox_id, container_id FROM sandbox_instances
-                           WHERE status IN ('ready', 'running', 'starting')
+                           WHERE status IN ('creating', 'ready', 'running', 'starting')
                              AND deleted_at IS NULL
                              AND NOT (sandbox_id = ANY($2::text[]))
                              AND ($3::text[] IS NULL OR sandbox_id = ANY($3::text[]))
@@ -914,7 +925,7 @@ class PostgresSandboxStore(SandboxStore):
                 else:
                     active_rows = await conn.fetch(
                         """SELECT sandbox_id, container_id FROM sandbox_instances
-                           WHERE status IN ('ready', 'running', 'starting')
+                           WHERE status IN ('creating', 'ready', 'running', 'starting')
                              AND deleted_at IS NULL
                              AND NOT (sandbox_id = ANY($1::text[]))
                              AND ($2::text[] IS NULL OR sandbox_id = ANY($2::text[]))""",
@@ -940,6 +951,23 @@ class PostgresSandboxStore(SandboxStore):
                 for row in active_rows:
                     sandbox_id = row["sandbox_id"]
                     container_id = row["container_id"]
+                    # A just-reserved creating row has no container id yet.
+                    # It becomes terminal only after a successful complete
+                    # runtime inventory says this exact sandbox label is absent;
+                    # the caller holds the same operation lease, so an active
+                    # creator is excluded rather than raced.
+                    if (not container_id and authoritative_sandbox_ids is not None
+                            and sandbox_id not in authoritative_sandbox_ids):
+                        result = await conn.execute(
+                            """UPDATE sandbox_instances SET status = 'stopped', stopped_at = NOW(),
+                                   stop_reason = 'creation_runtime_absent'
+                               WHERE sandbox_id = $1 AND container_id IS NULL AND status = 'creating'
+                                 AND deleted_at IS NULL AND ($2::text IS NULL OR tier = $2)""",
+                            sandbox_id, tier,
+                        )
+                        if result.endswith(" 1"):
+                            stopped.append(sandbox_id)
+                        continue
                     if container_id and container_id not in alive_container_ids:
                         # Re-assert the live-status guard in the WHERE so we never
                         # stomp a row a concurrent request just moved to terminal.

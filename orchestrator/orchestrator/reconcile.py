@@ -350,7 +350,7 @@ async def reconcile_from_docker(store: SandboxStore) -> dict:
     return summary
 
 
-def _alive_container_ids(client, host_tier: str | None) -> set[str]:
+def _alive_container_inventory(client, host_tier: str | None) -> tuple[set[str], set[str]]:
     """Set of container IDs for THIS tier that are alive enough to keep their
     DB row in a live status.
 
@@ -360,6 +360,7 @@ def _alive_container_ids(client, host_tier: str | None) -> set[str]:
     restarting) is deliberately kept alive so we never stop a sandbox mid-boot.
     """
     alive: set[str] = set()
+    sandbox_ids: set[str] = set()
     containers = client.containers.list(
         all=True, filters={"label": "matrx.sandbox_id"}
     )
@@ -379,6 +380,9 @@ def _alive_container_ids(client, host_tier: str | None) -> set[str]:
                 SandboxStatus.STARTING,
             ):
                 alive.add(container.id)
+                sandbox_id = labels.get("matrx.sandbox_id")
+                if sandbox_id:
+                    sandbox_ids.add(sandbox_id)
         except Exception:
             # We can SEE this container in the list but failed to read its
             # state. Treat it as alive — never stop a row whose container
@@ -390,7 +394,12 @@ def _alive_container_ids(client, host_tier: str | None) -> set[str]:
             except Exception:
                 pass
             continue
-    return alive
+    return alive, sandbox_ids
+
+
+def _alive_container_ids(client, host_tier: str | None) -> set[str]:
+    """Compatibility projection for callers that only need Docker IDs."""
+    return _alive_container_inventory(client, host_tier)[0]
 
 
 async def reap_zombie_containers(store: SandboxStore) -> list[str]:
@@ -563,7 +572,17 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
             return summary
 
         try:
+            # Keep the ID projection as the established liveness seam.  The
+            # second complete label inventory is only an additional proof for
+            # orphaned creating reservations; if it cannot be read, creating
+            # rows stay occupied rather than being expired by guesswork.
             alive_ids = await asyncio.to_thread(_alive_container_ids, client, host_tier)
+            try:
+                _, authoritative_sandbox_ids = await asyncio.to_thread(
+                    _alive_container_inventory, client, host_tier,
+                )
+            except Exception:
+                authoritative_sandbox_ids = None
         except Exception as exc:
             # If we can't enumerate containers, do NOT proceed — an empty/partial
             # alive set would wrongly stop healthy rows. Better to skip this tick.
@@ -571,10 +590,14 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
             return summary
 
         try:
-            return await reconcile(
-                alive_ids, tier=host_tier, exclude_sandbox_ids=excluded,
-                include_sandbox_ids=included,
-            )
+            kwargs = {
+                "tier": host_tier,
+                "exclude_sandbox_ids": excluded,
+                "include_sandbox_ids": included,
+            }
+            if authoritative_sandbox_ids is not None:
+                kwargs["authoritative_sandbox_ids"] = authoritative_sandbox_ids
+            return await reconcile(alive_ids, **kwargs)
         except Exception as exc:
             logger.warning("Liveness reconcile failed: %s", exc)
             return summary
