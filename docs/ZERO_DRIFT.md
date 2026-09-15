@@ -176,6 +176,12 @@ actually changed AND `activity.open_session_count(box) == 0`. Otherwise the
 restart is `deferred` and said so in the diagnostics — the CLI half is live
 immediately either way, because `mtx` is a fresh process on every invocation.
 
+**If the new daemon will not start** (a release that needs a dependency a file
+copy cannot install), and the old one was healthy before we touched it, the
+installer renames the previous tree back, restarts on it, keeps the failed tree
+for inspection, and reports `rolled_back` — a broken daemon is worse than an old
+one, and that box then genuinely needs a migration.
+
 **Knob:** `infrastructure.sandbox.sdk_refresh_on_binding` (default on). A missing
 row does not fall back to a constant — the hook reports `unavailable` and logs
 the remedy.

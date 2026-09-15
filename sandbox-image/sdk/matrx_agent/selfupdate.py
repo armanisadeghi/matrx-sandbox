@@ -292,6 +292,7 @@ def apply(
         result["reason"] = f"{source} does not look like an SDK tree (matrx_agent/api/main.py missing)"
         return result
 
+    pre_healthy = _daemon_healthy()
     old_daemon = daemon_digest(target)
     new_daemon = daemon_digest(source)
     old_all = tree_digest(target)
@@ -338,6 +339,15 @@ def apply(
     if new_daemon != old_daemon:
         if allow_daemon_restart:
             result["daemon_restart"] = restart_daemon()
+            if result["daemon_restart"].get("status") == "failed" and pre_healthy:
+                # We stopped a daemon that WAS working and the new code will not
+                # come up (a dependency the file copy cannot install, most
+                # likely). Put the box back the way we found it — a broken
+                # daemon is worse than an old one.
+                result["rollback"] = _rollback(target, prev)
+                result["status"] = "rolled_back"
+                result["elapsed_seconds"] = round(time.time() - started, 3)
+                return result
         else:
             result["daemon_restart"] = {
                 "status": "deferred",
@@ -350,6 +360,25 @@ def apply(
     result["status"] = "refreshed"
     result["elapsed_seconds"] = round(time.time() - started, 3)
     return result
+
+
+def _rollback(target: str, prev: str) -> dict:
+    """Put the previous SDK back and restart on it. Returns what happened."""
+    failed = f"{target}.failed-{int(time.time())}"
+    try:
+        if not os.path.isdir(prev):
+            return {"status": "impossible", "reason": f"no previous tree at {prev}"}
+        os.rename(target, failed)
+        os.rename(prev, target)
+    except OSError as exc:
+        return {"status": "failed", "reason": f"rollback rename failed: {exc}"}
+    restarted = restart_daemon()
+    return {
+        "status": "restored" if restarted.get("status") == "restarted" else "restored_daemon_down",
+        "restored_from": prev,
+        "failed_tree_kept_at": failed,
+        "daemon": restarted.get("status"),
+    }
 
 
 def _write_version(root: str, image_version: str) -> None:

@@ -125,6 +125,46 @@ def test_a_changed_daemon_defers_its_restart_unless_allowed(boxes, monkeypatch):
     assert allowed["daemon_restart"]["status"] == "restarted"
 
 
+def test_a_daemon_that_will_not_come_up_is_rolled_back(boxes, monkeypatch):
+    """The one way this primitive could really hurt a box: we stop a WORKING
+    daemon and the new code cannot start (a dependency a file copy cannot
+    install). The old tree goes back and the daemon comes back on it."""
+    _write(os.path.join(boxes["source"], "matrx_agent", "api", "main.py"), "import nonexistent\n")
+    monkeypatch.setattr(selfupdate, "_daemon_healthy", lambda *a, **k: True)
+    restarts = []
+
+    def _restart(*_a, **_k):
+        restarts.append(1)
+        return {"status": "failed" if len(restarts) == 1 else "restarted"}
+
+    monkeypatch.setattr(selfupdate, "restart_daemon", _restart)
+
+    result = selfupdate.apply(
+        boxes["source"], boxes["target"], image_version="sep14", allow_daemon_restart=True
+    )
+
+    assert result["status"] == "rolled_back"
+    assert result["rollback"]["status"] == "restored"
+    # The box is back on the SDK it was working with.
+    with open(os.path.join(boxes["target"], "matrx_agent", "api", "main.py")) as fh:
+        assert fh.read() == "# august daemon\n"
+    assert os.path.isfile(os.path.join(boxes["target"], "matrx_agent", "cli", "files.py"))
+    assert len(restarts) == 2
+
+
+def test_a_daemon_that_was_already_down_is_not_blamed_on_the_refresh(boxes, monkeypatch):
+    _write(os.path.join(boxes["source"], "matrx_agent", "api", "main.py"), "# september daemon\n")
+    monkeypatch.setattr(selfupdate, "_daemon_healthy", lambda *a, **k: False)
+    monkeypatch.setattr(selfupdate, "restart_daemon", lambda *a, **k: {"status": "failed"})
+
+    result = selfupdate.apply(
+        boxes["source"], boxes["target"], image_version="sep14", allow_daemon_restart=True
+    )
+
+    assert result["status"] == "refreshed"
+    assert "rollback" not in result
+
+
 def test_an_identical_tree_is_a_no_op(boxes):
     selfupdate.apply(boxes["source"], boxes["target"], image_id="i1", image_version="sep14")
     again = selfupdate.apply(boxes["source"], boxes["target"], image_id="i1", image_version="sep14")

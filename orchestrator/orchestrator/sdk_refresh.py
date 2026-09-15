@@ -205,8 +205,19 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
             "deps_added": list((installed.get("deps_checked") or {}).get("added") or []),
             "mtx_shim": str(installed.get("mtx_shim", "")) or None,
             "elapsed_seconds": installed.get("elapsed_seconds"),
+            "rollback": (
+                str((installed.get("rollback") or {}).get("status"))
+                if installed.get("rollback")
+                else None
+            ),
         },
     )
+    if result["status"] == "rolled_back":
+        logger.error(
+            "SDK REFRESH ROLLED BACK on %s: the current SDK's daemon would not start, so the "
+            "box was restored to %s (rollback=%s). This box needs a real image migration.",
+            sandbox_id, from_version, result["rollback"],
+        )
     if result["deps_added"]:
         logger.warning(
             "SDK REFRESH on %s installed a tree that declares NEW dependencies %s — the file "
