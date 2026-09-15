@@ -176,6 +176,13 @@ actually changed AND `activity.open_session_count(box) == 0`. Otherwise the
 restart is `deferred` and said so in the diagnostics — the CLI half is live
 immediately either way, because `mtx` is a fresh process on every invocation.
 
+**Overlayfs.** On a box still running its original image the SDK tree sits in a
+lower overlayfs layer and cannot be renamed at all (`EXDEV`) — a live rehearsal
+against a real container caught this. The installer falls back to copying the old
+tree aside and replacing it, and reports which path it took as `swap_mode`
+(`rename` or `replace`). It also never rewrites an existing `mtx` shim: a shim
+pointing at another interpreter is a box where `mtx` works today.
+
 **If the new daemon will not start** (a release that needs a dependency a file
 copy cannot install), and the old one was healthy before we touched it, the
 installer renames the previous tree back, restarts on it, keeps the failed tree

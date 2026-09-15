@@ -96,6 +96,34 @@ def test_an_old_box_gains_the_new_command_and_the_home_is_untouched(boxes):
     assert not os.path.exists(boxes["target"] + ".staging")
 
 
+def test_a_tree_that_cannot_be_renamed_is_still_replaced(boxes, monkeypatch):
+    """On a box still running its original image the SDK sits in a lower
+    overlayfs layer and CANNOT be renamed (EXDEV) — the case a live rehearsal
+    caught. The swap falls back to copy-aside + replace, and says which it did."""
+    import errno as _errno
+
+    real_rename = os.rename
+    tripped = []
+
+    def _rename(src, dst):
+        if src == boxes["target"] and not tripped:
+            tripped.append(1)
+            raise OSError(_errno.EXDEV, "Invalid cross-device link", src, None, dst)
+        return real_rename(src, dst)
+
+    monkeypatch.setattr(os, "rename", _rename)
+    before = _digest_dir(boxes["home"])
+
+    result = selfupdate.apply(boxes["source"], boxes["target"], image_version="sep14")
+
+    assert tripped, "the fallback was never exercised"
+    assert result["status"] == "refreshed"
+    assert result["swap_mode"] == "replace"
+    assert os.path.isfile(os.path.join(boxes["target"], "matrx_agent", "cli", "toolchain.py"))
+    assert os.path.isfile(os.path.join(boxes["target"] + ".prev", "matrx_agent", "cli", "files.py"))
+    assert _digest_dir(boxes["home"]) == before
+
+
 def test_an_unchanged_daemon_is_never_restarted(boxes, monkeypatch):
     called = []
     monkeypatch.setattr(selfupdate, "restart_daemon", lambda *a, **k: called.append(1) or {"status": "restarted"})
@@ -186,6 +214,25 @@ def test_on_demand_with_nothing_staged_names_the_remedy(tmp_path, boxes):
     result = selfupdate.apply(str(tmp_path / "nothing-here"), boxes["target"])
     assert result["status"] == "failed"
     assert "Rebind this sandbox" in result["reason"]
+
+
+def test_an_existing_mtx_shim_is_never_rewritten(boxes):
+    """A box whose shim points at another interpreter is a box where mtx WORKS.
+    Correcting it would break the very command this refresh delivers."""
+    with open(selfupdate.MTX_SHIM, "w", encoding="utf-8") as fh:
+        fh.write("#!/bin/sh\nexec /usr/local/bin/python3 -m matrx_agent.cli \"$@\"\n")
+
+    result = selfupdate.apply(boxes["source"], boxes["target"], image_version="sep14")
+
+    assert result["mtx_shim"] == "present"
+    with open(selfupdate.MTX_SHIM, encoding="utf-8") as fh:
+        assert "/usr/local/bin/python3 " in fh.read()
+
+
+def test_a_box_born_without_the_shim_gets_one(boxes):
+    result = selfupdate.apply(boxes["source"], boxes["target"], image_version="sep14")
+    assert result["mtx_shim"] == "installed"
+    assert os.access(selfupdate.MTX_SHIM, os.X_OK)
 
 
 def test_it_refuses_to_install_into_a_home(tmp_path):

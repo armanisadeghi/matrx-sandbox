@@ -37,6 +37,7 @@ THE RULES.
 from __future__ import annotations
 
 import argparse
+import errno
 import hashlib
 import json
 import os
@@ -128,7 +129,16 @@ def installed_version(target: str = DEFAULT_TARGET) -> str:
             return baked
     except OSError:
         pass
-    return os.environ.get("MATRX_IMAGE_VERSION", "") or "unknown"
+    if os.environ.get("MATRX_IMAGE_VERSION"):
+        return os.environ["MATRX_IMAGE_VERSION"]
+    try:
+        with open("/etc/sandbox-image-version", "r", encoding="utf-8") as fh:
+            baked = fh.read().strip()
+        if baked:
+            return baked
+    except OSError:
+        pass
+    return "unknown"
 
 
 # ── daemon ───────────────────────────────────────────────────────────────────
@@ -318,7 +328,21 @@ def apply(
         _write_version(staged, image_version)
         shutil.rmtree(prev, ignore_errors=True)
         if os.path.isdir(target):
-            os.rename(target, prev)
+            try:
+                os.rename(target, prev)
+                result["swap_mode"] = "rename"
+            except OSError as exc:
+                if exc.errno != errno.EXDEV:
+                    raise
+                # A tree that came from a lower overlayfs layer cannot be
+                # renamed — which is exactly the case on a box running its
+                # original image. Copy the old tree aside instead, then swap.
+                # The replacement is still one rename, so the window in which
+                # /opt/sandbox/sdk is absent is the rmtree, not a file-by-file
+                # overwrite: no import can ever see a half-merged tree.
+                shutil.copytree(target, prev, symlinks=True)
+                shutil.rmtree(target)
+                result["swap_mode"] = "replace"
         os.rename(staged, target)
     except OSError as exc:
         # Nothing was swapped, or the swap failed after the old tree moved:
@@ -327,7 +351,10 @@ def apply(
             try:
                 os.rename(prev, target)
             except OSError:
-                pass
+                try:
+                    shutil.copytree(prev, target, symlinks=True)
+                except OSError:
+                    pass
         shutil.rmtree(staged, ignore_errors=True)
         result["reason"] = f"install failed: {exc}"
         return result
@@ -368,7 +395,13 @@ def _rollback(target: str, prev: str) -> dict:
     try:
         if not os.path.isdir(prev):
             return {"status": "impossible", "reason": f"no previous tree at {prev}"}
-        os.rename(target, failed)
+        try:
+            os.rename(target, failed)
+        except OSError as exc:
+            if exc.errno != errno.EXDEV:
+                raise
+            shutil.copytree(target, failed, symlinks=True)
+            shutil.rmtree(target)
         os.rename(prev, target)
     except OSError as exc:
         return {"status": "failed", "reason": f"rollback rename failed: {exc}"}
@@ -416,12 +449,11 @@ def _purge_pycache(root: str) -> None:
 def _ensure_shim(result: dict) -> None:
     """A box born before the ``mtx`` shim existed gets it here, or it could
     never type the command the refresh just installed."""
-    try:
-        existing = open(MTX_SHIM, "r", encoding="utf-8").read()
-    except OSError:
-        existing = None
-    if existing == MTX_SHIM_BODY:
-        result["mtx_shim"] = "current"
+    # Only ever CREATE it. A box whose shim points at a different interpreter
+    # is a box where mtx works today; "correcting" it would break the command
+    # this refresh exists to deliver.
+    if os.path.exists(MTX_SHIM):
+        result["mtx_shim"] = "present"
         return
     try:
         with open(MTX_SHIM, "w", encoding="utf-8") as fh:
