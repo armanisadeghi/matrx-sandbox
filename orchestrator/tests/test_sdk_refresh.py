@@ -124,6 +124,9 @@ async def test_binding_installs_the_current_sdk_into_an_older_box(monkeypatch):
     assert put_path == "/opt/sandbox"
     names = tarfile.open(fileobj=io.BytesIO(payload)).getnames()
     assert names and all(n.startswith("sdk.incoming/") for n in names), names
+    # The hook must not relocate the agent's shell: the exec helper caches the
+    # directory each call lands in, and that cache is the user's location.
+    assert sdk_refresh.sandbox_manager._sandbox_cwd.get("sbx-old") in (None, "/home/agent")
     install_cmd = execute.await_args_list[-1].kwargs["command"]
     assert "/opt/sandbox/sdk.incoming/matrx_agent/selfupdate.py" in install_cmd
     assert "--target /opt/sandbox/sdk" in install_cmd

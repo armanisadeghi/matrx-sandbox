@@ -129,6 +129,68 @@ The Manager's **orchestrator-sandboxes** admin page (`manager.dev.codematrx.com`
 
 ---
 
+## Runtime SDK refresh — the tooling half of drift, closed at binding time
+
+Migration moves a box to a new **image**; it is gated, opt-in, and (per the
+banner above) held. But the thing users actually hit when a box is old is much
+smaller: the `matrx_agent` SDK — the `mtx` CLI and the in-container daemon — is
+baked into the image, so a box created before a command existed could never run
+it. `mtx toolchain ensure` (commit `8a1680a`) was the first casualty; the prompt
+carried a three-command shell fallback to paper over it.
+
+The **runtime SDK refresh** closes that without replacing anything:
+
+1. `POST /sandboxes/{id}/agent-binding` runs the hook on EVERY binding, every
+   template ([routes/sandboxes.py `_prepare_connection`](../orchestrator/orchestrator/routes/sandboxes.py)).
+2. [`orchestrator/sdk_refresh.py`](../orchestrator/orchestrator/sdk_refresh.py)
+   compares the box's running image id with the current image for its template.
+   **Same id → it stops there, zero execs.** Different id → it reads the box's
+   refresh stamp (`/opt/sandbox/sdk/.matrx-sdk-refresh`); already on this image
+   → stop (that is the once-per-box-per-image-version rate limit, plus a 15-min
+   process cache).
+3. Otherwise it pulls `/opt/sandbox/sdk` out of the **current image** (a
+   throwaway `/bin/true` container + `get_archive`), rewrites the tar members to
+   `sdk.incoming/` so the live tree is never overwritten mid-import, and unpacks
+   it into the running container.
+4. It then runs the **staged tree's own installer**,
+   [`matrx_agent/selfupdate.py`](../sandbox-image/sdk/matrx_agent/selfupdate.py)
+   — so the installer is always the new code, never the ancient copy the box
+   carries. The installer renames the new tree into `/opt/sandbox/sdk` (the pip
+   editable install points at that PATH, so the rename IS the install), keeps
+   the old tree once as `sdk.prev`, refreshes the `/usr/local/bin/mtx` shim, and
+   stamps the result.
+5. The outcome lands on the binding response as
+   `connection_hooks.sdk_refresh: {status, from, to, daemon_restart, …}`.
+
+**What it does NOT do.** It does not touch `/home/agent` — it refuses any target
+inside a home or a system root — and it does not change the image: the container
+still runs its old one, `/etc/sandbox-image-version` is unchanged, and `/drift`
+still reports the box as stale, because it is. A release that adds a new
+third-party **dependency** still needs a real migration; the refresh reports
+`deps_added` loudly rather than half-installing it.
+
+**The daemon and your terminal.** The daemon (uvicorn `matrx_agent.api.main`)
+holds every PTY session inside its own process, so restarting it kills live
+terminals. The refresh therefore restarts it only when the daemon's own code
+actually changed AND `activity.open_session_count(box) == 0`. Otherwise the
+restart is `deferred` and said so in the diagnostics — the CLI half is live
+immediately either way, because `mtx` is a fresh process on every invocation.
+
+**Knob:** `infrastructure.sandbox.sdk_refresh_on_binding` (default on). A missing
+row does not fall back to a constant — the hook reports `unavailable` and logs
+the remedy.
+
+**On demand, from inside the box:** `mtx self-update` runs the same installer
+against whatever the orchestrator staged (`--status` prints what SDK the box is
+carrying). `mtx whoami` now reports the SDK version actually on disk.
+
+Guards: [orchestrator/tests/test_sdk_refresh.py](../orchestrator/tests/test_sdk_refresh.py),
+[sandbox-image/sdk/tests/test_selfupdate.py](../sandbox-image/sdk/tests/test_selfupdate.py)
+(the second runs the real installer against real directories and checksums the
+home before and after).
+
+---
+
 ## Known limitations
 
 1. ~~Blocking docker calls freeze the orchestrator event loop.~~ **FIXED (commit `e3e1770`, both tiers).** All blocking `docker-py` calls (`exec_run`, `containers.run`, stop/rename/remove, readiness poll, drift scan, reconcile, warm pool, memory sync) are now wrapped in `asyncio.to_thread`, so a long exec or a migration build no longer freezes the orchestrator. Proven under load: during a 41s migration the orchestrator stayed responsive and served 32 retryable 503s cleanly. **Any NEW blocking docker call added in an `async def` MUST be `to_thread`-wrapped** — that's the standing rule now.
@@ -151,6 +213,8 @@ The Manager's **orchestrator-sandboxes** admin page (`manager.dev.codematrx.com`
 | [`orchestrator/main.py`](../orchestrator/orchestrator/main.py) | `GET /drift`, `POST /migrate-all` |
 | [`orchestrator/routes/sandboxes.py`](../orchestrator/orchestrator/routes/sandboxes.py) | `POST /{id}/migrate`; the 503-migrating guard on exec/fs/git |
 | [`orchestrator/connection_hooks.py`](../orchestrator/orchestrator/connection_hooks.py) | Development-repository synchronization; no implicit image migration |
+| [`orchestrator/sdk_refresh.py`](../orchestrator/orchestrator/sdk_refresh.py) | Binding-time runtime SDK refresh (tooling only; never an image swap) |
+| [`sandbox-image/sdk/matrx_agent/selfupdate.py`](../sandbox-image/sdk/matrx_agent/selfupdate.py) | The in-container installer + `mtx self-update` |
 | [`orchestrator/reaper.py`](../orchestrator/orchestrator/reaper.py) | Drift alarm + opt-in auto-migrate |
 | [`scripts/deploy-ec2.sh`](../scripts/deploy-ec2.sh) | Orchestrator/image deployment; no implicit user-container migration |
 | aidream `matrx-ai/.../tools/_sandbox_proxy.py` | Agent-side transparent retry on 503-migrating |

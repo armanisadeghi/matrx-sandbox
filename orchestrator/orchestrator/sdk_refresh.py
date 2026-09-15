@@ -38,6 +38,7 @@ SAFETY.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import io
 import json
 import logging
@@ -69,6 +70,21 @@ _locks: dict[str, asyncio.Lock] = {}
 #: in this process is not re-checked for the TTL, so repeated bindings are free.
 _recent: dict[str, tuple[str, float]] = {}
 _RECENT_TTL = 900.0
+
+
+@contextlib.contextmanager
+def _preserved_cwd(sandbox_id: str):
+    """The exec helper caches the working directory each call lands in, and that
+    cache is the user's shell location. A background tooling update must not
+    move the agent's next command to /opt/sandbox."""
+    prior = sandbox_manager._sandbox_cwd.get(sandbox_id)
+    try:
+        yield
+    finally:
+        if prior is None:
+            sandbox_manager._sandbox_cwd.pop(sandbox_id, None)
+        else:
+            sandbox_manager._sandbox_cwd[sandbox_id] = prior
 
 
 def _result(status: str, **extra) -> dict:
@@ -130,35 +146,36 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
     if cached and cached[0] == current.image_id and time.monotonic() - cached[1] < _RECENT_TTL:
         return _result("already_refreshed", **{"from": box_version, "to": to_version, "cached": True})
 
-    async with activity.track(sandbox_id):
-        stamp = await _read_stamp(sandbox_id)
-        if stamp.get("to_image_id") == current.image_id:
-            _recent[sandbox_id] = (current.image_id, time.monotonic())
-            return _result(
-                "already_refreshed",
-                **{"from": stamp.get("to_version") or box_version, "to": to_version},
+    with _preserved_cwd(sandbox_id):
+        async with activity.track(sandbox_id):
+            stamp = await _read_stamp(sandbox_id)
+            if stamp.get("to_image_id") == current.image_id:
+                _recent[sandbox_id] = (current.image_id, time.monotonic())
+                return _result(
+                    "already_refreshed",
+                    **{"from": stamp.get("to_version") or box_version, "to": to_version},
+                )
+            from_version = stamp.get("to_version") or box_version
+
+            payload = await asyncio.to_thread(_stage_payload, client, current.tag)
+            await asyncio.to_thread(_put_payload, container, payload)
+
+            allow_restart = activity.open_session_count(sandbox_id) == 0
+            command = (
+                f"python3 {STAGE_PATH}/matrx_agent/selfupdate.py "
+                f"--source {STAGE_PATH} --target {SDK_PATH} "
+                f"--image-id {current.image_id} --image-version {to_version}"
             )
-        from_version = stamp.get("to_version") or box_version
-
-        payload = await asyncio.to_thread(_stage_payload, client, current.tag)
-        await asyncio.to_thread(_put_payload, container, payload)
-
-        allow_restart = activity.open_session_count(sandbox_id) == 0
-        command = (
-            f"python3 {STAGE_PATH}/matrx_agent/selfupdate.py "
-            f"--source {STAGE_PATH} --target {SDK_PATH} "
-            f"--image-id {current.image_id} --image-version {to_version}"
-        )
-        if allow_restart:
-            command += " --allow-daemon-restart"
-        command += f"; rc=$?; rm -rf {STAGE_PATH}; exit $rc"
-        exit_code, stdout, stderr, _ = await sandbox_manager.exec_in_sandbox(
-            sandbox_id=sandbox_id,
-            command=command,
-            timeout=INSTALL_TIMEOUT,
-            user="root",
-            cwd=OPT_SANDBOX,
-        )
+            if allow_restart:
+                command += " --allow-daemon-restart"
+            command += f"; rc=$?; rm -rf {STAGE_PATH}; exit $rc"
+            exit_code, stdout, stderr, _ = await sandbox_manager.exec_in_sandbox(
+                sandbox_id=sandbox_id,
+                command=command,
+                timeout=INSTALL_TIMEOUT,
+                user="root",
+                cwd=OPT_SANDBOX,
+            )
 
     installed = _parse_json(stdout)
     if exit_code != 0 or not installed:
