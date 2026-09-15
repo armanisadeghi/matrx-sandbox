@@ -98,6 +98,20 @@ def _receipt_tier(record: dict[str, Any]) -> str:
     return settings.host_tier
 
 
+def _immutable_identity_matches(record: dict[str, Any], row: Any, lifecycle: dict[str, Any] | None) -> bool:
+    """One complete witness comparison for every lifecycle decision boundary."""
+    if row is None or lifecycle is None:
+        return False
+    from orchestrator.home_identity import home_key
+    return (
+        getattr(row, "sandbox_id", None) == record["sandbox_id"]
+        and str(lifecycle.get("row_id")) == record["row_id"]
+        and getattr(row, "container_id", None) == record["container_id"]
+        and (home_key(row) or f"layer-{record['sandbox_id']}") == record["home_key"]
+        and getattr(getattr(row, "tier", None), "value", getattr(row, "tier", None)) == _receipt_tier(record)
+    )
+
+
 def _read(journal: HostedMigrationJournal, sandbox_id: str, operation_id: str) -> dict[str, Any] | None:
     path = _path(journal, sandbox_id, operation_id)
     try:
@@ -331,13 +345,7 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
             original_runtime_terminal = await _runtime_is_terminal(prior["container_id"])
             latest = await _get_store().get(sandbox_id)
             latest_life = await _get_store().get_lifecycle(sandbox_id)
-            identity_matches = (
-                latest is not None and latest_life is not None
-                and str(latest_life.get("row_id")) == prior["row_id"]
-                and latest.container_id == prior["container_id"]
-                and (home_key(latest) or f"layer-{sandbox_id}") == prior["home_key"]
-                and getattr(latest.tier, "value", latest.tier) == _receipt_tier(prior)
-            )
+            identity_matches = _immutable_identity_matches(prior, latest, latest_life)
             if not identity_matches:
                 # The operation lock plus original lifecycle/home leases prove
                 # no competing lifecycle side effect can be in flight.  Only
@@ -358,10 +366,7 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
             raise LifecycleConflict("lifecycle recovery belongs to another tier")
         latest = await _get_store().get(sandbox_id)
         latest_life = await _get_store().get_lifecycle(sandbox_id)
-        if (latest is None or latest_life is None or str(latest_life.get("row_id")) != record["row_id"]
-                or latest.container_id != record["container_id"]
-                or (home_key(latest) or f"layer-{sandbox_id}") != record["home_key"]
-                or getattr(latest.tier, "value", latest.tier) != _receipt_tier(record)):
+        if not _immutable_identity_matches(record, latest, latest_life):
             raise LifecycleConflict("sandbox identity changed before lifecycle admission")
         durable_write = asyncio.create_task(asyncio.to_thread(_write, state, record))
         try:
@@ -378,11 +383,7 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
                 from orchestrator.sandbox_manager import _destroy_sandbox_unleased
                 current = await _get_store().get(sandbox_id)
                 current_life = await _get_store().get_lifecycle(sandbox_id)
-                if (current is None or current_life is None
-                        or str(current_life.get("row_id")) != record["row_id"]
-                        or current.container_id != record["container_id"]
-                        or (home_key(current) or f"layer-{sandbox_id}") != record["home_key"]
-                        or getattr(current.tier, "value", current.tier) != _receipt_tier(record)):
+                if not _immutable_identity_matches(record, current, current_life):
                     raise LifecycleConflict("sandbox identity changed before side effect")
                 terminal_states = {"stopped", "expired", "failed"}
                 already_terminal = current_life.get("status") in terminal_states
@@ -398,8 +399,7 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
                 await asyncio.to_thread(_write, state, finalizing)
                 checked = await _get_store().get(sandbox_id)
                 checked_life = await _get_store().get_lifecycle(sandbox_id)
-                if (checked is None or checked_life is None
-                        or str(checked_life.get("row_id")) != record["row_id"]
+                if (not _immutable_identity_matches(record, checked, checked_life)
                         or checked_life.get("status") not in terminal_states
                         or (kind == "delete" and not checked_life.get("deleted"))):
                     raise LifecycleUnavailable("terminal row census is incomplete")

@@ -2,7 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import multiprocessing
 from datetime import datetime, timezone
+from pathlib import Path
 from uuid import UUID, uuid4
 
 import pytest
@@ -15,6 +17,14 @@ from orchestrator.store import InMemorySandboxStore
 USER = "11111111-1111-4111-8111-111111111111"
 ORG = "22222222-2222-4222-8222-222222222222"
 SID = "sbx-durable-stop"
+
+
+def _hold_lifecycle_operation_lock(root: str, operation_id: str, ready, release) -> None:
+    """Separate-process owner witness for orphan detection."""
+    journal = HostedMigrationJournal(Path(root))
+    with journal.lock("lifecycle-operation-" + operation_id):
+        ready.set()
+        release.wait(5)
 
 
 def _row() -> SandboxResponse:
@@ -104,6 +114,33 @@ async def test_orphaned_running_receipt_becomes_durable_recovery_attention(tmp_p
         "state": "recovery_required", "phase": "recovery_required",
         "attention_needed": True, "reason": "operation owner disappeared; recover the same operation",
     }
+
+
+@pytest.mark.asyncio
+async def test_real_process_owner_prevents_false_orphan_until_its_lock_releases(tmp_path):
+    """Break caught: a live owner in another process became recovery-required."""
+    from orchestrator import lifecycle_operations
+
+    journal = HostedMigrationJournal(tmp_path); operation = uuid4().hex
+    record = {
+        "schema_version": 1, "operation_id": operation, "sandbox_id": SID,
+        "row_id": str(uuid4()), "container_id": "runtime-original", "home_key": "home-durable",
+        "kind": "stop", "state": "running", "phase": "stopping",
+    }
+    lifecycle_operations._write(journal, record)
+    ready, release = multiprocessing.Event(), multiprocessing.Event()
+    process = multiprocessing.Process(
+        target=_hold_lifecycle_operation_lock, args=(str(tmp_path), operation, ready, release),
+    )
+    process.start(); assert ready.wait(5)
+    try:
+        live = await lifecycle_operations.lifecycle_status(SID, operation, journal=journal)
+        assert live["state"] == "running"
+    finally:
+        release.set(); process.join(5)
+    assert process.exitcode == 0
+    orphaned = await lifecycle_operations.lifecycle_status(SID, operation, journal=journal)
+    assert orphaned["state"] == "recovery_required"
 
 
 @pytest.mark.asyncio
@@ -275,6 +312,112 @@ async def test_home_or_tier_drift_after_handoff_never_calls_destroy(monkeypatch,
         if receipt and receipt["state"] == "recovery_required": break
         await asyncio.sleep(0)
     assert destroyed == [] and receipt["state"] == "recovery_required"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("field", ["row_id", "container_id", "persistence_volume", "tier"])
+@pytest.mark.parametrize("boundary", ["pre_side_effect", "terminal_census"])
+async def test_every_immutable_identity_drift_stays_attention_never_success(monkeypatch, tmp_path, field, boundary):
+    """All identity witnesses fence both destroy admission and terminal proof."""
+    from orchestrator import lifecycle_operations, sandbox_manager
+    from orchestrator.hosted_operation_lease import settings
+
+    store = InMemorySandboxStore(); await store.save(_row())
+    monkeypatch.setattr(settings, "host_tier", "hosted")
+    monkeypatch.setattr(sandbox_manager, "_get_store", lambda: store)
+    destroyed = []
+
+    async def drift():
+        current = await store.get(SID)
+        if field == "row_id": current.row_id = uuid4()
+        elif field == "container_id": current.container_id = "replacement-runtime"
+        elif field == "persistence_volume": current.persistence_volume = "home-replaced"
+        else: current.tier = "ec2"
+        await store.save(current)
+
+    async def destroy(*_args):
+        destroyed.append(True)
+        await store.mark_stopped(SID, "user_requested")
+        if boundary == "terminal_census":
+            await drift()
+        return True
+
+    async def handoff(_sandbox_id, _operation_id, factory, **_kwargs):
+        if boundary == "pre_side_effect":
+            await drift()
+        return asyncio.create_task(factory())
+
+    monkeypatch.setattr(sandbox_manager, "_destroy_sandbox_unleased", destroy)
+    monkeypatch.setattr(lifecycle_operations, "start_owned_operation", handoff)
+    monkeypatch.setattr(lifecycle_operations, "_runtime_is_terminal", lambda _id: _terminal_runtime())
+    operation = str(uuid4())
+    status, _ = await lifecycle_operations.admit_lifecycle_operation(SID, operation, "stop", journal=HostedMigrationJournal(tmp_path))
+    assert status == 202
+    for _ in range(30):
+        receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=HostedMigrationJournal(tmp_path))
+        if receipt and receipt["state"] == "recovery_required": break
+        await asyncio.sleep(0)
+    assert receipt["state"] == "recovery_required"
+    assert destroyed == ([] if boundary == "pre_side_effect" else [True])
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("phase", ["stopping", "removing", "finalizing", "complete"])
+async def test_each_work_phase_write_failure_persists_recovery_attention(monkeypatch, tmp_path, phase):
+    """A write failure at any durable work phase never reports false success."""
+    from orchestrator import lifecycle_operations, sandbox_manager
+    from orchestrator.hosted_operation_lease import settings
+
+    store = InMemorySandboxStore(); await store.save(_row())
+    monkeypatch.setattr(settings, "host_tier", "hosted")
+    monkeypatch.setattr(sandbox_manager, "_get_store", lambda: store)
+    original_write = lifecycle_operations._write
+    failed = False
+
+    def flaky_write(journal, record):
+        nonlocal failed
+        if record["phase"] == phase and not failed:
+            failed = True
+            raise OSError("injected durable write failure")
+        return original_write(journal, record)
+
+    async def destroy(*_args): return await store.mark_stopped(SID, "user_requested")
+
+    monkeypatch.setattr(lifecycle_operations, "_write", flaky_write)
+    monkeypatch.setattr(sandbox_manager, "_destroy_sandbox_unleased", destroy)
+    monkeypatch.setattr(lifecycle_operations, "_runtime_is_terminal", lambda _id: _terminal_runtime())
+    operation = str(uuid4())
+    status, _ = await lifecycle_operations.admit_lifecycle_operation(SID, operation, "stop", journal=HostedMigrationJournal(tmp_path))
+    assert status == 202
+    for _ in range(30):
+        receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=HostedMigrationJournal(tmp_path))
+        if receipt and receipt["state"] == "recovery_required": break
+        await asyncio.sleep(0)
+    assert failed is True and receipt["state"] == "recovery_required"
+
+
+@pytest.mark.asyncio
+async def test_terminal_store_failure_persists_recovery_attention(monkeypatch, tmp_path):
+    """A terminal row-store failure is fenced rather than represented as success."""
+    from orchestrator import lifecycle_operations, sandbox_manager
+    from orchestrator.hosted_operation_lease import settings
+
+    store = InMemorySandboxStore(); await store.save(_row())
+    monkeypatch.setattr(settings, "host_tier", "hosted")
+    monkeypatch.setattr(sandbox_manager, "_get_store", lambda: store)
+    monkeypatch.setattr(store, "soft_delete", lambda _sid: (_ for _ in ()).throw(OSError("store unavailable")))
+
+    async def destroy(*_args): return await store.mark_stopped(SID, "user_requested")
+
+    monkeypatch.setattr(sandbox_manager, "_destroy_sandbox_unleased", destroy)
+    operation = str(uuid4())
+    status, _ = await lifecycle_operations.admit_lifecycle_operation(SID, operation, "delete", journal=HostedMigrationJournal(tmp_path))
+    assert status == 202
+    for _ in range(30):
+        receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=HostedMigrationJournal(tmp_path))
+        if receipt and receipt["state"] == "recovery_required": break
+        await asyncio.sleep(0)
+    assert receipt["state"] == "recovery_required"
 
 
 async def _terminal_runtime() -> bool:
