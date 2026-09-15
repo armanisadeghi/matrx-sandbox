@@ -41,6 +41,7 @@ from orchestrator.models import (
     SandboxListResponse,
     SandboxResponse,
 )
+from orchestrator.store import AdmissionCapacityExceeded, KnobSourceUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -169,19 +170,26 @@ async def create_sandbox(req: CreateSandboxRequest):
                 detail="workspace_key must be 1-63 lowercase letters, numbers, hyphens, or underscores.",
             )
 
-    await storage.ensure_user_storage(req.user_id)
-    sandbox = await sandbox_manager.create_sandbox(
-        user_id=req.user_id,
-        name=req.name,
-        organization_id=req.organization_id,
-        config=req.config,
-        template=req.template,
-        template_version=req.template_version,
-        tier=effective_tier,
-        resources=req.resources.model_dump(exclude_none=True) if req.resources else None,
-        labels=req.labels,
-        ttl_seconds=req.ttl_seconds,
-    )
+    try:
+        sandbox = await sandbox_manager.create_sandbox(
+            user_id=req.user_id,
+            name=req.name,
+            organization_id=req.organization_id,
+            config=req.config,
+            template=req.template,
+            template_version=req.template_version,
+            tier=effective_tier,
+            resources=req.resources.model_dump(exclude_none=True) if req.resources else None,
+            labels=req.labels,
+            ttl_seconds=req.ttl_seconds,
+        )
+    except AdmissionCapacityExceeded as exc:
+        raise HTTPException(status_code=429, detail={
+            "code": "admission_capacity_exceeded", "ceiling": exc.ceiling,
+            "occupied": exc.occupied,
+        }) from exc
+    except KnobSourceUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="sandbox admission configuration is unavailable") from exc
     return sandbox
 
 
@@ -511,6 +519,24 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
         sandbox_id, user_id, template, wipe_volume,
     )
 
+    # Reserve the successor while the exact predecessor still proves the
+    # replacement identity.  Nothing destructive (container removal or home
+    # wipe) occurs until this transaction succeeds.
+    try:
+        reserved = await sandbox_manager.reserve_sandbox_admission(
+            user_id=user_id, organization_id=organization_id, name=name,
+            config=config, template=template, template_version=template_version,
+            tier=tier, labels=labels, ttl_seconds=ttl_seconds,
+            replacement_for=sandbox_id,
+        )
+    except AdmissionCapacityExceeded as exc:
+        raise HTTPException(status_code=429, detail={
+            "code": "admission_capacity_exceeded", "ceiling": exc.ceiling,
+            "occupied": exc.occupied,
+        }) from exc
+    except KnobSourceUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="sandbox admission configuration is unavailable") from exc
+
     # 1. Destroy the existing container (preserves named volume).
     destroyed = await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="user_requested")
     if not destroyed:
@@ -547,6 +573,7 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
             labels=labels,
             ttl_seconds=ttl_seconds,
             persistence_from=(sandbox_id if is_ec2 and not wipe_volume and old.persistence_volume and not development_bind else None),
+            reserved=reserved,
         )
     except Exception as exc:
         logger.exception("Reset re-create failed for %s", sandbox_id)
@@ -642,6 +669,13 @@ async def resume_sandbox(sandbox_id: str):
             ttl_seconds=ttl_seconds,
             persistence_from=(sandbox_id if is_ec2 and old.persistence_volume and not old.persistence_volume.startswith("host:") else None),
         )
+    except AdmissionCapacityExceeded as exc:
+        raise HTTPException(status_code=429, detail={
+            "code": "admission_capacity_exceeded", "ceiling": exc.ceiling,
+            "occupied": exc.occupied,
+        }) from exc
+    except KnobSourceUnavailableError as exc:
+        raise HTTPException(status_code=503, detail="sandbox admission configuration is unavailable") from exc
     except Exception as exc:
         logger.exception("Resume re-create failed for %s", sandbox_id)
         raise HTTPException(status_code=500, detail=f"Resume failed: {exc}")

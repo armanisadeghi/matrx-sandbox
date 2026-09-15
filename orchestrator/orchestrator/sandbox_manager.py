@@ -420,6 +420,25 @@ async def close_store() -> None:
         _store = None
 
 
+async def reserve_sandbox_admission(
+    *, user_id: str, organization_id: str, name: str | None, config: dict | None,
+    template: str | None, template_version: str | None, tier: str | None,
+    labels: dict | None, ttl_seconds: int | None, replacement_for: str | None = None,
+) -> SandboxResponse:
+    """Persist only the manager-allocated creating identity before mutation."""
+    sandbox_id = f"sbx-{uuid.uuid4().hex[:12]}"
+    sandbox = SandboxResponse(
+        sandbox_id=sandbox_id, user_id=user_id, organization_id=organization_id,
+        name=name, status=SandboxStatus.CREATING, created_at=datetime.now(timezone.utc),
+        config={**(config or {}), "organization_id": organization_id},
+        ttl_seconds=ttl_seconds or 7200, tier=tier, template=template,
+        template_version=template_version, labels=labels,
+        proxy_url=_proxy_url_for(sandbox_id),
+    )
+    await _get_store().reserve_active(sandbox, replacement_for=replacement_for)
+    return sandbox
+
+
 async def create_sandbox(
     user_id: str,
     organization_id: str,
@@ -432,6 +451,8 @@ async def create_sandbox(
     labels: dict | None = None,
     ttl_seconds: int | None = None,
     persistence_from: str | None = None,
+    replacement_for: str | None = None,
+    reserved: SandboxResponse | None = None,
 ) -> SandboxResponse:
     """Create under the hosted home lease before the first durable write."""
     config = config or {}
@@ -441,7 +462,9 @@ async def create_sandbox(
             "config.organization_id must match the explicit organization_id"
         )
     location = resolve_user_storage(user_id, tier)
-    sandbox_id = f"sbx-{uuid.uuid4().hex[:12]}"
+    sandbox_id = reserved.sandbox_id if reserved is not None else f"sbx-{uuid.uuid4().hex[:12]}"
+    if reserved is not None and (reserved.user_id != user_id or reserved.organization_id != organization_id):
+        raise RuntimeError("reserved sandbox identity does not match the create request")
     persistence_reference: str | None = None
     if persistence_from is not None:
         if template == "development":
@@ -490,6 +513,7 @@ async def create_sandbox(
         return await _create_sandbox_unleased(
             sandbox_id, user_id, organization_id, name, config, template,
             template_version, tier, resources, labels, ttl_seconds, persistence_reference,
+            replacement_for, reserved,
         )
 
 
@@ -506,6 +530,8 @@ async def _create_sandbox_unleased(
     labels: dict | None = None,
     ttl_seconds: int | None = None,
     persistence_reference: str | None = None,
+    replacement_for: str | None = None,
+    reserved: SandboxResponse | None = None,
 ) -> SandboxResponse:
     """Create and start a new sandbox container for a user.
 
@@ -521,22 +547,18 @@ async def _create_sandbox_unleased(
     config["organization_id"] = organization_id
     resources = resources or {}
 
-    sandbox = SandboxResponse(
-        sandbox_id=sandbox_id,
-        user_id=user_id,
-        organization_id=organization_id,
-        name=name,
-        status=SandboxStatus.CREATING,
-        created_at=datetime.now(timezone.utc),
-        config=config,
-        ttl_seconds=ttl_seconds or 7200,
-        tier=tier,
-        template=template,
-        template_version=template_version,
-        labels=labels,
-        proxy_url=_proxy_url_for(sandbox_id),
+    sandbox = reserved or SandboxResponse(
+        sandbox_id=sandbox_id, user_id=user_id, organization_id=organization_id,
+        name=name, status=SandboxStatus.CREATING, created_at=datetime.now(timezone.utc),
+        config=config, ttl_seconds=ttl_seconds or 7200, tier=tier, template=template,
+        template_version=template_version, labels=labels, proxy_url=_proxy_url_for(sandbox_id),
     )
-    await store.save(sandbox)
+    # Capacity is a durable admission, not a best-effort count in a route.
+    # This INSERT is deliberately before Docker volumes, storage hydration,
+    # vault fetches, or a container create.  A manager-generated sandbox id
+    # makes a retry after an ambiguous commit idempotent.
+    if reserved is None:
+        await store.reserve_active(sandbox, replacement_for=replacement_for)
 
     logger.info(
         "Creating sandbox %s for user %s (tier=%s, template=%s)",

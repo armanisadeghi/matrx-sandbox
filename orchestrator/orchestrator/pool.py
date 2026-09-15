@@ -327,7 +327,9 @@ async def claim_warm(
             sandbox_id=sandbox_id,
             user_id=user_id,
             organization_id=organization_id,
-            status=SandboxStatus.READY,
+            # The user capacity reservation is a durable creating row before
+            # this live warm runtime is adopted or hydrated.
+            status=SandboxStatus.CREATING,
             container_id=container.id,
             created_at=datetime.now(timezone.utc),
             hot_path="/home/agent",
@@ -339,9 +341,9 @@ async def claim_warm(
             ssh_port=ssh_port,
             proxy_url=_proxy_url_for(sandbox_id),
         )
-        # Reserve the box: create the row inside the lock so the next claim sees
-        # it as claimed. (expires_at is stamped just below — the DB auto-expire
-        # trigger only fires on UPDATE into ready/running, but we INSERT ready.)
+        await store.reserve_active(sandbox)
+        sandbox.status = SandboxStatus.READY
+        # Persist the selected runtime only after the capacity reservation.
         await store.save(sandbox)
 
     try:

@@ -53,6 +53,9 @@ SANDBOX_KNOB_TEST_VALUES = {
     "migrate_recent_heartbeat_seconds": 120,
     "enable_s3_migrate": False,
     "sdk_refresh_on_binding": True,
+    # Platform-locked operational ceiling. Production is fail-closed until
+    # the canonical platform row exists; this is the test database seam.
+    "active_sandbox_capacity": 5,
 }
 
 

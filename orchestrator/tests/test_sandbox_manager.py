@@ -60,6 +60,7 @@ def clean_sandbox_state(tmp_path, monkeypatch):
     from orchestrator.hosted_migration import HostedMigrationJournal
 
     store = InMemorySandboxStore()
+    store.seed_feature_knobs("infrastructure.sandbox", {"active_sandbox_capacity": 5})
     # EC2 now shares the durable operation-fence contract.  Use its real
     # filesystem journal in a test root; do not bypass the lease in unit tests.
     journal_root = tmp_path / "migration-state"

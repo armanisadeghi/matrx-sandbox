@@ -32,12 +32,31 @@ class KnobSourceUnavailableError(RuntimeError):
     """This store has no database to read ``platform.feature_knob`` from."""
 
 
+class AdmissionCapacityExceeded(RuntimeError):
+    """The durable active-sandbox admission ceiling refused a new row."""
+
+    def __init__(self, *, ceiling: int, occupied: int) -> None:
+        self.ceiling = ceiling
+        self.occupied = occupied
+        super().__init__(f"active sandbox capacity exhausted ({occupied}/{ceiling})")
+
+
 class SandboxStore(ABC):
     """Abstract base class for sandbox persistence."""
 
     @abstractmethod
     async def save(self, sandbox: SandboxResponse) -> None:
         """Save or update a sandbox record."""
+
+    @abstractmethod
+    async def reserve_active(self, sandbox: SandboxResponse, *, replacement_for: str | None = None) -> None:
+        """Atomically reserve an occupied slot by inserting ``sandbox``.
+
+        Implementations must serialize by the canonical user UUID and count
+        active rows across both tiers.  A repeat for the exact sandbox id is
+        idempotent; all other capacity refusals raise
+        :class:`AdmissionCapacityExceeded`.
+        """
 
     async def replace_container_if_current(self, sandbox_id: str, old_container_id: str,
                                            new_container_id: str, template_version: str | None,
@@ -215,6 +234,7 @@ class InMemorySandboxStore(SandboxStore):
     """
 
     def __init__(self) -> None:
+        import asyncio
         self._sandboxes: dict[str, SandboxResponse] = {}
         # sandbox_id -> deleted_at (soft-delete marker, mirrors Postgres)
         self._deleted: dict[str, datetime] = {}
@@ -225,6 +245,45 @@ class InMemorySandboxStore(SandboxStore):
         # deliberate local-dev boot) seeds them with ``seed_feature_knobs``.
         # A silent default here would be the env var in a new coat.
         self._feature_knobs: dict[str, dict[str, Any]] = {}
+        self._admission_locks: dict[str, asyncio.Lock] = {}
+
+    async def reserve_active(self, sandbox: SandboxResponse, *, replacement_for: str | None = None) -> None:
+        import asyncio
+
+        _explicit_organization_id(sandbox)
+        lock = self._admission_locks.setdefault(sandbox.user_id, asyncio.Lock())
+        async with lock:
+            existing = self._sandboxes.get(sandbox.sandbox_id)
+            if existing is not None:
+                if existing.user_id != sandbox.user_id or existing.organization_id != sandbox.organization_id:
+                    raise RuntimeError("sandbox id is already reserved by another identity")
+                return
+            try:
+                ceiling = int(self._feature_knobs["infrastructure.sandbox"]["active_sandbox_capacity"])
+            except (KeyError, TypeError, ValueError) as exc:
+                raise KnobSourceUnavailableError(
+                    "active sandbox admission requires the platform-locked "
+                    "infrastructure.sandbox.active_sandbox_capacity knob"
+                ) from exc
+            if ceiling < 1:
+                raise RuntimeError("active sandbox capacity knob must be positive")
+            active = {"creating", "starting", "ready", "running"}
+            occupied_rows = [
+                row for sid, row in self._sandboxes.items()
+                if sid not in self._deleted and row.user_id == sandbox.user_id
+                and getattr(row.status, "value", row.status) in active
+                and sid != replacement_for
+            ]
+            if replacement_for is not None:
+                predecessor = self._sandboxes.get(replacement_for)
+                if (predecessor is None or replacement_for in self._deleted
+                        or predecessor.user_id != sandbox.user_id
+                        or predecessor.organization_id != sandbox.organization_id
+                        or getattr(predecessor.status, "value", predecessor.status) not in active):
+                    raise RuntimeError("replacement predecessor is not the caller's active sandbox")
+            if len(occupied_rows) >= ceiling:
+                raise AdmissionCapacityExceeded(ceiling=ceiling, occupied=len(occupied_rows))
+            self._sandboxes[sandbox.sandbox_id] = sandbox
 
     def seed_feature_knobs(self, feature: str, values: dict[str, Any]) -> None:
         """The test seam: give this store the settings a database would hold."""
@@ -488,6 +547,77 @@ class PostgresSandboxStore(SandboxStore):
             }
 
         return await self._execute_with_retry(_fetch)
+
+    async def reserve_active(self, sandbox: SandboxResponse, *, replacement_for: str | None = None) -> None:
+        """Reserve a ``creating`` row under one transaction-scoped UUID lock.
+
+        The configuration read, advisory lock, occupied-count and insert all
+        share one connection.  Never route this through ``knobs.py``: its
+        process cache would make this transaction non-authoritative.
+        """
+        organization_id = _explicit_organization_id(sandbox)
+        active = ("creating", "starting", "ready", "running")
+
+        async def _do() -> None:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended($1::text, 0))",
+                        str(UUID(sandbox.user_id)),
+                    )
+                    existing = await conn.fetchrow(
+                        "SELECT user_id, organization_id FROM sandbox_instances WHERE sandbox_id = $1",
+                        sandbox.sandbox_id,
+                    )
+                    if existing is not None:
+                        if str(existing["user_id"]) != sandbox.user_id or str(existing["organization_id"]) != str(organization_id):
+                            raise RuntimeError("sandbox id is already reserved by another identity")
+                        return
+                    knob = await conn.fetchrow(
+                        "SELECT value FROM platform.feature_knob WHERE feature = $1 AND key = $2",
+                        "infrastructure.sandbox", "active_sandbox_capacity",
+                    )
+                    if knob is None:
+                        raise KnobSourceUnavailableError(
+                            "active sandbox admission requires platform-locked infrastructure.sandbox.active_sandbox_capacity"
+                        )
+                    value = knob["value"]
+                    ceiling = int(json.loads(value) if isinstance(value, str) else value)
+                    if ceiling < 1:
+                        raise RuntimeError("active sandbox capacity knob must be positive")
+                    if replacement_for is not None:
+                        predecessor = await conn.fetchrow(
+                            """SELECT sandbox_id FROM sandbox_instances
+                               WHERE sandbox_id = $1 AND user_id = $2 AND organization_id = $3
+                                 AND deleted_at IS NULL AND status = ANY($4::text[])""",
+                            replacement_for, UUID(sandbox.user_id), organization_id, list(active),
+                        )
+                        if predecessor is None:
+                            raise RuntimeError("replacement predecessor is not the caller's active sandbox")
+                    occupied = await conn.fetchval(
+                        """SELECT count(*) FROM sandbox_instances
+                           WHERE user_id = $1 AND deleted_at IS NULL AND status = ANY($2::text[])
+                             AND ($3::text IS NULL OR sandbox_id <> $3)""",
+                        UUID(sandbox.user_id), list(active), replacement_for,
+                    )
+                    if occupied >= ceiling:
+                        raise AdmissionCapacityExceeded(ceiling=ceiling, occupied=occupied)
+                    row = await conn.fetchrow(
+                        """INSERT INTO sandbox_instances
+                           (id, user_id, organization_id, sandbox_id, name, status, container_id, created_at,
+                            hot_path, cold_path, config, ttl_seconds, tier, template, template_version, labels,
+                            persistence_volume, created_by)
+                           VALUES ($1, $2, $3, $4, $5, 'creating', NULL, $6, $7, $8, $9::jsonb, $10, $11, $12, $13, $14::jsonb, NULL, $2)
+                           RETURNING id""",
+                        sandbox.row_id, UUID(sandbox.user_id), organization_id, sandbox.sandbox_id,
+                        sandbox.name, sandbox.created_at, sandbox.hot_path, sandbox.cold_path,
+                        json.dumps(sandbox.config) if sandbox.config else '{}', sandbox.ttl_seconds,
+                        sandbox.tier, sandbox.template, sandbox.template_version,
+                        json.dumps(sandbox.labels) if sandbox.labels else None,
+                    )
+                    sandbox.row_id = UUID(str(row["id"]))
+        await self._execute_with_retry(_do)
 
     async def save(self, sandbox: SandboxResponse) -> None:
         organization_id = _explicit_organization_id(sandbox)
