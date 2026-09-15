@@ -8,6 +8,7 @@ Uses a pluggable SandboxStore for persistence (in-memory or Postgres).
 from __future__ import annotations
 
 import asyncio
+from contextlib import asynccontextmanager
 import logging
 import os
 import re
@@ -439,6 +440,48 @@ async def reserve_sandbox_admission(
     return sandbox
 
 
+@asynccontextmanager
+async def reset_successor_admission(
+    predecessor: SandboxResponse,
+    *, name: str | None, config: dict | None, template: str | None,
+    template_version: str | None, tier: str | None, labels: dict | None,
+    ttl_seconds: int | None,
+):
+    """Own one reset successor from reservation through runtime creation.
+
+    The lifecycle-home lock is acquired before the creating row exists and is
+    retained while the predecessor is destroyed, its home is optionally
+    wiped, and the successor is created. Reconciliation therefore cannot
+    prove the reserved SID absent in the destructive gap. All nested lifecycle
+    calls must use their explicit already-leased path.
+    """
+    from orchestrator.home_identity import home_key
+    from orchestrator.hosted_operation_lease import hosted_operation_lease
+
+    successor = SandboxResponse(
+        sandbox_id=f"sbx-{uuid.uuid4().hex[:12]}",
+        user_id=predecessor.user_id,
+        organization_id=predecessor.organization_id,
+        name=name,
+        status=SandboxStatus.CREATING,
+        created_at=datetime.now(timezone.utc),
+        config={**(config or {}), "organization_id": predecessor.organization_id},
+        ttl_seconds=ttl_seconds or 7200,
+        tier=tier,
+        template=template,
+        template_version=template_version,
+        labels=labels,
+        proxy_url=None,
+    )
+    successor.proxy_url = _proxy_url_for(successor.sandbox_id)
+    reset_home = home_key(predecessor)
+    async with hosted_operation_lease(successor.sandbox_id, reset_home, lifecycle=True):
+        await _get_store().reserve_active(
+            successor, replacement_for=predecessor.sandbox_id,
+        )
+        yield successor
+
+
 async def create_sandbox(
     user_id: str,
     organization_id: str,
@@ -453,6 +496,7 @@ async def create_sandbox(
     persistence_from: str | None = None,
     replacement_for: str | None = None,
     reserved: SandboxResponse | None = None,
+    _lifecycle_lease_held: bool = False,
 ) -> SandboxResponse:
     """Create under the hosted home lease before the first durable write."""
     config = config or {}
@@ -496,7 +540,7 @@ async def create_sandbox(
         ))
     else:
         home_key = ec2_home_volume_name(sandbox_id)
-    async with hosted_operation_lease(sandbox_id, home_key, lifecycle=True):
+    async def create_under_lease() -> SandboxResponse:
         if persistence_reference:
             prior = await _get_store().get(persistence_from)
             life = await _get_store().get_lifecycle(persistence_from)
@@ -515,6 +559,10 @@ async def create_sandbox(
             template_version, tier, resources, labels, ttl_seconds, persistence_reference,
             replacement_for, reserved,
         )
+    if _lifecycle_lease_held:
+        return await create_under_lease()
+    async with hosted_operation_lease(sandbox_id, home_key, lifecycle=True):
+        return await create_under_lease()
 
 
 async def _create_sandbox_unleased(
@@ -1374,11 +1422,15 @@ async def destroy_sandbox(
     graceful: bool = True,
     reason: str = "user_requested",
     final_status: SandboxStatus | None = None,
+    *,
+    _lifecycle_lease_held: bool = False,
 ) -> bool:
     """Destroy under the exact hosted home lease, including reaper callers."""
     sandbox = await _get_store().get(sandbox_id)
     if not sandbox:
         return False
+    if _lifecycle_lease_held:
+        return await _destroy_sandbox_unleased(sandbox_id, graceful, reason, final_status)
     from orchestrator.home_identity import home_key
     volume = home_key(sandbox)
     tier = getattr(sandbox.tier, "value", sandbox.tier) or settings.host_tier
@@ -1536,15 +1588,17 @@ async def resume_retained_ec2_layer(sandbox: SandboxResponse) -> SandboxResponse
         await asyncio.to_thread(container.reload)
         if container.status not in {"exited", "created"}:
             raise RuntimeError("retained layer was already resumed")
+        await _get_store().resume_active(sandbox)
         sandbox.status = SandboxStatus.STARTING
-        await _get_store().save(sandbox)
         await asyncio.to_thread(container.start)
         sandbox = await _wait_for_ready(sandbox)
         await _get_store().save(sandbox)
         return sandbox
 
 
-async def wipe_retained_ec2_layer(sandbox: SandboxResponse) -> None:
+async def wipe_retained_ec2_layer(
+    sandbox: SandboxResponse, *, _lifecycle_lease_held: bool = False,
+) -> None:
     """Explicitly discard one stopped legacy EC2 writable layer by exact ID.
 
     The lease covers the row re-read and Docker removal: a concurrent resume
@@ -1591,6 +1645,9 @@ async def wipe_retained_ec2_layer(sandbox: SandboxResponse) -> None:
         await asyncio.to_thread(container.remove, force=False)
         logger.warning("Explicitly wiped retained EC2 writable layer for %s", fresh.sandbox_id)
 
+    if _lifecycle_lease_held:
+        await remove_under_lease()
+        return
     from orchestrator.hosted_operation_lease import hosted_operation_lease
     async with hosted_operation_lease(sandbox.sandbox_id, f"layer-{sandbox.sandbox_id}", lifecycle=True):
         task = asyncio.create_task(remove_under_lease())
@@ -1603,7 +1660,9 @@ async def wipe_retained_ec2_layer(sandbox: SandboxResponse) -> None:
                 raise
 
 
-async def delete_ec2_home_volume(sandbox: SandboxResponse) -> bool:
+async def delete_ec2_home_volume(
+    sandbox: SandboxResponse, *, _lifecycle_lease_held: bool = False,
+) -> bool:
     """Delete exactly one validated, terminal EC2 home under its home lease."""
     reference = sandbox.persistence_volume
     if getattr(sandbox.tier, "value", sandbox.tier) != "ec2" or not reference:
@@ -1638,6 +1697,8 @@ async def delete_ec2_home_volume(sandbox: SandboxResponse) -> bool:
         logger.warning("Explicitly wiped EC2 durable home %s for %s", reference, fresh.sandbox_id)
         return True
 
+    if _lifecycle_lease_held:
+        return await remove_under_lease()
     from orchestrator.hosted_operation_lease import hosted_operation_lease
     async with hosted_operation_lease(sandbox.sandbox_id, reference, lifecycle=True):
         task = asyncio.create_task(remove_under_lease())
@@ -1650,7 +1711,9 @@ async def delete_ec2_home_volume(sandbox: SandboxResponse) -> bool:
                 raise
 
 
-async def delete_user_volume(user_id: str) -> bool:
+async def delete_user_volume(
+    user_id: str, *, _lifecycle_lease_held: bool = False,
+) -> bool:
     """Hard-delete a user's per-user Docker volume (hosted tier only).
 
     Use case: a user explicitly clicks "Delete my persistent storage" in the
@@ -1685,6 +1748,8 @@ async def delete_user_volume(user_id: str) -> bool:
             logger.error("Failed to delete volume %s: %s", name, e)
             return False
 
+    if _lifecycle_lease_held:
+        return await remove_under_lease()
     from orchestrator.hosted_operation_lease import hosted_operation_lease
     operation_id = f"volume-delete-{user_id}"
     async with hosted_operation_lease(operation_id, name, lifecycle=True):

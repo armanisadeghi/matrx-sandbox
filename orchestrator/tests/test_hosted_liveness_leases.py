@@ -60,7 +60,7 @@ async def test_liveness_excludes_only_migrating_home_while_reconciling_unrelated
     journal.write(_record("box-a", "home-a"))
     _inject_journal(monkeypatch, journal)
     monkeypatch.setattr("orchestrator.reconcile.settings.host_tier", "hosted")
-    monkeypatch.setattr("orchestrator.reconcile._alive_container_ids", lambda *_: {"live-b"})
+    monkeypatch.setattr("orchestrator.reconcile._alive_container_inventory", lambda *_: ({"live-b"}, {"box-b"}))
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: object())
 
     class Store:
@@ -70,7 +70,7 @@ async def test_liveness_excludes_only_migrating_home_while_reconciling_unrelated
                 SimpleNamespace(sandbox_id="box-a", persistence_volume="home-a", tier="hosted"),
                 SimpleNamespace(sandbox_id="box-b", persistence_volume="home-b", tier="hosted"),
             ]
-        async def reconcile(self, alive_ids, *, tier, exclude_sandbox_ids=frozenset(), include_sandbox_ids=None):
+        async def reconcile(self, alive_ids, *, tier, exclude_sandbox_ids=frozenset(), include_sandbox_ids=None, **_kwargs):
             self.called = (alive_ids, tier, exclude_sandbox_ids, include_sandbox_ids)
             return {"stopped": [], "refreshed": 1}
 
@@ -85,7 +85,7 @@ async def test_deployment_exclusivity_defers_then_allows_next_liveness_pass(monk
     journal = HostedMigrationJournal(tmp_path)
     _inject_journal(monkeypatch, journal)
     monkeypatch.setattr("orchestrator.reconcile.settings.host_tier", "hosted")
-    monkeypatch.setattr("orchestrator.reconcile._alive_container_ids", lambda *_: {"live-a"})
+    monkeypatch.setattr("orchestrator.reconcile._alive_container_inventory", lambda *_: ({"live-a"}, {"box-a"}))
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: object())
 
     class Store:
@@ -152,6 +152,70 @@ async def test_postgres_liveness_update_rechecks_snapshot_identity_and_lease_sco
     assert "tier = $3" in update
     assert "sandbox_id = ANY($5::text[])" in update
     assert args == ("box-a", "old-container", "hosted", [], ["box-a"])
+
+
+@pytest.mark.asyncio
+async def test_complete_empty_inventory_releases_only_unbound_creating_reservation(monkeypatch):
+    """Break caught: zero-runtime safety valve wedges a crashed reservation forever."""
+    from orchestrator.store import PostgresSandboxStore
+    calls = []
+
+    class Conn:
+        async def fetch(self, query, *args):
+            return [
+                {"sandbox_id": "reserved", "container_id": None},
+                {"sandbox_id": "bound", "container_id": "container-bound"},
+            ]
+        async def execute(self, query, *args):
+            calls.append((query, args))
+            return "UPDATE 1"
+    class Acquire:
+        async def __aenter__(self): return Conn()
+        async def __aexit__(self, *_args): return False
+    class Pool:
+        def acquire(self): return Acquire()
+
+    store = PostgresSandboxStore("postgresql://unused")
+    async def pool(): return Pool()
+    async def retry(operation): return await operation()
+    monkeypatch.setattr(store, "_get_pool", pool)
+    monkeypatch.setattr(store, "_execute_with_retry", retry)
+
+    result = await store.reconcile(
+        set(), tier="hosted", authoritative_sandbox_ids=set(),
+    )
+
+    assert result == {"stopped": ["reserved"], "refreshed": 0}
+    assert len(calls) == 1
+    assert "stop_reason = 'error'" in calls[0][0]
+    assert calls[0][1] == ("reserved", "hosted")
+
+
+@pytest.mark.asyncio
+async def test_partial_inventory_never_proves_creating_runtime_absent(monkeypatch):
+    """Break caught: failed label inspection frees a live creation slot."""
+    from orchestrator.store import PostgresSandboxStore
+
+    class Conn:
+        async def fetch(self, query, *args):
+            return [{"sandbox_id": "reserved", "container_id": None}]
+        async def execute(self, *_args):
+            raise AssertionError("partial inventory must not mutate")
+    class Acquire:
+        async def __aenter__(self): return Conn()
+        async def __aexit__(self, *_args): return False
+    class Pool:
+        def acquire(self): return Acquire()
+
+    store = PostgresSandboxStore("postgresql://unused")
+    async def pool(): return Pool()
+    async def retry(operation): return await operation()
+    monkeypatch.setattr(store, "_get_pool", pool)
+    monkeypatch.setattr(store, "_execute_with_retry", retry)
+
+    assert await store.reconcile(
+        set(), tier="hosted", authoritative_sandbox_ids=None,
+    ) == {"stopped": [], "refreshed": 0}
 
 
 @pytest.mark.asyncio

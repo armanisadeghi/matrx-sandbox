@@ -519,16 +519,65 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
         sandbox_id, user_id, template, wipe_volume,
     )
 
-    # Reserve the successor while the exact predecessor still proves the
-    # replacement identity.  Nothing destructive (container removal or home
-    # wipe) occurs until this transaction succeeds.
     try:
-        reserved = await sandbox_manager.reserve_sandbox_admission(
-            user_id=user_id, organization_id=organization_id, name=name,
-            config=config, template=template, template_version=template_version,
-            tier=tier, labels=labels, ttl_seconds=ttl_seconds,
-            replacement_for=sandbox_id,
-        )
+        # One same-home lifecycle owner spans the creating reservation through
+        # predecessor teardown, optional wipe, and successor creation.  The
+        # reaper cannot acquire this home for the reserved SID in the gap.
+        async with sandbox_manager.reset_successor_admission(
+            old, name=name, config=config, template=template,
+            template_version=template_version, tier=tier, labels=labels,
+            ttl_seconds=ttl_seconds,
+        ) as reserved:
+            destroyed = await sandbox_manager.destroy_sandbox(
+                sandbox_id, graceful=True, reason="user_requested",
+                _lifecycle_lease_held=True,
+            )
+            if not destroyed:
+                raise HTTPException(
+                    status_code=503,
+                    detail="Reset deferred: sandbox or shared home is migration-fenced",
+                )
+
+            if wipe_volume:
+                try:
+                    if legacy_ec2_layer:
+                        await sandbox_manager.wipe_retained_ec2_layer(
+                            old, _lifecycle_lease_held=True,
+                        )
+                        wiped = True
+                    elif is_ec2:
+                        wiped = await sandbox_manager.delete_ec2_home_volume(
+                            old, _lifecycle_lease_held=True,
+                        )
+                    else:
+                        wiped = await sandbox_manager.delete_user_volume(
+                            user_id, _lifecycle_lease_held=True,
+                        )
+                    logger.info("Reset wiped exact persistent home for %s: %s", sandbox_id, wiped)
+                except Exception as exc:
+                    raise HTTPException(status_code=502, detail=f"Reset volume wipe failed: {exc}") from exc
+                if not wiped:
+                    raise HTTPException(status_code=502, detail="Reset volume wipe did not complete; refusing recreate")
+
+            try:
+                return await sandbox_manager.create_sandbox(
+                    user_id=user_id,
+                    name=name,
+                    organization_id=organization_id,
+                    config=config,
+                    template=template,
+                    template_version=template_version,
+                    tier=tier,
+                    resources=resources,
+                    labels=labels,
+                    ttl_seconds=ttl_seconds,
+                    persistence_from=(sandbox_id if is_ec2 and not wipe_volume and old.persistence_volume and not development_bind else None),
+                    reserved=reserved,
+                    _lifecycle_lease_held=True,
+                )
+            except Exception as exc:
+                logger.exception("Reset re-create failed for %s", sandbox_id)
+                raise HTTPException(status_code=500, detail=f"Reset re-create failed: {exc}")
     except AdmissionCapacityExceeded as exc:
         raise HTTPException(status_code=429, detail={
             "code": "admission_capacity_exceeded", "ceiling": exc.ceiling,
@@ -536,50 +585,6 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
         }) from exc
     except KnobSourceUnavailableError as exc:
         raise HTTPException(status_code=503, detail="sandbox admission configuration is unavailable") from exc
-
-    # 1. Destroy the existing container (preserves named volume).
-    destroyed = await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="user_requested")
-    if not destroyed:
-        raise HTTPException(status_code=503, detail="Reset deferred: sandbox or shared home is migration-fenced")
-
-    # 2. Optional volume wipe — clears the per-user Docker volume so the
-    # new sandbox boots with an empty /home/agent.
-    if wipe_volume:
-        try:
-            if legacy_ec2_layer:
-                await sandbox_manager.wipe_retained_ec2_layer(old)
-                wiped = True
-            elif is_ec2:
-                wiped = await sandbox_manager.delete_ec2_home_volume(old)
-            else:
-                wiped = await sandbox_manager.delete_user_volume(user_id)
-            logger.info("Reset wiped exact persistent home for %s: %s", sandbox_id, wiped)
-        except Exception as exc:
-            raise HTTPException(status_code=502, detail=f"Reset volume wipe failed: {exc}") from exc
-        if not wiped:
-            raise HTTPException(status_code=502, detail="Reset volume wipe did not complete; refusing recreate")
-
-    # 3. Re-create with the same shape.
-    try:
-        new_sandbox = await sandbox_manager.create_sandbox(
-            user_id=user_id,
-            name=name,
-            organization_id=organization_id,
-            config=config,
-            template=template,
-            template_version=template_version,
-            tier=tier,
-            resources=resources,
-            labels=labels,
-            ttl_seconds=ttl_seconds,
-            persistence_from=(sandbox_id if is_ec2 and not wipe_volume and old.persistence_volume and not development_bind else None),
-            reserved=reserved,
-        )
-    except Exception as exc:
-        logger.exception("Reset re-create failed for %s", sandbox_id)
-        raise HTTPException(status_code=500, detail=f"Reset re-create failed: {exc}")
-
-    return new_sandbox
 
 
 @router.post("/{sandbox_id}/resume", response_model=SandboxResponse)
@@ -655,7 +660,6 @@ async def resume_sandbox(sandbox_id: str):
     try:
         if is_ec2 and not getattr(old, "persistence_volume", None):
             return await sandbox_manager.resume_retained_ec2_layer(old)
-        await storage.ensure_user_storage(user_id)
         new_sandbox = await sandbox_manager.create_sandbox(
             user_id=user_id,
             name=name,

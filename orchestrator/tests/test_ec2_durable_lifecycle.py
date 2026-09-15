@@ -68,6 +68,7 @@ async def test_legacy_ec2_destroy_retains_exact_layer_and_resume_restarts_it(mon
 
     monkeypatch.setattr("orchestrator.hosted_operation_lease.hosted_operation_lease", lease)
     store = InMemorySandboxStore()
+    store.seed_feature_knobs("infrastructure.sandbox", {"active_sandbox_capacity": 5})
     row = _row()
     await store.save(row)
     monkeypatch.setattr(sandbox_manager, "_store", store)
@@ -111,15 +112,26 @@ async def test_ec2_named_reset_passes_prior_row_to_keep_exact_home(monkeypatch):
         captured.update(kwargs)
         return old
 
+    @asynccontextmanager
+    async def reset_admission(predecessor, **kwargs):
+        captured["admission_predecessor"] = predecessor.sandbox_id
+        successor = _row(persistence_volume=reference)
+        successor.sandbox_id = "sbx-successor"
+        successor.status = SandboxStatus.CREATING
+        yield successor
+
     monkeypatch.setattr(sandboxes, "_migration_fenced", lambda _: __import__("asyncio").sleep(0, result=False))
     monkeypatch.setattr(sandboxes.sandbox_manager, "get_sandbox", get)
     monkeypatch.setattr(sandboxes.sandbox_manager, "destroy_sandbox", destroy)
     monkeypatch.setattr(sandboxes.sandbox_manager, "create_sandbox", create)
+    monkeypatch.setattr(sandboxes.sandbox_manager, "reset_successor_admission", reset_admission)
 
     result = await sandboxes.reset_sandbox(SID)
     assert result is old
     assert captured["persistence_from"] == SID
     assert captured["stop_reason"] == "user_requested"
+    assert captured["admission_predecessor"] == SID
+    assert captured["_lifecycle_lease_held"] is True
 
 
 @pytest.mark.asyncio
@@ -128,6 +140,7 @@ async def test_expiry_that_loses_to_real_legacy_resume_never_stops_the_resumed_c
     from orchestrator import reaper, sandbox_manager
 
     store = InMemorySandboxStore()
+    store.seed_feature_knobs("infrastructure.sandbox", {"active_sandbox_capacity": 5})
     row = _row()
     row.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     await store.save(row)

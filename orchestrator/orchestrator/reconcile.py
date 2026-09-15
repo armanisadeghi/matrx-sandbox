@@ -569,17 +569,12 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
             return summary
 
         try:
-            # Keep the ID projection as the established liveness seam.  The
-            # second complete label inventory is only an additional proof for
-            # orphaned creating reservations; if it cannot be read, creating
-            # rows stay occupied rather than being expired by guesswork.
-            alive_ids = await asyncio.to_thread(_alive_container_ids, client, host_tier)
-            try:
-                _, authoritative_sandbox_ids = await asyncio.to_thread(
-                    _alive_container_inventory, client, host_tier,
-                )
-            except Exception:
-                authoritative_sandbox_ids = None
+            # One complete inventory supplies both projections. A partial
+            # second read must never be mistaken for positive absence, and a
+            # duplicate Docker scan only widened the race between the views.
+            alive_ids, authoritative_sandbox_ids = await asyncio.to_thread(
+                _alive_container_inventory, client, host_tier,
+            )
         except Exception as exc:
             # If we can't enumerate containers, do NOT proceed — an empty/partial
             # alive set would wrongly stop healthy rows. Better to skip this tick.

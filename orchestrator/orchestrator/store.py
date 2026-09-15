@@ -58,6 +58,15 @@ class SandboxStore(ABC):
         :class:`AdmissionCapacityExceeded`.
         """
 
+    @abstractmethod
+    async def resume_active(self, sandbox: SandboxResponse) -> None:
+        """Atomically reserve capacity while reactivating an exact terminal row.
+
+        A connection-ambiguous retry for the same immutable row after it has
+        reached ``starting`` is idempotent. A different active row for the
+        user is never displaced.
+        """
+
     async def replace_container_if_current(self, sandbox_id: str, old_container_id: str,
                                            new_container_id: str, template_version: str | None,
                                            *, persistence_volume: str | None = None,
@@ -289,6 +298,45 @@ class InMemorySandboxStore(SandboxStore):
             if len(occupied_rows) >= ceiling:
                 raise AdmissionCapacityExceeded(ceiling=ceiling, occupied=len(occupied_rows))
             self._sandboxes[sandbox.sandbox_id] = sandbox
+
+    async def resume_active(self, sandbox: SandboxResponse) -> None:
+        import asyncio
+
+        _explicit_organization_id(sandbox)
+        lock = self._admission_locks.setdefault(sandbox.user_id, asyncio.Lock())
+        async with lock:
+            current = self._sandboxes.get(sandbox.sandbox_id)
+            if (current is None or sandbox.sandbox_id in self._deleted
+                    or current.row_id != sandbox.row_id
+                    or current.user_id != sandbox.user_id
+                    or current.organization_id != sandbox.organization_id
+                    or current.container_id != sandbox.container_id
+                    or current.created_at != sandbox.created_at
+                    or current.tier != sandbox.tier):
+                raise RuntimeError("resume target is not the caller's exact sandbox")
+            status = getattr(current.status, "value", current.status)
+            if status == "starting":
+                return
+            if status not in {"stopped", "expired", "failed"}:
+                raise RuntimeError("resume target is not terminal")
+            try:
+                ceiling = self._feature_knobs["infrastructure.sandbox"]["active_sandbox_capacity"]
+            except KeyError as exc:
+                raise KnobSourceUnavailableError(
+                    "active sandbox admission requires the platform-locked "
+                    "infrastructure.sandbox.active_sandbox_capacity knob"
+                ) from exc
+            if isinstance(ceiling, bool) or not isinstance(ceiling, int) or not 1 <= ceiling <= 100:
+                raise RuntimeError("active sandbox capacity knob must be an integer from 1 through 100")
+            active = {"creating", "starting", "ready", "running"}
+            occupied = sum(
+                1 for sid, row in self._sandboxes.items()
+                if sid not in self._deleted and row.user_id == sandbox.user_id
+                and getattr(row.status, "value", row.status) in active
+            )
+            if occupied >= ceiling:
+                raise AdmissionCapacityExceeded(ceiling=ceiling, occupied=occupied)
+            current.status = SandboxStatus.STARTING
 
     def seed_feature_knobs(self, feature: str, values: dict[str, Any]) -> None:
         """The test seam: give this store the settings a database would hold."""
@@ -629,6 +677,70 @@ class PostgresSandboxStore(SandboxStore):
                     sandbox.row_id = UUID(str(row["id"]))
         await self._execute_with_retry(_do)
 
+    async def resume_active(self, sandbox: SandboxResponse) -> None:
+        """Reserve one active slot and CAS an exact terminal row to starting."""
+        organization_id = _explicit_organization_id(sandbox)
+        active = ("creating", "starting", "ready", "running")
+
+        async def _do() -> None:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                async with conn.transaction():
+                    await conn.execute(
+                        "SELECT pg_advisory_xact_lock(hashtextextended('sandbox-admission:' || $1::text, 0))",
+                        str(UUID(sandbox.user_id)),
+                    )
+                    current = await conn.fetchrow(
+                        """SELECT id, user_id, organization_id, sandbox_id, status,
+                                  container_id, deleted_at, tier, created_at
+                           FROM sandbox_instances WHERE sandbox_id = $1""",
+                        sandbox.sandbox_id,
+                    )
+                    if (current is None or current["deleted_at"] is not None
+                            or str(current["id"]) != str(sandbox.row_id)
+                            or str(current["user_id"]) != sandbox.user_id
+                            or str(current["organization_id"]) != str(organization_id)
+                            or current["container_id"] != sandbox.container_id
+                            or current["tier"] != sandbox.tier
+                            or current["created_at"] != sandbox.created_at):
+                        raise RuntimeError("resume target is not the caller's exact sandbox")
+                    if current["status"] == "starting":
+                        return
+                    if current["status"] not in {"stopped", "expired", "failed"}:
+                        raise RuntimeError("resume target is not terminal")
+                    knob = await conn.fetchrow(
+                        "SELECT value FROM platform.feature_knob WHERE feature = $1 AND key = $2",
+                        "infrastructure.sandbox", "active_sandbox_capacity",
+                    )
+                    if knob is None:
+                        raise KnobSourceUnavailableError(
+                            "active sandbox admission requires platform-locked infrastructure.sandbox.active_sandbox_capacity"
+                        )
+                    value = knob["value"]
+                    ceiling = json.loads(value) if isinstance(value, str) else value
+                    if isinstance(ceiling, bool) or not isinstance(ceiling, int) or not 1 <= ceiling <= 100:
+                        raise RuntimeError("active sandbox capacity knob must be an integer from 1 through 100")
+                    occupied = await conn.fetchval(
+                        """SELECT count(*) FROM sandbox_instances
+                           WHERE user_id = $1 AND deleted_at IS NULL AND status = ANY($2::text[])""",
+                        UUID(sandbox.user_id), list(active),
+                    )
+                    if occupied >= ceiling:
+                        raise AdmissionCapacityExceeded(ceiling=ceiling, occupied=occupied)
+                    updated = await conn.execute(
+                        """UPDATE sandbox_instances SET status = 'starting'
+                           WHERE sandbox_id = $1 AND id = $2 AND user_id = $3
+                             AND organization_id = $4 AND container_id IS NOT DISTINCT FROM $5
+                             AND created_at = $6 AND deleted_at IS NULL
+                             AND status IN ('stopped', 'expired', 'failed')""",
+                        sandbox.sandbox_id, sandbox.row_id, UUID(sandbox.user_id),
+                        organization_id, sandbox.container_id, sandbox.created_at,
+                    )
+                    if not updated.endswith(" 1"):
+                        raise RuntimeError("resume target changed during admission")
+
+        await self._execute_with_retry(_do)
+
     async def save(self, sandbox: SandboxResponse) -> None:
         organization_id = _explicit_organization_id(sandbox)
         pool = await self._get_pool()
@@ -939,7 +1051,8 @@ class PostgresSandboxStore(SandboxStore):
                 # Marking them all STOPPED on that basis would be a self-
                 # inflicted mass-outage in the FE. Refuse the stop pass this
                 # tick; the next tick / boot reconcile corrects real drift.
-                if not alive_container_ids and active_rows:
+                if (not alive_container_ids and active_rows
+                        and authoritative_sandbox_ids is None):
                     logger.warning(
                         "Liveness reconcile (tier=%s): %d active row(s) but ZERO "
                         "alive containers reported — treating as a transient docker "
@@ -960,13 +1073,19 @@ class PostgresSandboxStore(SandboxStore):
                             and sandbox_id not in authoritative_sandbox_ids):
                         result = await conn.execute(
                             """UPDATE sandbox_instances SET status = 'stopped', stopped_at = NOW(),
-                                   stop_reason = 'creation_runtime_absent'
+                                   stop_reason = 'error'
                                WHERE sandbox_id = $1 AND container_id IS NULL AND status = 'creating'
                                  AND deleted_at IS NULL AND ($2::text IS NULL OR tier = $2)""",
                             sandbox_id, tier,
                         )
                         if result.endswith(" 1"):
                             stopped.append(sandbox_id)
+                        continue
+                    # A successful empty inventory proves an unbound creating
+                    # reservation absent, but it does not justify a mass stop
+                    # of rows that already have runtime identities. Preserve
+                    # those rows for the next non-empty liveness pass.
+                    if not alive_container_ids:
                         continue
                     if container_id and container_id not in alive_container_ids:
                         # Re-assert the live-status guard in the WHERE so we never
