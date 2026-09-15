@@ -339,37 +339,26 @@ async def destroy_sandbox(sandbox_id: str, graceful: bool = True, purge: bool = 
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
 
-    success = await sandbox_manager.destroy_sandbox(
-        sandbox_id, graceful=graceful, reason="user_requested"
+    # Legacy synchronous DELETE is intentionally only a compatibility waiter.
+    # It must never open a second destroy/purge implementation outside the
+    # durable receipt, task ownership, and full-duration lifecycle lease.
+    from orchestrator.lifecycle_operations import (
+        LifecycleConflict, LifecycleUnavailable, admit_lifecycle_operation,
+        wait_lifecycle_operation,
     )
-    if not success:
-        raise HTTPException(status_code=500, detail="Failed to destroy sandbox")
-    if purge:
-        from orchestrator.sandbox_manager import _get_store
-        from orchestrator.home_identity import home_key
-        from orchestrator.hosted_operation_lease import hosted_operation_lease
-
-        store = _get_store()
-        fresh = await store.get(sandbox_id)
-        if not fresh:
-            raise HTTPException(status_code=409, detail="Sandbox changed before purge; no row was deleted")
-        async with hosted_operation_lease(sandbox_id, home_key(fresh), lifecycle=True):
-            # A retained legacy EC2 layer resumes the same row/id.  Re-read
-            # while holding the lifecycle fence so delete cannot erase a box
-            # that restarted after destroy released its own lease.
-            fresh = await store.get(sandbox_id)
-            lifecycle = await store.get_lifecycle(sandbox_id)
-            terminal = {"stopped", "expired", "failed"}
-            if (
-                not fresh
-                or not lifecycle
-                or lifecycle.get("deleted")
-                or lifecycle.get("status") not in terminal
-                or getattr(fresh.status, "value", fresh.status) not in terminal
-            ):
-                raise HTTPException(status_code=409, detail="Sandbox resumed or changed before purge; no row was deleted")
-            if not await store.soft_delete(sandbox_id):
-                raise HTTPException(status_code=409, detail="Sandbox changed before purge; no row was deleted")
+    operation_id = str(uuid4())
+    try:
+        _, receipt = await admit_lifecycle_operation(
+            sandbox_id, operation_id, "delete" if purge else "stop", graceful=graceful,
+        )
+        if receipt["state"] not in {"succeeded", "failed", "recovery_required"}:
+            receipt = await wait_lifecycle_operation(sandbox_id, operation_id)
+    except LifecycleConflict as exc:
+        raise HTTPException(status_code=409, detail="Sandbox lifecycle operation conflicts") from exc
+    except LifecycleUnavailable as exc:
+        raise HTTPException(status_code=503, detail="Sandbox lifecycle operation unavailable") from exc
+    if receipt is None or receipt["state"] != "succeeded":
+        raise HTTPException(status_code=503, detail="Sandbox lifecycle operation requires recovery")
 
 
 @router.post("/{sandbox_id}/lifecycle-operations")

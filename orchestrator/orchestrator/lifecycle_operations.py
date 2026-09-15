@@ -51,10 +51,15 @@ def _path(journal: HostedMigrationJournal, sandbox_id: str, operation_id: str) -
 
 def _validate(record: dict[str, Any], *, sandbox_id: str | None = None,
               operation_id: str | None = None) -> dict[str, Any]:
-    if not isinstance(record, dict) or record.get("schema_version") != 1:
+    if not isinstance(record, dict) or record.get("schema_version") not in {1, 2}:
         raise LifecycleUnavailable("lifecycle receipt is unreadable")
     required = {"schema_version", "operation_id", "sandbox_id", "row_id", "container_id", "home_key", "kind", "state", "phase"}
-    if set(record) - required - {"reason"} or not required <= set(record):
+    allowed = required | {"reason"}
+    if record["schema_version"] == 2:
+        allowed |= {"graceful"}
+        if not isinstance(record.get("graceful"), bool):
+            raise LifecycleUnavailable("lifecycle receipt has an invalid graceful intent")
+    if set(record) - allowed or not required <= set(record):
         raise LifecycleUnavailable("lifecycle receipt has an invalid shape")
     if record["kind"] not in {"stop", "delete"} or record["state"] not in _STATES:
         raise LifecycleUnavailable("lifecycle receipt has an invalid state")
@@ -73,6 +78,11 @@ def _validate(record: dict[str, Any], *, sandbox_id: str | None = None,
     if operation_id is not None and record["operation_id"] != _operation_id(operation_id):
         raise LifecycleUnavailable("lifecycle receipt targets another operation")
     return record
+
+
+def _graceful(record: dict[str, Any]) -> bool:
+    """v1 receipts predate force-stop and were exclusively graceful."""
+    return record.get("graceful", True)
 
 
 def _read(journal: HostedMigrationJournal, sandbox_id: str, operation_id: str) -> dict[str, Any] | None:
@@ -128,10 +138,28 @@ def _records(journal: HostedMigrationJournal) -> list[dict[str, Any]]:
 
 
 def _projection(record: dict[str, Any]) -> dict[str, Any]:
-    out = {key: record[key] for key in ("operation_id", "sandbox_id", "kind", "state", "phase")}
+    out = {key: record[key] for key in ("operation_id", "sandbox_id", "row_id", "kind", "state", "phase")}
     if record.get("state") == "recovery_required": out["attention_needed"] = True
     if record.get("state") in {"failed", "recovery_required"}: out["reason"] = record.get("reason", "operation needs attention")
     return out
+
+
+def _operation_lock_key(operation_id: str) -> str:
+    """Global UUID fence; operation UUIDs are never target-local identities."""
+    return "lifecycle-operation-" + _operation_id(operation_id)
+
+
+def _global_target_conflict(journal: HostedMigrationJournal, operation_id: str, sandbox_id: str) -> None:
+    """Reject a reused UUID before looking up a possibly missing new target.
+
+    Admission takes this same lock again and retains it through its durable
+    write; this short probe only gives UUID identity precedence over a target
+    availability error.
+    """
+    with journal.lock(_operation_lock_key(operation_id)):
+        for record in _records(journal):
+            if record["operation_id"] == operation_id and record["sandbox_id"] != sandbox_id:
+                raise LifecycleConflict("operation id was already used for another lifecycle target")
 
 
 async def _runtime_is_terminal(container_id: str) -> bool:
@@ -161,9 +189,15 @@ def _acquire(journal: HostedMigrationJournal, record: dict[str, Any]) -> ExitSta
     stack = ExitStack()
     try:
         journal.ensure_ready()
-        stack.enter_context(journal.lock(f"lifecycle-operation-{record['sandbox_id']}-{record['operation_id']}"))
+        # This must precede every receipt census.  A per-sandbox lock lets two
+        # processes both observe no receipt and admit the same UUID elsewhere.
+        stack.enter_context(journal.lock(_operation_lock_key(record["operation_id"])))
+        records = _records(journal)
+        for other in records:
+            if other["operation_id"] == record["operation_id"] and other["sandbox_id"] != record["sandbox_id"]:
+                raise LifecycleConflict("operation id was already used for another lifecycle target")
         stack.enter_context(hosted_operation_lease_sync(record["sandbox_id"], record["home_key"], journal=journal, lifecycle=True, deployment=True, lifecycle_operation_id=record["operation_id"] if _read(journal, record["sandbox_id"], record["operation_id"]) else None))
-        for other in _records(journal):
+        for other in records:
             if other["operation_id"] != record["operation_id"] and other["state"] in _ACTIVE and (other["sandbox_id"] == record["sandbox_id"] or other["home_key"] == record["home_key"]):
                 raise LifecycleConflict("another lifecycle operation fences this sandbox or home")
         return stack
@@ -180,7 +214,12 @@ async def lifecycle_status(sandbox_id: str, operation_id: str, *, journal: Hoste
         # attention rather than reporting a forever-running ghost.
         def orphan() -> dict[str, Any] | None:
             try:
-                with state.lock(f"lifecycle-operation-{sandbox_id}-{record['operation_id']}"):
+                # The same global UUID key used by admission tells us whether
+                # a different process still owns this exact operation.
+                with state.lock(_operation_lock_key(record["operation_id"])):
+                    fresh = _read(state, sandbox_id, record["operation_id"])
+                    if fresh is None or fresh["state"] not in {"accepted", "running"}:
+                        return fresh
                     attention = {**record, "state": "recovery_required", "phase": "recovery_required", "reason": "operation owner disappeared; recover the same operation"}
                     _write(state, attention)
                     return attention
@@ -192,19 +231,22 @@ async def lifecycle_status(sandbox_id: str, operation_id: str, *, journal: Hoste
     return _projection(record) if record is not None else None
 
 
-async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: LifecycleKind, *, journal: HostedMigrationJournal | None = None, recover: bool = False) -> tuple[int, dict[str, Any]]:
+async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: LifecycleKind, *, journal: HostedMigrationJournal | None = None, recover: bool = False, graceful: bool = True) -> tuple[int, dict[str, Any]]:
     """Persist and own an exact graceful stop/delete without awaiting Docker."""
     state = journal or HostedMigrationJournal()
     operation_id = _operation_id(operation_id)
-    # UUIDs are global operation identities, not per-sandbox filenames. A
-    # complete journal census prevents the same UUID from targeting a second
-    # sandbox/home even when its per-target receipt path does not exist.
-    for prior in await asyncio.to_thread(_records, state):
-        if prior["operation_id"] == operation_id and prior["sandbox_id"] != sandbox_id:
-            raise LifecycleConflict("operation id was already used for another lifecycle target")
+    try:
+        await asyncio.to_thread(_global_target_conflict, state, operation_id, sandbox_id)
+    except HostedMigrationStateError as exc:
+        duplicate = await lifecycle_status(sandbox_id, operation_id, journal=state)
+        duplicate_record = await asyncio.to_thread(_read, state, sandbox_id, operation_id)
+        if duplicate is not None and duplicate["kind"] == kind and duplicate_record is not None and _graceful(duplicate_record) == graceful:
+            return (202 if duplicate["state"] in {"accepted", "running"} else 200), duplicate
+        raise LifecycleConflict("sandbox lifecycle operation conflicts") from exc
+    prior = await asyncio.to_thread(_read, state, sandbox_id, operation_id)
     existing = await lifecycle_status(sandbox_id, operation_id, journal=state)
     if existing is not None:
-        if existing["kind"] != kind:
+        if existing["kind"] != kind or prior is None or _graceful(prior) != graceful:
             raise LifecycleConflict("operation id was already used for another lifecycle intent")
         if existing["state"] == "recovery_required" and not recover:
             return 200, existing
@@ -220,28 +262,30 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
         if existing["state"] in {"succeeded", "failed"}:
             return 200, existing
 
+    # Read the target receipt only to select the immutable witness used for
+    # lock acquisition.  The authoritative all-receipt census happens under
+    # the global operation lock in _acquire.
     from orchestrator.home_identity import home_key
     from orchestrator.sandbox_manager import _get_store
     row = await _get_store().get(sandbox_id)
     life = await _get_store().get_lifecycle(sandbox_id)
-    if row is None or life is None or not row.container_id:
+    if (row is None or life is None or not row.container_id) and not (recover and prior is not None):
         raise LifecycleUnavailable("sandbox lifecycle target is unavailable")
     from orchestrator.config import settings
-    row_tier = getattr(row.tier, "value", row.tier)
-    if row_tier not in {"hosted", "ec2"} or row_tier != settings.host_tier:
+    row_tier = getattr(row.tier, "value", row.tier) if row is not None else settings.host_tier
+    if row is not None and (row_tier not in {"hosted", "ec2"} or row_tier != settings.host_tier):
         # A foreign-tier row is canonical data owned by another orchestrator.
         # Never let a local Docker NotFound turn it into a local terminal row.
         raise LifecycleConflict("sandbox lifecycle target belongs to another tier")
-    home = home_key(row) or f"layer-{sandbox_id}"
-    record = {
-        "schema_version": 1, "operation_id": operation_id, "sandbox_id": sandbox_id,
+    home = home_key(row) if row is not None else None
+    home = home or f"layer-{sandbox_id}"
+    record = prior or {
+        "schema_version": 2, "operation_id": operation_id, "sandbox_id": sandbox_id,
         "row_id": str(life["row_id"]), "container_id": row.container_id, "home_key": home,
-        "kind": kind, "state": "accepted", "phase": "admitting",
+        "kind": kind, "graceful": graceful, "state": "accepted", "phase": "admitting",
     }
-    if existing is not None:
-        prior = await asyncio.to_thread(_read, state, sandbox_id, operation_id)
-        assert prior is not None
-        record = {**prior, "state": "running", "phase": "stopping"}
+    if prior is not None and (prior["kind"] != kind or _graceful(prior) != graceful):
+        raise LifecycleConflict("operation id was already used for another lifecycle intent")
     acquisition = asyncio.create_task(asyncio.to_thread(_acquire, state, record))
     try:
         stack = await asyncio.shield(acquisition)
@@ -252,9 +296,42 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
             asyncio.create_task(asyncio.to_thread(done.result().close))
         acquisition.add_done_callback(release_when_acquired)
         raise
-    except HostedOperationDenied as exc:
+    except (HostedOperationDenied, HostedMigrationStateError) as exc:
+        # A held global UUID lock can be an identical request whose owner has
+        # not yet returned 202.  It can never authorize a second target.
+        duplicate = await lifecycle_status(sandbox_id, operation_id, journal=state)
+        duplicate_record = await asyncio.to_thread(_read, state, sandbox_id, operation_id)
+        if duplicate is not None and duplicate["kind"] == kind and duplicate_record is not None and _graceful(duplicate_record) == graceful:
+            return (202 if duplicate["state"] in {"accepted", "running"} else 200), duplicate
         raise LifecycleConflict("sandbox lifecycle operation conflicts") from exc
+    owns_stack = True
+    transfer_pending = False
     try:
+        # A receipt can only be recovered using its original witnesses.  Do
+        # not overwrite it with a current replacement row or runtime.
+        if recover and prior is not None:
+            original_runtime_terminal = await _runtime_is_terminal(prior["container_id"])
+            latest = await _get_store().get(sandbox_id)
+            latest_life = await _get_store().get_lifecycle(sandbox_id)
+            identity_matches = (
+                latest is not None and latest_life is not None
+                and str(latest_life.get("row_id")) == prior["row_id"]
+                and latest.container_id == prior["container_id"]
+                and (home_key(latest) or f"layer-{sandbox_id}") == prior["home_key"]
+            )
+            if not identity_matches:
+                # The operation lock plus original lifecycle/home leases prove
+                # no competing lifecycle side effect can be in flight.  Only
+                # an exact original-runtime terminal census permits failed
+                # terminalization; Docker uncertainty remains fenced.
+                if original_runtime_terminal:
+                    failed = {**prior, "state": "failed", "phase": "complete", "reason": "original lifecycle identity no longer matches"}
+                    await asyncio.to_thread(_write, state, failed)
+                    return 200, _projection(failed)
+                attention = {**prior, "state": "recovery_required", "phase": "recovery_required", "reason": "original lifecycle identity needs recovery"}
+                await asyncio.to_thread(_write, state, attention)
+                return 200, _projection(attention)
+            record = {**prior, "state": "running", "phase": "stopping"}
         latest = await _get_store().get(sandbox_id)
         latest_life = await _get_store().get_lifecycle(sandbox_id)
         if (latest is None or latest_life is None or str(latest_life.get("row_id")) != record["row_id"]
@@ -280,7 +357,7 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
                 terminal_states = {"stopped", "expired", "failed"}
                 already_terminal = current_life.get("status") in terminal_states
                 if not already_terminal:
-                    stopped = await _destroy_sandbox_unleased(sandbox_id, True, "user_requested", SandboxStatus.STOPPED)
+                    stopped = await _destroy_sandbox_unleased(sandbox_id, _graceful(record), "user_requested", SandboxStatus.STOPPED)
                     if not stopped: raise LifecycleUnavailable("graceful stop did not complete")
                 removing = {**running, "phase": "removing"}
                 await asyncio.to_thread(_write, state, removing)
@@ -314,6 +391,7 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
         # The registry's returned task is the explicit ownership-transfer
         # witness.  Until it exists this caller owns the descriptor stack;
         # after it exists only the child may close it.
+        transfer_pending = True
         transfer = asyncio.create_task(start_owned_operation(sandbox_id, operation_id, work, kind="lifecycle"))
         try:
             task = await asyncio.shield(transfer)
@@ -327,10 +405,31 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
                 asyncio.create_task(asyncio.to_thread(stack.close))
             transfer.add_done_callback(close_only_if_untransferred)
             raise
+        transfer_pending = False
         if isinstance(task, dict):
-            await asyncio.to_thread(stack.close)
             raise LifecycleConflict("another sandbox operation is already in progress")
+        owns_stack = False
         return 202, _projection(record)
-    except Exception:
-        await asyncio.to_thread(stack.close)
-        raise
+    finally:
+        # CancelledError is a BaseException, so this cannot rely on an
+        # ``except Exception`` branch.  Before registry handoff, admission is
+        # still the descriptor owner at every store/write await boundary.
+        # Once handoff starts, its callback alone decides whether the child
+        # accepted ownership or the stack must be released.
+        if owns_stack and not transfer_pending:
+            await asyncio.shield(asyncio.to_thread(stack.close))
+
+
+async def wait_lifecycle_operation(sandbox_id: str, operation_id: str, *, journal: HostedMigrationJournal | None = None) -> dict[str, Any] | None:
+    """Join the admitted child without making a synchronous caller own it."""
+    active = active_operation(sandbox_id)
+    if active is not None and active.operation_id == _operation_id(operation_id):
+        try:
+            return await asyncio.shield(active.task)
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            # The child writes recovery_required before an unexpected error
+            # reaches its owner; status is the durable source of truth.
+            pass
+    return await lifecycle_status(sandbox_id, operation_id, journal=journal)

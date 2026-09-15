@@ -231,6 +231,25 @@ def test_migration_actions_bypass_shared_middleware_lease_to_acquire_exclusive_l
 
 
 @pytest.mark.asyncio
+async def test_synchronous_delete_reaches_durable_service_without_outer_home_lease(hosted, monkeypatch):
+    """The compatibility waiter owns no middleware lease; lifecycle admission owns it."""
+    _wire(monkeypatch, hosted, {"box": SimpleNamespace(persistence_volume="home")})
+    acquired = False
+
+    async def delete_handler(scope, receive, send):
+        nonlocal acquired
+        with hosted.lock("lifecycle-home"):
+            acquired = True
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+
+    sent = await _call(
+        HostedOperationLeaseMiddleware(delete_handler),
+        {"type": "http", "method": "DELETE", "path": "/sandboxes/box"},
+    )
+    assert acquired is True and sent[0]["status"] == 204
+
+
+@pytest.mark.asyncio
 async def test_refresh_route_can_acquire_exclusive_home_lock_without_self_deadlock(hosted, monkeypatch):
     """Regression: middleware must not hold a shared lock around refresh migration."""
     _wire(monkeypatch, hosted, {"box": SimpleNamespace(persistence_volume="home")})

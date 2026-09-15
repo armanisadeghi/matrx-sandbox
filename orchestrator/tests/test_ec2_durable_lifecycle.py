@@ -204,32 +204,32 @@ async def test_expiry_that_loses_to_real_legacy_resume_never_stops_the_resumed_c
 
 
 @pytest.mark.asyncio
-async def test_purge_refuses_legacy_row_when_resume_wins_after_destroy(monkeypatch, tmp_path):
-    """Break caught: DELETE purge soft-deletes the same legacy id after it restarted."""
-    from orchestrator import sandbox_manager
+async def test_synchronous_delete_delegates_to_the_durable_lifecycle_service(monkeypatch):
+    """Break caught: compatibility DELETE maintained a second purge engine."""
+    from orchestrator import lifecycle_operations, sandbox_manager
     from orchestrator.routes import sandboxes
 
     store = InMemorySandboxStore()
     row = _row()
-    row.status = SandboxStatus.STOPPED
     await store.save(row)
-    journal = HostedMigrationJournal(tmp_path)
-    monkeypatch.setattr(sandbox_manager.settings, "host_tier", "ec2")
-    monkeypatch.setattr("orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: journal)
     monkeypatch.setattr(sandbox_manager, "_store", store)
 
     async def not_migrating(_): return False
     async def get(_): return await store.get(SID)
-    async def destroy(*_args, **_kwargs):
-        row.status = SandboxStatus.READY
-        await store.save(row)
-        return True
+    calls = []
+
+    async def admit(sandbox_id, operation_id, kind, *, graceful=True):
+        calls.append((sandbox_id, operation_id, kind, graceful))
+        return 202, {"operation_id": operation_id, "sandbox_id": sandbox_id, "kind": kind, "state": "accepted", "phase": "admitting"}
+
+    async def wait(sandbox_id, operation_id):
+        assert (sandbox_id, operation_id, "delete", False) == calls[0]
+        return {"operation_id": operation_id, "sandbox_id": sandbox_id, "kind": "delete", "state": "succeeded", "phase": "complete"}
 
     monkeypatch.setattr(sandboxes, "_migration_fenced", not_migrating)
     monkeypatch.setattr(sandboxes.sandbox_manager, "get_sandbox", get)
-    monkeypatch.setattr(sandboxes.sandbox_manager, "destroy_sandbox", destroy)
+    monkeypatch.setattr(lifecycle_operations, "admit_lifecycle_operation", admit)
+    monkeypatch.setattr(lifecycle_operations, "wait_lifecycle_operation", wait)
 
-    with pytest.raises(HTTPException, match="resumed or changed") as refusal:
-        await sandboxes.destroy_sandbox(SID, purge=True)
-    assert refusal.value.status_code == 409
-    assert (await store.get_lifecycle(SID))["deleted"] is False
+    await sandboxes.destroy_sandbox(SID, graceful=False, purge=True)
+    assert calls and calls[0][0] == SID and calls[0][2:] == ("delete", False)

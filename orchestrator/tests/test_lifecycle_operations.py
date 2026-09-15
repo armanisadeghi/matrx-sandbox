@@ -56,7 +56,7 @@ async def test_durable_admission_returns_before_stop_and_duplicate_joins_receipt
         receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=journal)
         if receipt and receipt["state"] == "succeeded": break
         await asyncio.sleep(0)
-    assert receipt == {"operation_id": UUID(operation).hex, "sandbox_id": SID, "kind": "stop", "state": "succeeded", "phase": "complete"}
+    assert receipt == {"operation_id": UUID(operation).hex, "sandbox_id": SID, "row_id": str((await store.get_lifecycle(SID))["row_id"]), "kind": "stop", "state": "succeeded", "phase": "complete"}
 
 
 @pytest.mark.asyncio
@@ -100,7 +100,7 @@ async def test_orphaned_running_receipt_becomes_durable_recovery_attention(tmp_p
     receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=journal)
 
     assert receipt == {
-        "operation_id": operation, "sandbox_id": SID, "kind": "stop",
+        "operation_id": operation, "sandbox_id": SID, "row_id": record["row_id"], "kind": "stop",
         "state": "recovery_required", "phase": "recovery_required",
         "attention_needed": True, "reason": "operation owner disappeared; recover the same operation",
     }
@@ -141,6 +141,86 @@ async def test_same_operation_uuid_cannot_be_reused_for_another_sandbox(tmp_path
     })
     with pytest.raises(lifecycle_operations.LifecycleConflict, match="another lifecycle target"):
         await lifecycle_operations.admit_lifecycle_operation(SID, operation, "stop", journal=journal)
+
+
+@pytest.mark.asyncio
+async def test_same_operation_uuid_refuses_force_intent_mismatch(tmp_path):
+    """Break caught: a retry could silently change graceful teardown intent."""
+    from orchestrator import lifecycle_operations
+
+    journal = HostedMigrationJournal(tmp_path); operation = uuid4().hex
+    lifecycle_operations._write(journal, {
+        "schema_version": 2, "operation_id": operation, "sandbox_id": SID,
+        "row_id": str(uuid4()), "container_id": "runtime-original", "home_key": "home-durable",
+        "kind": "stop", "graceful": True, "state": "succeeded", "phase": "complete",
+    })
+    with pytest.raises(lifecycle_operations.LifecycleConflict, match="another lifecycle intent"):
+        await lifecycle_operations.admit_lifecycle_operation(SID, operation, "stop", graceful=False, journal=journal)
+
+
+@pytest.mark.asyncio
+async def test_cancellation_during_post_lock_identity_reread_closes_leases(monkeypatch, tmp_path):
+    """Break caught: cancellation after _acquire leaked the lifecycle leases."""
+    from orchestrator import lifecycle_operations, sandbox_manager
+    from orchestrator.hosted_operation_lease import settings
+
+    store = InMemorySandboxStore(); await store.save(_row())
+    monkeypatch.setattr(settings, "host_tier", "hosted")
+    monkeypatch.setattr(sandbox_manager, "_get_store", lambda: store)
+    entered = asyncio.Event()
+    calls = 0
+    original_get = store.get
+
+    async def blocked_get(sandbox_id):
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            entered.set()
+            await asyncio.Event().wait()
+        return await original_get(sandbox_id)
+
+    class Stack:
+        closed = False
+        def close(self): self.closed = True
+
+    stack = Stack()
+    monkeypatch.setattr(store, "get", blocked_get)
+    monkeypatch.setattr(lifecycle_operations, "_acquire", lambda *_args: stack)
+    task = asyncio.create_task(lifecycle_operations.admit_lifecycle_operation(SID, str(uuid4()), "stop", journal=HostedMigrationJournal(tmp_path)))
+    await entered.wait()
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+    assert stack.closed is True
+
+
+@pytest.mark.asyncio
+async def test_recovery_identity_conflict_fails_only_after_original_runtime_census(monkeypatch, tmp_path):
+    """Break caught: recovery rebound a receipt to a replacement sandbox row."""
+    from orchestrator import lifecycle_operations, sandbox_manager
+    from orchestrator.hosted_operation_lease import settings
+
+    store = InMemorySandboxStore(); replacement = _row()
+    replacement.row_id = uuid4(); replacement.container_id = "replacement-runtime"
+    await store.save(replacement)
+    monkeypatch.setattr(settings, "host_tier", "hosted")
+    monkeypatch.setattr(sandbox_manager, "_get_store", lambda: store)
+    journal = HostedMigrationJournal(tmp_path); operation = uuid4().hex
+    original_row_id = str(uuid4())
+    lifecycle_operations._write(journal, {
+        "schema_version": 2, "operation_id": operation, "sandbox_id": SID,
+        "row_id": original_row_id, "container_id": "runtime-original", "home_key": "home-durable",
+        "kind": "delete", "graceful": True, "state": "recovery_required", "phase": "recovery_required",
+        "reason": "operation needs recovery",
+    })
+    monkeypatch.setattr(lifecycle_operations, "_runtime_is_terminal", lambda _id: _terminal_runtime())
+
+    status, receipt = await lifecycle_operations.admit_lifecycle_operation(SID, operation, "delete", recover=True, journal=journal)
+
+    assert status == 200 and receipt["state"] == "failed" and receipt["row_id"] == original_row_id
+    current = await store.get(SID)
+    assert current.container_id == "replacement-runtime"
+    assert (await store.get_lifecycle(SID))["deleted"] is False
 
 
 async def _terminal_runtime() -> bool:
