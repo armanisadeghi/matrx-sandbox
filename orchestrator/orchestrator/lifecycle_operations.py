@@ -311,7 +311,22 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
                 return _projection(attention)
             finally:
                 await asyncio.to_thread(stack.close)
-        task = await start_owned_operation(sandbox_id, operation_id, work, kind="lifecycle")
+        # The registry's returned task is the explicit ownership-transfer
+        # witness.  Until it exists this caller owns the descriptor stack;
+        # after it exists only the child may close it.
+        transfer = asyncio.create_task(start_owned_operation(sandbox_id, operation_id, work, kind="lifecycle"))
+        try:
+            task = await asyncio.shield(transfer)
+        except asyncio.CancelledError:
+            def close_only_if_untransferred(done: asyncio.Task[Any]) -> None:
+                if done.cancelled() or done.exception() is not None:
+                    asyncio.create_task(asyncio.to_thread(stack.close))
+                    return
+                if isinstance(done.result(), asyncio.Task):
+                    return
+                asyncio.create_task(asyncio.to_thread(stack.close))
+            transfer.add_done_callback(close_only_if_untransferred)
+            raise
         if isinstance(task, dict):
             await asyncio.to_thread(stack.close)
             raise LifecycleConflict("another sandbox operation is already in progress")
