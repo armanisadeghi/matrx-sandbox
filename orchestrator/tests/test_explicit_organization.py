@@ -129,6 +129,7 @@ async def test_recreate_lifecycle_preserves_model_organization(monkeypatch, oper
             if operation == "resume_sandbox"
             else SandboxStatus.READY
         ),
+        tier="hosted",
         config={},
     )
     create = AsyncMock(return_value=old)

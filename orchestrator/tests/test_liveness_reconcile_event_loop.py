@@ -58,8 +58,15 @@ class _Store:
             for i in range(FLEET)
         ]
 
-    async def reconcile(self, alive_ids, *, tier, exclude_sandbox_ids=frozenset(),
-                        include_sandbox_ids=None):
+    async def reconcile(
+        self,
+        alive_ids,
+        *,
+        tier,
+        exclude_sandbox_ids=frozenset(),
+        include_sandbox_ids=None,
+        authoritative_sandbox_ids=None,
+    ):
         self.called = (tier, exclude_sandbox_ids, include_sandbox_ids)
         return {"stopped": [], "refreshed": len(include_sandbox_ids or ())}
 
@@ -94,8 +101,13 @@ async def test_liveness_reconcile_leases_the_fleet_without_stalling_health(monke
     monkeypatch.setattr("orchestrator.hosted_migration.HostedMigrationJournal", lambda: journal)
     monkeypatch.setattr("orchestrator.reconcile.settings.host_tier", "hosted")
     monkeypatch.setattr("orchestrator.hosted_operation_lease.settings.host_tier", "hosted")
-    monkeypatch.setattr("orchestrator.reconcile._alive_container_ids",
-                        lambda *_: {f"live-{i:04d}" for i in range(FLEET)})
+    monkeypatch.setattr(
+        "orchestrator.reconcile._alive_container_inventory",
+        lambda *_: (
+            {f"live-{i:04d}" for i in range(FLEET)},
+            {f"live-{i:04d}" for i in range(FLEET)},
+        ),
+    )
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: object())
 
     real_lock = HostedMigrationJournal.lock
