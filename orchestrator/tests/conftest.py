@@ -46,6 +46,7 @@ SANDBOX_KNOB_TEST_VALUES = {
     "warm_pool_template": "slim",
     "warm_pool_templates": "",
     "auto_migrate": False,
+    "auto_update_check_interval_seconds": 600,
     "migrate_max_per_pass": 2,
     "terminal_retention_days": 7,
     "migrate_recent_heartbeat_seconds": 120,

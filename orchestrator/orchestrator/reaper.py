@@ -62,6 +62,45 @@ REAP_INTERVAL_SECONDS = 60
 _MIGRATE_BACKOFF_CAP_SECONDS = 3600
 _migrate_backoff = {"next_attempt": 0.0, "fails": 0}
 
+# The lifecycle sweep deliberately stays at 60 seconds, but a Docker image
+# comparison is fleet-wide work. This timestamp is process-local by design:
+# after a reaper restart the first eligible comparison should run immediately.
+# The interval itself is always read from the platform knob below; never add a
+# fallback constant here because an unreadable row must make the reaper skip
+# this optional work rather than quietly resume minute-by-minute Docker scans.
+_last_update_check_at: float | None = None
+
+
+async def _update_check_due() -> bool:
+    """Return whether this tick may inspect image drift for the whole fleet."""
+    global _last_update_check_at
+    try:
+        interval_seconds = await knob_int("auto_update_check_interval_seconds")
+    except Exception as exc:
+        logger.warning(
+            "Reaper: auto-update check interval unreadable; skipping drift check this tick: %s",
+            exc,
+        )
+        return False
+
+    if interval_seconds <= 0:
+        logger.warning(
+            "Reaper: auto-update check interval must be positive; skipping drift check this tick: %s",
+            interval_seconds,
+        )
+        return False
+
+    now = time.monotonic()
+    if (_last_update_check_at is not None
+            and now - _last_update_check_at < interval_seconds):
+        return False
+
+    # Claim the pass before contacting Docker. A failed scan still consumed an
+    # attempt, so retrying it every lifecycle tick would defeat the fleet-wide
+    # coalescing guarantee.
+    _last_update_check_at = now
+    return True
+
 
 def _lease_reaper_fleet(targets: list[tuple[str, str]]) -> tuple[ExitStack, set[str]]:
     """Acquire one batch of reaper leases off the request-serving event loop."""
@@ -217,19 +256,22 @@ async def _reap_once() -> dict:
     except Exception as exc:
         logger.warning("Reaper: liveness reconcile failed this tick: %s", exc)
 
-    # Version-drift alarm (zero-drift system, Phase 1). Tier-scoped, never
-    # raises. drift_summary() logs loudly when any live box is stale; we also
-    # surface the count in the sweep summary so it shows in the periodic line.
-    try:
-        from orchestrator.sandbox_manager import _get_docker_client
-        from orchestrator.versioning import drift_summary
-        drift = drift_summary(_get_docker_client())
-        summary["drifted"] = drift["drifted"]
-    except Exception as exc:
-        logger.warning("Reaper: drift check failed this tick: %s", exc)
+    # Version-drift alarm (zero-drift system, Phase 1). Its configurable,
+    # process-coalesced cadence is independent of the 60-second lifecycle
+    # sweep above. Each eligible pass resolves the newest image then; it never
+    # builds a backlog for every image published between passes.
+    if await _update_check_due():
+        try:
+            from orchestrator.sandbox_manager import _get_docker_client
+            from orchestrator.versioning import drift_summary
+            drift = drift_summary(_get_docker_client())
+            summary["drifted"] = drift["drifted"]
+        except Exception as exc:
+            logger.warning("Reaper: drift check failed this tick: %s", exc)
 
     # Opt-in rolling auto-migration: when enabled, migrate a few drifted boxes
-    # each sweep (busy ones deferred to the next sweep). Off by default.
+    # in an eligible drift pass (busy ones defer to the next such pass). Off by
+    # default; its serial batch and failure backoff stay unchanged.
     if summary.get("drifted") and await _auto_migrate_enabled():
         now = time.monotonic()
         if now < _migrate_backoff["next_attempt"]:
