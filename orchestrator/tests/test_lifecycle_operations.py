@@ -128,5 +128,20 @@ async def test_admission_refuses_a_row_owned_by_another_orchestrator_tier(monkey
     assert called is False
 
 
+@pytest.mark.asyncio
+async def test_same_operation_uuid_cannot_be_reused_for_another_sandbox(tmp_path):
+    """Break caught: per-sandbox receipt paths made UUID identity non-global."""
+    from orchestrator import lifecycle_operations
+
+    journal = HostedMigrationJournal(tmp_path); operation = uuid4().hex
+    lifecycle_operations._write(journal, {
+        "schema_version": 1, "operation_id": operation, "sandbox_id": "sbx-first",
+        "row_id": str(uuid4()), "container_id": "first-runtime", "home_key": "home-first",
+        "kind": "stop", "state": "succeeded", "phase": "complete",
+    })
+    with pytest.raises(lifecycle_operations.LifecycleConflict, match="another lifecycle target"):
+        await lifecycle_operations.admit_lifecycle_operation(SID, operation, "stop", journal=journal)
+
+
 async def _terminal_runtime() -> bool:
     return True

@@ -196,12 +196,23 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
     """Persist and own an exact graceful stop/delete without awaiting Docker."""
     state = journal or HostedMigrationJournal()
     operation_id = _operation_id(operation_id)
+    # UUIDs are global operation identities, not per-sandbox filenames. A
+    # complete journal census prevents the same UUID from targeting a second
+    # sandbox/home even when its per-target receipt path does not exist.
+    for prior in await asyncio.to_thread(_records, state):
+        if prior["operation_id"] == operation_id and prior["sandbox_id"] != sandbox_id:
+            raise LifecycleConflict("operation id was already used for another lifecycle target")
     existing = await lifecycle_status(sandbox_id, operation_id, journal=state)
     if existing is not None:
         if existing["kind"] != kind:
             raise LifecycleConflict("operation id was already used for another lifecycle intent")
         if existing["state"] == "recovery_required" and not recover:
             return 200, existing
+        if recover and existing["state"] in {"accepted", "running"}:
+            # Its exact operation flock is still held by another owner. The
+            # reconnect observes the immutable receipt; it never gets a 500
+            # from attempting to steal that nonblocking lock.
+            return 202, existing
         if existing["state"] in _ACTIVE and not recover:
             return 202, existing
         if existing["state"] in {"succeeded", "failed", "recovery_required"} and not recover:
@@ -266,17 +277,20 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
                 current_life = await _get_store().get_lifecycle(sandbox_id)
                 if current is None or current_life is None or str(current_life.get("row_id")) != record["row_id"] or current.container_id != record["container_id"]:
                     raise LifecycleConflict("sandbox identity changed before side effect")
-                stopped = await _destroy_sandbox_unleased(sandbox_id, True, "user_requested", SandboxStatus.STOPPED)
-                if not stopped: raise LifecycleUnavailable("graceful stop did not complete")
+                terminal_states = {"stopped", "expired", "failed"}
+                already_terminal = current_life.get("status") in terminal_states
+                if not already_terminal:
+                    stopped = await _destroy_sandbox_unleased(sandbox_id, True, "user_requested", SandboxStatus.STOPPED)
+                    if not stopped: raise LifecycleUnavailable("graceful stop did not complete")
                 removing = {**running, "phase": "removing"}
                 await asyncio.to_thread(_write, state, removing)
-                if kind == "delete" and not await _get_store().soft_delete(sandbox_id):
-                    raise LifecycleUnavailable("terminal row could not be deleted")
+                if kind == "delete" and not current_life.get("deleted"):
+                    if not await _get_store().soft_delete(sandbox_id):
+                        raise LifecycleUnavailable("terminal row could not be deleted")
                 finalizing = {**removing, "phase": "finalizing"}
                 await asyncio.to_thread(_write, state, finalizing)
                 checked = await _get_store().get(sandbox_id)
                 checked_life = await _get_store().get_lifecycle(sandbox_id)
-                terminal_states = {"stopped", "expired", "failed"}
                 if (checked is None or checked_life is None
                         or str(checked_life.get("row_id")) != record["row_id"]
                         or checked_life.get("status") not in terminal_states
