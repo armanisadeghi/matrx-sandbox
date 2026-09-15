@@ -373,6 +373,12 @@ def _alive_container_inventory(client, host_tier: str | None) -> tuple[set[str],
             # Only consider containers belonging to this orchestrator's tier.
             if host_tier and tier and tier != host_tier:
                 continue
+            # Presence, not liveness, is the proof for an orphaned creating
+            # reservation: a created/exited matching runtime means its owner
+            # may still recover or terminalize it by a richer path.
+            sandbox_id = labels.get("matrx.sandbox_id")
+            if sandbox_id:
+                sandbox_ids.add(sandbox_id)
             status = _docker_state_to_status(attrs.get("State", {}) or {})
             if status in (
                 SandboxStatus.RUNNING,
@@ -380,19 +386,10 @@ def _alive_container_inventory(client, host_tier: str | None) -> tuple[set[str],
                 SandboxStatus.STARTING,
             ):
                 alive.add(container.id)
-                sandbox_id = labels.get("matrx.sandbox_id")
-                if sandbox_id:
-                    sandbox_ids.add(sandbox_id)
         except Exception:
-            # We can SEE this container in the list but failed to read its
-            # state. Treat it as alive — never stop a row whose container
-            # demonstrably exists just because a metadata read hiccupped.
-            # (A cross-tier id added here is harmless: it won't match any of
-            # this tier's rows.)
-            try:
-                alive.add(container.id)
-            except Exception:
-                pass
+            # A partial inventory cannot prove a creating runtime absent.
+            # Propagate so the caller disables the creating cleanup globally.
+            raise
             continue
     return alive, sandbox_ids
 
