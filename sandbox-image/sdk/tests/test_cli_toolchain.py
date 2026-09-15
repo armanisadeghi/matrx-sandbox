@@ -215,3 +215,30 @@ def test_mtx_toolchain_check_names_what_is_missing(monkeypatch, capsys):
     captured = capsys.readouterr()
     assert "gh: MISSING" in captured.out
     assert "mtx toolchain ensure" in captured.err
+
+
+def test_unwritable_local_dir_is_named_not_a_traceback(tmp_path, monkeypatch, capsys):
+    """`mtx toolchain ensure` on a box whose ~/.local is root-owned.
+
+    The 2026-09-15 regression reached `Path.home()/".local"/"bin".mkdir()` with
+    a root-owned ~/.local and raised PermissionError straight out of `mtx new`.
+    Fails against the pre-fix code: the exception escapes `ensure()`.
+    """
+    from matrx_agent.cli import toolchain
+
+    home = tmp_path / "home"
+    (home / ".local").mkdir(parents=True)
+    (home / ".local").chmod(0o555)
+    monkeypatch.setattr(toolchain.Path, "home", staticmethod(lambda: home))
+    monkeypatch.setattr(toolchain.shutil, "which", lambda _n, **kw: None)
+    monkeypatch.setattr(toolchain, "_have_sudo", lambda: False)
+    monkeypatch.setenv("PATH", str(tmp_path / "nowhere"))
+    try:
+        rc = toolchain.ensure(["uv"])
+    finally:
+        (home / ".local").chmod(0o755)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "permission denied" in err
+    assert "install by hand" in err

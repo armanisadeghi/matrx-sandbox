@@ -176,3 +176,65 @@ def test_projects_root_defaults_to_home_projects(monkeypatch, tmp_path):
     monkeypatch.delenv("MATRX_PROJECTS_ROOT", raising=False)
     monkeypatch.setenv("HOME", str(tmp_path))
     assert _projects_root() == Path(str(tmp_path)) / "projects"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# The 2026-09-15 live regression: a fresh EC2 `bare` box booted with a
+# root-owned home (the root-run S3 restore created ~/projects and nothing
+# chowned it back), the shell ran as uid 1000, and `mtx new python <name>` died
+# with a raw `PermissionError` traceback at new.py:70 — no name, no remedy.
+# These fail against the pre-fix code: the exception escapes `run()`.
+# ─────────────────────────────────────────────────────────────────────────────
+
+
+def _readonly(path: Path) -> None:
+    path.mkdir(parents=True, exist_ok=True)
+    path.chmod(0o555)
+
+
+def test_unwritable_projects_root_is_a_named_error_not_a_traceback(
+    projects_root, monkeypatch, capsys
+):
+    monkeypatch.setattr("shutil.which", lambda _n, **kw: "/usr/local/bin/uv")
+    _readonly(projects_root)
+    try:
+        rc = new_run(_args("python", "demo"))  # must not raise
+    finally:
+        projects_root.chmod(0o755)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "permission denied" in err
+    assert "chown -R" in err  # the remedy, spelled out
+    assert str(projects_root / "demo") in err
+
+
+def test_unwritable_project_dir_during_write_is_named(projects_root, monkeypatch, capsys):
+    monkeypatch.setattr("shutil.which", lambda _n, **kw: "/usr/local/bin/uv")
+    projects_root.mkdir(parents=True, exist_ok=True)
+    target = projects_root / "demo"
+    _readonly(target)
+    try:
+        rc = new_run(_args("python", "demo"))
+    finally:
+        target.chmod(0o755)
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "permission denied" in err
+
+
+def test_cli_entrypoint_never_lets_a_permission_error_escape(monkeypatch, capsys):
+    """The process boundary backstop, for whatever a subcommand forgets."""
+    from matrx_agent.cli.__main__ import _entrypoint
+
+    def _boom(_args):
+        raise PermissionError(13, "Permission denied", "/home/agent/projects/x")
+
+    monkeypatch.setattr("matrx_agent.cli.new.run", _boom)
+    rc = _entrypoint(["new", "python", "demo"])
+    assert rc == 1
+    err = capsys.readouterr().err
+    assert "Traceback" not in err
+    assert "permission denied" in err
+    assert "/home/agent/projects/x" in err

@@ -36,6 +36,8 @@ import shutil
 import sys
 from pathlib import Path
 
+from matrx_agent.cli import errors
+
 # Name that is safe as a Python module, a directory and an npm package name.
 _SAFE_NAME = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
 
@@ -62,20 +64,38 @@ def _validate(name: str) -> str | None:
 def _prepare_dir(name: str) -> tuple[Path | None, int]:
     root = _projects_root()
     target = root / name
-    if target.exists() and any(target.iterdir()):
-        return None, _fail(
-            f"{target} already exists and is not empty. Pick another name, or "
-            f"work in it directly: cd {target}"
-        )
-    target.mkdir(parents=True, exist_ok=True)
+    try:
+        if target.exists() and any(target.iterdir()):
+            return None, _fail(
+                f"{target} already exists and is not empty. Pick another name, or "
+                f"work in it directly: cd {target}"
+            )
+        target.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # A root-owned ~/projects (see errors.py) used to end here as an
+        # unhandled PermissionError traceback. Name it and give the remedy.
+        if errors.is_permission_error(exc):
+            return None, errors.report(
+                exc, prefix="mtx new", action=f"creating the project directory {target}"
+            )
+        return None, _fail(f"could not create {target}: {exc}")
     return target, 0
 
 
-def _write(target: Path, files: dict[str, str]) -> None:
+def _write(target: Path, files: dict[str, str]) -> int:
+    """Write the scaffold. Returns 0, or 1 after naming a permission failure."""
     for rel, content in files.items():
         path = target / rel
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(content)
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(content)
+        except OSError as exc:
+            if errors.is_permission_error(exc):
+                return errors.report(
+                    exc, prefix="mtx new", action=f"writing {path}"
+                )
+            return _fail(f"could not write {path}: {exc}")
+    return 0
 
 
 def _module_name(name: str) -> str:
@@ -109,7 +129,7 @@ def _new_python(name: str) -> int:
     if target is None:
         return rc
     mod = _module_name(name)
-    _write(
+    rc = _write(
         target,
         {
             "pyproject.toml": (
@@ -146,6 +166,8 @@ def _new_python(name: str) -> int:
             ".gitignore": ".venv/\n__pycache__/\n*.pyc\n.pytest_cache/\n",
         },
     )
+    if rc:
+        return rc
     print(f"[mtx new] created {target}")
     print("[mtx new] next:")
     print(f"  cd {target} && uv run pytest")
@@ -162,7 +184,7 @@ def _new_node(name: str) -> int:
     if target is None:
         return rc
     mod = _module_name(name)
-    _write(
+    rc = _write(
         target,
         {
             "package.json": (
@@ -197,6 +219,8 @@ def _new_node(name: str) -> int:
             ".gitignore": "node_modules/\n",
         },
     )
+    if rc:
+        return rc
     print(f"[mtx new] created {target}")
     print("[mtx new] next:")
     print(f"  cd {target} && pnpm install && pnpm test")

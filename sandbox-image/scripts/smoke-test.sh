@@ -312,6 +312,15 @@ done
 # ─── 3. File permission checks ──────────────────────────────────────────────
 header "Permission checks"
 
+# THE HOME OWNERSHIP LAW — every path under the agent's home is agent-owned.
+# A single root-owned directory here is what broke `mtx new python <name>` on
+# every fresh EC2 box on 2026-09-15, so the smoke test fails on it.
+if own_out="$(bash /opt/sandbox/scripts/check-home-ownership.sh 2>&1)"; then
+    pass "home ownership — $(echo "$own_out" | tail -1)"
+else
+    fail "home ownership" "$(echo "$own_out" | head -8)"
+fi
+
 # Can we write to home?
 if touch "$HOME/.smoke_test_marker" 2>/dev/null; then
     rm -f "$HOME/.smoke_test_marker"

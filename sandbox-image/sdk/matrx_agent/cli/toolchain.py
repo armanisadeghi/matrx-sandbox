@@ -48,6 +48,12 @@ import sys
 import tempfile
 from pathlib import Path
 
+from matrx_agent.cli import errors
+
+
+class NoWritableToolTarget(RuntimeError):
+    """No directory on this box can receive a toolchain binary — already named."""
+
 # ─── Pins. Keep in lockstep with sandbox-image/Dockerfile's ARGs. ────────────
 # tests/test_cli_toolchain.py parses the Dockerfile and fails when they drift.
 UV_VERSION = "0.10.8"
@@ -123,7 +129,17 @@ def _pick_target() -> _Target:
     if on_path and _have_sudo():
         return _Target(local, ["sudo", "-n"], True)
     fallback = Path.home() / ".local" / "bin"
-    fallback.mkdir(parents=True, exist_ok=True)
+    try:
+        fallback.mkdir(parents=True, exist_ok=True)
+    except OSError as exc:
+        # A root-owned ~/.local (the 2026-09-15 home-ownership regression) used
+        # to end here as an unhandled PermissionError traceback out of `mtx
+        # toolchain ensure` and therefore out of `mtx new`. Name it instead.
+        raise NoWritableToolTarget(
+            errors.permission_message(
+                exc, action=f"creating the tool directory {fallback}"
+            )
+        ) from exc
     return _Target(fallback, [], str(fallback) in _path_entries())
 
 
@@ -282,7 +298,16 @@ def ensure(tools: tuple[str, ...] | list[str] = REQUIRED_TOOLS, quiet: bool = Fa
             )
         return 1 if unknown else 0
 
-    target = _pick_target()
+    try:
+        target = _pick_target()
+    except NoWritableToolTarget as exc:
+        _warn(str(exc))
+        _warn(
+            "no writable directory for "
+            + ", ".join(missing)
+            + f"; install by hand with: {'; '.join(_MANUAL[n] for n in missing)}"
+        )
+        return 1
     if not quiet:
         _say(
             f"missing: {', '.join(missing)} — installing into {target.directory}"

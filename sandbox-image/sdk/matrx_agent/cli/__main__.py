@@ -183,5 +183,29 @@ def main(argv: list[str] | None = None) -> int:
     return 2
 
 
+def _entrypoint(argv: list[str] | None = None) -> int:
+    """The process boundary: a filesystem refusal never reaches the agent as a
+    traceback. Whatever a subcommand forgets to catch, this names.
+
+    (2026-09-15: a root-owned ``~/projects`` on a fresh EC2 box made
+    ``mtx new python <name>`` answer with a raw ``PermissionError`` and no
+    remedy. The image-side cause is fixed by the ownership chokepoint in
+    ``scripts/ensure-layout.sh``; this is the promise that the tool stays honest
+    even on a box that is broken in some new way.)
+    """
+    try:
+        return main(argv)
+    except OSError as exc:
+        from matrx_agent.cli import errors
+
+        if errors.is_permission_error(exc):
+            return errors.report(exc, prefix="mtx", action="running this command")
+        print(f"[mtx] {type(exc).__name__}: {exc}", file=sys.stderr)
+        return 1
+    except KeyboardInterrupt:
+        print("[mtx] interrupted", file=sys.stderr)
+        return 130
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(_entrypoint())

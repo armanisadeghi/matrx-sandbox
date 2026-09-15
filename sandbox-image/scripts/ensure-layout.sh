@@ -102,4 +102,50 @@ the user's project files in `cloud-files/`, they appear in the AI Dream
 Files panel without manual upload.
 LAYOUT_EOF
 
-# Permissions — only chown if running as root (e.g., entrypoint).
+# ─── THE OWNERSHIP CHOKEPOINT ────────────────────────────────────────────────
+# One place, running last as root on every boot, enforces one invariant:
+#
+#     no path under the agent's home is owned by root.
+#
+# Why it has to live here and be unconditional. The home is populated by steps
+# that run as ROOT before the agent ever gets a shell — on the EC2 :core box
+# `hot-sync.sh down` restores the user's entire home from S3 with `aws s3 sync`
+# as root, so every restored directory (.cache, .local, .matrx, projects,
+# cloud-files, scratch) lands root:root. `ensure_dir` above cannot fix that: it
+# only chowns a directory it CREATES, and a restored one already exists.
+#
+# On 2026-09-12 commit 03bf8ed deleted the blanket `chown -R` that used to end
+# this script. From then on every fresh EC2 box whose user had an S3 hot home
+# booted with a root-owned home: the shell runs as uid 1000, so `mtx new python
+# <name>` died with an unhandled PermissionError on ~/projects, and so did any
+# plain `mkdir ~/anything`. The hosted/local entrypoint never showed it because
+# it still runs its own `chown -R agent:agent /home/agent`.
+#
+# Scope. Only paths owned by ROOT are repaired — root ownership inside an agent
+# home is never legitimate user data; the user here IS `agent`. A path owned by
+# some OTHER non-agent uid is left exactly as it is and reported, never touched.
+# Symlinks are chowned with -h, so no link target outside the home is affected,
+# and -xdev keeps the walk on the home's own filesystem.
+#
+# Nothing fails silently: the repair says how many paths it fixed and names the
+# first of them; an unrepairable path is a loud warning.
+# The guard that keeps this honest: scripts/check-home-ownership.sh (run by
+# scripts/smoke-test.sh) fails if any path under the home is not agent-owned.
+if [ "$(id -u)" = "0" ]; then
+  agent_uid="$(id -u "$AGENT_USER" 2>/dev/null || echo 1000)"
+  root_owned="$(find "$AGENT_HOME" -xdev -uid 0 -print 2>/dev/null || true)"
+  if [ -n "$root_owned" ]; then
+    count="$(printf '%s\n' "$root_owned" | wc -l | tr -d ' ')"
+    echo "[ensure-layout] repairing $count root-owned path(s) under $AGENT_HOME (first: $(printf '%s\n' "$root_owned" | head -1))"
+    # -print0/xargs so paths with spaces or newlines survive.
+    if ! find "$AGENT_HOME" -xdev -uid 0 -print0 2>/dev/null \
+         | xargs -0 chown -h "$AGENT_USER:$AGENT_USER"; then
+      echo "[ensure-layout] WARNING: could not chown every root-owned path under $AGENT_HOME; the agent shell (uid $agent_uid) may hit permission errors. Repair by hand: sudo chown -R $AGENT_USER:$AGENT_USER $AGENT_HOME" >&2
+    fi
+  fi
+  foreign="$(find "$AGENT_HOME" -xdev ! -uid 0 ! -uid "$agent_uid" -print 2>/dev/null | head -5 || true)"
+  if [ -n "$foreign" ]; then
+    echo "[ensure-layout] WARNING: path(s) under $AGENT_HOME belong to neither root nor $AGENT_USER and were left untouched:" >&2
+    printf '%s\n' "$foreign" | while IFS= read -r p; do echo "  $p" >&2; done
+  fi
+fi
