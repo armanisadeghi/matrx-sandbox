@@ -87,8 +87,9 @@ async def test_postgres_insert_carries_explicit_organization():
     calls: list[tuple[str, tuple]] = []
 
     class Connection:
-        async def execute(self, sql, *args):
+        async def fetchrow(self, sql, *args):
             calls.append((sql, args))
+            return {"id": args[0]}
 
     class Acquire:
         async def __aenter__(self):
@@ -107,13 +108,13 @@ async def test_postgres_insert_carries_explicit_organization():
 
     assert len(calls) == 1
     sql, args = calls[0]
-    assert "(user_id, organization_id, sandbox_id" in sql
+    assert "(id, user_id, organization_id, sandbox_id" in sql
     assert "organization_id = EXCLUDED.organization_id" in sql
-    assert args[1] == UUID(ORG_ID)
+    assert args[2] == UUID(ORG_ID)
     # Live audit found 227 rows with user_id but no canonical created_by,
     # making their actual owners fail the platform's access predicate.
     assert "persistence_volume, created_by)" in sql
-    assert "$16, $1)" in sql
+    assert "$17, $2)" in sql
     assert "created_by = COALESCE(sandbox_instances.created_by, sandbox_instances.user_id)" in sql
 
 

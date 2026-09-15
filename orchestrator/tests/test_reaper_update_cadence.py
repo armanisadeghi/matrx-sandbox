@@ -135,7 +135,7 @@ async def test_automatic_reaper_uses_the_batch_that_owns_quiet_policy(monkeypatc
     monkeypatch.setattr(reaper, "knob_int", knob_int)
     monkeypatch.setattr(reaper, "_auto_migrate_enabled", auto_migrate_on)
     monkeypatch.setattr(
-        "orchestrator.versioning.drift_summary", lambda _docker: {"drifted": ["quiet"]},
+        "orchestrator.versioning.drift_summary", lambda _docker: {"drifted": 1},
     )
     monkeypatch.setattr("orchestrator.migrate.migrate_all_drifted", migrate_all)
 
