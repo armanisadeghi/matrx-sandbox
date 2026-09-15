@@ -65,15 +65,18 @@ _migrate_backoff = {"next_attempt": 0.0, "fails": 0}
 
 def _lease_reaper_fleet(targets: list[tuple[str, str]]) -> tuple[ExitStack, set[str]]:
     """Acquire one batch of reaper leases off the request-serving event loop."""
-    from orchestrator.hosted_migration import HostedMigrationJournal
     from orchestrator.hosted_operation_lease import (
         HostedOperationDenied,
         hosted_operation_lease_sync,
+        new_journal,
     )
 
     stack = ExitStack()
     included: set[str] = set()
-    journal = HostedMigrationJournal()
+    # Keep journal construction behind the lease module's single injection
+    # point.  Apart from making tests deterministic, this ensures every lease
+    # caller observes the same configured durable-state authority.
+    journal = new_journal()
     pending = journal.pending()
     try:
         for sandbox_id, volume in targets:

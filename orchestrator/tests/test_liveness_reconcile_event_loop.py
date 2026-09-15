@@ -146,7 +146,7 @@ async def test_liveness_reconcile_leases_the_fleet_without_stalling_health(monke
 async def test_reaper_leases_the_fleet_without_stalling_health(monkeypatch, tmp_path):
     """Break caught: reaper lease admission repeated on the request loop."""
     journal = HostedMigrationJournal(tmp_path)
-    monkeypatch.setattr("orchestrator.hosted_migration.HostedMigrationJournal", lambda: journal)
+    monkeypatch.setattr("orchestrator.hosted_operation_lease.HostedMigrationJournal", lambda: journal)
     monkeypatch.setattr("orchestrator.config.settings.host_tier", "hosted")
     monkeypatch.setattr("orchestrator.hosted_operation_lease.settings.host_tier", "hosted")
 
