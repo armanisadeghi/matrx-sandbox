@@ -275,12 +275,17 @@ def _stage_payload(client, image_tag: str) -> bytes:
     out = io.BytesIO()
     with tarfile.open(fileobj=raw, mode="r|*") as src, tarfile.open(fileobj=out, mode="w") as dst:
         for member in src:
-            if member.name == "sdk":
-                member.name = STAGE_DIR
-            elif member.name.startswith("sdk/"):
-                member.name = STAGE_DIR + member.name[3:]
-            else:
+            # Docker names the archive after its root path ("sdk", "sdk/..."),
+            # and tarfile strips a directory's trailing slash. Rewrite the first
+            # segment whatever it is called, so the payload can only ever unpack
+            # into the staging directory.
+            name = member.name.lstrip("./")
+            if not name:
                 continue
+            head, _, rest = name.partition("/")
+            member.name = f"{STAGE_DIR}/{rest}" if rest else STAGE_DIR
+            if member.islnk() and member.linkname.startswith(f"{head}/"):
+                member.linkname = f"{STAGE_DIR}/{member.linkname[len(head) + 1:]}"
             if member.isfile():
                 dst.addfile(member, src.extractfile(member))
             else:

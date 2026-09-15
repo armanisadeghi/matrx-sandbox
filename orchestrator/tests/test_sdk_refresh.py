@@ -51,6 +51,9 @@ def _sdk_tar() -> bytes:
     """A payload shaped like ``docker cp`` of /opt/sandbox/sdk from the image."""
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w") as tar:
+        root = tarfile.TarInfo("sdk")
+        root.type = tarfile.DIRTYPE
+        tar.addfile(root)
         body = b"print('current')\n"
         for name in ("sdk/matrx_agent/cli/toolchain.py", "sdk/matrx_agent/api/main.py"):
             info = tarfile.TarInfo(name)
@@ -123,7 +126,12 @@ async def test_binding_installs_the_current_sdk_into_an_older_box(monkeypatch):
     put_path, payload = container.put_archive.call_args[0]
     assert put_path == "/opt/sandbox"
     names = tarfile.open(fileobj=io.BytesIO(payload)).getnames()
-    assert names and all(n.startswith("sdk.incoming/") for n in names), names
+    assert names and all(n == "sdk.incoming" or n.startswith("sdk.incoming/") for n in names), names
+    assert "sdk.incoming/matrx_agent/cli/toolchain.py" in names
+    assert not any(n == "sdk" or n.startswith("sdk/") for n in names), (
+        "a member still addressed the LIVE tree — unpacking would overwrite the "
+        "SDK the box is importing right now"
+    )
     # The hook must not relocate the agent's shell: the exec helper caches the
     # directory each call lands in, and that cache is the user's location.
     assert sdk_refresh.sandbox_manager._sandbox_cwd.get("sbx-old") in (None, "/home/agent")
