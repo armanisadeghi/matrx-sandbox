@@ -140,6 +140,14 @@ def test_a_new_dependency_is_reported_not_silently_skipped(boxes):
     assert result["deps_checked"]["added"] == ["anyio"]
 
 
+def test_on_demand_with_nothing_staged_names_the_remedy(tmp_path, boxes):
+    """`mtx self-update` by hand is the normal empty case — only the orchestrator
+    can reach the image. It must say what fixes it, not just fail."""
+    result = selfupdate.apply(str(tmp_path / "nothing-here"), boxes["target"])
+    assert result["status"] == "failed"
+    assert "Rebind this sandbox" in result["reason"]
+
+
 def test_it_refuses_to_install_into_a_home(tmp_path):
     with pytest.raises(selfupdate.RefuseToInstall):
         selfupdate.apply(str(tmp_path), "/home/agent/sdk")

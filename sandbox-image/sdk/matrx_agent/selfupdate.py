@@ -277,7 +277,16 @@ def apply(
         "deps_checked": {"added": [], "removed": []},
     }
     if not os.path.isdir(source):
-        result["reason"] = f"no staged SDK at {source}"
+        # Nothing to install is the NORMAL case on demand: only the orchestrator
+        # can reach the image, and it removes the payload after installing it.
+        # Say what actually fixes it instead of a bare failure.
+        result["reason"] = (
+            f"no SDK staged at {source}. Only the orchestrator can fetch the current SDK "
+            "(it holds the image); it stages and installs one on every agent binding when "
+            "this box is behind. Rebind this sandbox to get the newest tools, or pass "
+            "--source <dir> if you have a tree already. `mtx self-update --status` shows "
+            "what this box is carrying."
+        )
         return result
     if not os.path.isfile(os.path.join(source, "matrx_agent", "api", "main.py")):
         result["reason"] = f"{source} does not look like an SDK tree (matrx_agent/api/main.py missing)"
