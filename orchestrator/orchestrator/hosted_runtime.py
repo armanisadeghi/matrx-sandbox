@@ -1311,6 +1311,13 @@ async def migrate_hosted(sandbox_id, *, old, target, env, volumes, labels, host,
             if any((r["sandbox_id"] == sandbox_id or r["source_volume"] == volume)
                    for r in journal.recovery_records()):
                 raise HostedMigrationStateError("an earlier migration still requires recovery")
+            # This is the final exclusive admission, shared by automatic and
+            # confirmed-manual migration. A lost client cannot be treated as
+            # idle merely because its process-local WebSocket lease drained.
+            if journal.unresolved_presence(sandbox_id, source_key):
+                raise HostedMigrationBusyError(
+                    "bound agent presence is unresolved; exact settlement or verified recovery is required"
+                )
             previous_record = journal.read(sandbox_id)
             retained_helper_receipts = _retained_helper_receipts(previous_record)
             if activity.inflight_count(sandbox_id) or (
