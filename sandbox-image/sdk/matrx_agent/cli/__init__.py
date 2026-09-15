@@ -16,6 +16,8 @@ Subcommands:
   mtx files sync down --dest X  → bulk pull into a local dir (used at startup)
   mtx files sync up   --src X   → bulk push from a local dir (used at shutdown)
   mtx whoami                    → identity + AI Dream config in this sandbox
+  mtx self-update               → install the current SDK the orchestrator
+                                  staged at /opt/sandbox/sdk.incoming
 
 Authentication: orchestrator-injected env vars
   MATRX_AIDREAM_URL              — base URL of the AI Dream backend

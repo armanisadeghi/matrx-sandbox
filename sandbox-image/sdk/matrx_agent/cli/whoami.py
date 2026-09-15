@@ -40,8 +40,21 @@ def _probe_bridge(url: str) -> dict:
 
 def run() -> int:
     aidream_url = os.environ.get("MATRX_AIDREAM_URL", "")
+    # The SDK version on disk is NOT the image's baked version once a binding-time
+    # refresh has run (matrx_agent/selfupdate.py) — read the real one.
+    try:
+        from matrx_agent import selfupdate
+
+        sdk = {
+            "version": selfupdate.installed_version(),
+            "baked_image_version": os.environ.get("MATRX_IMAGE_VERSION", "unknown"),
+            "refreshed": selfupdate.read_stamp() or None,
+        }
+    except Exception as exc:  # never let diagnostics break `mtx whoami`
+        sdk = {"version": "unknown", "error": str(exc)}
     info = {
         "sandbox_id": os.environ.get("SANDBOX_ID", "unknown"),
+        "sdk": sdk,
         "user_id": os.environ.get("USER_ID", "unknown"),
         "tier": os.environ.get("MATRX_TIER", "unknown"),
         "hostname": socket.gethostname(),

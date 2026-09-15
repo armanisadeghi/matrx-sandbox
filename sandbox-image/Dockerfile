@@ -248,6 +248,11 @@ ARG MATRX_IMAGE_VERSION=dev
 ENV MATRX_IMAGE_VERSION=${MATRX_IMAGE_VERSION}
 LABEL com.aimatrx.sandbox.version="${MATRX_IMAGE_VERSION}"
 RUN echo "${MATRX_IMAGE_VERSION}" > /etc/sandbox-image-version
+# The SDK tree carries the same stamp: the binding-time runtime refresh
+# (orchestrator/sdk_refresh.py + matrx_agent/selfupdate.py) reads it to say what
+# a box is upgrading FROM, and rewrites it when it installs a newer tree — so
+# `mtx whoami` reports the SDK actually on disk, not the image's birth date.
+RUN echo "${MATRX_IMAGE_VERSION}" > /opt/sandbox/sdk/VERSION
 
 # Use tini as init to handle signals properly
 ENTRYPOINT ["tini", "--"]

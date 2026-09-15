@@ -102,6 +102,24 @@ def main(argv: list[str] | None = None) -> int:
             help="Limit to these tools (default: uv pnpm gh)",
         )
 
+    # `mtx self-update` — install the SDK the orchestrator staged at
+    # /opt/sandbox/sdk.incoming (the agent-side half of the binding-time
+    # refresh). Same code path the orchestrator runs; never touches the home.
+    su_p = sub.add_parser(
+        "self-update",
+        help="Install the staged current SDK into this box (never touches your home)",
+    )
+    su_p.add_argument("--source", default=None, help="staged SDK tree (default /opt/sandbox/sdk.incoming)")
+    su_p.add_argument("--target", default=None, help="install location (default /opt/sandbox/sdk)")
+    su_p.add_argument("--image-id", default="", help="image identity to stamp")
+    su_p.add_argument("--image-version", default="", help="image version to stamp")
+    su_p.add_argument(
+        "--allow-daemon-restart",
+        action="store_true",
+        help="restart the in-container daemon when its code changed (drops live terminal sessions)",
+    )
+    su_p.add_argument("--status", action="store_true", help="print what SDK this box carries and exit")
+
     # `mtx aidream <subcommand> [args...]` — dispatches to a shell helper.
     # Only available on matrx-sandbox:aidream image variants. We use
     # parser.parse_known_args so the subcommand args pass through untouched.
@@ -127,6 +145,24 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "toolchain":
         from matrx_agent.cli.toolchain import run as toolchain_run
         return toolchain_run(args)
+
+    if args.cmd == "self-update":
+        from matrx_agent import selfupdate
+
+        sub_argv = []
+        if args.source:
+            sub_argv += ["--source", args.source]
+        if args.target:
+            sub_argv += ["--target", args.target]
+        if args.image_id:
+            sub_argv += ["--image-id", args.image_id]
+        if args.image_version:
+            sub_argv += ["--image-version", args.image_version]
+        if args.allow_daemon_restart:
+            sub_argv.append("--allow-daemon-restart")
+        if args.status:
+            sub_argv.append("--status")
+        return selfupdate.main(sub_argv)
 
     if args.cmd == "files":
         from matrx_agent.cli.files import run as files_run

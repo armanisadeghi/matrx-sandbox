@@ -203,6 +203,8 @@ ARG MATRX_IMAGE_VERSION=dev
 ENV MATRX_IMAGE_VERSION=${MATRX_IMAGE_VERSION}
 LABEL com.aimatrx.sandbox.version="${MATRX_IMAGE_VERSION}"
 RUN echo "${MATRX_IMAGE_VERSION}" > /etc/sandbox-image-version
+# Same stamp on the SDK tree — read by the binding-time runtime SDK refresh.
+RUN echo "${MATRX_IMAGE_VERSION}" > /opt/sandbox/sdk/VERSION
 
 ENTRYPOINT ["tini", "--"]
 CMD ["/opt/sandbox/scripts/entrypoint-slim.sh"]

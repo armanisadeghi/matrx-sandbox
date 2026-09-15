@@ -1636,13 +1636,24 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
 
 
 async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
-    """Run internal SessionStart hooks before development-worker tool access.
+    """Run the SessionStart hooks before the agent gets its hands on the box.
+
+    Two hooks, different reach:
+
+    * ``sdk_refresh`` runs on EVERY binding, every template. A box created from
+      an older image is never force-migrated (SBX-006), so without this it could
+      never run a command the SDK grew after its birth. See
+      ``orchestrator/sdk_refresh.py``.
+    * the repository sync runs only for the internal ``development`` worker.
 
     Failures stay visible in the report and logs, but never overwrite work or
-    prevent token issuance. Ordinary user sandboxes do not run this path.
+    prevent token issuance.
     """
+    from orchestrator.sdk_refresh import refresh_sdk_if_stale
+
+    sdk_refresh = await refresh_sdk_if_stale(sandbox)
     if sandbox.template != "development":
-        return None
+        return {"sdk_refresh": sdk_refresh}
     from orchestrator.connection_hooks import prepare_development_connection
 
     try:
@@ -1671,6 +1682,7 @@ async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
                 and isinstance(value, (str, int, float, bool, type(None)))
             }
         return {
+            "sdk_refresh": sdk_refresh,
             "hook": str(report.get("hook", "session_start.repo_sync")),
             "status": str(report.get("status", "unknown")),
             "exit_code": (
@@ -1693,6 +1705,7 @@ async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
             sandbox.sandbox_id,
         )
         return {
+            "sdk_refresh": sdk_refresh,
             "status": "failed",
             "summary": "Development connection preparation failed; it will retry on the next binding.",
         }

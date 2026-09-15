@@ -50,6 +50,7 @@ SANDBOX_KNOB_TEST_VALUES = {
     "terminal_retention_days": 7,
     "migrate_recent_heartbeat_seconds": 120,
     "enable_s3_migrate": False,
+    "sdk_refresh_on_binding": True,
 }
 
 
