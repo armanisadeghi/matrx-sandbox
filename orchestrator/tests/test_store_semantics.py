@@ -15,6 +15,7 @@ import pytest
 
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.store import InMemorySandboxStore
+from tests.conftest import seed_store_sandbox_knobs
 
 ORG_ID = "22222222-2222-4222-8222-222222222222"
 
@@ -69,6 +70,7 @@ async def test_concurrent_claim_does_not_double_assign_warm_box(monkeypatch):
     from orchestrator import pool
 
     store = InMemorySandboxStore()
+    seed_store_sandbox_knobs(store)
     async def _enabled() -> bool:
         return True
 

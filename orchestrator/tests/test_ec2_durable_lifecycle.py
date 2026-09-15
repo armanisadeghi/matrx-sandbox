@@ -12,6 +12,7 @@ from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.hosted_migration import HostedMigrationJournal
 from orchestrator.storage_layout import ec2_home_volume_name, validate_ec2_home_volume
 from orchestrator.store import InMemorySandboxStore
+from tests.conftest import seed_store_sandbox_knobs
 
 
 USER = "00000000-0000-4000-8000-000000000001"
@@ -103,6 +104,9 @@ async def test_ec2_named_reset_passes_prior_row_to_keep_exact_home(monkeypatch):
     reference = ec2_home_volume_name(SID)
     old = _row(persistence_volume=reference)
     captured = {}
+    store = InMemorySandboxStore()
+    seed_store_sandbox_knobs(store)
+    await store.save(old)
 
     async def get(_): return old
     async def destroy(*_args, **kwargs):
@@ -125,6 +129,7 @@ async def test_ec2_named_reset_passes_prior_row_to_keep_exact_home(monkeypatch):
     monkeypatch.setattr(sandboxes.sandbox_manager, "destroy_sandbox", destroy)
     monkeypatch.setattr(sandboxes.sandbox_manager, "create_sandbox", create)
     monkeypatch.setattr(sandboxes.sandbox_manager, "reset_successor_admission", reset_admission)
+    monkeypatch.setattr(sandboxes.sandbox_manager, "_get_store", lambda: store)
 
     result = await sandboxes.reset_sandbox(SID)
     assert result is old

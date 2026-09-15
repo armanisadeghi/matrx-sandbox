@@ -26,7 +26,7 @@ from unittest.mock import MagicMock
 import pytest
 
 from orchestrator.store import InMemorySandboxStore
-from tests.conftest import seed_sandbox_knobs
+from tests.conftest import seed_sandbox_knobs, seed_store_sandbox_knobs
 
 ORG_ID = "22222222-2222-4222-8222-222222222222"
 
@@ -77,6 +77,7 @@ def created_env(monkeypatch, tmp_path):
     from orchestrator.hosted_migration import HostedMigrationJournal
 
     store = InMemorySandboxStore()
+    seed_store_sandbox_knobs(store)
     journal_root = tmp_path / "migration-state"
     journal_root.mkdir(mode=0o700)
     journal = HostedMigrationJournal(journal_root)

@@ -69,6 +69,14 @@ def seed_sandbox_knobs(values: dict | None = None) -> None:
     knobs._cache[knobs.FEATURE] = (time.monotonic() + 10**9, merged)
 
 
+def seed_store_sandbox_knobs(store, values: dict | None = None) -> None:
+    """Prime an in-memory store with the same canonical test values."""
+    from orchestrator import knobs
+
+    merged = {**SANDBOX_KNOB_TEST_VALUES, **(values or {})}
+    store.seed_feature_knobs(knobs.FEATURE, merged)
+
+
 @pytest.fixture(autouse=True)
 def _sandbox_knobs_seeded():
     from orchestrator import knobs
