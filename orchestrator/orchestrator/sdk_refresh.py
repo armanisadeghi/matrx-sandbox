@@ -60,7 +60,9 @@ SDK_PATH = "/opt/sandbox/sdk"
 STAGE_DIR = "sdk.incoming"
 STAGE_PATH = f"/opt/sandbox/{STAGE_DIR}"
 OPT_SANDBOX = "/opt/sandbox"
-INSTALL_TIMEOUT = 120
+#: The install itself is seconds; the budget is for the worst case — a daemon
+#: restart that waits out a slow start (60s) AND a rollback restart after it.
+INSTALL_TIMEOUT = 240
 #: Guardrail on the staged payload — the SDK tree is a few MB; anything near
 #: this means we are about to copy the wrong path into a user's box.
 MAX_STAGE_BYTES = 256 * 1024 * 1024

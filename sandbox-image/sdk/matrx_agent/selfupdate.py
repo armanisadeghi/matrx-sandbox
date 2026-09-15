@@ -171,7 +171,7 @@ def _daemon_healthy(timeout: float = 2.0) -> bool:
         return False
 
 
-def restart_daemon(wait_seconds: float = 30.0) -> dict:
+def restart_daemon(wait_seconds: float = 60.0) -> dict:
     """Stop and relaunch the in-container daemon, exactly as the entrypoint does.
 
     Destroys PTY sessions (they are ``pty.fork()`` children of this process) and
