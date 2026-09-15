@@ -202,6 +202,7 @@ async def test_recovery_identity_conflict_fails_only_after_original_runtime_cens
 
     store = InMemorySandboxStore(); replacement = _row()
     replacement.row_id = uuid4(); replacement.container_id = "replacement-runtime"
+    replacement.tier = "ec2"
     await store.save(replacement)
     monkeypatch.setattr(settings, "host_tier", "hosted")
     monkeypatch.setattr(sandbox_manager, "_get_store", lambda: store)
@@ -221,6 +222,59 @@ async def test_recovery_identity_conflict_fails_only_after_original_runtime_cens
     current = await store.get(SID)
     assert current.container_id == "replacement-runtime"
     assert (await store.get_lifecycle(SID))["deleted"] is False
+
+
+@pytest.mark.asyncio
+async def test_new_uuid_refuses_soft_deleted_tombstone_before_lease_admission(monkeypatch, tmp_path):
+    """Break caught: a tombstone admitted a fresh destructive operation."""
+    from orchestrator import lifecycle_operations, sandbox_manager
+    from orchestrator.hosted_operation_lease import settings
+
+    store = InMemorySandboxStore(); await store.save(_row()); await store.soft_delete(SID)
+    monkeypatch.setattr(settings, "host_tier", "hosted")
+    monkeypatch.setattr(sandbox_manager, "_get_store", lambda: store)
+    called = False
+
+    def must_not_acquire(*_args):
+        nonlocal called; called = True
+        raise AssertionError("deleted tombstone must refuse before lifecycle lease admission")
+
+    monkeypatch.setattr(lifecycle_operations, "_acquire", must_not_acquire)
+    with pytest.raises(lifecycle_operations.LifecycleConflict, match="deleted"):
+        await lifecycle_operations.admit_lifecycle_operation(SID, str(uuid4()), "delete", journal=HostedMigrationJournal(tmp_path))
+    assert called is False
+
+
+@pytest.mark.asyncio
+async def test_home_or_tier_drift_after_handoff_never_calls_destroy(monkeypatch, tmp_path):
+    """Break caught: a changed home/tier ran under the old lifecycle lease."""
+    from orchestrator import lifecycle_operations, sandbox_manager
+    from orchestrator.hosted_operation_lease import settings
+
+    store = InMemorySandboxStore(); row = _row(); await store.save(row)
+    monkeypatch.setattr(settings, "host_tier", "hosted")
+    monkeypatch.setattr(sandbox_manager, "_get_store", lambda: store)
+    destroyed = []
+
+    async def destroy(*_args):
+        destroyed.append(True); return True
+
+    async def handoff(_sandbox_id, _operation_id, factory, **_kwargs):
+        current = await store.get(SID)
+        current.persistence_volume = "home-replaced"
+        await store.save(current)
+        return asyncio.create_task(factory())
+
+    monkeypatch.setattr(sandbox_manager, "_destroy_sandbox_unleased", destroy)
+    monkeypatch.setattr(lifecycle_operations, "start_owned_operation", handoff)
+    operation = str(uuid4())
+    status, _ = await lifecycle_operations.admit_lifecycle_operation(SID, operation, "stop", journal=HostedMigrationJournal(tmp_path))
+    assert status == 202
+    for _ in range(20):
+        receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=HostedMigrationJournal(tmp_path))
+        if receipt and receipt["state"] == "recovery_required": break
+        await asyncio.sleep(0)
+    assert destroyed == [] and receipt["state"] == "recovery_required"
 
 
 async def _terminal_runtime() -> bool:

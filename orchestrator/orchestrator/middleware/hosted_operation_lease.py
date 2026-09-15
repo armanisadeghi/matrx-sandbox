@@ -23,8 +23,10 @@ def _sandbox_id(scope: dict) -> str | None:
         return None
     if parts[2] in _COLLECTION_PATHS:
         return None
-    # These endpoints acquire the migration's exclusive locks themselves.
-    if scope.get("method") == "DELETE":
+    # Only the compatibility root DELETE delegates to the durable lifecycle
+    # service, which owns its full exclusive lease. Nested DELETE proxy/file
+    # routes remain ordinary sandbox operations and must stay fenced.
+    if scope.get("method") == "DELETE" and len(parts) == 3:
         return None
     # The correlated status projection is the one per-sandbox observation
     # endpoint that must remain reachable while this exact migration owns the

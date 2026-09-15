@@ -250,6 +250,28 @@ async def test_synchronous_delete_reaches_durable_service_without_outer_home_lea
 
 
 @pytest.mark.asyncio
+async def test_nested_delete_stays_under_the_canonical_home_lease(hosted, monkeypatch):
+    """Only root DELETE is self-locking; proxy/filesystem DELETE must remain fenced."""
+    _wire(monkeypatch, hosted, {"box": SimpleNamespace(persistence_volume="home")})
+    acquired = False
+
+    async def nested_handler(scope, receive, send):
+        nonlocal acquired
+        try:
+            with hosted.lock("lifecycle-home"):
+                acquired = True
+        except HostedMigrationStateError:
+            pass
+        await send({"type": "http.response.start", "status": 204, "headers": []})
+
+    await _call(
+        HostedOperationLeaseMiddleware(nested_handler),
+        {"type": "http", "method": "DELETE", "path": "/sandboxes/box/fs/tmp/x"},
+    )
+    assert acquired is False
+
+
+@pytest.mark.asyncio
 async def test_refresh_route_can_acquire_exclusive_home_lock_without_self_deadlock(hosted, monkeypatch):
     """Regression: middleware must not hold a shared lock around refresh migration."""
     _wire(monkeypatch, hosted, {"box": SimpleNamespace(persistence_volume="home")})

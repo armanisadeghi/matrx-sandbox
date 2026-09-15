@@ -51,14 +51,18 @@ def _path(journal: HostedMigrationJournal, sandbox_id: str, operation_id: str) -
 
 def _validate(record: dict[str, Any], *, sandbox_id: str | None = None,
               operation_id: str | None = None) -> dict[str, Any]:
-    if not isinstance(record, dict) or record.get("schema_version") not in {1, 2}:
+    if not isinstance(record, dict) or record.get("schema_version") not in {1, 2, 3}:
         raise LifecycleUnavailable("lifecycle receipt is unreadable")
     required = {"schema_version", "operation_id", "sandbox_id", "row_id", "container_id", "home_key", "kind", "state", "phase"}
     allowed = required | {"reason"}
-    if record["schema_version"] == 2:
+    if record["schema_version"] in {2, 3}:
         allowed |= {"graceful"}
         if not isinstance(record.get("graceful"), bool):
             raise LifecycleUnavailable("lifecycle receipt has an invalid graceful intent")
+    if record["schema_version"] == 3:
+        allowed |= {"tier"}
+        if record.get("tier") not in {"hosted", "ec2"}:
+            raise LifecycleUnavailable("lifecycle receipt has an invalid tier intent")
     if set(record) - allowed or not required <= set(record):
         raise LifecycleUnavailable("lifecycle receipt has an invalid shape")
     if record["kind"] not in {"stop", "delete"} or record["state"] not in _STATES:
@@ -83,6 +87,15 @@ def _validate(record: dict[str, Any], *, sandbox_id: str | None = None,
 def _graceful(record: dict[str, Any]) -> bool:
     """v1 receipts predate force-stop and were exclusively graceful."""
     return record.get("graceful", True)
+
+
+def _receipt_tier(record: dict[str, Any]) -> str:
+    """Legacy receipts belong to this journal's admitting host, never a replacement row."""
+    tier = record.get("tier")
+    if tier in {"hosted", "ec2"}:
+        return tier
+    from orchestrator.config import settings
+    return settings.host_tier
 
 
 def _read(journal: HostedMigrationJournal, sandbox_id: str, operation_id: str) -> dict[str, Any] | None:
@@ -273,16 +286,21 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
         raise LifecycleUnavailable("sandbox lifecycle target is unavailable")
     from orchestrator.config import settings
     row_tier = getattr(row.tier, "value", row.tier) if row is not None else settings.host_tier
-    if row is not None and (row_tier not in {"hosted", "ec2"} or row_tier != settings.host_tier):
+    # A tombstone authorizes only its exact durable receipt.  A fresh UUID
+    # must never gain a new destructive path through a soft-deleted row.
+    if life is not None and life.get("deleted") and prior is None:
+        raise LifecycleConflict("sandbox lifecycle target is deleted")
+    if (not (recover and prior is not None)
+            and (row is None or row_tier not in {"hosted", "ec2"} or row_tier != settings.host_tier)):
         # A foreign-tier row is canonical data owned by another orchestrator.
         # Never let a local Docker NotFound turn it into a local terminal row.
         raise LifecycleConflict("sandbox lifecycle target belongs to another tier")
     home = home_key(row) if row is not None else None
     home = home or f"layer-{sandbox_id}"
     record = prior or {
-        "schema_version": 2, "operation_id": operation_id, "sandbox_id": sandbox_id,
+        "schema_version": 3, "operation_id": operation_id, "sandbox_id": sandbox_id,
         "row_id": str(life["row_id"]), "container_id": row.container_id, "home_key": home,
-        "kind": kind, "graceful": graceful, "state": "accepted", "phase": "admitting",
+        "kind": kind, "graceful": graceful, "tier": row_tier, "state": "accepted", "phase": "admitting",
     }
     if prior is not None and (prior["kind"] != kind or _graceful(prior) != graceful):
         raise LifecycleConflict("operation id was already used for another lifecycle intent")
@@ -318,6 +336,7 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
                 and str(latest_life.get("row_id")) == prior["row_id"]
                 and latest.container_id == prior["container_id"]
                 and (home_key(latest) or f"layer-{sandbox_id}") == prior["home_key"]
+                and getattr(latest.tier, "value", latest.tier) == _receipt_tier(prior)
             )
             if not identity_matches:
                 # The operation lock plus original lifecycle/home leases prove
@@ -332,10 +351,17 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
                 await asyncio.to_thread(_write, state, attention)
                 return 200, _projection(attention)
             record = {**prior, "state": "running", "phase": "stopping"}
+        # A recovery receipt is owned by the host that admitted it.  Current
+        # row tier is an identity witness only; a replacement on another tier
+        # must not prevent its original runtime census.
+        if recover and prior is not None and _receipt_tier(prior) != settings.host_tier:
+            raise LifecycleConflict("lifecycle recovery belongs to another tier")
         latest = await _get_store().get(sandbox_id)
         latest_life = await _get_store().get_lifecycle(sandbox_id)
         if (latest is None or latest_life is None or str(latest_life.get("row_id")) != record["row_id"]
-                or latest.container_id != record["container_id"] or (home_key(latest) or f"layer-{sandbox_id}") != record["home_key"]):
+                or latest.container_id != record["container_id"]
+                or (home_key(latest) or f"layer-{sandbox_id}") != record["home_key"]
+                or getattr(latest.tier, "value", latest.tier) != _receipt_tier(record)):
             raise LifecycleConflict("sandbox identity changed before lifecycle admission")
         durable_write = asyncio.create_task(asyncio.to_thread(_write, state, record))
         try:
@@ -352,7 +378,11 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
                 from orchestrator.sandbox_manager import _destroy_sandbox_unleased
                 current = await _get_store().get(sandbox_id)
                 current_life = await _get_store().get_lifecycle(sandbox_id)
-                if current is None or current_life is None or str(current_life.get("row_id")) != record["row_id"] or current.container_id != record["container_id"]:
+                if (current is None or current_life is None
+                        or str(current_life.get("row_id")) != record["row_id"]
+                        or current.container_id != record["container_id"]
+                        or (home_key(current) or f"layer-{sandbox_id}") != record["home_key"]
+                        or getattr(current.tier, "value", current.tier) != _receipt_tier(record)):
                     raise LifecycleConflict("sandbox identity changed before side effect")
                 terminal_states = {"stopped", "expired", "failed"}
                 already_terminal = current_life.get("status") in terminal_states

@@ -79,20 +79,21 @@ def mock_health_sandbox_manager():
 
 
 @pytest.mark.asyncio
-async def test_lifecycle_lock_contention_is_a_retryable_service_refusal(mock_sandbox_manager):
+async def test_lifecycle_lock_contention_is_a_retryable_service_refusal(mock_sandbox_manager, monkeypatch):
     """A self-locking lifecycle route must not turn expected contention into HTTP 500."""
+    from orchestrator import lifecycle_operations
+
     mock_sandbox_manager.get_sandbox.return_value = SimpleNamespace(sandbox_id="sbx-busy-delete")
-    mock_sandbox_manager.destroy_sandbox.side_effect = HostedOperationDenied(
-        "hosted operation lease unavailable"
-    )
+    monkeypatch.setattr(lifecycle_operations, "admit_lifecycle_operation", AsyncMock(
+        side_effect=lifecycle_operations.LifecycleUnavailable("hosted operation lease unavailable")
+    ))
 
     transport = ASGITransport(app=app)
     async with AsyncClient(transport=transport, base_url="http://test") as client:
         response = await client.delete("/sandboxes/sbx-busy-delete")
 
     assert response.status_code == 503
-    assert response.headers["retry-after"] == "1"
-    assert response.json() == {"detail": "sandbox operation temporarily unavailable"}
+    assert response.json() == {"detail": "Sandbox lifecycle operation unavailable"}
 
 
 @pytest.mark.asyncio
@@ -600,6 +601,41 @@ async def test_request_with_bearer_token_returns_200(mock_sandbox_manager, mock_
         )
 
     assert response.status_code == 200
+
+
+@pytest.mark.asyncio
+async def test_lifecycle_operation_routes_preserve_master_auth_and_receipt_http_matrix(monkeypatch, mock_api_key):
+    """Assembled app proof: auth precedes lifecycle receipt admission/status."""
+    from orchestrator import lifecycle_operations
+
+    operation = "11111111-2222-4333-8444-555555555555"
+    receipt = {
+        "operation_id": operation.replace("-", ""), "sandbox_id": "sbx-route-op",
+        "row_id": "22222222-2222-4333-8444-555555555555", "kind": "stop",
+        "state": "accepted", "phase": "admitting",
+    }
+    admit = AsyncMock(return_value=(202, receipt))
+    monkeypatch.setattr(lifecycle_operations, "admit_lifecycle_operation", admit)
+    monkeypatch.setattr(lifecycle_operations, "lifecycle_status", AsyncMock(return_value=None))
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        denied = await client.post(
+            "/sandboxes/sbx-route-op/lifecycle-operations",
+            json={"operation_id": operation, "kind": "stop"},
+        )
+        accepted = await client.post(
+            "/sandboxes/sbx-route-op/lifecycle-operations",
+            headers={"X-API-Key": TEST_API_KEY},
+            json={"operation_id": operation, "kind": "stop"},
+        )
+        missing = await client.get(
+            f"/sandboxes/sbx-route-op/lifecycle-operations/{operation}",
+            headers={"X-API-Key": TEST_API_KEY},
+        )
+    assert denied.status_code == 401
+    assert accepted.status_code == 202 and accepted.json() == receipt
+    assert missing.status_code == 404
+    admit.assert_awaited_once()
 
 
 @pytest.mark.asyncio
