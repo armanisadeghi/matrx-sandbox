@@ -1,5 +1,6 @@
 """Regression for real slim lifecycle: entrypoint-slim never hot-syncs S3."""
 from types import SimpleNamespace
+from unittest.mock import Mock
 
 import pytest
 
@@ -64,3 +65,24 @@ async def test_correlated_core_s3_migration_refuses_without_durable_status(monke
 
     assert result["status"] == "unsupported_storage"
     assert "durable exact-operation journal" in result["reason"]
+
+
+@pytest.mark.asyncio
+async def test_auto_quiet_gate_refuses_before_s3_route_or_docker_lookup(monkeypatch):
+    """S3's unsupported path cannot bypass automatic idle admission."""
+    from orchestrator import activity
+
+    sid = "ec2-auto-quiet-contract"
+    activity.note_activity(sid)
+    docker_lookup = Mock(side_effect=AssertionError("auto gate reached S3/Docker"))
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", docker_lookup)
+    try:
+        result = await migrate.migrate_sandbox(
+            sid, store=None, require_idle=True, quiet_interval=1800,
+        )
+    finally:
+        activity._last_activity.pop(sid, None)
+        activity._quiet_observation_started.pop(sid, None)
+
+    assert result["status"] == "busy_deferred"
+    docker_lookup.assert_not_called()

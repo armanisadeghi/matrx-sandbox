@@ -48,6 +48,7 @@ KEYS = (
     "warm_pool_templates",
     "auto_migrate",
     "auto_update_check_interval_seconds",
+    "auto_update_idle_seconds",
     "migrate_max_per_pass",
     "terminal_retention_days",
     "migrate_recent_heartbeat_seconds",
@@ -67,7 +68,7 @@ def test_retired_env_vars_do_nothing(monkeypatch):
         "healthcheck_interval_seconds", "max_command_length",
         "command_timeout_seconds", "warm_pool_size", "warm_pool_template",
         "warm_pool_templates", "auto_migrate", "migrate_max_per_pass",
-        "auto_update_check_interval_seconds",
+        "auto_update_check_interval_seconds", "auto_update_idle_seconds",
         "terminal_retention_days", "migrate_recent_heartbeat_seconds",
         "enable_s3_migrate",
     ):
@@ -118,6 +119,7 @@ async def test_live_rows_resolve_through_the_postgres_store(monkeypatch):
         assert await knobs.knob_str("warm_pool_templates") == ""
         assert await knobs.knob_bool("auto_migrate") is False
         assert await knobs.knob_int("auto_update_check_interval_seconds") == 600
+        assert await knobs.knob_int("auto_update_idle_seconds") == 1800
         assert await knobs.knob_int("migrate_max_per_pass") == 2
         assert await knobs.knob_int("terminal_retention_days") == 7
         assert await knobs.knob_int("migrate_recent_heartbeat_seconds") == 120

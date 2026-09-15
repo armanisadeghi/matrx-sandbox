@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from contextlib import ExitStack
+from unittest.mock import AsyncMock
 
 import pytest
 
@@ -108,3 +109,37 @@ async def test_unreadable_update_interval_skips_drift_but_not_expiry(monkeypatch
     assert drift_scans == []
     assert store.expiry_ticks == 1
     assert "auto-update check interval unreadable" in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_automatic_reaper_uses_the_batch_that_owns_quiet_policy(monkeypatch):
+    """The automatic caller reaches migrate_all, not a shortcut around its fences."""
+    store = _ReaperStore()
+    clock = [1_000.0]
+    _wire_reaper(monkeypatch, store, [], clock)
+
+    async def knob_int(key: str) -> int:
+        return {
+            "terminal_retention_days": 7,
+            "auto_update_check_interval_seconds": 600,
+            "migrate_max_per_pass": 2,
+        }[key]
+
+    async def auto_migrate_on() -> bool:
+        return True
+
+    migrate_all = AsyncMock(return_value={
+        "migrated": [], "deferred": ["quiet"], "failed": [],
+        "skipped": [], "unsupported": [],
+    })
+    monkeypatch.setattr(reaper, "knob_int", knob_int)
+    monkeypatch.setattr(reaper, "_auto_migrate_enabled", auto_migrate_on)
+    monkeypatch.setattr(
+        "orchestrator.versioning.drift_summary", lambda _docker: {"drifted": ["quiet"]},
+    )
+    monkeypatch.setattr("orchestrator.migrate.migrate_all_drifted", migrate_all)
+
+    summary = await reaper._reap_once()
+
+    migrate_all.assert_awaited_once_with(store=store, max_per_pass=2)
+    assert summary["auto_migrated"] == 0

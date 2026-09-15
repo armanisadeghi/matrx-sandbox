@@ -523,6 +523,97 @@ async def test_recent_tool_activity_defers_migration():
     assert "activity" in result["reason"]
 
 
+@pytest.mark.asyncio
+@pytest.mark.parametrize("value", [None, 0, -1, 1.5, "1800", True])
+async def test_auto_migrate_invalid_quiet_policy_fails_closed_before_docker(
+    monkeypatch, value,
+):
+    """A malformed operator value must not even inspect Docker for drift."""
+    from orchestrator import migrate, knobs
+
+    docker_lookup = Mock(side_effect=AssertionError("invalid policy reached Docker"))
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", docker_lookup)
+    monkeypatch.setattr(knobs, "_raw", AsyncMock(return_value=value))
+
+    result = await migrate.migrate_all_drifted(store=_IdleStore())
+
+    assert result["migrated"] == []
+    assert "quiet policy unavailable or invalid" in result["error"]
+    docker_lookup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_auto_migrate_captures_policy_once_and_forwards_to_each_box(monkeypatch):
+    """The reaper's real batch entrypoint owns one immutable quiet interval."""
+    from orchestrator import migrate, knobs
+
+    drifted = [SimpleNamespace(sandbox_id="auto-quiet", drifted=True)]
+    client = object()
+    store = _IdleStore()
+    migrate_one = AsyncMock(return_value={"status": "busy_deferred"})
+    monkeypatch.setattr(knobs, "_raw", AsyncMock(return_value=1800))
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: client)
+    monkeypatch.setattr("orchestrator.versioning.compute_drift", lambda received: drifted)
+    monkeypatch.setattr(migrate, "migrate_sandbox", migrate_one)
+
+    result = await migrate.migrate_all_drifted(store=store)
+
+    assert result == {
+        "migrated": [], "deferred": ["auto-quiet"], "failed": [],
+        "skipped": [], "unsupported": [],
+    }
+    migrate_one.assert_awaited_once_with(
+        "auto-quiet", store=store,
+        require_idle=True, quiet_interval=1800,
+    )
+
+
+@pytest.mark.asyncio
+async def test_auto_quiet_interval_stays_captured_across_fenced_admission(monkeypatch):
+    """A knob change after initial admission cannot shorten an automatic swap."""
+    from orchestrator import migrate
+
+    sid = "sbx-captured-auto-quiet"
+    migrate = _wire_idle_admission(monkeypatch, sid, quiet_window=1)
+    activity._last_activity.pop(sid, None)
+    activity._quiet_observation_started[sid] = 100.0
+    # Any manual-window read would prove the second fence can be shortened.
+    manual_window = AsyncMock(side_effect=AssertionError("read manual window"))
+    monkeypatch.setattr(migrate, "knob_int", manual_window)
+    engine = AsyncMock(return_value={"status": "migrated", "sandbox_id": sid})
+    monkeypatch.setattr(migrate, "_migrate_hosted_ordered", engine)
+    old_row = _Row(datetime.now(timezone.utc) - timedelta(days=1))
+
+    result = await migrate.migrate_sandbox(
+        sid, store=_IdleStore(old_row), require_idle=True, quiet_interval=10,
+    )
+
+    assert result["status"] == "migrated"
+    manual_window.assert_not_awaited()
+    assert "quiet_interval" not in engine.await_args.kwargs
+
+
+@pytest.mark.asyncio
+async def test_manual_idle_migration_keeps_heartbeat_window(monkeypatch):
+    """The automatic-only policy does not replace the manual 120-second gate."""
+    from orchestrator import migrate
+
+    sid = "sbx-manual-window"
+    activity._last_activity.pop(sid, None)
+    activity._quiet_observation_started[sid] = 100.0
+    monkeypatch.setattr(activity.time, "monotonic", lambda: 111.0)
+    manual_window = AsyncMock(return_value=120)
+    monkeypatch.setattr(migrate, "knob_int", manual_window)
+    docker_lookup = Mock(side_effect=AssertionError("manual quiet gate reached Docker"))
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", docker_lookup)
+
+    result = await migrate.migrate_sandbox(sid, store=_IdleStore(), require_idle=True)
+
+    assert result["status"] == "busy_deferred"
+    manual_window.assert_awaited_once_with("migrate_recent_heartbeat_seconds")
+    docker_lookup.assert_not_called()
+
+
 def test_session_refcount_balances():
     sid = "sbx-gate-refcnt01"
     assert activity.open_session_count(sid) == 0

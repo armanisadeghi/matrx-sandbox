@@ -198,6 +198,7 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
                           verify_timeout: int = 90, require_idle: bool = False,
                           refresh_platform_env: bool = False,
                           interrupt_attached_sessions: bool = False,
+                          quiet_interval: int | None = None,
                           operation_id: str | None = None) -> dict:
     """Migrate one box to the current image (or an explicit target_image).
     Returns a status dict; never raises.
@@ -229,6 +230,7 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
             require_idle=require_idle,
             refresh_platform_env=refresh_platform_env,
             interrupt_attached_sessions=interrupt_attached_sessions,
+            quiet_interval=quiet_interval,
             operation_id=canonical_operation,
         ),
     )
@@ -239,6 +241,7 @@ async def _migrate_sandbox_once(
     verify_timeout: int = 90, require_idle: bool = False,
     refresh_platform_env: bool = False,
     interrupt_attached_sessions: bool = False,
+    quiet_interval: int | None = None,
     operation_id: str,
 ) -> dict:
     """Execute one already-owned exact migration operation."""
@@ -252,6 +255,7 @@ async def _migrate_sandbox_once(
         store=store,
         require_idle=require_idle,
         interrupt_attached_sessions=interrupt_attached_sessions,
+        quiet_interval=quiet_interval,
     )
     if refusal is not None:
         return refusal
@@ -321,6 +325,7 @@ async def _migrate_sandbox_once(
             platform_env_changes=platform_env_changes,
             interrupt_attached_sessions=interrupt_attached_sessions,
             require_idle=require_idle,
+            quiet_interval=quiet_interval,
             operation_id=operation_id,
         )
 
@@ -366,6 +371,7 @@ async def _migrate_sandbox_once(
         platform_env_changes=platform_env_changes,
         interrupt_attached_sessions=interrupt_attached_sessions,
         require_idle=require_idle,
+        quiet_interval=quiet_interval,
         operation_id=operation_id,
     )
 
@@ -376,10 +382,14 @@ async def _idle_refusal(
     store,
     require_idle: bool,
     interrupt_attached_sessions: bool,
+    quiet_interval: int | None = None,
 ) -> dict | None:
     """Return the first conservative idle-admission refusal, if any.
 
-    The existing heartbeat-window knob is the quiet interval. In particular,
+    Manual migration uses the existing heartbeat-window knob. Automatic
+    migration supplies its already-resolved dedicated quiet interval, so a
+    knob edit cannot shorten the interval between the initial and fenced
+    admission checks. In particular,
     no remembered request history starts observation at zero, so an
     orchestrator restart cannot turn unknown prior use into eligible idleness.
     Confirmed owner interruption is intentionally exempt from presence/quiet
@@ -397,7 +407,15 @@ async def _idle_refusal(
     if activity.open_session_count(sandbox_id) > 0:
         return {"status": "busy_deferred", "sandbox_id": sandbox_id,
                 "reason": "box has an open interactive session (PTY/watch); defer until it closes"}
-    recent_window = await knob_int("migrate_recent_heartbeat_seconds")
+    if quiet_interval is None:
+        recent_window = await knob_int("migrate_recent_heartbeat_seconds")
+    elif type(quiet_interval) is int and quiet_interval > 0:
+        recent_window = quiet_interval
+    else:
+        return {
+            "status": "busy_deferred", "sandbox_id": sandbox_id,
+            "reason": "automatic migration quiet interval is invalid; defer without mutating Docker",
+        }
     age, observation_began = activity.quiet_age(sandbox_id)
     if age < recent_window:
         subject = "quiet observation began" if observation_began else "tool activity"
@@ -446,11 +464,13 @@ async def _migrate_hosted_with_admission(sandbox_id: str, **kwargs) -> dict:
             store=kwargs.get("store"),
             require_idle=bool(kwargs.get("require_idle")),
             interrupt_attached_sessions=bool(kwargs.get("interrupt_attached_sessions")),
+            quiet_interval=kwargs.get("quiet_interval"),
         )
         if refusal is not None:
             return refusal
         engine_kwargs = dict(kwargs)
         engine_kwargs.pop("require_idle", None)
+        engine_kwargs.pop("quiet_interval", None)
         return await _migrate_hosted_ordered(sandbox_id, **engine_kwargs)
     finally:
         await activity.release_migration(sandbox_id)
@@ -619,10 +639,21 @@ async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
     pass (the reaper calls this every sweep when MATRX_AUTO_MIGRATE=1), which is
     the "keep checking until it's idle, then migrate" behavior. ``max_per_pass``
     caps swaps per call (0 = no cap). Never raises."""
+    from orchestrator import knobs
     from orchestrator.sandbox_manager import _get_docker_client
     from orchestrator.versioning import compute_drift
 
     results: dict[str, list[str]] = {"migrated": [], "deferred": [], "failed": [], "skipped": [], "unsupported": []}
+    # Capture and validate the automatic policy before Docker discovery. This
+    # exact value is carried through both admission fences for the entire pass.
+    try:
+        quiet_interval = await knobs._raw(knobs.FEATURE, "auto_update_idle_seconds")
+        if type(quiet_interval) is not int or quiet_interval <= 0:
+            raise ValueError("must be a positive integer number of seconds")
+    except Exception as exc:
+        reason = f"automatic migration quiet policy unavailable or invalid: {exc}"
+        logger.warning("migrate_all: %s", reason)
+        return {"error": reason, **results}
     try:
         client = _get_docker_client()
         drifted = await asyncio.to_thread(
@@ -638,7 +669,10 @@ async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
             results["skipped"].append(box.sandbox_id)
             continue
         try:
-            res = await migrate_sandbox(box.sandbox_id, store=store, require_idle=True)
+            res = await migrate_sandbox(
+                box.sandbox_id, store=store, require_idle=True,
+                quiet_interval=quiet_interval,
+            )
         except Exception as exc:  # defensive — migrate_sandbox already guards, but never let one box abort the pass
             logger.error("migrate_all: %s raised: %s", box.sandbox_id, exc)
             results["failed"].append(box.sandbox_id)
