@@ -133,7 +133,8 @@ async def test_recreate_lifecycle_preserves_model_organization(monkeypatch, oper
     )
     create = AsyncMock(return_value=old)
     store = SimpleNamespace(
-        get_lifecycle=AsyncMock(return_value={"deleted": False, "status": "stopped"})
+        get_lifecycle=AsyncMock(return_value={"deleted": False, "status": "stopped"}),
+        reserve_active=AsyncMock(),
     )
 
     monkeypatch.setattr(
