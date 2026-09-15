@@ -90,6 +90,172 @@ from unittest.mock import AsyncMock
 from orchestrator import activity
 
 
+_DEFAULT_ROW = object()
+
+
+class _IdleStore:
+    def __init__(self, row=_DEFAULT_ROW):
+        self.row = _Row(None) if row is _DEFAULT_ROW else row
+
+    async def get(self, _sandbox_id):
+        return self.row
+
+
+class _UnavailableIdleStore:
+    async def get(self, _sandbox_id):
+        raise RuntimeError("store unavailable")
+
+
+def _migratable_old(image: str):
+    return SimpleNamespace(
+        id="old-container",
+        labels={"matrx.template": "bare"},
+        attrs={
+            "Image": image,
+            "Config": {"Env": []},
+            "HostConfig": {"Binds": ["home-volume:/home/agent:rw"]},
+            "Mounts": [{
+                "Type": "volume", "Name": "home-volume",
+                "Destination": "/home/agent", "RW": True,
+            }],
+        },
+    )
+
+
+def _wire_idle_admission(monkeypatch, sid, *, now=111.0, quiet_window=10):
+    """Use the public migration entrypoint with real admission, not a stub."""
+    from orchestrator import migrate
+
+    old_image = "sha256:" + "a" * 64
+    old = _migratable_old(old_image)
+    client = SimpleNamespace(
+        containers=SimpleNamespace(get=lambda received: old if received == sid else None)
+    )
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: client)
+    monkeypatch.setattr(migrate.settings, "host_tier", "hosted")
+    monkeypatch.setattr(
+        migrate,
+        "current_image",
+        lambda *_: SimpleNamespace(
+            tag="matrx-sandbox:bare",
+            image_id="sha256:" + "b" * 64,
+            version="new-version",
+        ),
+    )
+    monkeypatch.setattr(migrate, "knob_int", AsyncMock(return_value=quiet_window))
+    monkeypatch.setattr(activity.time, "monotonic", lambda: now)
+    return migrate
+
+
+@pytest.mark.asyncio
+async def test_missing_activity_history_defers_before_docker_and_starts_observation(monkeypatch):
+    """Break caught: absent process-local history was treated as idle."""
+    from orchestrator import migrate
+
+    sid = "sbx-unknown-history"
+    activity._last_activity.pop(sid, None)
+    activity._quiet_observation_started.pop(sid, None)
+    monkeypatch.setattr(migrate, "knob_int", AsyncMock(return_value=10))
+    monkeypatch.setattr(activity.time, "monotonic", lambda: 100.0)
+    docker_lookup = AsyncMock()
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", docker_lookup)
+
+    result = await migrate.migrate_sandbox(sid, store=_IdleStore(), require_idle=True)
+
+    assert result["status"] == "busy_deferred"
+    assert "quiet observation began 0s ago (< 10s)" in result["reason"]
+    assert activity._quiet_observation_started[sid] == 100.0
+    docker_lookup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_observed_quiet_window_reaches_hosted_engine(monkeypatch):
+    """Break caught: a quiet interval observed by this process could never admit."""
+    sid = "sbx-observed-quiet"
+    migrate = _wire_idle_admission(monkeypatch, sid)
+    activity._last_activity.pop(sid, None)
+    activity._quiet_observation_started[sid] = 100.0
+    engine = AsyncMock(return_value={"status": "migrated", "sandbox_id": sid})
+    monkeypatch.setattr(migrate, "_migrate_hosted_ordered", engine)
+
+    old_row = _Row(datetime.now(timezone.utc) - timedelta(days=1))
+    result = await migrate.migrate_sandbox(sid, store=_IdleStore(old_row), require_idle=True)
+
+    assert result["status"] == "migrated"
+    engine.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_completion_between_early_gate_and_fence_defers_and_releases_fence(monkeypatch):
+    """Break caught: work completing in the admission race entered a quiet swap."""
+    sid = "sbx-admission-completion-race"
+    migrate = _wire_idle_admission(monkeypatch, sid)
+    activity._last_activity.pop(sid, None)
+    activity._quiet_observation_started[sid] = 100.0
+    engine = AsyncMock(return_value={"status": "migrated", "sandbox_id": sid})
+    monkeypatch.setattr(migrate, "_migrate_hosted_ordered", engine)
+    original_mark = activity.mark_migrating
+
+    async def mark_then_complete(sandbox_id):
+        acquired = await original_mark(sandbox_id)
+        if acquired:
+            activity.note_activity(sandbox_id)
+        return acquired
+
+    monkeypatch.setattr(activity, "mark_migrating", mark_then_complete)
+
+    result = await migrate.migrate_sandbox(sid, store=_IdleStore(), require_idle=True)
+
+    assert result["status"] == "busy_deferred"
+    assert "tool activity 0s ago (< 10s)" in result["reason"]
+    engine.assert_not_awaited()
+    assert sid not in activity._migrating
+
+
+@pytest.mark.asyncio
+async def test_unavailable_authoritative_heartbeat_defers_before_docker(monkeypatch):
+    """Break caught: a missing heartbeat row or read failure was accepted as quiet."""
+    from orchestrator import migrate
+
+    sid = "sbx-heartbeat-unavailable"
+    activity._last_activity.pop(sid, None)
+    activity._quiet_observation_started[sid] = 100.0
+    monkeypatch.setattr(migrate, "knob_int", AsyncMock(return_value=10))
+    monkeypatch.setattr(activity.time, "monotonic", lambda: 111.0)
+    docker_lookup = AsyncMock()
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", docker_lookup)
+
+    result = await migrate.migrate_sandbox(sid, store=_IdleStore(row=None), require_idle=True)
+
+    assert result["status"] == "busy_deferred"
+    assert "authoritative heartbeat is unavailable" in result["reason"]
+    docker_lookup.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_failed_authoritative_heartbeat_read_defers_before_docker(monkeypatch):
+    """Break caught: a heartbeat-store failure was accepted as idle."""
+    from orchestrator import migrate
+
+    sid = "sbx-heartbeat-read-failed"
+    activity._last_activity.pop(sid, None)
+    activity._quiet_observation_started[sid] = 100.0
+    monkeypatch.setattr(migrate, "knob_int", AsyncMock(return_value=10))
+    monkeypatch.setattr(activity.time, "monotonic", lambda: 111.0)
+    docker_lookup = AsyncMock()
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", docker_lookup)
+
+    result = await migrate.migrate_sandbox(
+        sid, store=_UnavailableIdleStore(), require_idle=True,
+    )
+
+    assert result["status"] == "busy_deferred"
+    assert result["reason"] == (
+        "authoritative heartbeat is unavailable; defer migration until idle is confirmed"
+    )
+    docker_lookup.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_open_session_defers_migration():
     from orchestrator.migrate import migrate_sandbox

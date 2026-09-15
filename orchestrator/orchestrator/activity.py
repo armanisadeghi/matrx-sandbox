@@ -39,11 +39,15 @@ _cond = asyncio.Condition()
 # Idle-gate signals beyond in-flight counts (an agent "between commands" and a
 # human with an open terminal both look idle to _inflight alone):
 #   _last_activity — monotonic timestamp of the most recent tool-call FINISH.
+#   _quiet_observation_started — first process-local observation used to
+#     establish a quiet interval. An empty activity map after an orchestrator
+#     restart is unknown, not evidence that the sandbox was idle before us.
 #   _open_sessions — live interactive attachments (PTY terminals, fs-watch
 #     websockets). ANY open session = busy: never swap a box out from under an
 #     attached human/editor. Process-local; an orchestrator restart clears them
 #     (the in-flight + heartbeat gates still apply after).
 _last_activity: dict[str, float] = {}
+_quiet_observation_started: dict[str, float] = {}
 _open_sessions: dict[str, int] = {}
 _operation_leases: dict[str, set["OperationLease"]] = {}
 
@@ -60,13 +64,30 @@ class OperationLease:
 
 
 def note_activity(sandbox_id: str) -> None:
-    _last_activity[sandbox_id] = time.monotonic()
+    now = time.monotonic()
+    _last_activity[sandbox_id] = now
+    _quiet_observation_started[sandbox_id] = now
 
 
-def last_activity_age(sandbox_id: str) -> float | None:
-    """Seconds since the last tracked tool call finished, or None if never."""
+def quiet_age(sandbox_id: str) -> tuple[float, bool]:
+    """Return conservative quiet seconds and whether observation began now.
+
+    On the first inquiry after process-local history is absent, begin observing
+    at that instant. This deliberately returns zero rather than treating an
+    unknown pre-restart history as a sufficiently old idle period.
+    """
+    now = time.monotonic()
     ts = _last_activity.get(sandbox_id)
-    return None if ts is None else time.monotonic() - ts
+    if ts is None:
+        observed = sandbox_id not in _quiet_observation_started
+        ts = _quiet_observation_started.setdefault(sandbox_id, now)
+        return max(0.0, now - ts), observed
+    return max(0.0, now - ts), False
+
+
+def last_activity_age(sandbox_id: str) -> float:
+    """Compatibility wrapper for the conservative process-local quiet age."""
+    return quiet_age(sandbox_id)[0]
 
 
 async def acquire_operation_lease(sandbox_id: str) -> OperationLease | None:

@@ -179,13 +179,6 @@ async def _container_version(container) -> str | None:
     return None
 
 
-async def _safe_get(store, sandbox_id: str):
-    try:
-        return await store.get(sandbox_id)
-    except Exception:
-        return None
-
-
 def _has_recent_heartbeat(sbx, window_seconds: int) -> bool:
     """True if the sandbox row has a heartbeat within ``window_seconds``
     (the ``infrastructure.sandbox.migrate_recent_heartbeat_seconds`` setting)."""
@@ -254,27 +247,14 @@ async def _migrate_sandbox_once(
 
     # The idle gate runs FIRST — before any docker lookups — so a busy box
     # defers with zero side effects (and the gate is testable without docker).
-    if require_idle:
-        if activity.inflight_count(sandbox_id) > 0:
-            return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                    "reason": "box has in-flight tool calls; defer migration to an idle gap"}
-        if not interrupt_attached_sessions:
-            # Automatic/unconfirmed migration never swaps a box out from under
-            # an attached person, editor, or recently active agent.
-            if activity.open_session_count(sandbox_id) > 0:
-                return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                        "reason": "box has an open interactive session (PTY/watch); defer until it closes"}
-            # Recent tool activity = an agent mid-task between commands. Hosted
-            # boxes rarely heartbeat, so orchestrator-side activity is the real
-            # "recently in use" signal; reuse the heartbeat window as the cutoff.
-            recent_window = await knob_int("migrate_recent_heartbeat_seconds")
-            age = activity.last_activity_age(sandbox_id)
-            if age is not None and age < recent_window:
-                return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                        "reason": f"tool activity {int(age)}s ago (< {recent_window}s); defer until idle"}
-            if _has_recent_heartbeat(await _safe_get(store, sandbox_id), recent_window):
-                return {"status": "busy_deferred", "sandbox_id": sandbox_id,
-                        "reason": "box had a recent heartbeat; defer migration until idle"}
+    refusal = await _idle_refusal(
+        sandbox_id,
+        store=store,
+        require_idle=require_idle,
+        interrupt_attached_sessions=interrupt_attached_sessions,
+    )
+    if refusal is not None:
+        return refusal
 
     client = _get_docker_client()
     try:
@@ -340,6 +320,7 @@ async def _migrate_sandbox_once(
             labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
             platform_env_changes=platform_env_changes,
             interrupt_attached_sessions=interrupt_attached_sessions,
+            require_idle=require_idle,
             operation_id=operation_id,
         )
 
@@ -384,8 +365,56 @@ async def _migrate_sandbox_once(
         labels=labels, host=host, cur=cur, store=store, verify_timeout=verify_timeout,
         platform_env_changes=platform_env_changes,
         interrupt_attached_sessions=interrupt_attached_sessions,
+        require_idle=require_idle,
         operation_id=operation_id,
     )
+
+
+async def _idle_refusal(
+    sandbox_id: str,
+    *,
+    store,
+    require_idle: bool,
+    interrupt_attached_sessions: bool,
+) -> dict | None:
+    """Return the first conservative idle-admission refusal, if any.
+
+    The existing heartbeat-window knob is the quiet interval. In particular,
+    no remembered request history starts observation at zero, so an
+    orchestrator restart cannot turn unknown prior use into eligible idleness.
+    Confirmed owner interruption is intentionally exempt from presence/quiet
+    checks; it still uses the fence and operation drains below.
+    """
+    if not require_idle:
+        return None
+    from orchestrator import activity
+
+    if activity.inflight_count(sandbox_id) > 0:
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": "box has in-flight tool calls; defer migration to an idle gap"}
+    if interrupt_attached_sessions:
+        return None
+    if activity.open_session_count(sandbox_id) > 0:
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": "box has an open interactive session (PTY/watch); defer until it closes"}
+    recent_window = await knob_int("migrate_recent_heartbeat_seconds")
+    age, observation_began = activity.quiet_age(sandbox_id)
+    if age < recent_window:
+        subject = "quiet observation began" if observation_began else "tool activity"
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": f"{subject} {int(age)}s ago (< {recent_window}s); defer until idle"}
+    try:
+        sbx = await store.get(sandbox_id)
+    except Exception:
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": "authoritative heartbeat is unavailable; defer migration until idle is confirmed"}
+    if sbx is None:
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": "authoritative heartbeat is unavailable for this sandbox; defer migration until idle is confirmed"}
+    if _has_recent_heartbeat(sbx, recent_window):
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": "box had a recent heartbeat; defer migration until idle"}
+    return None
 
 
 async def _migrate_hosted_with_admission(sandbox_id: str, **kwargs) -> dict:
@@ -412,7 +441,17 @@ async def _migrate_hosted_with_admission(sandbox_id: str, **kwargs) -> dict:
         ):
             return {"status": "busy_deferred", "sandbox_id": sandbox_id,
                     "reason": "attached sessions or operations did not drain; retry later"}
-        return await _migrate_hosted_ordered(sandbox_id, **kwargs)
+        refusal = await _idle_refusal(
+            sandbox_id,
+            store=kwargs.get("store"),
+            require_idle=bool(kwargs.get("require_idle")),
+            interrupt_attached_sessions=bool(kwargs.get("interrupt_attached_sessions")),
+        )
+        if refusal is not None:
+            return refusal
+        engine_kwargs = dict(kwargs)
+        engine_kwargs.pop("require_idle", None)
+        return await _migrate_hosted_ordered(sandbox_id, **engine_kwargs)
     finally:
         await activity.release_migration(sandbox_id)
 
