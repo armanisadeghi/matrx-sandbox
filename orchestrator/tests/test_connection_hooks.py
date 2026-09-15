@@ -7,9 +7,22 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from orchestrator import connection_hooks
+from orchestrator import connection_hooks, sdk_refresh
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.routes import sandboxes
+
+
+@pytest.fixture(autouse=True)
+def _stub_sdk_refresh(monkeypatch):
+    """The SDK refresh is its own hook with its own guards
+    (tests/test_sdk_refresh.py); here it is stubbed so these tests stay about
+    the repository sync. It runs for EVERY template, so it cannot be skipped."""
+    monkeypatch.setattr(
+        sdk_refresh,
+        "refresh_sdk_if_stale",
+        AsyncMock(return_value={"hook": "session_start.sdk_refresh", "status": "current",
+                                "from": "v1", "to": "v1"}),
+    )
 
 
 def _sandbox() -> SandboxResponse:
@@ -96,6 +109,8 @@ async def test_prepare_connection_isolates_hook_failure_from_token_mint(
     result = await sandboxes._prepare_connection(_sandbox())
 
     assert result == {
+        "sdk_refresh": {"hook": "session_start.sdk_refresh", "status": "current",
+                        "from": "v1", "to": "v1"},
         "status": "failed",
         "summary": "Development connection preparation failed; it will retry on the next binding.",
     }
@@ -104,12 +119,19 @@ async def test_prepare_connection_isolates_hook_failure_from_token_mint(
 
 
 @pytest.mark.asyncio
-async def test_prepare_connection_skips_hooks_for_ordinary_sandbox(monkeypatch):
+async def test_prepare_connection_skips_the_repo_sync_for_an_ordinary_sandbox(monkeypatch):
+    """The repository sync is the dev worker's alone — but the SDK refresh is
+    every box's, so an ordinary sandbox still gets a hook report."""
     hook = AsyncMock()
     monkeypatch.setattr(connection_hooks, "prepare_development_connection", hook)
     ordinary = _sandbox().model_copy(update={"template": "default"})
 
-    assert await sandboxes._prepare_connection(ordinary) is None
+    result = await sandboxes._prepare_connection(ordinary)
+
+    assert result == {
+        "sdk_refresh": {"hook": "session_start.sdk_refresh", "status": "current",
+                        "from": "v1", "to": "v1"},
+    }
     hook.assert_not_awaited()
 
 
@@ -136,6 +158,8 @@ async def test_prepare_connection_returns_only_json_safe_bounded_diagnostics(mon
     result = await sandboxes._prepare_connection(_sandbox())
 
     assert result == {
+        "sdk_refresh": {"hook": "session_start.sdk_refresh", "status": "current",
+                        "from": "v1", "to": "v1"},
         "hook": "session_start.repo_sync",
         "status": "ok",
         "exit_code": 0,
