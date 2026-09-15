@@ -17,7 +17,7 @@ from orchestrator.auth import sandbox_token
 from orchestrator.config import settings
 from orchestrator.main import app
 from orchestrator.middleware.auth import _required_scope_for
-from orchestrator.routes.sandboxes import _authenticate_websocket
+from orchestrator.routes.sandboxes import _authenticate_websocket, _presence_token
 
 TEST_API_KEY = "test-secret-key-for-auth-tests"
 TEST_TOKEN_SECRET = "test-token-signing-secret"
@@ -39,6 +39,20 @@ def _token(scopes: list[str], sandbox_id: str = SBX) -> str:
         secret=TEST_TOKEN_SECRET, sandbox_id=sandbox_id, scopes=scopes, tier="hosted",
     )
     return token
+
+
+def test_presence_requires_signed_scoped_token_even_without_master_api_key(monkeypatch):
+    """Break caught: API-key-unset development mode accidentally opened presence."""
+    monkeypatch.setattr(settings, "api_key", "")
+    monkeypatch.setattr(settings, "access_token_secret", TEST_TOKEN_SECRET)
+    owner = "22222222-2222-2222-2222-222222222222"
+    token, _ = sandbox_token.issue_token(
+        secret=TEST_TOKEN_SECRET, sandbox_id=SBX, scopes=["agent.presence"], tier="hosted",
+        actor={"sandbox_owner_id": owner},
+    )
+    assert _presence_token(_FakeWS(query=f"token={token}"), SBX)["actor"]["sandbox_owner_id"] == owner
+    assert _presence_token(_FakeWS(), SBX) is None
+    assert _presence_token(_FakeWS(query=f"token={_token(['agent.presence'], 'sbx-other000000')}"), SBX) is None
 
 
 # ── _required_scope_for mapping ──────────────────────────────────────────────

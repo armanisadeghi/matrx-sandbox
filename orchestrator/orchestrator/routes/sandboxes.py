@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import asyncio
 import hmac
 import inspect
 import json
 import logging
 import re
+import secrets
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -19,6 +21,8 @@ from orchestrator import activity, sandbox_manager, storage
 from orchestrator.auth import sandbox_token
 from orchestrator.config import settings
 from orchestrator.knobs import knob_int
+from orchestrator.home_identity import home_key, opaque_home_identity
+from orchestrator.hosted_migration import HostedMigrationJournal, HostedMigrationStateError
 from orchestrator.models import (
     AccessResponse,
     AccessTokenRequest,
@@ -57,6 +61,50 @@ def _with_agent(headers: dict, sandbox_id: str) -> dict:
     value must not override the orchestrator's."""
     headers.update(sandbox_manager.agent_forward_headers(sandbox_id))
     return headers
+
+
+def _presence_descriptor(sandbox: SandboxResponse) -> dict[str, str | int]:
+    home = home_key(sandbox)
+    tier = settings.resolve_host_tier(getattr(sandbox, "tier", None))
+    container_id = str(getattr(sandbox, "container_id", "") or "")
+    if not container_id:
+        raise HTTPException(status_code=409, detail="sandbox has no live runtime identity")
+    return {"protocol_version": 1, "sandbox_id": sandbox.sandbox_id,
+            "row_id": str(sandbox.row_id), "tier": tier,
+            "container_id": container_id, "home_identity": opaque_home_identity(home)}
+
+
+def _presence_token(websocket: WebSocket, sandbox_id: str) -> dict | None:
+    """Presence never inherits the API-key-unset development bypass."""
+    token = (websocket.headers.get("x-sandbox-access-token")
+             or websocket.query_params.get("token")
+             or websocket.query_params.get("access_token"))
+    if not token or not settings.access_token_secret:
+        return None
+    try:
+        return sandbox_token.verify_token(token=token, secret=settings.access_token_secret,
+                                          expected_sandbox_id=sandbox_id,
+                                          required_scope="agent.presence")
+    except sandbox_token.TokenError:
+        return None
+
+
+async def _presence_current_identity(sandbox_id: str, expected: dict[str, str | int]) -> dict[str, str] | None:
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if sandbox is None:
+        return None
+    status = getattr(getattr(sandbox, "status", None), "value", getattr(sandbox, "status", None))
+    if status not in {"ready", "running"}:
+        return None
+    try:
+        descriptor, home = _presence_descriptor(sandbox), home_key(sandbox)
+    except (HTTPException, ValueError):
+        return None
+    if descriptor != expected:
+        return None
+    return {"sandbox_id": sandbox_id, "row_id": str(sandbox.row_id),
+            "owner_id": str(sandbox.user_id), "container_id": str(sandbox.container_id),
+            "home_key": home, "tier": str(descriptor["tier"])}
 
 
 @router.post("", response_model=SandboxResponse, status_code=201)
@@ -1645,8 +1693,9 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
     # every structured tool route; it also satisfies the /proxy/* "ai" scope.
     scopes = (body.scopes if body and body.scopes else None) or [
         "ai", "exec.run", "exec.stream", "fs.read", "fs.write", "fs.watch",
-        "git", "ports.read", "processes.read", "pty",
+        "git", "ports.read", "processes.read", "pty", "agent.presence",
     ]
+    descriptor = _presence_descriptor(sandbox)
     try:
         token, payload = sandbox_token.issue_token(
             secret=settings.access_token_secret,
@@ -1659,6 +1708,7 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
             # session, not the 15-min browser ceiling, so a long agent run
             # isn't silently cut off mid-turn.
             max_ttl_seconds=max_session_seconds,
+            actor={"sandbox_owner_id": str(sandbox.user_id)},
         )
     except sandbox_token.TokenError as exc:
         raise HTTPException(status_code=400, detail=str(exc)) from exc
@@ -1670,7 +1720,97 @@ async def agent_binding(sandbox_id: str, body: AgentBindingRequest | None = None
         "root_path": sandbox.hot_path or "/home/agent",
         "expires_at": datetime.fromtimestamp(payload["exp"], tz=timezone.utc).isoformat(),
         "connection_hooks": connection_hooks,
+        "agent_presence": descriptor,
     }
+
+
+@router.websocket("/{sandbox_id}/agent-presence")
+async def agent_presence(sandbox_id: str, websocket: WebSocket):
+    """v1: ACK after durable opening; settle same nonce after provider await.
+
+    Client wire: connect with the signed binding token; receive ``ack`` with
+    ``execution_nonce`` and immutable descriptor; after the exact provider
+    task has returned/cancelled send ``{type:settle, execution_nonce,
+    settlement:completed|cancelled|failed}``. A disconnected client leaves its
+    receipt open: the server must not infer completion from socket loss.
+    """
+    payload = _presence_token(websocket, sandbox_id)
+    if payload is None:
+        await websocket.close(code=1008, reason="signed agent.presence token required")
+        return
+    actor = payload.get("actor")
+    snapshot = websocket.scope.get("state", {}).get("matrx_operation_identity")
+    if not isinstance(actor, dict) or not isinstance(actor.get("sandbox_owner_id"), str) or not isinstance(snapshot, dict):
+        await websocket.close(code=1008, reason="canonical presence identity required")
+        return
+    try:
+        expected = {"protocol_version": 1, "sandbox_id": snapshot["sandbox_id"],
+                    "row_id": snapshot["row_id"], "tier": snapshot["tier"],
+                    "container_id": snapshot["container_id"],
+                    "home_identity": opaque_home_identity(snapshot["home_key"])}
+    except (KeyError, ValueError):
+        await websocket.close(code=1013, reason="presence admission snapshot is invalid")
+        return
+    if actor["sandbox_owner_id"] != snapshot.get("owner_id"):
+        await websocket.close(code=1008, reason="presence owner witness mismatch")
+        return
+    identity = await _presence_current_identity(sandbox_id, expected)
+    if identity is None:
+        await websocket.close(code=1013, reason="sandbox identity changed before presence admission")
+        return
+    nonce = secrets.token_urlsafe(24)
+    journal = HostedMigrationJournal()
+    try:
+        await asyncio.to_thread(journal.write_presence, {
+            "schema_version": 1, "execution_nonce": nonce, "state": "open", "identity": identity,
+        })
+    except HostedMigrationStateError:
+        await websocket.close(code=1013, reason="durable presence journal unavailable")
+        return
+    session = activity.session_opened(sandbox_id, websocket.scope.get("state", {}).get("matrx_operation_lease"))
+    settled = False
+    try:
+        await websocket.accept()
+        await websocket.send_json({"type": "ack", "protocol_version": 1,
+                                   "execution_nonce": nonce, "identity": expected})
+        while True:
+            receive = asyncio.create_task(websocket.receive_json())
+            interrupted = asyncio.create_task(session.interrupt.wait())
+            done, pending = await asyncio.wait({receive, interrupted}, return_when=asyncio.FIRST_COMPLETED)
+            for task in pending:
+                task.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            if interrupted in done:
+                await websocket.close(code=1012, reason="sandbox image update")
+                return
+            message = receive.result()
+            if not isinstance(message, dict) or message.get("type") != "settle" or message.get("execution_nonce") != nonce:
+                await websocket.close(code=1008, reason="same-nonce settlement required")
+                return
+            settlement = message.get("settlement")
+            if settlement not in {"completed", "cancelled", "failed"}:
+                await websocket.close(code=1008, reason="invalid presence settlement")
+                return
+            current = await asyncio.to_thread(journal.read_presence, nonce)
+            if current is None or current.get("identity") != identity:
+                await websocket.close(code=1008, reason="presence receipt identity mismatch")
+                return
+            await asyncio.to_thread(
+                journal.write_presence, {**current, "state": "settled", "settlement": settlement}
+            )
+            settled = True
+            await websocket.send_json({"type": "settled", "execution_nonce": nonce})
+            return
+    except Exception:
+        # Loss asks the client runtime to cancel; it is not proof the provider stopped.
+        return
+    finally:
+        activity.session_closed(sandbox_id, session)
+        if settled:
+            try:
+                await websocket.close()
+            except Exception:
+                pass
 
 
 async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:

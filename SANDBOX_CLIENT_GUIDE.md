@@ -412,7 +412,39 @@ The matrx-frontend editor reads `session-report.md` via the regular `/api/sandbo
 
 ---
 
-## 13. Out of scope (deferred wishlist items)
+## 13. Bound-agent presence WebSocket (protocol v1)
+
+`POST /sandboxes/{sandbox_id}/agent-binding` advertises an `agent_presence`
+descriptor and mints a signed token carrying `agent.presence`; its actor is
+also bound to the server-derived sandbox owner. Only a bound cloud runtime uses
+this route. Local-machine and unbound runs do not open it.
+
+Connect `WS /sandboxes/{sandbox_id}/agent-presence?token=<binding token>`. This
+route requires the signed sandbox token even when `MATRX_API_KEY` is unset; a
+master key is not a substitute. The first server message is:
+
+```json
+{"type":"ack","protocol_version":1,"execution_nonce":"opaque nonce","identity":{"protocol_version":1,"sandbox_id":"sbx-...","row_id":"uuid","tier":"hosted","container_id":"immutable id","home_identity":"sha256:..."}}
+```
+
+The client compares every ACK witness with its freshly authorized binding
+before provider work. When the exact provider task has returned (including
+after cancellation has completed), it sends:
+
+```json
+{"type":"settle","execution_nonce":"the ACK nonce","settlement":"completed"}
+```
+
+`settlement` is one of `completed`, `cancelled`, or `failed`; the successful
+reply is `{"type":"settled","execution_nonce":"..."}`. The nonce is
+single-execution and cannot settle a sibling. The server fsyncs the opening
+receipt before ACK and only terminalizes it after the same-nonce authenticated
+settlement. A lost socket or missing settlement is deliberately not idle proof:
+it fences automatic and destructive lifecycle/deployment migration for that
+sandbox or canonical home until exact settlement or explicit verified recovery.
+Ordinary shared sandbox tool calls remain available.
+
+## 14. Out of scope (deferred wishlist items)
 
 These are recognized needs but are not implemented in v0.2.0:
 

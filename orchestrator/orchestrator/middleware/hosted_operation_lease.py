@@ -93,6 +93,15 @@ class HostedOperationLeaseMiddleware:
                 ):
                     await self._deny(scope, send); return
                 scope.setdefault("state", {})["matrx_operation_lease"] = operation_lease
+                scope["state"]["matrx_operation_identity"] = {
+                    "sandbox_id": sandbox_id,
+                    "row_id": str(getattr(fresh, "row_id", "")),
+                    "owner_id": str(getattr(fresh, "user_id", "")),
+                    "container_id": str(getattr(fresh, "container_id", "")),
+                    "home_key": volume,
+                    "tier": str(getattr(getattr(fresh, "tier", None), "value", getattr(fresh, "tier", ""))),
+                    "status": str(getattr(getattr(fresh, "status", None), "value", getattr(fresh, "status", ""))),
+                }
                 await self.app(scope, receive, send)
         except HostedOperationDenied:
             await self._deny(scope, send)

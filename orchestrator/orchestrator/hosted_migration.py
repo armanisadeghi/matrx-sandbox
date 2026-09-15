@@ -377,6 +377,77 @@ class HostedMigrationJournal:
         _safe_component(sandbox_id)
         return self.root / f"{sandbox_id}.receipt"
 
+    def _presence_path(self, nonce: str) -> Path:
+        _safe_component(nonce)
+        return self.root / f"{nonce}.presence"
+
+    @staticmethod
+    def _validate_presence(record: dict[str, Any]) -> None:
+        identity = record.get("identity")
+        keys = {"sandbox_id", "row_id", "owner_id", "container_id", "home_key", "tier"}
+        if (
+            not isinstance(record, dict) or record.get("schema_version") != 1
+            or not isinstance(record.get("execution_nonce"), str)
+            or not re.fullmatch(r"[A-Za-z0-9_-]{16,200}", record["execution_nonce"])
+            or record.get("state") not in {"open", "settled"}
+            or not isinstance(identity, dict) or set(identity) != keys
+            or any(not isinstance(identity.get(key), str) or not identity[key] for key in keys)
+        ):
+            raise HostedMigrationStateError("agent presence record has invalid identity")
+        if record["state"] == "settled" and record.get("settlement") not in {"completed", "cancelled", "failed"}:
+            raise HostedMigrationStateError("agent presence record has invalid settlement")
+        if record["state"] == "open" and "settlement" in record:
+            raise HostedMigrationStateError("open agent presence record cannot have a settlement")
+
+    def read_presence(self, nonce: str) -> dict[str, Any] | None:
+        try:
+            record = json.loads(self._presence_path(nonce).read_text())
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError) as exc:
+            raise HostedMigrationStateError("agent presence record is corrupt") from exc
+        self._validate_presence(record)
+        if record["execution_nonce"] != nonce:
+            raise HostedMigrationStateError("agent presence record nonce mismatch")
+        return record
+
+    def write_presence(self, record: dict[str, Any]) -> None:
+        self._validate_presence(record)
+        nonce = record["execution_nonce"]
+        fd, temporary = tempfile.mkstemp(prefix=f".{nonce}.", dir=self.root)
+        try:
+            os.fchmod(fd, 0o600)
+            with os.fdopen(fd, "wb", closefd=False) as output:
+                output.write(json.dumps(record, sort_keys=True, separators=(",", ":")).encode() + b"\n")
+                output.flush()
+                os.fsync(fd)
+        finally:
+            os.close(fd)
+        os.replace(temporary, self._presence_path(nonce))
+        directory = os.open(self.root, os.O_RDONLY)
+        try:
+            os.fsync(directory)
+        finally:
+            os.close(directory)
+
+    def unresolved_presence(self, sandbox_id: str, home_key: str) -> list[dict[str, Any]]:
+        """Nonterminal provider receipts fence exclusive work by sandbox or home."""
+        self.ensure_ready()
+        records: list[dict[str, Any]] = []
+        try:
+            for path in self.root.glob("*.presence"):
+                record = self.read_presence(path.stem)
+                if record and record["state"] == "open" and (
+                    record["identity"]["sandbox_id"] == sandbox_id
+                    or record["identity"]["home_key"] == home_key
+                ):
+                    records.append(record)
+        except HostedMigrationStateError:
+            raise
+        except Exception as exc:
+            raise HostedMigrationStateError("agent presence census is unavailable") from exc
+        return records
+
     def read_operation_receipt(self, sandbox_id: str) -> dict[str, Any] | None:
         try:
             value = json.loads(self._receipt_path(sandbox_id).read_text())

@@ -123,6 +123,12 @@ def hosted_operation_lease_sync(
                 if lifecycle_operation_id is None:
                     raise HostedOperationDenied("hosted migration is pending for sandbox or home")
                 raise HostedOperationDenied("hosted lifecycle operation is pending for sandbox or home")
+            # Presence does not block ordinary shared tool calls. It fences
+            # only exclusive lifecycle/deployment work, including a sibling
+            # that shares this canonical home.
+            if lifecycle or deployment:
+                if state.unresolved_presence(sandbox_id, volume):
+                    raise HostedOperationDenied("agent presence is unresolved for sandbox or home")
             yield
     except HostedMigrationStateError as exc:
         raise HostedOperationDenied("hosted operation lease unavailable") from exc

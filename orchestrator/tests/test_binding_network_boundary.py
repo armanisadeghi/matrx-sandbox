@@ -6,18 +6,23 @@ own configured, authenticated orchestrator endpoint for private tool transport.
 """
 
 from types import SimpleNamespace
+from uuid import UUID
 
 import pytest
 from fastapi import HTTPException
 
 from orchestrator.models import SandboxStatus
 from orchestrator.routes import sandboxes
+from orchestrator.auth import sandbox_token
 
 
 @pytest.mark.asyncio
 async def test_portable_binding_uses_public_endpoint(monkeypatch):
     sandbox = SimpleNamespace(
         sandbox_id="sbx-7ddc2eb0c364",
+        row_id=UUID("11111111-1111-1111-1111-111111111111"),
+        user_id="22222222-2222-2222-2222-222222222222",
+        container_id="container-immutable-1",
         tier="ec2",
         hot_path="/home/agent",
         status=SandboxStatus.RUNNING,
@@ -47,6 +52,13 @@ async def test_portable_binding_uses_public_endpoint(monkeypatch):
     )
     assert binding["root_path"] == "/home/agent"
     assert binding["access_token"]
+    assert binding["agent_presence"]["protocol_version"] == 1
+    assert binding["agent_presence"]["home_identity"].startswith("sha256:")
+    payload = sandbox_token.verify_token(
+        token=binding["access_token"], secret="test-only-boundary-secret",
+        expected_sandbox_id=sandbox.sandbox_id, required_scope="agent.presence",
+    )
+    assert payload["actor"] == {"sandbox_owner_id": sandbox.user_id}
 
     monkeypatch.setattr(sandboxes.settings, "public_url", "")
     with pytest.raises(HTTPException) as refusal:

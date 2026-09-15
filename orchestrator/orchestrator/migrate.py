@@ -429,6 +429,20 @@ async def _idle_refusal(
     if sbx is None:
         return {"status": "busy_deferred", "sandbox_id": sandbox_id,
                 "reason": "authoritative heartbeat is unavailable for this sandbox; defer migration until idle is confirmed"}
+    # Runtime heartbeats and process-local activity cannot clear a lost bound
+    # provider. Only its durable same-nonce settlement is positive evidence.
+    try:
+        from orchestrator.home_identity import home_key
+        from orchestrator.hosted_migration import HostedMigrationJournal
+        unresolved = await asyncio.to_thread(
+            HostedMigrationJournal().unresolved_presence, sandbox_id, home_key(sbx)
+        )
+    except Exception:
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": "agent presence fence is unavailable; defer migration until idle is confirmed"}
+    if unresolved:
+        return {"status": "busy_deferred", "sandbox_id": sandbox_id,
+                "reason": "bound agent presence is unresolved; defer migration until exact settlement or verified recovery"}
     if _has_recent_heartbeat(sbx, recent_window):
         return {"status": "busy_deferred", "sandbox_id": sandbox_id,
                 "reason": "box had a recent heartbeat; defer migration until idle"}

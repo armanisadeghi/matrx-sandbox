@@ -20,3 +20,10 @@ def home_key(sandbox) -> str:
     if tier == "ec2" and getattr(sandbox, "sandbox_id", None):
         return "layer-" + sandbox.sandbox_id
     raise ValueError("sandbox has no authoritative home identity")
+
+
+def opaque_home_identity(home: str) -> str:
+    """Portable witness only; never disclose a host path or volume identity."""
+    if not isinstance(home, str) or not home:
+        raise ValueError("sandbox has no authoritative home identity")
+    return "sha256:" + hashlib.sha256(home.encode()).hexdigest()

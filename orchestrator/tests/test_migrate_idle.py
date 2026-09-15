@@ -12,6 +12,8 @@ from orchestrator.migrate import _refresh_platform_environment
 class _Row:
     def __init__(self, hb):
         self.last_heartbeat_at = hb
+        self.user_id = "22222222-2222-2222-2222-222222222222"
+        self.tier = "hosted"
 
 
 def test_no_row_is_not_recent():
@@ -133,6 +135,12 @@ def _wire_idle_admission(monkeypatch, sid, *, now=111.0, quiet_window=10):
     )
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: client)
     monkeypatch.setattr(migrate.settings, "host_tier", "hosted")
+    # Presence has its own forcing tests. These historical idle-window tests
+    # model an otherwise healthy durable presence census, not its filesystem.
+    class _NoPresenceJournal:
+        def unresolved_presence(self, _sandbox_id, _home):
+            return []
+    monkeypatch.setattr("orchestrator.hosted_migration.HostedMigrationJournal", _NoPresenceJournal)
     monkeypatch.setattr(
         migrate,
         "current_image",
