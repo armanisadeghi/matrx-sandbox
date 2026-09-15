@@ -11,6 +11,7 @@ from fastapi.testclient import TestClient
 from orchestrator.auth import sandbox_token
 from orchestrator.config import settings
 from orchestrator.hosted_migration import HostedMigrationJournal
+from orchestrator.middleware.auth import APIKeyMiddleware
 from orchestrator.middleware.hosted_operation_lease import HostedOperationLeaseMiddleware
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.routes import sandboxes
@@ -33,13 +34,14 @@ def assembled_presence(monkeypatch, tmp_path):
     async def get_sandbox(sandbox_id): return sandbox if sandbox_id == SID else None
     journal = HostedMigrationJournal(tmp_path)
     monkeypatch.setattr(settings, "host_tier", "hosted")
-    monkeypatch.setattr(settings, "api_key", "")
+    monkeypatch.setattr(settings, "api_key", "master-key-must-not-authorize-presence")
     monkeypatch.setattr(settings, "access_token_secret", SECRET)
     monkeypatch.setattr("orchestrator.middleware.hosted_operation_lease._get_store", lambda: Store())
     monkeypatch.setattr("orchestrator.hosted_operation_lease.new_journal", lambda: journal)
     monkeypatch.setattr(sandboxes.sandbox_manager, "get_sandbox", get_sandbox)
     monkeypatch.setattr(sandboxes, "HostedMigrationJournal", lambda: journal)
     app = FastAPI()
+    app.add_middleware(APIKeyMiddleware)
     app.add_middleware(HostedOperationLeaseMiddleware)
     app.include_router(sandboxes.router)
     return TestClient(app), sandbox, journal
@@ -86,6 +88,14 @@ def test_assembled_ws_open_loss_then_http_same_nonce_settlement_replays(assemble
     mismatch = {**body, "settlement": "completed"}
     assert client.post(f"/sandboxes/{SID}/agent-presence/{nonce}/settle",
                        json=mismatch, headers={"X-Sandbox-Access-Token": _token()}).status_code == 409
+    for invalid_identity in (
+        {**identity, "protocol_version": 999},
+        {key: value for key, value in identity.items() if key != "protocol_version"},
+        {**identity, "unexpected": "receipt smuggling"},
+    ):
+        assert client.post(f"/sandboxes/{SID}/agent-presence/{nonce}/settle",
+                           json={**body, "identity": invalid_identity},
+                           headers={"X-Sandbox-Access-Token": _token()}).status_code == 403
 
 
 def test_assembled_ws_refuses_identity_drift_before_ack(assembled_presence, monkeypatch):

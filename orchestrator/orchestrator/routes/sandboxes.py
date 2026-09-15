@@ -1847,7 +1847,12 @@ async def settle_agent_presence(sandbox_id: str, execution_nonce: str, request: 
         UUID(execution_nonce); UUID(runtime_execution_id)
     except (sandbox_token.TokenError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
         raise HTTPException(status_code=401, detail="invalid presence settlement receipt") from exc
-    if not isinstance(identity, dict) or payload.get("tier") != identity.get("tier") or payload.get("actor", {}).get("sandbox_owner_id") != identity.get("sandbox_owner_id") or identity.get("sandbox_id") != sandbox_id:
+    descriptor_keys = {"protocol_version", "sandbox_id", "row_id", "tier", "container_id", "home_identity", "sandbox_owner_id"}
+    if (not isinstance(identity, dict) or set(identity) != descriptor_keys
+            or identity.get("protocol_version") != 1
+            or payload.get("tier") != identity.get("tier")
+            or payload.get("actor", {}).get("sandbox_owner_id") != identity.get("sandbox_owner_id")
+            or identity.get("sandbox_id") != sandbox_id):
         raise HTTPException(status_code=403, detail="presence settlement identity mismatch")
     durable_identity = {"sandbox_id": identity.get("sandbox_id"), "row_id": identity.get("row_id"),
                         "owner_id": identity.get("sandbox_owner_id"), "container_id": identity.get("container_id"),
