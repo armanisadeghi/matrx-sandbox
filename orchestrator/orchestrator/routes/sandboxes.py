@@ -8,7 +8,6 @@ import inspect
 import json
 import logging
 import re
-import secrets
 from datetime import datetime, timezone
 from typing import Any
 from uuid import UUID, uuid4
@@ -71,7 +70,8 @@ def _presence_descriptor(sandbox: SandboxResponse) -> dict[str, str | int]:
         raise HTTPException(status_code=409, detail="sandbox has no live runtime identity")
     return {"protocol_version": 1, "sandbox_id": sandbox.sandbox_id,
             "row_id": str(sandbox.row_id), "tier": tier,
-            "container_id": container_id, "home_identity": opaque_home_identity(home)}
+            "container_id": container_id, "home_identity": opaque_home_identity(home),
+            "sandbox_owner_id": str(sandbox.user_id)}
 
 
 def _presence_token(websocket: WebSocket, sandbox_id: str) -> dict | None:
@@ -1747,22 +1747,36 @@ async def agent_presence(sandbox_id: str, websocket: WebSocket):
         expected = {"protocol_version": 1, "sandbox_id": snapshot["sandbox_id"],
                     "row_id": snapshot["row_id"], "tier": snapshot["tier"],
                     "container_id": snapshot["container_id"],
-                    "home_identity": opaque_home_identity(snapshot["home_key"])}
+                    "home_identity": opaque_home_identity(snapshot["home_key"]),
+                    "sandbox_owner_id": snapshot["owner_id"]}
     except (KeyError, ValueError):
         await websocket.close(code=1013, reason="presence admission snapshot is invalid")
         return
-    if actor["sandbox_owner_id"] != snapshot.get("owner_id"):
+    if actor["sandbox_owner_id"] != snapshot.get("owner_id") or payload.get("tier") != snapshot.get("tier"):
         await websocket.close(code=1008, reason="presence owner witness mismatch")
         return
     identity = await _presence_current_identity(sandbox_id, expected)
     if identity is None:
         await websocket.close(code=1013, reason="sandbox identity changed before presence admission")
         return
-    nonce = secrets.token_urlsafe(24)
+    # Upgrade is not an admission ACK. It only lets the client transmit its
+    # caller-chosen immutable opening receipt.
+    await websocket.accept()
+    try:
+        opening = await websocket.receive_json()
+        nonce = str(opening.get("execution_nonce"))
+        runtime_execution_id = str(opening.get("runtime_execution_id"))
+        if opening.get("type") != "open" or opening.get("identity") != expected:
+            raise ValueError("open identity mismatch")
+        UUID(nonce); UUID(runtime_execution_id)
+    except Exception:
+        await websocket.close(code=1008, reason="exact presence open receipt required")
+        return
     journal = HostedMigrationJournal()
     try:
-        await asyncio.to_thread(journal.write_presence, {
-            "schema_version": 1, "execution_nonce": nonce, "state": "open", "identity": identity,
+        await asyncio.to_thread(journal.open_presence, {
+            "schema_version": 1, "execution_nonce": nonce, "runtime_execution_id": runtime_execution_id,
+            "state": "open", "identity": identity,
         })
     except HostedMigrationStateError:
         await websocket.close(code=1013, reason="durable presence journal unavailable")
@@ -1770,9 +1784,9 @@ async def agent_presence(sandbox_id: str, websocket: WebSocket):
     session = activity.session_opened(sandbox_id, websocket.scope.get("state", {}).get("matrx_operation_lease"))
     settled = False
     try:
-        await websocket.accept()
         await websocket.send_json({"type": "ack", "protocol_version": 1,
-                                   "execution_nonce": nonce, "identity": expected})
+                                   "execution_nonce": nonce, "runtime_execution_id": runtime_execution_id,
+                                   "identity": expected})
         while True:
             receive = asyncio.create_task(websocket.receive_json())
             interrupted = asyncio.create_task(session.interrupt.wait())
@@ -1791,13 +1805,11 @@ async def agent_presence(sandbox_id: str, websocket: WebSocket):
             if settlement not in {"completed", "cancelled", "failed"}:
                 await websocket.close(code=1008, reason="invalid presence settlement")
                 return
-            current = await asyncio.to_thread(journal.read_presence, nonce)
-            if current is None or current.get("identity") != identity:
-                await websocket.close(code=1008, reason="presence receipt identity mismatch")
+            if message.get("runtime_execution_id") != runtime_execution_id:
+                await websocket.close(code=1008, reason="presence runtime execution mismatch")
                 return
-            await asyncio.to_thread(
-                journal.write_presence, {**current, "state": "settled", "settlement": settlement}
-            )
+            await asyncio.to_thread(journal.settle_presence, nonce, identity=identity,
+                                    runtime_execution_id=runtime_execution_id, settlement=settlement)
             settled = True
             await websocket.send_json({"type": "settled", "execution_nonce": nonce})
             return
@@ -1811,6 +1823,55 @@ async def agent_presence(sandbox_id: str, websocket: WebSocket):
                 await websocket.close()
             except Exception:
                 pass
+
+
+@router.post("/{sandbox_id}/agent-presence/{execution_nonce}/settle")
+async def settle_agent_presence(sandbox_id: str, execution_nonce: str, request: Request):
+    """Idempotent receipt replay after a lost socket/terminal response.
+
+    This intentionally bypasses the ordinary operation lease middleware: it
+    reads/authenticates one fixed durable receipt and never touches runtime or
+    home state, allowing cancellation settlement while migration drains.
+    """
+    token = (request.headers.get("x-sandbox-access-token")
+             or request.headers.get("authorization", "").removeprefix("Bearer "))
+    if not token or not settings.access_token_secret:
+        raise HTTPException(status_code=401, detail="signed agent.presence token required")
+    try:
+        payload = sandbox_token.verify_token(token=token, secret=settings.access_token_secret,
+                                             expected_sandbox_id=sandbox_id, required_scope="agent.presence")
+        body = await request.json()
+        identity = body["identity"]
+        runtime_execution_id = str(body["runtime_execution_id"])
+        settlement = body["settlement"]
+        UUID(execution_nonce); UUID(runtime_execution_id)
+    except (sandbox_token.TokenError, ValueError, KeyError, TypeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=401, detail="invalid presence settlement receipt") from exc
+    if not isinstance(identity, dict) or payload.get("tier") != identity.get("tier") or payload.get("actor", {}).get("sandbox_owner_id") != identity.get("sandbox_owner_id") or identity.get("sandbox_id") != sandbox_id:
+        raise HTTPException(status_code=403, detail="presence settlement identity mismatch")
+    durable_identity = {"sandbox_id": identity.get("sandbox_id"), "row_id": identity.get("row_id"),
+                        "owner_id": identity.get("sandbox_owner_id"), "container_id": identity.get("container_id"),
+                        "home_key": None, "tier": identity.get("tier")}
+    # The opaque home witness is checked against the fixed durable record; it
+    # cannot be expanded back into a host path from the client request.
+    journal = HostedMigrationJournal()
+    try:
+        record = await asyncio.to_thread(journal.read_presence, execution_nonce)
+        if record is None:
+            raise HTTPException(status_code=404, detail="unknown presence receipt")
+        if (record["identity"]["sandbox_id"] != sandbox_id
+                or record["identity"]["row_id"] != durable_identity["row_id"]
+                or record["identity"]["owner_id"] != durable_identity["owner_id"]
+                or record["identity"]["container_id"] != durable_identity["container_id"]
+                or record["identity"]["tier"] != durable_identity["tier"]
+                or opaque_home_identity(record["identity"]["home_key"]) != identity.get("home_identity")):
+            raise HTTPException(status_code=409, detail="presence receipt immutable identity mismatch")
+        terminal = await asyncio.to_thread(journal.settle_presence, execution_nonce,
+            identity=record["identity"], runtime_execution_id=runtime_execution_id, settlement=settlement)
+    except HostedMigrationStateError as exc:
+        raise HTTPException(status_code=409, detail=str(exc)) from exc
+    return {"type": "settled", "execution_nonce": execution_nonce,
+            "runtime_execution_id": terminal["runtime_execution_id"], "settlement": terminal["settlement"]}
 
 
 async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:

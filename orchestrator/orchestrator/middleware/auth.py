@@ -35,6 +35,11 @@ def _is_proxy_path(path: str) -> bool:
     return len(parts) >= 5 and parts[1] == "sandboxes" and parts[3] == "proxy"
 
 
+def _is_presence_settlement_path(path: str, method: str) -> bool:
+    parts = path.split("/")
+    return method == "POST" and len(parts) == 6 and parts[1] == "sandboxes" and parts[3] == "agent-presence" and parts[5] == "settle"
+
+
 # Per-sandbox subpaths that form the agent's "hands in the box" tool surface.
 # These accept EITHER the master key OR a sandbox-scoped token bound to the
 # {id} in the path — the same trust level as /proxy/*. This is what lets the
@@ -113,6 +118,8 @@ class APIKeyMiddleware(BaseHTTPMiddleware):
         # Per-sandbox /proxy/* uses a per-route bearer/master combined check
         # — see proxy_to_container in routes/sandboxes.py.
         if _is_proxy_path(request.url.path):
+            return await call_next(request)
+        if _is_presence_settlement_path(request.url.path, request.method):
             return await call_next(request)
 
         # Per-sandbox TOOL routes (fs/exec/git/search/processes/ports/pty)

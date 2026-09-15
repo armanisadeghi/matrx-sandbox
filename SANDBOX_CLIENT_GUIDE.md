@@ -421,10 +421,18 @@ this route. Local-machine and unbound runs do not open it.
 
 Connect `WS /sandboxes/{sandbox_id}/agent-presence?token=<binding token>`. This
 route requires the signed sandbox token even when `MATRX_API_KEY` is unset; a
-master key is not a substitute. The first server message is:
+master key is not a substitute. Before ACK, send a client-generated UUID open
+receipt with the exact advertised descriptor and a distinct UUID
+`runtime_execution_id`:
 
 ```json
-{"type":"ack","protocol_version":1,"execution_nonce":"opaque nonce","identity":{"protocol_version":1,"sandbox_id":"sbx-...","row_id":"uuid","tier":"hosted","container_id":"immutable id","home_identity":"sha256:..."}}
+{"type":"open","execution_nonce":"uuid","runtime_execution_id":"uuid","identity":{"protocol_version":1,"sandbox_id":"sbx-...","row_id":"uuid","tier":"hosted","container_id":"immutable id","home_identity":"sha256:...","sandbox_owner_id":"uuid"}}
+```
+
+The server creates (or exact-replays) that nonce durably before its ACK:
+
+```json
+{"type":"ack","protocol_version":1,"execution_nonce":"uuid","runtime_execution_id":"uuid","identity":{"protocol_version":1,"sandbox_id":"sbx-...","row_id":"uuid","tier":"hosted","container_id":"immutable id","home_identity":"sha256:...","sandbox_owner_id":"uuid"}}
 ```
 
 The client compares every ACK witness with its freshly authorized binding
@@ -443,6 +451,13 @@ settlement. A lost socket or missing settlement is deliberately not idle proof:
 it fences automatic and destructive lifecycle/deployment migration for that
 sandbox or canonical home until exact settlement or explicit verified recovery.
 Ordinary shared sandbox tool calls remain available.
+
+If the socket ACK or terminal response is lost, replay the identical completion
+receipt to `POST /sandboxes/{sandbox_id}/agent-presence/{execution_nonce}/settle`
+with the same signed token and `{runtime_execution_id, identity, settlement}`.
+It reads only the fixed durable receipt and is terminal-idempotent: an exact
+replay succeeds, while an absent nonce is 404 and any mismatched identity,
+runtime ID, or terminal result is refused.
 
 ## 14. Out of scope (deferred wishlist items)
 

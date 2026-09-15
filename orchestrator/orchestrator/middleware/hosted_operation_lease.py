@@ -45,6 +45,10 @@ def _sandbox_id(scope: dict) -> str | None:
     # semantics come from its receipt rather than a generic 503.
     if len(parts) >= 4 and parts[3] == "lifecycle-operations":
         return None
+    # Same-nonce presence settlement reads only its fixed receipt; it must be
+    # able to complete while an exclusive migration drains the original socket.
+    if scope.get("method") == "POST" and len(parts) == 6 and parts[3] == "agent-presence" and parts[5] == "settle":
+        return None
     if len(parts) >= 4 and parts[3] in _SELF_LOCKING_ACTIONS:
         return None
     return parts[2]

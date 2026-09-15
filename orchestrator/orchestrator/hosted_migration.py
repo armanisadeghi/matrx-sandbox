@@ -12,6 +12,7 @@ import os
 import re
 import stat
 import tempfile
+from uuid import UUID
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any, Iterator
@@ -388,12 +389,16 @@ class HostedMigrationJournal:
         if (
             not isinstance(record, dict) or record.get("schema_version") != 1
             or not isinstance(record.get("execution_nonce"), str)
-            or not re.fullmatch(r"[A-Za-z0-9_-]{16,200}", record["execution_nonce"])
+            or not isinstance(record.get("runtime_execution_id"), str)
             or record.get("state") not in {"open", "settled"}
             or not isinstance(identity, dict) or set(identity) != keys
             or any(not isinstance(identity.get(key), str) or not identity[key] for key in keys)
         ):
             raise HostedMigrationStateError("agent presence record has invalid identity")
+        try:
+            UUID(record["execution_nonce"]); UUID(record["runtime_execution_id"])
+        except (ValueError, AttributeError):
+            raise HostedMigrationStateError("agent presence record has invalid execution identity")
         if record["state"] == "settled" and record.get("settlement") not in {"completed", "cancelled", "failed"}:
             raise HostedMigrationStateError("agent presence record has invalid settlement")
         if record["state"] == "open" and "settlement" in record:
@@ -412,6 +417,7 @@ class HostedMigrationJournal:
         return record
 
     def write_presence(self, record: dict[str, Any]) -> None:
+        self.ensure_ready()
         self._validate_presence(record)
         nonce = record["execution_nonce"]
         fd, temporary = tempfile.mkstemp(prefix=f".{nonce}.", dir=self.root)
@@ -429,6 +435,35 @@ class HostedMigrationJournal:
             os.fsync(directory)
         finally:
             os.close(directory)
+
+    def open_presence(self, record: dict[str, Any]) -> dict[str, Any]:
+        """Create once under a nonce lock; exact reconnect replay is harmless."""
+        self._validate_presence(record)
+        with self.probed(), self.lock("presence-" + record["execution_nonce"]):
+            existing = self.read_presence(record["execution_nonce"])
+            if existing is None:
+                self.write_presence(record)
+                return record
+            if existing == record:
+                return existing
+            raise HostedMigrationStateError("agent presence nonce conflicts with another execution")
+
+    def settle_presence(self, nonce: str, *, identity: dict[str, str], runtime_execution_id: str, settlement: str) -> dict[str, Any]:
+        if settlement not in {"completed", "cancelled", "failed"}:
+            raise HostedMigrationStateError("agent presence record has invalid settlement")
+        with self.probed(), self.lock("presence-" + nonce):
+            record = self.read_presence(nonce)
+            if record is None:
+                raise FileNotFoundError(nonce)
+            if record["identity"] != identity or record["runtime_execution_id"] != runtime_execution_id:
+                raise HostedMigrationStateError("agent presence settlement identity mismatch")
+            terminal = {**record, "state": "settled", "settlement": settlement}
+            if record["state"] == "settled":
+                if record != terminal:
+                    raise HostedMigrationStateError("agent presence settlement conflicts with terminal receipt")
+                return record
+            self.write_presence(terminal)
+            return terminal
 
     def unresolved_presence(self, sandbox_id: str, home_key: str) -> list[dict[str, Any]]:
         """Nonterminal provider receipts fence exclusive work by sandbox or home."""
