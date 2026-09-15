@@ -85,7 +85,7 @@ def test_platform_environment_refresh_removes_retired_platform_key(monkeypatch):
 
 import pytest
 from types import SimpleNamespace
-from unittest.mock import AsyncMock
+from unittest.mock import AsyncMock, Mock
 
 from orchestrator import activity
 
@@ -157,7 +157,7 @@ async def test_missing_activity_history_defers_before_docker_and_starts_observat
     activity._quiet_observation_started.pop(sid, None)
     monkeypatch.setattr(migrate, "knob_int", AsyncMock(return_value=10))
     monkeypatch.setattr(activity.time, "monotonic", lambda: 100.0)
-    docker_lookup = AsyncMock()
+    docker_lookup = Mock(side_effect=AssertionError("idle refusal touched Docker"))
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", docker_lookup)
 
     result = await migrate.migrate_sandbox(sid, store=_IdleStore(), require_idle=True)
@@ -222,7 +222,7 @@ async def test_unavailable_authoritative_heartbeat_defers_before_docker(monkeypa
     activity._quiet_observation_started[sid] = 100.0
     monkeypatch.setattr(migrate, "knob_int", AsyncMock(return_value=10))
     monkeypatch.setattr(activity.time, "monotonic", lambda: 111.0)
-    docker_lookup = AsyncMock()
+    docker_lookup = Mock(side_effect=AssertionError("idle refusal touched Docker"))
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", docker_lookup)
 
     result = await migrate.migrate_sandbox(sid, store=_IdleStore(row=None), require_idle=True)
@@ -242,7 +242,7 @@ async def test_failed_authoritative_heartbeat_read_defers_before_docker(monkeypa
     activity._quiet_observation_started[sid] = 100.0
     monkeypatch.setattr(migrate, "knob_int", AsyncMock(return_value=10))
     monkeypatch.setattr(activity.time, "monotonic", lambda: 111.0)
-    docker_lookup = AsyncMock()
+    docker_lookup = Mock(side_effect=AssertionError("idle refusal touched Docker"))
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", docker_lookup)
 
     result = await migrate.migrate_sandbox(
