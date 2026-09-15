@@ -16,6 +16,8 @@ server". Incident: 2026-09-13, ``docs/incidents/2026-09-13-edge-drop-reconcile.m
 from __future__ import annotations
 
 from contextlib import asynccontextmanager, contextmanager, ExitStack
+import json
+import os
 from typing import Any, Iterator, Sequence
 
 from orchestrator.config import settings
@@ -36,15 +38,46 @@ def _pending_conflict(
     sandbox_id: str,
     volume: str,
     pending: Sequence[dict[str, Any]] | None = None,
+    lifecycle_operation_id: str | None = None,
 ) -> bool:
     # ``pending`` lets a batch caller read the journal ONCE instead of once per
     # sandbox; the records are the same durable state either way.
     records = journal.pending() if pending is None else pending
-    return any(
+    migration_conflict = any(
         record.get("sandbox_id") == sandbox_id or record.get("source_volume") == volume
         or record.get("source_home_key") == volume
         for record in records
     )
+    if migration_conflict:
+        return True
+    # Lifecycle receipts are a separate suffix so migration recovery ignores
+    # them.  They are nevertheless a durable fence shared by every canonical
+    # lease caller, including synchronous destroy/reaper/reconcile paths.
+    try:
+        for path in journal.root.glob("*.lifecycle"):
+            fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW)
+            try:
+                raw = os.read(fd, 16_385)
+            finally:
+                os.close(fd)
+            if len(raw) > 16_384:
+                return True
+            record = json.loads(raw)
+            if (
+                record.get("state") in {"accepted", "running", "recovery_required"}
+                and not (
+                    lifecycle_operation_id is not None
+                    and record.get("sandbox_id") == sandbox_id
+                    and record.get("operation_id") == lifecycle_operation_id
+                )
+                and (record.get("sandbox_id") == sandbox_id or record.get("home_key") == volume)
+            ):
+                return True
+    except Exception:
+        # Receipt corruption/read failure is never evidence that a destructive
+        # target is free.
+        return True
+    return False
 
 
 @contextmanager
@@ -56,6 +89,7 @@ def hosted_operation_lease_sync(
     lifecycle: bool = False,
     deployment: bool = False,
     pending: Sequence[dict[str, Any]] | None = None,
+    lifecycle_operation_id: str | None = None,
 ) -> Iterator[None]:
     """The real lease. Blocking; safe to enter from a worker thread.
 
@@ -82,8 +116,13 @@ def hosted_operation_lease_sync(
             locks.enter_context(state.lock("lifecycle-" + volume, shared=not lifecycle))
             locks.enter_context(state.lock(sandbox_id, shared=True))
             locks.enter_context(state.lock(f"volume-{volume}", shared=True))
-            if _pending_conflict(state, sandbox_id, volume, pending):
-                raise HostedOperationDenied("hosted migration is pending for sandbox or home")
+            if _pending_conflict(state, sandbox_id, volume, pending, lifecycle_operation_id):
+                # Exact recovery owns its operation lock before reaching this
+                # point and is the only lifecycle action allowed through its
+                # own durable fence. Other migration/lifecycle fences remain.
+                if lifecycle_operation_id is None:
+                    raise HostedOperationDenied("hosted migration is pending for sandbox or home")
+                raise HostedOperationDenied("hosted lifecycle operation is pending for sandbox or home")
             yield
     except HostedMigrationStateError as exc:
         raise HostedOperationDenied("hosted operation lease unavailable") from exc
@@ -97,6 +136,7 @@ async def hosted_operation_lease(
     journal: HostedMigrationJournal | None = None,
     lifecycle: bool = False,
     deployment: bool = False,
+    lifecycle_operation_id: str | None = None,
 ):
     """Hold shared sandbox and home locks through one hosted operation.
 
@@ -114,5 +154,6 @@ async def hosted_operation_lease(
     """
     with hosted_operation_lease_sync(
         sandbox_id, volume, journal=journal, lifecycle=lifecycle, deployment=deployment,
+        lifecycle_operation_id=lifecycle_operation_id,
     ):
         yield

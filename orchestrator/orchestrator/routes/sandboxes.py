@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import hmac
 import inspect
+import json
 import logging
 import re
 from datetime import datetime, timezone
@@ -33,6 +34,7 @@ from orchestrator.models import (
     ExtendRequest,
     ExtendResponse,
     HeartbeatResponse,
+    LifecycleOperationRequest,
     SandboxListResponse,
     SandboxResponse,
 )
@@ -368,6 +370,53 @@ async def destroy_sandbox(sandbox_id: str, graceful: bool = True, purge: bool = 
                 raise HTTPException(status_code=409, detail="Sandbox resumed or changed before purge; no row was deleted")
             if not await store.soft_delete(sandbox_id):
                 raise HTTPException(status_code=409, detail="Sandbox changed before purge; no row was deleted")
+
+
+@router.post("/{sandbox_id}/lifecycle-operations")
+async def admit_lifecycle_operation(sandbox_id: str, req: LifecycleOperationRequest):
+    """Start an idempotent, durable graceful stop/delete operation.
+
+    This route is intentionally exempt from the generic operation middleware:
+    it acquires the same canonical lifecycle/deployment locks itself and must
+    return the exact durable receipt to a reconnecting caller.
+    """
+    from orchestrator.lifecycle_operations import LifecycleConflict, LifecycleUnavailable, admit_lifecycle_operation as admit
+    try:
+        status, receipt = await admit(sandbox_id, str(req.operation_id), req.kind)
+    except LifecycleConflict as exc:
+        raise HTTPException(status_code=409, detail="sandbox lifecycle operation conflicts") from exc
+    except LifecycleUnavailable as exc:
+        raise HTTPException(status_code=503, detail="sandbox lifecycle operation unavailable") from exc
+    return Response(content=json.dumps(receipt), status_code=status, media_type="application/json")
+
+
+@router.get("/{sandbox_id}/lifecycle-operations/{operation_id}")
+async def lifecycle_operation_status(sandbox_id: str, operation_id: UUID):
+    """Return only the bounded receipt projection for one exact operation."""
+    from orchestrator.lifecycle_operations import LifecycleUnavailable, lifecycle_status
+    try:
+        receipt = await lifecycle_status(sandbox_id, str(operation_id))
+    except LifecycleUnavailable as exc:
+        raise HTTPException(status_code=503, detail="sandbox lifecycle operation unavailable") from exc
+    if receipt is None:
+        raise HTTPException(status_code=404, detail="sandbox lifecycle operation not found")
+    return receipt
+
+
+@router.post("/{sandbox_id}/lifecycle-operations/{operation_id}/recover")
+async def recover_lifecycle_operation(sandbox_id: str, operation_id: UUID):
+    """Continue only the same durably fenced stop/delete operation."""
+    from orchestrator.lifecycle_operations import LifecycleConflict, LifecycleUnavailable, admit_lifecycle_operation as admit, lifecycle_status
+    try:
+        existing = await lifecycle_status(sandbox_id, str(operation_id))
+        if existing is None:
+            raise HTTPException(status_code=404, detail="sandbox lifecycle operation not found")
+        status, receipt = await admit(sandbox_id, str(operation_id), existing["kind"], recover=True)
+    except LifecycleConflict as exc:
+        raise HTTPException(status_code=409, detail="sandbox lifecycle recovery conflicts") from exc
+    except LifecycleUnavailable as exc:
+        raise HTTPException(status_code=503, detail="sandbox lifecycle recovery unavailable") from exc
+    return Response(content=json.dumps(receipt), status_code=status, media_type="application/json")
 
 
 @router.post("/{sandbox_id}/reset", response_model=SandboxResponse)

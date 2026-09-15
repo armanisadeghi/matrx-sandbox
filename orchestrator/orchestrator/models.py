@@ -5,7 +5,7 @@ from __future__ import annotations
 from datetime import datetime
 from enum import Enum
 from typing import Literal
-from uuid import UUID
+from uuid import UUID, uuid4
 
 from pydantic import BaseModel, Field, field_validator
 
@@ -93,6 +93,9 @@ class CreateSandboxRequest(BaseModel):
 
 
 class SandboxResponse(BaseModel):
+    # Stable canonical row identity.  ``sandbox_id`` names the runtime route;
+    # this UUID names the persisted row and never substitutes for it.
+    row_id: UUID = Field(default_factory=uuid4)
     sandbox_id: str
     user_id: str
     organization_id: str = Field(
@@ -167,6 +170,11 @@ class SandboxResponse(BaseModel):
 class SandboxListResponse(BaseModel):
     sandboxes: list[SandboxResponse]
     total: int
+
+
+class LifecycleOperationRequest(BaseModel):
+    operation_id: UUID
+    kind: Literal["stop", "delete"]
 
 
 class ExecRequest(BaseModel):

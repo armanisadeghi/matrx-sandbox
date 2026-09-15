@@ -17,7 +17,7 @@ from orchestrator.hosted_migration import (
 )
 
 
-OperationKind = Literal["migrating", "recovering"]
+OperationKind = Literal["migrating", "recovering", "lifecycle"]
 
 
 @dataclass(frozen=True)
@@ -213,6 +213,26 @@ async def run_owned_operation(
     kind: OperationKind = "migrating",
 ) -> dict[str, Any]:
     """Run/share one exact operation without tying it to an HTTP waiter."""
+    task = await start_owned_operation(sandbox_id, operation_id, factory, kind=kind)
+    if isinstance(task, dict):
+        return task
+    result = await asyncio.shield(task)
+    return {**result, "operation_id": operation_id}
+
+
+async def start_owned_operation(
+    sandbox_id: str,
+    operation_id: str,
+    factory: Callable[[], Awaitable[dict[str, Any]]],
+    *,
+    kind: OperationKind = "migrating",
+) -> asyncio.Task[dict[str, Any]] | dict[str, Any]:
+    """Register a shielded child and return immediately for a 202 admission.
+
+    The caller must have already made any durable admission record before this
+    returns.  The task owns its full-duration descriptors; HTTP waiters join it
+    through :func:`run_owned_operation` when they need a terminal result.
+    """
     async with _lock():
         current = active_operation(sandbox_id)
         if current is not None:
@@ -240,9 +260,7 @@ async def run_owned_operation(
                     _finished.exception()
 
             task.add_done_callback(remove_if_current)
-
-    result = await asyncio.shield(task)
-    return {**result, "operation_id": operation_id}
+    return task
 
 
 def reset_operation_registry_for_tests() -> None:

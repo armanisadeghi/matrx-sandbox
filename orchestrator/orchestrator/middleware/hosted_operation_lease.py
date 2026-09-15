@@ -38,6 +38,11 @@ def _sandbox_id(scope: dict) -> str | None:
         and parts[3] == "migration"
     ):
         return None
+    # Durable lifecycle admission/status/recovery owns or observes its exact
+    # lifecycle locks itself.  Let it reach the route so duplicate/recovery
+    # semantics come from its receipt rather than a generic 503.
+    if len(parts) >= 4 and parts[3] == "lifecycle-operations":
+        return None
     if len(parts) >= 4 and parts[3] in _SELF_LOCKING_ACTIONS:
         return None
     return parts[2]

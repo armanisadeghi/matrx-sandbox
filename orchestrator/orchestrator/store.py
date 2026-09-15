@@ -136,7 +136,11 @@ class SandboxStore(ABC):
         sb = await self.get(sandbox_id)
         if sb is None:
             return None
-        return {"status": getattr(sb.status, "value", sb.status), "deleted": False}
+        return {
+            "row_id": str(sb.row_id),
+            "status": getattr(sb.status, "value", sb.status),
+            "deleted": False,
+        }
 
     async def reconcile(
         self, alive_container_ids: set[str], tier: str | None = None,
@@ -284,6 +288,7 @@ class InMemorySandboxStore(SandboxStore):
         if sb is None:
             return None
         return {
+            "row_id": str(sb.row_id),
             "status": getattr(sb.status, "value", sb.status),
             "deleted": sandbox_id in self._deleted,
         }
@@ -716,12 +721,16 @@ class PostgresSandboxStore(SandboxStore):
             pool = await self._get_pool()
             async with pool.acquire() as conn:
                 row = await conn.fetchrow(
-                    "SELECT status, deleted_at FROM sandbox_instances WHERE sandbox_id = $1",
+                    "SELECT id, status, deleted_at FROM sandbox_instances WHERE sandbox_id = $1",
                     sandbox_id,
                 )
                 if not row:
                     return None
-                return {"status": row["status"], "deleted": row["deleted_at"] is not None}
+                return {
+                    "row_id": str(row["id"]),
+                    "status": row["status"],
+                    "deleted": row["deleted_at"] is not None,
+                }
         return await self._execute_with_retry(_do)
 
     async def close(self) -> None:
@@ -956,6 +965,7 @@ def _row_to_sandbox(row) -> SandboxResponse:
         labels_val = json.loads(labels_val)
 
     return SandboxResponse(
+        row_id=_maybe("id") or uuid4(),
         sandbox_id=row["sandbox_id"],
         user_id=str(row["user_id"]),
         organization_id=str(row["organization_id"]),
