@@ -215,6 +215,12 @@ async def admit_lifecycle_operation(sandbox_id: str, operation_id: str, kind: Li
     life = await _get_store().get_lifecycle(sandbox_id)
     if row is None or life is None or not row.container_id:
         raise LifecycleUnavailable("sandbox lifecycle target is unavailable")
+    from orchestrator.config import settings
+    row_tier = getattr(row.tier, "value", row.tier)
+    if row_tier not in {"hosted", "ec2"} or row_tier != settings.host_tier:
+        # A foreign-tier row is canonical data owned by another orchestrator.
+        # Never let a local Docker NotFound turn it into a local terminal row.
+        raise LifecycleConflict("sandbox lifecycle target belongs to another tier")
     home = home_key(row) or f"layer-{sandbox_id}"
     record = {
         "schema_version": 1, "operation_id": operation_id, "sandbox_id": sandbox_id,

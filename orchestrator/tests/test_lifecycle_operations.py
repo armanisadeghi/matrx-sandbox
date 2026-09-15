@@ -106,5 +106,27 @@ async def test_orphaned_running_receipt_becomes_durable_recovery_attention(tmp_p
     }
 
 
+@pytest.mark.asyncio
+async def test_admission_refuses_a_row_owned_by_another_orchestrator_tier(monkeypatch, tmp_path):
+    """Break caught: hosted Docker absence terminalized an EC2 canonical row."""
+    from orchestrator import lifecycle_operations, sandbox_manager
+    from orchestrator.config import settings
+
+    row = _row(); row.tier = "ec2"
+    store = InMemorySandboxStore(); await store.save(row)
+    monkeypatch.setattr(settings, "host_tier", "hosted")
+    monkeypatch.setattr(sandbox_manager, "_get_store", lambda: store)
+    called = False
+
+    def must_not_acquire(*_args):
+        nonlocal called; called = True
+        raise AssertionError("foreign tier must refuse before local receipt/lease admission")
+
+    monkeypatch.setattr(lifecycle_operations, "_acquire", must_not_acquire)
+    with pytest.raises(lifecycle_operations.LifecycleConflict, match="another tier"):
+        await lifecycle_operations.admit_lifecycle_operation(SID, str(uuid4()), "delete", journal=HostedMigrationJournal(tmp_path))
+    assert called is False
+
+
 async def _terminal_runtime() -> bool:
     return True
