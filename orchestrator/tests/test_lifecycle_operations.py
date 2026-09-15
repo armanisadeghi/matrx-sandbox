@@ -70,6 +70,54 @@ async def test_durable_admission_returns_before_stop_and_duplicate_joins_receipt
 
 
 @pytest.mark.asyncio
+async def test_force_stop_intent_survives_durable_orphan_recovery_to_destroy(monkeypatch, tmp_path):
+    """A crashed force-stop owner must not recover as a graceful teardown."""
+    from orchestrator import lifecycle_operations, sandbox_manager
+    from orchestrator.hosted_operation_lease import settings
+
+    store = InMemorySandboxStore(); await store.save(_row())
+    journal = HostedMigrationJournal(tmp_path)
+    monkeypatch.setattr(settings, "host_tier", "hosted")
+    monkeypatch.setattr(sandbox_manager, "_get_store", lambda: store)
+    parked = asyncio.Event()
+
+    async def abandon_owner():
+        await parked.wait()
+
+    original_start = lifecycle_operations.start_owned_operation
+    task = asyncio.create_task(abandon_owner())
+    async def parked_start(*_args, **_kwargs): return task
+    monkeypatch.setattr(lifecycle_operations, "start_owned_operation", parked_start)
+    monkeypatch.setattr(lifecycle_operations, "_runtime_is_terminal", lambda _id: _terminal_runtime())
+    operation = str(uuid4())
+    status, admitted = await lifecycle_operations.admit_lifecycle_operation(
+        SID, operation, "stop", graceful=False, journal=journal,
+    )
+    assert status == 202 and admitted["graceful"] is False
+    assert lifecycle_operations._read(journal, SID, operation)["graceful"] is False
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError): await task
+    orphan = await lifecycle_operations.lifecycle_status(SID, operation, journal=journal)
+    assert orphan["state"] == "recovery_required" and orphan["graceful"] is False
+
+    seen: list[bool] = []
+    async def destroy(_sandbox_id, graceful, _reason, _final_status):
+        seen.append(graceful)
+        return await store.mark_stopped(SID, "user_requested")
+    monkeypatch.setattr(lifecycle_operations, "start_owned_operation", original_start)
+    monkeypatch.setattr(sandbox_manager, "_destroy_sandbox_unleased", destroy)
+    status, recovery = await lifecycle_operations.admit_lifecycle_operation(
+        SID, operation, "stop", recover=True, graceful=False, journal=journal,
+    )
+    assert status == 202 and recovery["graceful"] is False
+    for _ in range(30):
+        receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=journal)
+        if receipt and receipt["state"] == "succeeded": break
+        await asyncio.sleep(0)
+    assert receipt["graceful"] is False and seen == [False]
+
+
+@pytest.mark.asyncio
 async def test_second_uuid_is_refused_while_same_home_is_durably_fenced(monkeypatch, tmp_path):
     """Break caught: an unresolved first stop let another UUID touch its home."""
     from orchestrator import lifecycle_operations, sandbox_manager
