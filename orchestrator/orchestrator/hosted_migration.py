@@ -476,7 +476,15 @@ class HostedMigrationJournal:
         return bool(record and record["phase"] not in TERMINAL_PHASES)
 
     def pending(self) -> list[dict[str, Any]]:
-        return [record for record in self.records() if record["phase"] not in TERMINAL_PHASES]
+        # A verified terminal receipt proves that its (possibly very large)
+        # evidence journal cannot conflict with new work. Re-reading every
+        # completed manifest here made each ordinary lease parse the whole
+        # migration history again.
+        return [
+            record
+            for record in self.recovery_records()
+            if record["phase"] not in TERMINAL_PHASES
+        ]
 
     def records(self) -> list[dict[str, Any]]:
         self.ensure_ready()

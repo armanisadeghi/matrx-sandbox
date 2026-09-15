@@ -21,6 +21,7 @@ import pytest
 from orchestrator.hosted_migration import HostedMigrationJournal
 from orchestrator.hosted_runtime import recover_hosted_migrations
 from orchestrator.reconcile import reconcile_from_docker, reconcile_liveness
+from orchestrator.reaper import _reap_once
 from orchestrator.store import InMemorySandboxStore
 
 FLEET = 120
@@ -32,6 +33,18 @@ SLOW_LOCK_SECONDS = 0.01
 # The container healthcheck allows 3s. A tenth of that is a generous ceiling for
 # "the loop is still answering".
 MAX_LOOP_STALL_SECONDS = 0.3
+
+
+def test_pending_journal_census_skips_receipted_history(monkeypatch, tmp_path):
+    """Terminal receipts keep large completed manifests out of every lease."""
+    journal = HostedMigrationJournal(tmp_path)
+    monkeypatch.setattr(journal, "recovery_records", lambda: [])
+
+    def should_not_read_all_history():
+        raise AssertionError("pending() re-read completed migration history")
+
+    monkeypatch.setattr(journal, "records", should_not_read_all_history)
+    assert journal.pending() == []
 
 
 class _Store:
@@ -126,6 +139,40 @@ async def test_liveness_reconcile_leases_the_fleet_without_stalling_health(monke
         f"event loop stalled {max(stalls):.2f}s during the fleet lease sweep — "
         "the container healthcheck would fail and Traefik would drop the only "
         "orchestrator server from the edge"
+    )
+
+
+@pytest.mark.asyncio
+async def test_reaper_leases_the_fleet_without_stalling_health(monkeypatch, tmp_path):
+    """Break caught: reaper lease admission repeated on the request loop."""
+    journal = HostedMigrationJournal(tmp_path)
+    monkeypatch.setattr("orchestrator.hosted_migration.HostedMigrationJournal", lambda: journal)
+    monkeypatch.setattr("orchestrator.config.settings.host_tier", "hosted")
+    monkeypatch.setattr("orchestrator.hosted_operation_lease.settings.host_tier", "hosted")
+
+    real_lock = HostedMigrationJournal.lock
+
+    def slow_lock(self, key, *, shared=False):
+        time.sleep(SLOW_LOCK_SECONDS)
+        return real_lock(self, key, shared=shared)
+
+    monkeypatch.setattr(HostedMigrationJournal, "lock", slow_lock)
+
+    class ReaperStore(_Store):
+        async def expire_stale(self, *, tier, include_sandbox_ids):
+            self.called = (tier, frozenset(), include_sandbox_ids)
+            return []
+
+    store = ReaperStore()
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_store", lambda: store)
+    result, stalls = await _max_stall_while(_reap_once())
+
+    assert result["expired_found"] == 0
+    assert store.called is not None
+    assert len(store.called[2]) == FLEET
+    assert stalls
+    assert max(stalls) < MAX_LOOP_STALL_SECONDS, (
+        f"event loop stalled {max(stalls):.2f}s during the reaper lease sweep"
     )
 
 

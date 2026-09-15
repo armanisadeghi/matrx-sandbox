@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import time
+from contextlib import ExitStack
 
 from orchestrator.knobs import knob_bool, knob_int
 
@@ -62,6 +63,37 @@ _MIGRATE_BACKOFF_CAP_SECONDS = 3600
 _migrate_backoff = {"next_attempt": 0.0, "fails": 0}
 
 
+def _lease_reaper_fleet(targets: list[tuple[str, str]]) -> tuple[ExitStack, set[str]]:
+    """Acquire one batch of reaper leases off the request-serving event loop."""
+    from orchestrator.hosted_migration import HostedMigrationJournal
+    from orchestrator.hosted_operation_lease import (
+        HostedOperationDenied,
+        hosted_operation_lease_sync,
+    )
+
+    stack = ExitStack()
+    included: set[str] = set()
+    journal = HostedMigrationJournal()
+    pending = journal.pending()
+    try:
+        for sandbox_id, volume in targets:
+            try:
+                stack.enter_context(hosted_operation_lease_sync(
+                    sandbox_id,
+                    volume,
+                    journal=journal,
+                    deployment=True,
+                    pending=pending,
+                ))
+                included.add(sandbox_id)
+            except HostedOperationDenied:
+                continue
+        return stack, included
+    except Exception:
+        stack.close()
+        raise
+
+
 async def _reap_once() -> dict:
     """Single sweep. Returns a summary dict for logging. Never raises."""
     summary = {
@@ -82,30 +114,23 @@ async def _reap_once() -> dict:
     # Marking first means that even if a teardown fails, the row already
     # reflects "expired" so the FE stops showing it as usable.
     try:
-        from contextlib import AsyncExitStack
         from orchestrator.config import settings
         from orchestrator.home_identity import home_key
-        from orchestrator.hosted_operation_lease import hosted_operation_lease, HostedOperationDenied
         if settings.host_tier not in {"ec2", "hosted"}:
             raise RuntimeError("expiry requires an authoritative host tier")
-        async with AsyncExitStack() as leases:
-            included = set()
-            for sandbox in await store.list():
-                if getattr(sandbox.tier, "value", sandbox.tier) != settings.host_tier:
-                    continue
-                try:
-                    await leases.enter_async_context(
-                        hosted_operation_lease(
-                            sandbox.sandbox_id,
-                            home_key(sandbox),
-                            deployment=True,
-                        )
-                    )
-                    included.add(sandbox.sandbox_id)
-                except HostedOperationDenied:
-                    continue
+        targets = [
+            (sandbox.sandbox_id, home_key(sandbox))
+            for sandbox in await store.list()
+            if getattr(sandbox.tier, "value", sandbox.tier) == settings.host_tier
+        ]
+        leases = None
+        try:
+            leases, included = await asyncio.to_thread(_lease_reaper_fleet, targets)
             expired_ids = await store.expire_stale(tier=settings.host_tier,
                                                    include_sandbox_ids=frozenset(included))
+        finally:
+            if leases is not None:
+                await asyncio.to_thread(leases.close)
     except Exception as exc:
         logger.warning("Reaper: expire_stale failed this tick: %s", exc)
         return summary
