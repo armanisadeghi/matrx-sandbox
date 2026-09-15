@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Literal
 from uuid import UUID, uuid4
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, StrictBool, field_validator
 
 
 class SandboxStatus(str, Enum):
@@ -175,6 +175,7 @@ class SandboxListResponse(BaseModel):
 class LifecycleOperationRequest(BaseModel):
     operation_id: UUID
     kind: Literal["stop", "delete"]
+    graceful: StrictBool = True
 
 
 class ExecRequest(BaseModel):

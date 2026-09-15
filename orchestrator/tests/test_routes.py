@@ -639,6 +639,23 @@ async def test_lifecycle_operation_routes_preserve_master_auth_and_receipt_http_
 
 
 @pytest.mark.asyncio
+async def test_lifecycle_route_carries_strict_force_stop_intent(monkeypatch, mock_api_key):
+    from orchestrator import lifecycle_operations
+    operation = "11111111-2222-4333-8444-555555555556"
+    admit = AsyncMock(return_value=(202, {"operation_id": operation.replace("-", ""), "sandbox_id": "sbx-force", "row_id": "22222222-2222-4333-8444-555555555555", "kind": "stop", "state": "accepted", "phase": "admitting", "graceful": False}))
+    monkeypatch.setattr(lifecycle_operations, "admit_lifecycle_operation", admit)
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        omitted = await client.post("/sandboxes/sbx-force/lifecycle-operations", headers={"X-API-Key": TEST_API_KEY}, json={"operation_id": operation, "kind": "stop"})
+        forced = await client.post("/sandboxes/sbx-force/lifecycle-operations", headers={"X-API-Key": TEST_API_KEY}, json={"operation_id": operation, "kind": "stop", "graceful": False})
+        string = await client.post("/sandboxes/sbx-force/lifecycle-operations", headers={"X-API-Key": TEST_API_KEY}, json={"operation_id": operation, "kind": "stop", "graceful": "false"})
+        number = await client.post("/sandboxes/sbx-force/lifecycle-operations", headers={"X-API-Key": TEST_API_KEY}, json={"operation_id": operation, "kind": "stop", "graceful": 0})
+    assert omitted.status_code == 202 and forced.status_code == 202 and string.status_code == 422 and number.status_code == 422
+    assert admit.await_args_list[0].kwargs["graceful"] is True
+    assert admit.await_args_list[1].kwargs["graceful"] is False
+
+
+@pytest.mark.asyncio
 async def test_health_without_key_returns_200(mock_health_sandbox_manager, mock_api_key):
     """/health should be exempt from API key auth even when key is configured."""
     transport = ASGITransport(app=app)

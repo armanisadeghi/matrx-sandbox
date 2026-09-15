@@ -66,7 +66,7 @@ async def test_durable_admission_returns_before_stop_and_duplicate_joins_receipt
         receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=journal)
         if receipt and receipt["state"] == "succeeded": break
         await asyncio.sleep(0)
-    assert receipt == {"operation_id": UUID(operation).hex, "sandbox_id": SID, "row_id": str((await store.get_lifecycle(SID))["row_id"]), "kind": "stop", "state": "succeeded", "phase": "complete"}
+    assert receipt == {"operation_id": UUID(operation).hex, "sandbox_id": SID, "row_id": str((await store.get_lifecycle(SID))["row_id"]), "kind": "stop", "state": "succeeded", "phase": "complete", "graceful": True}
 
 
 @pytest.mark.asyncio
@@ -111,8 +111,8 @@ async def test_orphaned_running_receipt_becomes_durable_recovery_attention(tmp_p
 
     assert receipt == {
         "operation_id": operation, "sandbox_id": SID, "row_id": record["row_id"], "kind": "stop",
-        "state": "recovery_required", "phase": "recovery_required",
-        "attention_needed": True, "reason": "operation owner disappeared; recover the same operation",
+            "state": "recovery_required", "phase": "recovery_required",
+            "attention_needed": True, "reason": "operation owner disappeared; recover the same operation", "graceful": True,
     }
 
 

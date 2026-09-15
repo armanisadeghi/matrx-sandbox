@@ -419,7 +419,7 @@ async def admit_lifecycle_operation(sandbox_id: str, req: LifecycleOperationRequ
     """
     from orchestrator.lifecycle_operations import LifecycleConflict, LifecycleUnavailable, admit_lifecycle_operation as admit
     try:
-        status, receipt = await admit(sandbox_id, str(req.operation_id), req.kind)
+        status, receipt = await admit(sandbox_id, str(req.operation_id), req.kind, graceful=req.graceful)
     except LifecycleConflict as exc:
         raise HTTPException(status_code=409, detail="sandbox lifecycle operation conflicts") from exc
     except LifecycleUnavailable as exc:
@@ -448,7 +448,10 @@ async def recover_lifecycle_operation(sandbox_id: str, operation_id: UUID):
         existing = await lifecycle_status(sandbox_id, str(operation_id))
         if existing is None:
             raise HTTPException(status_code=404, detail="sandbox lifecycle operation not found")
-        status, receipt = await admit(sandbox_id, str(operation_id), existing["kind"], recover=True)
+        status, receipt = await admit(
+            sandbox_id, str(operation_id), existing["kind"], recover=True,
+            graceful=existing.get("graceful", True),
+        )
     except LifecycleConflict as exc:
         raise HTTPException(status_code=409, detail="sandbox lifecycle recovery conflicts") from exc
     except LifecycleUnavailable as exc:

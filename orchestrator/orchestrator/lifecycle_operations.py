@@ -166,6 +166,7 @@ def _records(journal: HostedMigrationJournal) -> list[dict[str, Any]]:
 
 def _projection(record: dict[str, Any]) -> dict[str, Any]:
     out = {key: record[key] for key in ("operation_id", "sandbox_id", "row_id", "kind", "state", "phase")}
+    out["graceful"] = _graceful(record)
     if record.get("state") == "recovery_required": out["attention_needed"] = True
     if record.get("state") in {"failed", "recovery_required"}: out["reason"] = record.get("reason", "operation needs attention")
     return out
