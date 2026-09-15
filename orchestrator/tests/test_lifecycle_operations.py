@@ -62,10 +62,12 @@ async def test_durable_admission_returns_before_stop_and_duplicate_joins_receipt
     status, duplicate = await lifecycle_operations.admit_lifecycle_operation(SID, operation, "stop", journal=journal)
     assert status == 202 and duplicate["state"] == "running"
     release.set()
-    for _ in range(20):
-        receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=journal)
-        if receipt and receipt["state"] == "succeeded": break
-        await asyncio.sleep(0)
+    async with asyncio.timeout(2):
+        while True:
+            receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=journal)
+            if receipt and receipt["state"] == "succeeded":
+                break
+            await asyncio.sleep(0.01)
     assert receipt == {"operation_id": UUID(operation).hex, "sandbox_id": SID, "row_id": str((await store.get_lifecycle(SID))["row_id"]), "kind": "stop", "state": "succeeded", "phase": "complete", "graceful": True}
 
 
