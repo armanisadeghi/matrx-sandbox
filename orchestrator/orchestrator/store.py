@@ -496,13 +496,13 @@ class PostgresSandboxStore(SandboxStore):
             # ``persistence_volume`` is added in migration 003 and is nullable
             # in old environments — wrapped in COALESCE on update so the
             # UPDATE branch tolerates missing values.
-            await conn.execute(
+            row = await conn.fetchrow(
                 """
                 INSERT INTO sandbox_instances
-                    (user_id, organization_id, sandbox_id, name, status, container_id, created_at, hot_path, cold_path,
+                    (id, user_id, organization_id, sandbox_id, name, status, container_id, created_at, hot_path, cold_path,
                      config, ttl_seconds, tier, template, template_version, labels,
                      persistence_volume, created_by)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10::jsonb, $11, $12, $13, $14, $15::jsonb, $16, $1)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, $16::jsonb, $17, $2)
                 ON CONFLICT (sandbox_id) DO UPDATE SET
                     organization_id = EXCLUDED.organization_id,
                     -- Canonical access uses created_by. Repair legacy blanks
@@ -530,7 +530,9 @@ class PostgresSandboxStore(SandboxStore):
                         WHEN EXCLUDED.status IN ('stopped', 'expired', 'failed', 'shutting_down')
                         THEN sandbox_instances.stop_reason ELSE NULL END,
                     updated_at = NOW()
+                RETURNING id
                 """,
+                sandbox.row_id,
                 UUID(sandbox.user_id),
                 organization_id,
                 sandbox.sandbox_id,
@@ -548,6 +550,7 @@ class PostgresSandboxStore(SandboxStore):
                 json.dumps(sandbox.labels) if sandbox.labels else None,
                 sandbox.persistence_volume,
             )
+            sandbox.row_id = UUID(str(row["id"]))
 
     async def replace_container_if_current(self, sandbox_id: str, old_container_id: str,
                                            new_container_id: str, template_version: str | None,
@@ -964,8 +967,11 @@ def _row_to_sandbox(row) -> SandboxResponse:
     if isinstance(labels_val, str):
         labels_val = json.loads(labels_val)
 
+    row_id = _maybe("id")
+    if row_id is None:
+        raise RuntimeError("sandbox row has no canonical id; refusing manufactured identity")
     return SandboxResponse(
-        row_id=_maybe("id") or uuid4(),
+        row_id=row_id,
         sandbox_id=row["sandbox_id"],
         user_id=str(row["user_id"]),
         organization_id=str(row["organization_id"]),
