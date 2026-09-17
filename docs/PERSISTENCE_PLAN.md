@@ -4,9 +4,18 @@
 **Owners:** Sandbox backend (matrx-sandbox), Code editor frontend (matrx-frontend `features/code/`)
 **Last updated:** 2026-04-26 — directives applied + audit findings integrated + Phases 1–3 implemented
 
+> 🔴 **Naming superseded (2026-09-17/18).** The hosted home is keyed by
+> **(user, organization)** — `matrx-user-<uid>-org-<oid>` — not by user alone.
+> Every `matrx-user-{uid}` below is the historical name; the live one carries the
+> `-org-<oid>` suffix. Pre-2026-09-17 volumes stay on disk untouched, and a
+> user's FIRST organization home is seeded from theirs automatically (a later
+> organization's home starts empty on purpose). Current truth:
+> `orchestrator/orchestrator/storage_layout.py` and
+> [OPERATIONS.md](OPERATIONS.md) § Pre-organization per-user volumes.
+
 ## What landed today (2026-04-26)
 
-- ✅ **Phase 1: hosted-tier per-user Docker volumes.** Volume `matrx-user-<uid>` mounted at `/home/agent` for hosted-tier sandboxes; survives container destroy. Verified: write file in sandbox A → destroy → create sandbox B for same user → file is there.
+- ✅ **Phase 1: hosted-tier per-user Docker volumes.** Volume `matrx-user-<uid>` (today: `matrx-user-<uid>-org-<oid>`) mounted at `/home/agent` for hosted-tier sandboxes; survives container destroy. Verified: write file in sandbox A → destroy → create sandbox B for same user → file is there.
 - ✅ **Phase 2: in-container session manifest + checkpoint daemon.** `matrx_agent.persistence` module writes `/home/agent/.matrx/session.json` every 5 min and on shutdown; renders `session-report.md` on startup.
 - ✅ **Phase 3: git auto-stash on shutdown.** Dirty repos under `/home/agent/` are stashed locally + (when creds work) pushed to `matrx/auto-stash/<ts>` branches.
 - ✅ **`/internal/{startup,shutdown,manifest,session-report}` routes** on the in-container daemon — invoked by `shutdown.sh` / `shutdown-local.sh` and lifespan hooks.
@@ -165,7 +174,7 @@ Make this user-visible in the editor (Settings → Data, plus a one-time onboard
               ▼                                        ▼
 ┌──────────────────────────────────────┐  ┌────────────────────────────┐
 │ EC2 tier:                            │  │ Hosted tier:               │
-│ s3://prod-bucket/users/{uid}/hot/    │  │ docker vol matrx-user-{uid}│
+│ s3://prod-bucket/users/{uid}/hot/    │  │ docker vol matrx-user-{uid} │
 │ s3://prod-bucket/users/{uid}/cold/   │  │   mounted at /home/agent   │
 │   (FUSE, large files)                │  │ + optional async S3 backup │
 │                                       │  │   (off by default for v1)  │
@@ -377,7 +386,7 @@ container = client.containers.run(
 )
 ```
 
-The Docker volume `matrx-user-{uid}` lives on the host filesystem (under `/var/lib/docker/volumes/`). It survives container destruction; it lives until explicitly deleted via the API or admin panel.
+The Docker volume (today `matrx-user-{uid}-org-{oid}`) lives on the host filesystem (under `/var/lib/docker/volumes/`). It survives container destruction; it lives until explicitly deleted via the API or admin panel.
 
 **For the existing starter pool (sandbox-1..5):** mark them deprecated. New flow doesn't use them. Eventually retire them in favor of dynamically-provisioned hosted sandboxes with proper user volumes. Until retirement they still work — they just don't share data with the new dynamic flow.
 
@@ -413,7 +422,7 @@ Goal: hosted sandboxes survive `docker rm` with the user's home dir intact.
 - [ ] Volume cleanup endpoint (`DELETE /users/{uid}/volume?force=true`) for explicit reset.
 - [ ] **Tests:** create a hosted sandbox, write to /home/agent, destroy, create another → file is there.
 
-**Risk:** none on EC2 (no changes). ~~Hosted tier currently broken in this regard~~ **SHIPPED — hosted per-user volumes (`matrx-user-<uid>`) are live and survive container destroy.**
+**Risk:** none on EC2 (no changes). ~~Hosted tier currently broken in this regard~~ **SHIPPED — hosted per-(user, organization) volumes (`matrx-user-<uid>-org-<oid>`) are live and survive container destroy.**
 
 ### Phase 2 — In-container persistence module — ~2 days
 
@@ -475,7 +484,7 @@ Add columns (nullable, no breaking change):
 
 ```sql
 ALTER TABLE sandbox_instances
-  ADD COLUMN IF NOT EXISTS persistence_volume TEXT,           -- e.g. "matrx-user-<uuid>"
+  ADD COLUMN IF NOT EXISTS persistence_volume TEXT,           -- e.g. "matrx-user-<uuid>-org-<org-uuid>"
   ADD COLUMN IF NOT EXISTS persistence_size_bytes BIGINT,     -- last-known size
   ADD COLUMN IF NOT EXISTS last_manifest_at TIMESTAMPTZ,      -- last time .matrx/session.json was written
   ADD COLUMN IF NOT EXISTS restored_from_session_id UUID;     -- nullable; points at the manifest used to restore (audit trail)
