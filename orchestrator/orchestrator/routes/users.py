@@ -9,12 +9,12 @@ from __future__ import annotations
 import logging
 from typing import Any
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel
 
 from orchestrator import sandbox_manager
 from orchestrator.config import settings
-from orchestrator.storage_layout import resolve_user_storage, user_volume_name
+from orchestrator.storage_layout import resolve_user_storage
 
 logger = logging.getLogger(__name__)
 
@@ -38,19 +38,36 @@ class MemoryListResponse(BaseModel):
 
 
 @router.get("/{user_id}/persistence")
-async def get_user_persistence(user_id: str) -> dict[str, Any]:
-    """Return what we know about a user's persistent storage on this orchestrator.
+async def get_user_persistence(
+    user_id: str,
+    organization_id: str = Query(
+        ...,
+        description=(
+            "The organization whose home to report. The hosted home is per "
+            "(user, organization) — there is no such thing as 'this user's "
+            "volume' any more, and nothing here picks a tenant for the caller."
+        ),
+    ),
+) -> dict[str, Any]:
+    """Return what we know about a user's persistent storage IN ONE ORGANIZATION.
 
     Cheap — uses Docker daemon metadata + SandboxStore counts, no shell-out.
     """
-    location = resolve_user_storage(user_id, tier=settings.host_tier or None)
+    try:
+        location = resolve_user_storage(
+            user_id, tier=settings.host_tier or None, organization_id=organization_id
+        )
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
 
     # This aggregate reports only the hosted per-user volume. EC2 durable homes
     # are retained per sandbox and are managed through that sandbox's exact
     # lifecycle/persistence actions, not through this user-volume endpoint.
     volume_bytes: int | None = None
     if location.tier == "hosted" and location.volume_name:
-        volume_bytes = await sandbox_manager.get_user_volume_size(user_id)
+        volume_bytes = await sandbox_manager.get_user_volume_size(
+            user_id, organization_id
+        )
 
     # How many sandboxes does this user have on this tier?
     sandboxes = await sandbox_manager.list_sandboxes(user_id=user_id)
@@ -58,6 +75,7 @@ async def get_user_persistence(user_id: str) -> dict[str, Any]:
 
     return {
         "user_id": user_id,
+        "organization_id": organization_id,
         "tier": location.tier,
         "volume_name": location.volume_name,
         "volume_bytes": volume_bytes,
@@ -71,8 +89,18 @@ async def get_user_persistence(user_id: str) -> dict[str, Any]:
 
 
 @router.delete("/{user_id}/volume", status_code=204)
-async def delete_user_volume(user_id: str) -> None:
-    """Permanently delete a user's hosted-tier Docker volume.
+async def delete_user_volume(
+    user_id: str,
+    organization_id: str = Query(
+        ...,
+        description=(
+            "The organization whose home to delete. Required: one user has one "
+            "home PER ORGANIZATION, and deleting 'the user's volume' without "
+            "saying which tenant would destroy the wrong one."
+        ),
+    ),
+) -> None:
+    """Permanently delete a user's hosted-tier Docker volume for ONE organization.
 
     Refuses if any sandbox is currently using it. Returns 204 on success.
     Returns 404 if the user has no volume on this tier (no-op).
@@ -92,7 +120,7 @@ async def delete_user_volume(user_id: str) -> None:
         )
 
     try:
-        ok = await sandbox_manager.delete_user_volume(user_id)
+        ok = await sandbox_manager.delete_user_volume(user_id, organization_id)
     except RuntimeError as e:
         # Container still attached — surface clearly.
         raise HTTPException(status_code=409, detail=str(e))

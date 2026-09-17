@@ -16,6 +16,9 @@ def _inject_journal(monkeypatch, journal: HostedMigrationJournal) -> None:
     monkeypatch.setattr("orchestrator.hosted_migration.HostedMigrationJournal", lambda: journal)
 
 
+ORG_ID = "33333333-3333-4333-8333-333333333333"
+
+
 def _record(sandbox_id: str, volume: str) -> dict:
     return {
         "schema_version": 1, "sandbox_id": sandbox_id, "phase": "admitted",
@@ -112,13 +115,13 @@ async def test_liveness_derives_missing_home_and_releases_lease_on_docker_failur
     monkeypatch.setattr("orchestrator.reconcile.settings.host_tier", "hosted")
     user_id = "12345678-1234-1234-1234-123456789abc"
     class Store:
-        async def list(self): return [SimpleNamespace(sandbox_id="legacy", persistence_volume=None, user_id=user_id, tier="hosted")]
+        async def list(self): return [SimpleNamespace(sandbox_id="legacy", persistence_volume=None, user_id=user_id, organization_id=ORG_ID, tier="hosted")]
         async def reconcile(self, *_args, **_kwargs): raise AssertionError("Docker failure must not mutate")
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: (_ for _ in ()).throw(RuntimeError("offline")))
     assert await reconcile_liveness(Store()) == {"stopped": [], "refreshed": 0}
     # The early Docker return closed the lease: migration can now acquire exclusivity.
     from orchestrator.storage_layout import user_volume_name
-    with journal.lock(f"volume-{user_volume_name(user_id)}"):
+    with journal.lock(f"volume-{user_volume_name(user_id, ORG_ID)}"):
         pass
 
 
@@ -265,11 +268,11 @@ async def test_destroy_derives_legacy_home_and_refuses_pending_migration(monkeyp
     journal = HostedMigrationJournal(tmp_path)
     user_id = "12345678-1234-1234-1234-123456789abc"
     from orchestrator.storage_layout import user_volume_name
-    journal.write(_record("old", user_volume_name(user_id)))
+    journal.write(_record("old", user_volume_name(user_id, ORG_ID)))
     monkeypatch.setattr(sandbox_manager.settings, "host_tier", "hosted")
     _inject_journal(monkeypatch, journal)
     monkeypatch.setattr(sandbox_manager, "_get_store", lambda: SimpleNamespace(
-        get=lambda _id: _one(SimpleNamespace(sandbox_id="legacy", persistence_volume=None, user_id=user_id, tier="hosted")),
+        get=lambda _id: _one(SimpleNamespace(sandbox_id="legacy", persistence_volume=None, user_id=user_id, organization_id=ORG_ID, tier="hosted")),
     ))
     async def teardown(*_args, **_kwargs): raise AssertionError("unleased teardown")
     monkeypatch.setattr(sandbox_manager, "_destroy_sandbox_unleased", teardown)

@@ -94,7 +94,7 @@ async def test_reset_successor_lease_spans_reservation_until_runtime_creation(
     predecessor = row("sbx-old")
     predecessor.status = SandboxStatus.READY
     predecessor.tier = "hosted"
-    predecessor.persistence_volume = user_volume_name(USER)
+    predecessor.persistence_volume = user_volume_name(USER, ORG)
     await store.save(predecessor)
     monkeypatch.setattr(sandbox_manager, "_store", store)
     monkeypatch.setattr(settings, "host_tier", "hosted")

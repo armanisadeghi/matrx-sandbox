@@ -7,7 +7,6 @@ from orchestrator.config import settings
 from orchestrator import activity
 from orchestrator.hosted_operation_lease import HostedOperationDenied, hosted_operation_lease
 from orchestrator.sandbox_manager import _get_store
-from orchestrator.storage_layout import user_volume_name
 
 _COLLECTION_PATHS = frozenset({"claim"})
 _SELF_LOCKING_ACTIONS = frozenset({

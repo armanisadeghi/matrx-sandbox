@@ -87,7 +87,7 @@ def _docker_state_to_status(state: dict) -> SandboxStatus:
 def _persistence_volume_from_mounts(container_attrs: dict) -> str | None:
     """Pull the per-user named volume out of container mounts.
 
-    Hosted-tier sandboxes mount ``matrx-user-<uid>`` at /home/agent. We
+    Hosted-tier sandboxes mount ``matrx-user-<uid>-org-<oid>`` at /home/agent. We
     care about that one specifically — anything else (Docker socket
     bind-mount, FUSE devices, etc.) is irrelevant to persistence.
     """
@@ -130,8 +130,10 @@ async def _lease_discovered_container(stack, container, store, sandbox_id):
             from orchestrator.home_identity import home_key
             volume = home_key(row)
         else:
+            organization_id = (getattr(row, "organization_id", None)
+                               or labels.get("matrx.organization_id"))
             volume = ("layer-" + sandbox_id if settings.host_tier == "ec2"
-                      else user_volume_name(user_id))
+                      else user_volume_name(user_id, organization_id or ""))
     # Taking the lease is blocking filesystem work (flocks + an fsync-ing
     # journal probe). Off the event loop it stays invisible to /health; on it,
     # a slow disk turns every discovered container into dead air for the
@@ -528,9 +530,10 @@ async def reconcile_liveness(store: SandboxStore) -> dict:
                     continue
                 if not volume:
                     user_id = getattr(sandbox, "user_id", None)
-                    if user_id:
+                    organization_id = getattr(sandbox, "organization_id", None)
+                    if user_id and organization_id:
                         from orchestrator.storage_layout import user_volume_name
-                        volume = user_volume_name(user_id)
+                        volume = user_volume_name(user_id, organization_id)
                     else:
                         unresolved.add(sandbox_id)
                         continue

@@ -60,12 +60,46 @@
 #   - It is rewritten from the live container env on every boot, so it can
 #     never disagree with the daemon.
 
-set -euo pipefail
+# WHEN THIS SCRIPT ITSELF FAILS (2026-09-17)
+# ------------------------------------------
+# It runs under `set -euo pipefail`, so any failure — a read-only /etc, a full
+# disk, a `chmod` refusal — aborts it halfway. Every entrypoint used to invoke
+# it as `write-bridge-env.sh || true`, which swallowed exactly that: the box
+# came up looking healthy while /etc/matrx/bridge-env.sh was absent, so every
+# shell on a FULLY WIRED box took bridge-headers.sh's quiet "unwired image"
+# branch and `git push` failed with no explanation. That is the silent failure
+# this file exists to prevent, reintroduced one level up.
+#
+# The ruling: the box still STARTS (an unreachable container cannot be
+# debugged, and the user loses their session for a problem in a five-line
+# helper), but it is never silently unwired. This script leaves a MARKER —
+# /etc/matrx/bridge-env.FAILED — carrying what went wrong, and everything that
+# builds bridge headers reads it and SCREAMS: scripts/bridge-headers.sh (every
+# shell caller) and matrx_agent.bridge_headers (the mtx CLI, the watcher).
+# The entrypoints no longer say `|| true`; they report the failure and continue
+# (guard: sandbox-image/sdk/tests/test_cloud_sync_boundaries.py).
+
+set -Eeuo pipefail
 
 BRIDGE_ENV_DIR="${MATRX_BRIDGE_ENV_DIR:-/etc/matrx}"
 BRIDGE_ENV_FILE="${MATRX_BRIDGE_ENV_FILE:-$BRIDGE_ENV_DIR/bridge-env.sh}"
 PROFILE_DROPIN="${MATRX_BRIDGE_PROFILE_DROPIN:-/etc/profile.d/00-matrx-bridge.sh}"
 BRIDGE_ENV_OWNER="${MATRX_BRIDGE_ENV_OWNER:-root:agent}"
+BRIDGE_ENV_FAILED_FILE="${MATRX_BRIDGE_ENV_FAILED_FILE:-$BRIDGE_ENV_DIR/bridge-env.FAILED}"
+
+matrx_bridge_env_failed() {
+    local line="${1:-?}" status="${2:-1}"
+    mkdir -p "$BRIDGE_ENV_DIR" 2>/dev/null || true
+    {
+        echo "write-bridge-env.sh FAILED (line $line, exit $status) at $(date -u +%Y-%m-%dT%H:%M:%SZ)."
+        echo "This sandbox could not publish its identity to $BRIDGE_ENV_FILE."
+        echo "Consequence: every SHELL on this box (ssh, docker exec, the mtx CLI, the git credential helper) sees no USER_ID/ORGANIZATION_ID and refuses AI Dream calls, even though the container itself is wired."
+        echo "Remedy: fix what stopped the write (usually a read-only or full /etc), then rerun /opt/sandbox/scripts/write-bridge-env.sh, or recreate the sandbox."
+    } > "$BRIDGE_ENV_FAILED_FILE" 2>/dev/null || true
+    chmod 0644 "$BRIDGE_ENV_FAILED_FILE" 2>/dev/null || true
+    echo "[bridge-env] FAILED to publish this sandbox's identity — see $BRIDGE_ENV_FAILED_FILE. Shells, the mtx CLI and git credentials will refuse AI Dream calls and say why." >&2
+}
+trap 'matrx_bridge_env_failed "$LINENO" "$?"' ERR
 
 mkdir -p "$BRIDGE_ENV_DIR"
 
@@ -91,6 +125,9 @@ cat > "$PROFILE_DROPIN" <<EOF
 [ -r "$BRIDGE_ENV_FILE" ] && . "$BRIDGE_ENV_FILE"
 EOF
 chmod 0644 "$PROFILE_DROPIN"
+
+# The write got all the way here, so any earlier failure marker is stale.
+rm -f "$BRIDGE_ENV_FAILED_FILE" 2>/dev/null || true
 
 missing=""
 for name in USER_ID ORGANIZATION_ID MATRX_AIDREAM_URL MATRX_AIDREAM_SERVICE_TOKEN; do

@@ -506,7 +506,7 @@ async def create_sandbox(
         raise ValueError(
             "config.organization_id must match the explicit organization_id"
         )
-    location = resolve_user_storage(user_id, tier)
+    location = resolve_user_storage(user_id, tier, organization_id)
     sandbox_id = reserved.sandbox_id if reserved is not None else f"sbx-{uuid.uuid4().hex[:12]}"
     if reserved is not None and (reserved.user_id != user_id or reserved.organization_id != organization_id):
         raise RuntimeError("reserved sandbox identity does not match the create request")
@@ -530,7 +530,7 @@ async def create_sandbox(
     if persistence_reference:
         home_key = persistence_reference
     elif location.tier == "hosted":
-        home_key = user_volume_name(user_id)
+        home_key = user_volume_name(user_id, organization_id)
     elif template == "development":
         # Keep development binds in the same canonical lock namespace, using
         # the hashed bind identity rather than a path-shaped lock key.
@@ -591,7 +591,9 @@ async def _create_sandbox_unleased(
     """
     store = _get_store()
     from orchestrator.hosted_migration import hosted_volume_fenced
-    if (tier or settings.host_tier) == "hosted" and hosted_volume_fenced(user_volume_name(user_id)):
+    if (tier or settings.host_tier) == "hosted" and hosted_volume_fenced(
+        user_volume_name(user_id, organization_id)
+    ):
         raise RuntimeError("hosted user home is fenced by an in-progress migration/recovery")
     config["organization_id"] = organization_id
     resources = resources or {}
@@ -618,7 +620,7 @@ async def _create_sandbox_unleased(
         client = _get_docker_client()
 
         # ── Resolve persistence location for this (user, tier) pair ───────────
-        location: StorageLocation = resolve_user_storage(user_id, tier)
+        location: StorageLocation = resolve_user_storage(user_id, tier, organization_id)
         volumes: dict[str, dict] = {}
         reusing_home = bool(persistence_reference)
         if location.tier == "hosted":
@@ -626,11 +628,15 @@ async def _create_sandbox_unleased(
             # Volume survives container destruction; subsequent sandboxes for
             # the same user see the same home dir.
             try:
-                await asyncio.to_thread(client.volumes.get, user_volume_name(user_id))
+                await asyncio.to_thread(
+                    client.volumes.get, user_volume_name(user_id, organization_id)
+                )
                 reusing_home = True
             except NotFound:
                 pass
-            volume_name = await asyncio.to_thread(ensure_user_volume, client, user_id)
+            volume_name = await asyncio.to_thread(
+                ensure_user_volume, client, user_id, organization_id
+            )
             volumes[volume_name] = {"bind": "/home/agent", "mode": "rw"}
             sandbox.persistence_volume = volume_name
             logger.info(
@@ -1443,8 +1449,8 @@ async def destroy_sandbox(
         from orchestrator.hosted_operation_lease import hosted_operation_lease
         async with hosted_operation_lease(sandbox_id, f"layer-{sandbox_id}", lifecycle=True):
             return await _destroy_sandbox_unleased(sandbox_id, graceful, reason, final_status)
-    if not volume and getattr(sandbox, "user_id", None):
-        volume = user_volume_name(sandbox.user_id)
+    if not volume and getattr(sandbox, "user_id", None) and getattr(sandbox, "organization_id", None):
+        volume = user_volume_name(sandbox.user_id, sandbox.organization_id)
     if not volume:
         logger.warning("Refusing hosted destroy without an authoritative home for %s", sandbox_id)
         if settings.host_tier == "hosted":
@@ -1715,7 +1721,7 @@ async def delete_ec2_home_volume(
 
 
 async def delete_user_volume(
-    user_id: str, *, _lifecycle_lease_held: bool = False,
+    user_id: str, organization_id: str, *, _lifecycle_lease_held: bool = False,
 ) -> bool:
     """Hard-delete a user's per-user Docker volume (hosted tier only).
 
@@ -1726,7 +1732,7 @@ async def delete_user_volume(
     """
     from orchestrator.storage_layout import user_volume_name
 
-    name = user_volume_name(user_id)
+    name = user_volume_name(user_id, organization_id)
 
     async def remove_under_lease() -> bool:
         client = _get_docker_client()
@@ -1741,7 +1747,10 @@ async def delete_user_volume(
         try:
             volume = await asyncio.to_thread(client.volumes.get, name)
         except NotFound:
-            logger.info("delete_user_volume(%s): volume not found, no-op", user_id)
+            logger.info(
+                "delete_user_volume(%s, %s): volume not found, no-op",
+                user_id, organization_id,
+            )
             return True
         try:
             await asyncio.to_thread(volume.remove, force=False)
@@ -1754,7 +1763,7 @@ async def delete_user_volume(
     if _lifecycle_lease_held:
         return await remove_under_lease()
     from orchestrator.hosted_operation_lease import hosted_operation_lease
-    operation_id = f"volume-delete-{user_id}"
+    operation_id = f"volume-delete-{user_id}-{organization_id}"
     async with hosted_operation_lease(operation_id, name, lifecycle=True):
         task = asyncio.create_task(remove_under_lease())
         try:
@@ -1766,7 +1775,7 @@ async def delete_user_volume(
                 raise
 
 
-async def get_user_volume_size(user_id: str) -> int | None:
+async def get_user_volume_size(user_id: str, organization_id: str) -> int | None:
     """Return the current size in bytes of a user's hosted-tier volume.
 
     None if the volume doesn't exist (user has no hosted-tier data yet) or
@@ -1775,7 +1784,7 @@ async def get_user_volume_size(user_id: str) -> int | None:
     """
     from orchestrator.storage_layout import user_volume_name
 
-    name = user_volume_name(user_id)
+    name = user_volume_name(user_id, organization_id)
     client = _get_docker_client()
     try:
         # API endpoint /volumes returns a list with UsageData when invoked

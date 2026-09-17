@@ -54,7 +54,15 @@ HOT_PATH="${HOT_PATH:-/home/agent}"
 # without this a `git push` or `mtx` from an SSH session sees an unwired box
 # and fails silently. Same script, same file, all three tiers; the ruling on
 # the service token is in its header.
-/opt/sandbox/scripts/write-bridge-env.sh || true
+# A failure in here is NOT swallowed: `|| true` used to hide it, and the box
+# then ran fully wired while every shell on it behaved as if it were unwired
+# (bridge-headers.sh's quiet branch). The box still starts — an unreachable
+# container cannot be debugged — but the writer leaves
+# /etc/matrx/bridge-env.FAILED, which bridge-headers.sh and the SDK read and
+# scream about, so nothing about this is silent.
+if ! /opt/sandbox/scripts/write-bridge-env.sh; then
+    echo "[entrypoint] write-bridge-env.sh failed; this box is starting UNWIRED for shells. See /etc/matrx/bridge-env.FAILED." >&2
+fi
 
 if [ "$MATRX_MIGRATION_ACTIVATION" = "0" ]; then
 chown -R agent:agent "$HOT_PATH" 2>/dev/null || true

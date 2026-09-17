@@ -24,8 +24,10 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import logging
+import random
 import time
 from collections import OrderedDict, deque
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,6 +38,11 @@ from watchdog.observers import Observer
 from matrx_agent.cloud_sync.client import AsyncBridgeClient, BridgeConfig
 from matrx_agent.cloud_sync.downstream import RemoteChange, make_subscriber
 from matrx_agent.cloud_sync.paths import is_system_path
+from matrx_agent.cloud_sync.refusals import (
+    describe_bridge_failure,
+    is_retryable_status,
+    refusal_sentence,
+)
 from matrx_agent.cloud_sync.queue import (
     DEFAULT_PATH as DEFAULT_QUEUE_PATH,
 )
@@ -80,16 +87,68 @@ RECENTLY_APPLIED_MAX = 1024
 # spurious 404s. They are internal scratch, never user content: always ignore.
 CLOUD_FILES_TMP_SUFFIX = ".cloud-files.tmp"
 
+# ─── Held writes ─────────────────────────────────────────────────────────────
+# A bridge call that FAILS — refused (403 organization_membership_required,
+# 409, 400) or unreachable after the hot ladder — never means the user's edit
+# is done. Until 2026-09-17 it did: the flush logged one warning and called
+# mark_done, so replay_pending never returned the event again and the edit was
+# gone from the durable queue with nothing on any surface a person reads. The
+# local file was still right, so nobody could tell.
+#
+# Now the event stays PENDING in the queue and the path is parked HERE: retried
+# on a slow cadence (never the hot loop), counted on /internal/cloud-sync-status
+# as ``held_writes``, carrying the server's own status/code/message/remedy so
+# the person sees WHY and WHAT TO DO. Nothing is ever deleted or overwritten
+# locally; a new edit to the same path simply supersedes the held event.
+HELD_RETRY_SECONDS = 300.0  # 5 minutes, jittered — a held write is not urgent
+HELD_RETRY_JITTER_FRACTION = 0.2
+HELD_MAX_TRACKED = 1000  # index cap; the QUEUE, not this dict, is the truth
+HELD_STATUS_SAMPLE = 20  # how many held paths the status endpoint names
+
 
 def _is_ignored_scratch(path: str) -> bool:
     return path.endswith(CLOUD_FILES_TMP_SUFFIX)
 
 
 def _is_retryable_bridge_error(error: Exception) -> bool:
+    """One judgement, shared with the refusal description (``refusals.py``)."""
     if not isinstance(error, httpx.HTTPStatusError):
         return True
-    status_code = error.response.status_code
-    return status_code in {408, 425, 429} or status_code >= 500
+    return is_retryable_status(error.response.status_code)
+
+
+def _held_retry_delay() -> float:
+    """``HELD_RETRY_SECONDS`` ± jitter — 226 boxes must not retry in lockstep."""
+    spread = HELD_RETRY_SECONDS * HELD_RETRY_JITTER_FRACTION
+    return max(1.0, HELD_RETRY_SECONDS + random.uniform(-spread, spread))
+
+
+@dataclass
+class HeldWrite:
+    """One user edit AI Dream would not accept, kept instead of dropped."""
+
+    kind: str  # "upsert" | "delete"
+    rel_path: str
+    event_id: str
+    refusal: dict[str, Any]
+    attempts: int
+    first_held_ts: float
+    last_attempt_ts: float
+    next_attempt_ts: float
+
+    def to_status(self) -> dict[str, Any]:
+        return {
+            "kind": self.kind,
+            "rel_path": self.rel_path,
+            "attempts": self.attempts,
+            "first_held_ts": self.first_held_ts,
+            "last_attempt_ts": self.last_attempt_ts,
+            "next_attempt_ts": self.next_attempt_ts,
+            "status": self.refusal.get("status"),
+            "code": self.refusal.get("code"),
+            "message": self.refusal.get("message"),
+            "remedy": self.refusal.get("remedy"),
+        }
 
 
 class _Handler(FileSystemEventHandler):
@@ -224,6 +283,9 @@ class CloudFilesWatcher:
         self._remote_received = 0
         self._remote_applied = 0
         self._remote_echo_suppressed = 0
+        # Writes AI Dream refused, still PENDING in the durable queue.
+        self._held: "OrderedDict[str, HeldWrite]" = OrderedDict()
+        self._held_total = 0
 
     @property
     def mode(self) -> str:
@@ -245,7 +307,22 @@ class CloudFilesWatcher:
         self._cfg = BridgeConfig.from_env()
         if self._cfg is None:
             self._set_mode("dormant")
-            _logger.info("cloud-files: AI Dream env not configured — watcher dormant")
+            from matrx_agent.bridge_headers import published_identity_failure
+
+            failure = published_identity_failure()
+            if failure:
+                # Not an unwired image — the boot-time identity writer failed
+                # and the entrypoint kept going. Never dormant-and-quiet.
+                _logger.error(
+                    "cloud-files: this sandbox published NO identity because "
+                    "write-bridge-env.sh failed, so cloud-files sync is off on "
+                    "a box that was meant to sync. %s",
+                    failure,
+                )
+            else:
+                _logger.info(
+                    "cloud-files: AI Dream env not configured — watcher dormant"
+                )
             return
 
         if not self.cloud_root.exists():
@@ -614,8 +691,11 @@ class CloudFilesWatcher:
                 old = self._pending.pop(rel, None)
                 if old is not None:
                     old[0].cancel()
-                    # Mark the superseded event done so the JSONL doesn't grow forever.
-                    self._safe_mark_done(old[1])
+                    # Mark the superseded event done so the JSONL doesn't grow
+                    # forever. A newer edit to the same path OWNS it now, so any
+                    # hold parked on it is released with it — the new event is
+                    # the one that will be accepted or held.
+                    self._safe_mark_done(old[1], rel)
 
                 # Backpressure cap.
                 if len(self._pending) >= MAX_PENDING:
@@ -623,7 +703,7 @@ class CloudFilesWatcher:
                         last=False
                     )
                     drop_handle.cancel()
-                    self._safe_mark_done(drop_eid)
+                    self._safe_mark_done(drop_eid, drop_rel)
                     _logger.warning(
                         "cloud-files: backpressure cap reached, dropping pending %s",
                         drop_rel,
@@ -657,7 +737,16 @@ class CloudFilesWatcher:
             except Exception as e:  # noqa: BLE001
                 _logger.exception("cloud-files: drain error: %s", e)
 
-    def _safe_mark_done(self, event_id: str) -> None:
+    def _safe_mark_done(self, event_id: str, rel: Optional[str] = None) -> None:
+        """Retire an event. ``rel`` also clears any hold parked on that path.
+
+        Only a genuinely FINISHED event comes here: accepted by the bridge,
+        superseded by a newer edit, or nothing to send (the file is gone, it is
+        a system path, it is over the size cap). A REFUSAL is not finished —
+        that goes to :meth:`_hold`.
+        """
+        if rel is not None:
+            self._release_hold(rel)
         if not self._persistent_queue or event_id.startswith("mem-"):
             return
         try:
@@ -669,12 +758,103 @@ class CloudFilesWatcher:
         except Exception as e:  # noqa: BLE001
             _logger.warning("cloud-files: mark_done failed: %s", e)
 
+    # ─── Held writes (a refusal is not a completion) ─────────────────────────
+
+    def _hold(self, kind: str, rel: str, event_id: str, error: BaseException) -> None:
+        """Park a write AI Dream would not accept — never mark it done.
+
+        The event stays PENDING in the persistent queue, so a restart replays
+        it; the path is parked here so the daemon's status endpoint can name
+        the refusal; and a slow-cadence retry is scheduled so a transient
+        server state (a membership that is being fixed, a 503 while the lookup
+        is unavailable) converges without anybody doing anything.
+        """
+        described = describe_bridge_failure(error)
+        now = time.time()
+        previous = self._held.get(rel)
+        attempts = (previous.attempts + 1) if previous else 1
+        delay = _held_retry_delay()
+        held = HeldWrite(
+            kind=kind,
+            rel_path=rel,
+            event_id=event_id,
+            refusal=described,
+            attempts=attempts,
+            first_held_ts=previous.first_held_ts if previous else now,
+            last_attempt_ts=now,
+            next_attempt_ts=now + delay,
+        )
+        if rel in self._held:
+            self._held.pop(rel, None)
+        elif len(self._held) >= HELD_MAX_TRACKED:
+            # The index is a view, not the truth: the queue still holds every
+            # event. Say so rather than silently forgetting the oldest entry.
+            dropped, _ = self._held.popitem(last=False)
+            _logger.warning(
+                "cloud-files: held-write index is full (%d) — %s is no longer "
+                "named on the status endpoint, but its event is still PENDING "
+                "in %s and will be retried.",
+                HELD_MAX_TRACKED,
+                dropped,
+                self._persistent_queue.path if self._persistent_queue else "the queue",
+            )
+        self._held[rel] = held
+        self._held_total += 1
+        self._metrics.record_error(kind, rel, described["error"])
+        self._event_arrivals.pop(rel, None)
+        _logger.error(
+            "cloud-files: %s %s was NOT accepted by AI Dream (%s). The edit is "
+            "HELD, not lost: your file on disk is untouched, the event stays in "
+            "the sync queue, and this box will try again in about %.0fs "
+            "(attempt %d). It is counted as held_writes on "
+            "/internal/cloud-sync-status.",
+            kind.upper(),
+            rel,
+            refusal_sentence(described),
+            delay,
+            attempts,
+        )
+        self._schedule_held_retry(held, delay)
+
+    def _schedule_held_retry(self, held: HeldWrite, delay: float) -> None:
+        """Re-run the flush on the SLOW cadence — never the hot loop."""
+        if self._loop is None or self._stop_requested:
+            return
+        kind, rel, eid = held.kind, held.rel_path, held.event_id
+        handle = self._loop.call_later(
+            delay,
+            lambda r=rel, e=eid, k=kind: asyncio.create_task(
+                self._flush_upsert(r, e) if k == "upsert" else self._flush_delete(r, e)
+            ),
+        )
+        self._pending[rel] = (handle, eid)
+
+    def _release_hold(self, rel: str) -> None:
+        """Drop a held write once its path has been accepted or superseded."""
+        if self._held.pop(rel, None) is not None:
+            _logger.info("cloud-files: held write for %s cleared", rel)
+
+    def _held_status(self) -> dict[str, Any]:
+        entries = [h.to_status() for h in list(self._held.values())[:HELD_STATUS_SAMPLE]]
+        last = max(self._held.values(), key=lambda h: h.last_attempt_ts, default=None)
+        return {
+            "count": len(self._held),
+            "held_total": self._held_total,
+            "truncated": max(0, len(self._held) - len(entries)),
+            "entries": entries,
+            "last_refusal": (
+                {**last.to_status(), "sentence": refusal_sentence(last.refusal)}
+                if last is not None
+                else None
+            ),
+        }
+
     # ─── Flush handlers ──────────────────────────────────────────────────────
 
     async def _flush_upsert(self, rel: str, event_id: str) -> None:
         if is_system_path(rel):
             self._event_arrivals.pop(rel, None)
-            self._safe_mark_done(event_id)
+            self._safe_mark_done(event_id, rel)
             return
         # Remove from pending so a new event can schedule a replacement.
         prev = self._pending.pop(rel, None)
@@ -682,7 +862,7 @@ class CloudFilesWatcher:
         # supersedes us — let it handle the upload.
         if prev is not None and prev[1] != event_id:
             self._pending[rel] = prev  # restore the newer one
-            self._safe_mark_done(event_id)
+            self._safe_mark_done(event_id, rel)
             return
 
         assert self._inflight_sem is not None and self._client is not None
@@ -695,12 +875,12 @@ class CloudFilesWatcher:
                         rel,
                     )
                     self._event_arrivals.pop(rel, None)
-                    self._safe_mark_done(event_id)
+                    self._safe_mark_done(event_id, rel)
                     return
                 if not local.exists():
                     # Created-then-deleted within the debounce window. Not an error.
                     self._event_arrivals.pop(rel, None)
-                    self._safe_mark_done(event_id)
+                    self._safe_mark_done(event_id, rel)
                     return
                 size = local.stat().st_size
                 if size > MAX_FILE_SIZE:
@@ -710,7 +890,7 @@ class CloudFilesWatcher:
                         size,
                     )
                     self._event_arrivals.pop(rel, None)
-                    self._safe_mark_done(event_id)
+                    self._safe_mark_done(event_id, rel)
                     return
 
                 # Stability check: re-stat after a short wait. If size is still moving,
@@ -718,7 +898,7 @@ class CloudFilesWatcher:
                 await asyncio.sleep(STABILITY_WAIT_SECONDS)
                 if not local.exists():
                     self._event_arrivals.pop(rel, None)
-                    self._safe_mark_done(event_id)
+                    self._safe_mark_done(event_id, rel)
                     return
                 if local.stat().st_size != size:
                     if self._loop is not None:
@@ -735,7 +915,7 @@ class CloudFilesWatcher:
                             ),
                         )
                         self._pending[rel] = (handle, new_eid)
-                    self._safe_mark_done(event_id)
+                    self._safe_mark_done(event_id, rel)
                     return
 
                 # Pre-send hash short-circuit (A5: don't even hit the bridge if
@@ -746,7 +926,7 @@ class CloudFilesWatcher:
                 new_hash = await asyncio.to_thread(self._sha256, local)
                 if self._last_hash.get(rel) == new_hash:
                     self._event_arrivals.pop(rel, None)
-                    self._safe_mark_done(event_id)
+                    self._safe_mark_done(event_id, rel)
                     return
 
                 t0 = self._event_arrivals.get(rel, time.monotonic())
@@ -768,35 +948,26 @@ class CloudFilesWatcher:
                         self._last_hash[rel] = new_hash
                         self._metrics.record_put(size, latency_ms)
                         self._event_arrivals.pop(rel, None)
-                        self._safe_mark_done(event_id)
+                        self._safe_mark_done(event_id, rel)
                         return
                     except Exception as e:  # noqa: BLE001
                         last_err = e
                         if not _is_retryable_bridge_error(e):
                             break
-                _logger.warning(
-                    "cloud-files: PUT %s failed after retries: %s",
-                    rel,
-                    last_err,
-                )
-                self._metrics.record_error("upsert", rel, str(last_err))
-                self._event_arrivals.pop(rel, None)
-                self._safe_mark_done(event_id)
+                self._hold("upsert", rel, event_id, last_err or RuntimeError("unknown"))
             except Exception as e:  # noqa: BLE001
                 _logger.exception("cloud-files: flush_upsert error for %s: %s", rel, e)
-                self._metrics.record_error("upsert", rel, str(e))
-                self._event_arrivals.pop(rel, None)
-                self._safe_mark_done(event_id)
+                self._hold("upsert", rel, event_id, e)
 
     async def _flush_delete(self, rel: str, event_id: str) -> None:
         if is_system_path(rel):
             self._event_arrivals.pop(rel, None)
-            self._safe_mark_done(event_id)
+            self._safe_mark_done(event_id, rel)
             return
         prev = self._pending.pop(rel, None)
         if prev is not None and prev[1] != event_id:
             self._pending[rel] = prev
-            self._safe_mark_done(event_id)
+            self._safe_mark_done(event_id, rel)
             return
 
         assert self._inflight_sem is not None and self._client is not None
@@ -820,7 +991,7 @@ class CloudFilesWatcher:
                             ),
                         )
                         self._pending[rel] = (handle, new_eid)
-                    self._safe_mark_done(event_id)
+                    self._safe_mark_done(event_id, rel)
                     return
 
                 t0 = self._event_arrivals.get(rel, time.monotonic())
@@ -839,25 +1010,16 @@ class CloudFilesWatcher:
                         self._last_hash.pop(rel, None)
                         self._metrics.record_delete(latency_ms)
                         self._event_arrivals.pop(rel, None)
-                        self._safe_mark_done(event_id)
+                        self._safe_mark_done(event_id, rel)
                         return
                     except Exception as e:  # noqa: BLE001
                         last_err = e
                         if not _is_retryable_bridge_error(e):
                             break
-                _logger.warning(
-                    "cloud-files: DELETE %s failed after retries: %s",
-                    rel,
-                    last_err,
-                )
-                self._metrics.record_error("delete", rel, str(last_err))
-                self._event_arrivals.pop(rel, None)
-                self._safe_mark_done(event_id)
+                self._hold("delete", rel, event_id, last_err or RuntimeError("unknown"))
             except Exception as e:  # noqa: BLE001
                 _logger.exception("cloud-files: flush_delete error for %s: %s", rel, e)
-                self._metrics.record_error("delete", rel, str(e))
-                self._event_arrivals.pop(rel, None)
-                self._safe_mark_done(event_id)
+                self._hold("delete", rel, event_id, e)
 
     # ─── Downstream / echo-loop helpers ──────────────────────────────────────
 
@@ -1032,12 +1194,26 @@ class CloudFilesWatcher:
                 "recent_errors": list(m.recent_errors)[:8],
             },
             "queue": queue_stats,
+            # Writes AI Dream refused. A non-zero count means a person has
+            # edits that are NOT in the cloud yet and the reason is right here
+            # — never a silent loss (this endpoint is what the frontend's sync
+            # indicator and the orchestrator read).
+            "held_writes": self._held_status(),
             "downstream": {
                 "subscriber": sub_kind,
                 "received": self._remote_received,
                 "applied": self._remote_applied,
                 "echo_suppressed": self._remote_echo_suppressed,
                 "recently_applied_size": len(self._recently_applied),
+                # A 4xx on the DOWN direction (the box is refused the change
+                # feed) means this sandbox stopped receiving the user's cloud
+                # edits. Same rule as a held write: it is named, not logged and
+                # forgotten.
+                **(
+                    self._subscriber.status()
+                    if hasattr(self._subscriber, "status")
+                    else {}
+                ),
             },
         }
 
@@ -1058,6 +1234,16 @@ class CloudFilesWatcher:
                 self._persistent_queue.stats()["pending"]
                 if self._persistent_queue
                 else 0
+            ),
+            "held_writes": len(self._held),
+            "held_last_refusal": (
+                refusal_sentence(
+                    max(
+                        self._held.values(), key=lambda h: h.last_attempt_ts
+                    ).refusal
+                )
+                if self._held
+                else None
             ),
             "downstream_received": self._remote_received,
             "downstream_applied": self._remote_applied,
