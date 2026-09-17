@@ -99,20 +99,26 @@ matrx_bridge_env_failed() {
     chmod 0644 "$BRIDGE_ENV_FAILED_FILE" 2>/dev/null || true
     echo "[bridge-env] FAILED to publish this sandbox's identity — see $BRIDGE_ENV_FAILED_FILE. Shells, the mtx CLI and git credentials will refuse AI Dream calls and say why." >&2
 }
-trap 'matrx_bridge_env_failed "$LINENO" "$?"' ERR
+trap 'status=$?; matrx_bridge_env_failed "$LINENO" "$status"; exit "$status"' ERR
 
 mkdir -p "$BRIDGE_ENV_DIR"
 
 umask 027
-{
-    echo "# Written by write-bridge-env.sh at container start — do not edit."
-    echo "# The identity this sandbox carries into every AI Dream call."
+write_bridge_env() {
+    echo "# Written by write-bridge-env.sh at container start — do not edit." || return
+    echo "# The identity this sandbox carries into every AI Dream call." || return
     for name in SANDBOX_ID USER_ID ORGANIZATION_ID MATRX_AIDREAM_URL MATRX_AIDREAM_SERVICE_TOKEN; do
         value="${!name:-}"
         [ -n "$value" ] || continue
-        printf 'export %s=%q\n' "$name" "$value"
+        printf 'export %s=%q\n' "$name" "$value" || return
     done
-} > "$BRIDGE_ENV_FILE"
+}
+# Bash does not reliably run ERR/errexit for a compound command whose output
+# redirection cannot be opened (observed with a directory at this path).
+if ! write_bridge_env > "$BRIDGE_ENV_FILE"; then
+    matrx_bridge_env_failed "$LINENO" 1
+    exit 1
+fi
 
 chown "$BRIDGE_ENV_OWNER" "$BRIDGE_ENV_FILE" 2>/dev/null || true
 chmod 0640 "$BRIDGE_ENV_FILE"
