@@ -38,9 +38,17 @@ retired from the durable queue after the one loud error record.
 hashes run through `asyncio.to_thread`. Filesystem observer callbacks hand work
 to the loop with `call_soon_threadsafe` and never perform network I/O.
 
-**The server sets the polling cadence; this box follows it.** Realtime is the primary
-down-direction path and `/api/cloud-files/changes` is the fallback. Every answer from that
-endpoint carries `poll_after_seconds` (mirrored in the `Retry-After` header) — 30 s normally,
+**There is ONE downstream transport: the bridge's change feed.** A sandbox never
+subscribes to the platform database. The direct Supabase-Realtime subscriber that used to sit
+beside the poller was deleted on 2026-09-17: it opened a WebSocket to the platform database
+scoped only by a client-side `owner_id` filter — no organization, no bridge — behind a
+five-name Supabase key ladder the orchestrator never injects (those names are on the
+platform-env deny-list), so it could not run, and `make_subscriber` fell back to polling without
+a word. `make_subscriber` now returns `PollingSubscriber` and LOGS which transport is in use;
+the poller logs its deletion support on the first answer.
+
+**The server sets the polling cadence; this box follows it.** Every answer from
+`/api/cloud-files/changes` carries `poll_after_seconds` (mirrored in the `Retry-After` header) — 30 s normally,
 45 s while AI Dream's change feed is shedding — and `downstream.PollingSubscriber` adopts it for
 its next wait, jittered like every other wait here. An instruction outside 5–600 s is refused with
 a warning and the built-in 30 s is kept; an answer with no instruction (an older bridge) changes
@@ -49,6 +57,39 @@ at 7.5 polls/s, which is more than the server's bounded feed can serve — follo
 the fleet to 5.02/s the moment anyone is shed. Server side:
 `aidream/services/sandboxes/change_feed_admission.py` + knobs `infrastructure.sandbox` /
 `change_feed_*`.
+
+## The `/changes` contract — what the two halves meet on
+
+`GET /api/cloud-files/changes?since=<iso>&limit=<n>` is the whole downstream path,
+so everything the sandbox must learn has to be in its answer. The sandbox half is
+implemented; the aidream half of the deletion leg is owned by the aidream lane.
+
+Envelope:
+
+| Key | Type | Meaning |
+|---|---|---|
+| `files` | list of row objects | every change with `updated_at > since`, oldest→newest |
+| `next_cursor` | ISO-8601 string | the cursor to send as `since` next round |
+| `deletions_supported` | bool | **whether `files` includes deletions at all** |
+| `poll_after_seconds` | number (optional) | cadence instruction, honoured within 5–600 s |
+
+Row object: `file_path` (required — a row without it is skipped), `file_size`,
+`checksum`, `current_version`, `updated_at`, and for a deletion **`deleted: true`**
+(`deleted_at` is accepted as the same statement, because a row carrying it can never
+be a modification). The sandbox turns a marked row into `RemoteChange(kind="deleted")`,
+which unlinks the local file and drops it from the hash cache; everything else becomes
+`kind="modified"`.
+
+**Why the deletion marker is not optional.** `deletions_supported` is `false` today
+(`aidream/api/routers/cloud_files_bridge.py::list_changes` filters `deleted_at IS NULL`
+and its docstring says soft-deletes "only show up via Realtime"). With Realtime gone,
+a file the user deletes in the UI is never removed from the sandbox, and the shutdown
+up-sync pushes it back to the cloud — the delete undoes itself. Until the aidream side
+ships, every sandbox says so once, at WARNING, with this remedy
+(`downstream.PollingSubscriber._note_deletion_support`); it is not a best-effort
+silence. When aidream includes soft-deleted rows marked `deleted: true` and flips
+`deletions_supported` to `true`, this image already honours it — no sandbox change, no
+image rebuild ordering problem, and the sandbox's log line flips to the INFO form.
 
 ## Entry points
 
@@ -64,9 +105,20 @@ the fleet to 5.02/s the moment anyone is shed. Server side:
 
 - `pytest sandbox-image/sdk/tests/test_cloud_sync_boundaries.py`
 - `pytest sandbox-image/sdk/tests/test_downstream_retry_after.py`
+- `pytest sandbox-image/sdk/tests/test_downstream_deletions.py`
 
 ## Change log
 
+- 2026-09-17 — **One downstream transport, and deletions are a contract, not a
+  hope.** The direct Supabase-Realtime subscriber and its five-name Supabase key
+  ladder were DELETED (a sandbox never talks to the platform database; the bridge
+  is the one hop and it carries the organization). The dead path had been
+  falling back to polling silently since it shipped. `make_subscriber` now
+  announces the transport, `PollingSubscriber` honours `deleted: true` rows, and
+  a bridge reporting `deletions_supported: false` makes the box state the
+  consequence (a deleted file is resurrected by the shutdown up-sync) with the
+  remedy. Contract: § The `/changes` contract above. Guards:
+  `tests/test_downstream_deletions.py`.
 - 2026-09-17 — **The organization now crosses the boundary.** Identity headers
   moved into one builder (`bridge_headers.py` / `scripts/bridge-headers.sh`) and
   every sandbox → AI Dream call sends `X-Organization-Id` beside

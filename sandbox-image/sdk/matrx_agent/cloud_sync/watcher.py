@@ -438,7 +438,7 @@ class CloudFilesWatcher:
         except Exception as e:  # noqa: BLE001
             _logger.warning("cloud-files: queue replay failed: %s", e)
 
-        # B1 — start the down-direction subscriber (Realtime + polling fallback).
+        # B1 — start the one down-direction subscriber (the bridge change feed).
         try:
             self._subscriber = make_subscriber(self._client, self._cfg)
             await self._subscriber.start(self._apply_remote_change)
@@ -901,7 +901,7 @@ class CloudFilesWatcher:
         For 'deleted': unlink locally, drop from _last_hash.
 
         Failures here are logged but never raise — the next polling cycle
-        (or Realtime event) will retry naturally.
+        will retry naturally.
         """
         self._remote_received += 1
         rel = change.rel_path or ""

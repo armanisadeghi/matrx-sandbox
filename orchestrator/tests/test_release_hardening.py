@@ -522,7 +522,10 @@ def test_every_aidream_container_path_uses_shared_isolation_and_readiness():
     assert '_wait_container_ready(new, verify_timeout, template)' in migrate
     assert "http://127.0.0.1:8001/api/health/ready" in migrate
     assert "aidream-helpers.sh verify-release" in migrate
-    assert "if not warm_pool_supports_template(template)" in pool
+    # The warm pool is retired: the file must no longer be able to BOOT a box
+    # (that is what made a sentinel-identity container in the first place).
+    assert "containers.run(" not in pool
+    assert "retire_warm_pool" in pool
 
 
 def test_aidream_release_source_verifier_rejects_dirty_and_wrong_sha(tmp_path: Path):

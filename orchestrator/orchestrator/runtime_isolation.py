@@ -5,7 +5,6 @@ from __future__ import annotations
 from typing import Any
 
 _AIDREAM_TEMPLATE = "aidream"
-_OWNER_BOUND_TEMPLATES = {_AIDREAM_TEMPLATE, "development"}
 _AIDREAM_TMPFS = {
     "/tmp": "rw,nosuid,nodev,mode=1777",
     "/var/tmp": "rw,nosuid,nodev,mode=1777",
@@ -41,10 +40,9 @@ def container_runtime_isolation(template: str | None, tier: str | None) -> dict[
     }
 
 
-def warm_pool_supports_template(template: str | None) -> bool:
-    """Owner-bound boxes require env/storage and cannot be pre-warmed."""
+# ``warm_pool_supports_template`` lived here until 2026-09-17, when the warm
+# pool was retired (orchestrator/pool.py): NO template can be pre-warmed, not
+# just the owner-bound ones, because a box that boots before it has a user and
+# an organization can never be handed one afterwards.
 
-    return template not in _OWNER_BOUND_TEMPLATES
-
-
-__all__ = ["container_runtime_isolation", "warm_pool_supports_template"]
+__all__ = ["container_runtime_isolation"]

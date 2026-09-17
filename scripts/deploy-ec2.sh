@@ -536,6 +536,9 @@ PY
   rollback_aidream_url=$(resolve_setting MATRX_AIDREAM_URL)
   [ "$rollback_aidream_url" = "$EXPECTED_AIDREAM_URL" ] \
     || log "ERROR: rollback EC2 route is '${rollback_aidream_url:-unset}', expected $EXPECTED_AIDREAM_URL"
+  # bridge-headers: exempt — an unauthenticated /health/version reachability
+  # probe from the deploy host; it carries no user and no organization because
+  # it acts for nobody.
   curl -fsS --max-time 15 "$EXPECTED_AIDREAM_URL/health/version" >/dev/null \
     || log "ERROR: rollback orchestrator cannot reach AWS-local AI Dream"
   [ "$rollback_verified" = 1 ] \
@@ -673,6 +676,7 @@ if [ "$LIVE_AIDREAM_URL" != "$EXPECTED_AIDREAM_URL" ]; then
   echo "[deploy-ec2] ERROR: live EC2 orchestrator route changed during promotion: '${LIVE_AIDREAM_URL:-unset}'" >&2
   rollback
 fi
+# bridge-headers: exempt — unauthenticated reachability probe, acts for nobody.
 if ! curl -fsS --max-time 15 "$LIVE_AIDREAM_URL/health/version" >/dev/null; then
   echo "[deploy-ec2] ERROR: live EC2 orchestrator cannot reach its AWS-local AI Dream replica" >&2
   rollback

@@ -280,26 +280,20 @@ def test_runtime_isolation_is_one_shared_policy_for_every_constructor():
     assert container_runtime_isolation("aidream", "ec2")["cap_add"] == ["SYS_ADMIN"]
 
 
-_WARM_KW = {"shutdown_timeout_seconds": 30, "container_cpu_limit": 2.0, "container_memory_limit": "4g"}
-
-
-def test_aidream_warm_pool_is_structurally_prohibited(monkeypatch):
+def test_no_template_can_be_pre_warmed_at_all(monkeypatch):
+    """These two tests used to prove that the OWNER-BOUND templates (aidream,
+    development) refused to pre-warm. The warm pool is retired
+    (orchestrator/pool.py, 2026-09-17): NO template can be pre-booted, because
+    a container that starts before it has a user and an organization can never
+    be given them afterwards — Docker cannot change a running container's
+    environment, and the request context is carried, never rebuilt."""
     from orchestrator import pool
 
     get_client = MagicMock(side_effect=AssertionError("Docker must not be called"))
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", get_client)
 
-    assert pool._warm_run_container("aidream", **_WARM_KW) is None
-    get_client.assert_not_called()
-
-
-def test_development_warm_pool_is_structurally_prohibited(monkeypatch):
-    from orchestrator import pool
-
-    get_client = MagicMock(side_effect=AssertionError("Docker must not be called"))
-    monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", get_client)
-
-    assert pool._warm_run_container("development", **_WARM_KW) is None
+    assert not hasattr(pool, "_warm_run_container")
+    assert not hasattr(pool, "claim_warm")
     get_client.assert_not_called()
 
 

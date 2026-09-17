@@ -131,6 +131,40 @@ names the missing variable; it never sends half the context.
 | Header user_id doesn't exist in `auth.users` | 404 (don't leak existence) |
 | User exists but is disabled | 403 |
 
+### What a SHELL in the sandbox sees (and the ruling on the token)
+
+The orchestrator injects `MATRX_AIDREAM_URL`, `MATRX_AIDREAM_SERVICE_TOKEN`,
+`USER_ID` and `ORGANIZATION_ID` as CONTAINER environment. PID 1 and the API
+daemon see it; **sshd passes its environment to nothing it starts**, so until
+2026-09-17 a person or agent who shelled in saw none of it: `git push` fell
+through to an absent `GITHUB_TOKEN` and exited 0 (the user's connected GitHub
+account silently not there), and `mtx files ls` said "AI Dream not configured
+for this sandbox" on a fully wired box.
+
+Every entrypoint now publishes that identity to **`/etc/matrx/bridge-env.sh`**
+(`sandbox-image/scripts/write-bridge-env.sh`, root:agent 0640, rewritten from
+the live env on every boot, never in the user's home volume). It is sourced by
+`/etc/profile.d/00-matrx-bridge.sh` (login shells), by `~/.sandbox_env`
+(interactive shells) and — the case that covers `ssh box 'git push'`, which
+reads neither — directly by `scripts/bridge-headers.sh` and
+`matrx_agent.bridge_headers`, which never override a value already exported.
+`bridge-headers.sh` is quiet only when NONE of the four variables exists
+anywhere (an unwired image); a box carrying some of them and missing the rest
+is a provisioning defect and says so on stderr, by variable name.
+
+**Ruling: the shell may hold the service token.** SSH admits only `agent` and
+`root`, `agent` has `NOPASSWD:ALL` sudo, and the API daemon runs as `agent`
+with the token in its environment — `tr '\0' '\n' < /proc/<daemon>/environ`
+already hands any shell the same value (verified 2026-09-17). Withholding it
+buys no confidentiality and costs an honest `git push`; routing the credential
+helper through a localhost daemon endpoint instead would need a daemon secret
+the shell equally lacks, on a daemon that binds 0.0.0.0 and fails open when
+`MATRX_AGENT_TOKEN` is unset — strictly weaker. What IS wrong is that the token
+is one SHARED master (a box holding it can act as any user); the remedy is the
+per-sandbox scoped token tracked in
+`docs/incidents/2026-09-13-platform-env-leak.md`, after which this channel
+carries the scoped token unchanged.
+
 ### Organization vault injection
 
 Sandbox creation also uses this service-token boundary for secret injection. Every caller must send the initiating `organization_id` with `POST /sandboxes`; requests without it fail before container creation or persistence. The orchestrator calls:
@@ -145,7 +179,7 @@ X-Organization-Id: <org_uuid>
 The query parameter is legacy: AI Dream reads the organization from the header
 and refuses the call when the two disagree. AI Dream revalidates that the user is an active member and may use each shared value, resolves organization entries, then overlays personal entries with the same key. Plaintext returns only to the orchestrator and is injected at container boot. The user-JWT `/api/user-secrets/sandbox-env` route remains personal-only, so it cannot be called as an organization-secret reveal endpoint.
 
-The orchestrator records `organization_id` as a required persistent model field, in sandbox config, and on the container label so reset, resume, and reconcile preserve it. It never selects a personal, active, or system organization. Organization-scoped claims skip the warm pool because a running container cannot accept new environment variables.
+The orchestrator records `organization_id` as a required persistent model field, in sandbox config, and on the container label so reset, resume, and reconcile preserve it. It never selects a personal, active, or system organization. That is also why the warm pool is retired (2026-09-17): a running container cannot accept new environment variables, so a pre-booted box could never be given the user and organization it must carry — every claim cold-creates.
 
 ---
 

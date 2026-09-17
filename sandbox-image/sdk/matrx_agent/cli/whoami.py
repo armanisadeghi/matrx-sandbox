@@ -16,6 +16,11 @@ from urllib.request import Request, urlopen
 
 
 def _probe_bridge(url: str) -> dict:
+    # bridge-headers: exempt — ``/api/cloud-files/integrations.aidream`` is AI
+    # Dream's PUBLIC probe: it takes no identity and returns only whether the
+    # bridge is configured on the server side. Sending the service token here
+    # would prove nothing and spread it further. Every other call this image
+    # makes to AI Dream goes through matrx_agent.bridge_headers.
     if not url:
         return {"reachable": False, "configured": False, "reason": "no MATRX_AIDREAM_URL"}
     probe = url.rstrip("/") + "/api/cloud-files/integrations.aidream"

@@ -19,7 +19,6 @@ dependencies = [
     # so the sandbox gets sub-second visibility into edits the user makes via
     # the AI Dream UI. Falls back to polling when SUPABASE_URL / KEY env are
     # absent, so it's safe on builds that don't pass them through.
-    "realtime>=2.0",
 ]
 
 [project.optional-dependencies]

@@ -47,7 +47,7 @@ MATRX_IMAGE_VERSION=v1.2.3 ./sandbox-image/build.sh slim   # pin an explicit ver
 
 ### 2. Drift detection — *which boxes are stale?*
 
-`orchestrator/versioning.py` compares each **live, claimed** box to the **current** image for its template. Detection is by **image ID** (exact, and works on boxes already running — no rebuild needed); the baked version string is shown for humans + used in the migration self-check. Warm/unclaimed pool boxes are skipped (the warm-pool refresher handles those).
+`orchestrator/versioning.py` compares each **live, claimed** box to the **current** image for its template. Detection is by **image ID** (exact, and works on boxes already running — no rebuild needed); the baked version string is shown for humans + used in the migration self-check. Warm/unclaimed boxes are skipped; since the warm pool was retired (2026-09-17) the boot sweep in `orchestrator/pool.py` REMOVES any that are left, so none should exist.
 
 - **`GET /drift`** (master-key) — tier-scoped report: `{tier, total, drifted, stale_sandbox_ids, boxes:[…]}`. Each box row carries `running_image_id`, `running_version`, `current_image_id`, `current_version`, `drifted`, `reason`.
 - The **reaper** logs a loud `SANDBOX VERSION DRIFT` warning every sweep when any box is stale, and includes a `drifted=N` count in its periodic line — so drift is never silent.

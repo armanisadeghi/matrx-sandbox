@@ -62,6 +62,15 @@ echo "[2/5] Cold storage mounted."
 # ─── Step 3: Set up environment for agent ─────────────────────────────────────
 echo "[3/5] Preparing agent environment..."
 
+# Publish the container identity (user, organization, AI Dream URL + token)
+# where SHELLS can read it. sshd passes the container env to nothing, so
+# without this a `git push` or `mtx` from an SSH session sees an unwired box
+# and fails silently — see write-bridge-env.sh for the full story and the
+# ruling on the service token. /etc is the container layer, never the user's
+# home volume, and it is rewritten from the live env on every boot (so it runs
+# on the migration-activation path too, which preserves the mounted home).
+/opt/sandbox/scripts/write-bridge-env.sh || true
+
 if [ "$MATRX_MIGRATION_ACTIVATION" = "0" ]; then
 /opt/sandbox/scripts/prepare-agent-home.sh
 
@@ -71,6 +80,10 @@ export SANDBOX_ID="${SANDBOX_ID}"
 export USER_ID="${USER_ID}"
 export HOT_PATH="${HOT_PATH}"
 export COLD_PATH="${COLD_PATH}"
+# The identity every AI Dream call carries (USER_ID, ORGANIZATION_ID,
+# MATRX_AIDREAM_URL, MATRX_AIDREAM_SERVICE_TOKEN). Sourced, not copied: this
+# file lives in the per-user home VOLUME and must never hold the token.
+[ -r /etc/matrx/bridge-env.sh ] && . /etc/matrx/bridge-env.sh
 EOF
 chown agent:agent /home/agent/.sandbox_env
 

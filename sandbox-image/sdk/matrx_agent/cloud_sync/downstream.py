@@ -1,25 +1,39 @@
-"""Downstream subscribers — the cloud → sandbox half of the sync.
+"""The downstream half of the sync: cloud → sandbox. ONE transport, announced.
 
-Two implementations:
+``PollingSubscriber`` calls the bridge's ``/api/cloud-files/changes?since=…``,
+dispatches one ``RemoteChange`` per row to the watcher, and follows the poll
+cadence the server asks for. It is the only downstream transport there is.
 
-- ``PollingSubscriber`` — calls the bridge's ``/api/cloud-files/changes?since=…``
-  endpoint every 30s, finds rows with ``updated_at > since``, and dispatches
-  one ``RemoteChange`` per row to the watcher. Always available; works on
-  ``:core`` and ``:aidream`` images alike. Doesn't surface deletions in v1
-  (the bridge doesn't expose them — see ``cloud_files_bridge.py::list_changes``).
+A ``RealtimeSubscriber`` lived here until 2026-09-17. It opened a WebSocket
+straight to the PLATFORM DATABASE (Supabase Realtime on ``cld_files``), scoped
+by nothing but a client-side ``owner_id`` filter — no organization, no bridge,
+no admission control — using whichever of five Supabase key names happened to
+be in the container env. It was dead code by construction: the orchestrator
+never injects any of those names (``*_SECRET*`` / ``*_KEY*`` are on the
+platform-env deny-list, docs/incidents/2026-09-13-platform-env-leak.md), so
+``_realtime_available()`` was always false and ``make_subscriber`` fell back to
+polling WITHOUT SAYING SO. It is deleted, not disabled, for two reasons:
 
-- ``RealtimeSubscriber`` — uses Supabase Realtime over a Postgres-WAL-backed
-  WebSocket to receive INSERT/UPDATE/DELETE events on ``cld_files`` filtered
-  by ``owner_id=eq.<USER_ID>``. Sub-second latency. Requires the operator to
-  have applied ``aidream/db/migrations/0002_cld_files_realtime.sql`` and the
-  sandbox image to ship the ``realtime`` Python package + Supabase URL/key
-  env passthrough. Falls back to ``PollingSubscriber`` on any connection
-  failure.
+  * **A sandbox never talks to the platform database directly.** The bridge is
+    the one hop, and the bridge is what carries the organization — the law is
+    THE REQUEST CONTEXT IS CARRIED, NEVER REBUILT
+    (``common-docs/policies/context-is-carried-never-rebuilt.md``). A WAL
+    subscription filtered client-side is the opposite of that.
+  * Reviving it would have needed a platform database key inside every user's
+    box, which is exactly the leak the platform spent an incident closing.
 
-The watcher uses ``make_subscriber()`` which returns the best implementation
-available for the current sandbox.
+**Deletions.** With Realtime gone, deletions must arrive on the one hop, and
+today they do not: ``/api/cloud-files/changes`` returns modifications only and
+says so with ``deletions_supported: false``. A file the user deletes in the UI
+therefore stays on disk in the sandbox, and the shutdown up-sync RESURRECTS it.
+That is a real, user-visible defect, so this subscriber (a) honours the
+deletion markers the moment the bridge ships them and (b) says the consequence
+out loud, once, when the bridge reports it cannot send them — never a silent
+best-effort. The exact contract the two halves meet on is written down in
+``sandbox-image/sdk/matrx_agent/cloud_sync/FEATURE.md`` § The ``/changes``
+contract; the aidream side of it is another lane's.
 
-Both implementations call back into a single async callback:
+Both call back into a single async callback:
 
     async def on_change(change: RemoteChange) -> None: ...
 
@@ -68,7 +82,6 @@ POLL_BACKOFF_MAX = 300.0  # 5 min
 # pollers landed inside one second and consumed the server's pool; the server
 # now sheds such herds with a 503 + Retry-After, which the loop honours).
 POLL_JITTER_FRACTION = 0.2
-REALTIME_RETRY_INTERVAL = 300.0  # try Realtime again every 5 min when we've fallen back to polling
 
 
 @dataclass(frozen=True)
@@ -108,12 +121,21 @@ class PollingSubscriber:
         #: does. Kept on the subscriber so a single instruction survives the
         #: next cycle rather than being re-learned each round.
         self._interval_seconds = POLL_INTERVAL_SECONDS
+        #: Whether the bridge has told us it can send deletions, and whether we
+        #: have already said what that means. Announced ONCE per session, on
+        #: the first answer — never per poll, never not at all.
+        self._deletions_supported: Optional[bool] = None
+        self._announced_deletion_support = False
 
     async def start(self, on_change: OnChange) -> None:
         if self._task is not None:
             return
         self._task = asyncio.create_task(self._loop(on_change))
-        _logger.info("cloud-files: PollingSubscriber started (interval=%.0fs)", POLL_INTERVAL_SECONDS)
+        _logger.info(
+            "cloud-files: downstream sync is polling the bridge change feed "
+            "every %.0fs (deletion support is reported by the server on the "
+            "first answer)", POLL_INTERVAL_SECONDS,
+        )
 
     async def stop(self) -> None:
         self._stop.set()
@@ -139,18 +161,23 @@ class PollingSubscriber:
                 rows = envelope.get("files") or []
                 next_cursor = envelope.get("next_cursor") or self._cursor_iso
 
+                self._note_deletion_support(envelope.get("deletions_supported"))
+
                 for rec in rows:
                     rel = rec.get("file_path")
                     if not rel:
                         continue
-                    change = RemoteChange(
-                        kind="modified",
-                        rel_path=rel,
-                        file_size=rec.get("file_size"),
-                        checksum=rec.get("checksum"),
-                        current_version=rec.get("current_version"),
-                        updated_at=rec.get("updated_at"),
-                    )
+                    if _row_is_deleted(rec):
+                        change = RemoteChange(kind="deleted", rel_path=rel)
+                    else:
+                        change = RemoteChange(
+                            kind="modified",
+                            rel_path=rel,
+                            file_size=rec.get("file_size"),
+                            checksum=rec.get("checksum"),
+                            current_version=rec.get("current_version"),
+                            updated_at=rec.get("updated_at"),
+                        )
                     try:
                         await on_change(change)
                     except Exception as e:  # noqa: BLE001
@@ -188,6 +215,38 @@ class PollingSubscriber:
             except asyncio.TimeoutError:
                 pass
 
+    def _note_deletion_support(self, raw: Any) -> None:
+        """Say — once — whether deletions reach this sandbox at all.
+
+        ``deletions_supported: false`` is not a detail: a file the user deleted
+        in AI Dream stays on disk here, and the shutdown up-sync pushes it back,
+        so the delete appears to undo itself. Nothing may fail silently, so the
+        box states the consequence and the remedy instead of quietly syncing
+        half the truth. The contract is in this package's FEATURE.md.
+        """
+        supported = bool(raw)
+        self._deletions_supported = supported
+        if self._announced_deletion_support:
+            return
+        self._announced_deletion_support = True
+        if supported:
+            _logger.info(
+                "cloud-files: the bridge change feed carries deletions — a file "
+                "deleted in AI Dream is removed from this sandbox too.",
+            )
+        else:
+            _logger.warning(
+                "cloud-files: the bridge change feed reports "
+                "deletions_supported=false, so a file DELETED in AI Dream is "
+                "NOT removed from this sandbox and the shutdown up-sync will "
+                "restore it in the cloud. Remedy: AI Dream's "
+                "/api/cloud-files/changes must include soft-deleted rows marked "
+                "deleted=true and set deletions_supported=true (contract: "
+                "matrx_agent/cloud_sync/FEATURE.md § The /changes contract). "
+                "Until it does, deletions only converge on the next session's "
+                "bulk down-sync.",
+            )
+
     def _adopt_server_interval(self, raw: Any) -> None:
         """Take the bridge's ``poll_after_seconds`` instruction, or say why not.
 
@@ -218,6 +277,19 @@ class PollingSubscriber:
                 "following it.", asked, self._interval_seconds,
             )
             self._interval_seconds = asked
+
+
+def _row_is_deleted(rec: dict) -> bool:
+    """True when the bridge marked this change-feed row as a deletion.
+
+    ``deleted: true`` is the contract (FEATURE.md § The /changes contract);
+    ``deleted_at`` is accepted as the same statement because it is the column
+    the soft-delete actually writes, and a row carrying it can never be a
+    modification.
+    """
+    if rec.get("deleted") is True:
+        return True
+    return bool(rec.get("deleted_at"))
 
 
 def _jittered(seconds: float) -> float:
@@ -251,219 +323,24 @@ def _retry_after_seconds(error: BaseException) -> Optional[float]:
 
 
 # ──────────────────────────────────────────────────────────────────────────
-# Realtime (optional)
-# ──────────────────────────────────────────────────────────────────────────
-
-
-def _realtime_available() -> bool:
-    """True iff the optional ``realtime`` package is importable AND the
-    Supabase URL/key are present in env. Used by ``make_subscriber`` to
-    decide whether to attempt Realtime at all.
-    """
-    if not _supabase_creds():
-        return False
-    try:
-        import realtime  # noqa: F401
-        return True
-    except ImportError:
-        return False
-
-
-def _supabase_creds() -> Optional[tuple[str, str]]:
-    url = (
-        os.environ.get("SUPABASE_URL")
-        or os.environ.get("SUPABASE_MATRIX_URL")
-        or ""
-    )
-    key = (
-        os.environ.get("SUPABASE_ANON_KEY")
-        or os.environ.get("SUPABASE_KEY")
-        or os.environ.get("SUPABASE_SECRET_KEY")
-        or os.environ.get("SUPABASE_SERVICE_ROLE_KEY")
-        or os.environ.get("SUPABASE_MATRIX_KEY")
-        or ""
-    )
-    if url and key:
-        return (url, key)
-    return None
-
-
-class RealtimeSubscriber:
-    """Listen to Postgres WAL events on ``cld_files`` filtered by owner_id.
-
-    Runs Realtime if the env + lib are present; transparently falls back to
-    the inner ``PollingSubscriber`` on any failure. Re-attempts Realtime
-    every REALTIME_RETRY_INTERVAL seconds even after a fallback so a flaky
-    network doesn't condemn us to polling for the rest of the session.
-    """
-
-    def __init__(self, cfg: BridgeConfig, fallback: PollingSubscriber):
-        self._cfg = cfg
-        self._fallback = fallback
-        self._task: Optional[asyncio.Task] = None
-        self._stop = asyncio.Event()
-        self._connected = False
-
-    async def start(self, on_change: OnChange) -> None:
-        if self._task is not None:
-            return
-        self._task = asyncio.create_task(self._supervisor(on_change))
-        _logger.info("cloud-files: RealtimeSubscriber started")
-
-    async def stop(self) -> None:
-        self._stop.set()
-        await self._fallback.stop()
-        if self._task is not None:
-            self._task.cancel()
-            try:
-                await self._task
-            except (asyncio.CancelledError, Exception):  # noqa: BLE001
-                pass
-            self._task = None
-
-    async def _supervisor(self, on_change: OnChange) -> None:
-        """Try Realtime; on any error, hand the channel over to the polling
-        fallback and retry Realtime in the background.
-        """
-        polling_active = False
-        while not self._stop.is_set():
-            ok = await self._try_realtime(on_change)
-            if ok:
-                # Realtime ran and exited cleanly (e.g. shutdown signal).
-                if polling_active:
-                    await self._fallback.stop()
-                return
-            # Realtime failed. Run polling in the meantime.
-            if not polling_active:
-                _logger.warning("cloud-files: Realtime unavailable, switching to polling fallback")
-                await self._fallback.start(on_change)
-                polling_active = True
-            try:
-                await asyncio.wait_for(self._stop.wait(), timeout=REALTIME_RETRY_INTERVAL)
-                return
-            except asyncio.TimeoutError:
-                _logger.info("cloud-files: retrying Realtime after %.0fs of polling", REALTIME_RETRY_INTERVAL)
-
-    async def _try_realtime(self, on_change: OnChange) -> bool:
-        """Attempt one Realtime session. Returns True on clean exit (stop
-        requested), False on any error or unsupported environment.
-        """
-        creds = _supabase_creds()
-        if creds is None:
-            return False
-        url, key = creds
-
-        try:
-            from realtime import AsyncRealtimeClient  # type: ignore
-        except ImportError:
-            return False
-
-        ws_url = url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
-        client = AsyncRealtimeClient(f"{ws_url}/realtime/v1/websocket", key)
-        try:
-            await client.connect()
-        except Exception as e:  # noqa: BLE001
-            _logger.warning("cloud-files: realtime connect failed: %s", e)
-            return False
-
-        self._connected = True
-        try:
-            channel = client.channel(f"realtime:public:cld_files:owner_id=eq.{self._cfg.user_id}")
-
-            async def _on_postgres_change(payload: dict) -> None:
-                try:
-                    await self._dispatch(payload, on_change)
-                except Exception as e:  # noqa: BLE001
-                    _logger.warning("cloud-files: realtime dispatch failed: %s", e)
-
-            channel.on_postgres_changes(
-                event="*",
-                schema="public",
-                table="cld_files",
-                callback=_on_postgres_change,
-                filter=f"owner_id=eq.{self._cfg.user_id}",
-            )
-            await channel.subscribe()
-            _logger.info("cloud-files: realtime subscribed to cld_files for user")
-
-            # Block until shutdown is requested.
-            await self._stop.wait()
-            try:
-                await channel.unsubscribe()
-            except Exception:  # noqa: BLE001
-                pass
-            return True
-        except Exception as e:  # noqa: BLE001
-            _logger.warning("cloud-files: realtime channel error: %s", e)
-            return False
-        finally:
-            self._connected = False
-            try:
-                await client.close()
-            except Exception:  # noqa: BLE001
-                pass
-
-    async def _dispatch(self, payload: dict, on_change: OnChange) -> None:
-        """Translate a Supabase Realtime payload into RemoteChange events.
-
-        Payload shape (Supabase Realtime v2):
-            {
-                "schema": "public",
-                "table": "cld_files",
-                "commit_timestamp": "...",
-                "eventType": "INSERT" | "UPDATE" | "DELETE",
-                "new": {...} | None,
-                "old": {...} | None,
-            }
-        """
-        event = (payload.get("eventType") or payload.get("type") or "").upper()
-        new = payload.get("new") or {}
-        old = payload.get("old") or {}
-
-        if event == "DELETE":
-            rel = old.get("file_path") or new.get("file_path")
-            if not rel:
-                return
-            await on_change(RemoteChange(kind="deleted", rel_path=rel))
-            return
-
-        # INSERT / UPDATE
-        rel = new.get("file_path")
-        if not rel:
-            return
-        # Soft-delete shows up as UPDATE with deleted_at set.
-        if new.get("deleted_at"):
-            await on_change(RemoteChange(kind="deleted", rel_path=rel))
-            return
-        await on_change(RemoteChange(
-            kind="modified",
-            rel_path=rel,
-            file_size=new.get("file_size"),
-            checksum=new.get("checksum"),
-            current_version=new.get("current_version"),
-            updated_at=new.get("updated_at"),
-        ))
-
-
-# ──────────────────────────────────────────────────────────────────────────
 # Factory
 # ──────────────────────────────────────────────────────────────────────────
 
 
-def make_subscriber(
-    client: AsyncBridgeClient,
-    cfg: BridgeConfig,
-):
-    """Pick the best subscriber for the current sandbox.
+def make_subscriber(client: AsyncBridgeClient, cfg: BridgeConfig):
+    """The downstream subscriber for this sandbox.
 
-    - If Realtime is configured (creds + lib), return a RealtimeSubscriber
-      that wraps a PollingSubscriber as its fallback.
-    - Otherwise, return a bare PollingSubscriber.
+    There is exactly one, and it says which one it is: a sandbox that quietly
+    changed transport is a sandbox nobody can reason about. ``cfg`` is accepted
+    (and unused) so the watcher's call site is unchanged now that the direct
+    database subscriber it used to select is gone.
     """
-    polling = PollingSubscriber(client)
-    if _realtime_available():
-        return RealtimeSubscriber(cfg, polling)
-    return polling
+    _logger.info(
+        "cloud-files: downstream transport is the AI Dream bridge change feed "
+        "(polling /api/cloud-files/changes). It is the only one — a sandbox "
+        "never subscribes to the platform database directly.",
+    )
+    return PollingSubscriber(client)
 
 
 def _now_iso() -> str:

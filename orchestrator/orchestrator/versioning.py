@@ -84,8 +84,9 @@ class BoxDrift:
 
 def compute_drift(client) -> list[BoxDrift]:
     """Compare every live, claimed box on this host to the current image for its
-    template. Warm/unclaimed boxes are skipped — the warm-pool refresher already
-    retires those on an image change."""
+    template. Warm/unclaimed boxes are skipped — the warm pool is retired
+    (orchestrator/pool.py) and its boot sweep removes any leftovers, so a
+    warm-labelled box with no row is on its way out, not a drift finding."""
     try:
         containers = client.containers.list(filters={"label": "matrx.sandbox_id"})
     except Exception as exc:  # docker unreachable — report nothing rather than crash

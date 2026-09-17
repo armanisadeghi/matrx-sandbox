@@ -49,6 +49,13 @@ echo "[3/5] Preparing agent environment..."
 
 HOT_PATH="${HOT_PATH:-/home/agent}"
 
+# Publish the container identity (user, organization, AI Dream URL + token)
+# where SHELLS can read it — sshd passes the container env to nothing, so
+# without this a `git push` or `mtx` from an SSH session sees an unwired box
+# and fails silently. Same script, same file, all three tiers; the ruling on
+# the service token is in its header.
+/opt/sandbox/scripts/write-bridge-env.sh || true
+
 if [ "$MATRX_MIGRATION_ACTIVATION" = "0" ]; then
 chown -R agent:agent "$HOT_PATH" 2>/dev/null || true
 
@@ -80,6 +87,10 @@ export SANDBOX_ID="${SANDBOX_ID:-sandbox}"
 export HOT_PATH="${HOT_PATH}"
 export SANDBOX_MODE="${SANDBOX_MODE_VALUE}"
 export SANDBOX_NAME="${SANDBOX_NAME:-sandbox}"
+# The identity every AI Dream call carries (USER_ID, ORGANIZATION_ID,
+# MATRX_AIDREAM_URL, MATRX_AIDREAM_SERVICE_TOKEN). Sourced, not copied: this
+# file lives in the per-user home VOLUME and must never hold the token.
+[ -r /etc/matrx/bridge-env.sh ] && . /etc/matrx/bridge-env.sh
 EOF
 chown agent:agent /home/agent/.sandbox_env
 

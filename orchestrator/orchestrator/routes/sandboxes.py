@@ -16,7 +16,7 @@ from fastapi import APIRouter, HTTPException, Request, Response, WebSocket
 from fastapi.responses import StreamingResponse
 import httpx
 
-from orchestrator import activity, sandbox_manager, storage
+from orchestrator import activity, pool, sandbox_manager, storage
 from orchestrator.auth import sandbox_token
 from orchestrator.config import settings
 from orchestrator.knobs import knob_int
@@ -195,64 +195,26 @@ async def create_sandbox(req: CreateSandboxRequest):
 
 @router.post("/claim", response_model=SandboxResponse, status_code=201)
 async def claim_sandbox(req: CreateSandboxRequest):
-    """Launch fast by CLAIMing a pre-warmed box; fall back to a cold create.
+    """Historically: adopt a pre-warmed box. Now: always a cold create.
 
-    Same request shape as ``POST /sandboxes``. If a warm box of the requested
-    template is available it's adopted (the user's memory is hydrated into it)
-    and returned in seconds; the pool replenishes in the background. If the
-    pool is empty / disabled, this transparently cold-creates so callers can
-    always use ``/claim`` and just get the fast path when it's available.
+    The warm pool is RETIRED (orchestrator/pool.py has the reasoning). A warm
+    box boots before anyone knows whose it is, so it carries a sentinel user
+    and no organization, and Docker cannot change a running container's
+    environment — every process in it would keep the sentinel identity after a
+    claim, which is exactly what THE REQUEST CONTEXT IS CARRIED, NEVER REBUILT
+    forbids. This path was already unreachable in practice: ``organization_id``
+    is required on every create request, and the claim path skipped the pool
+    whenever it was present.
+
+    The endpoint stays because clients call it; it creates a sandbox with the
+    full per-user environment — vault secrets, caller ``config.env``, user and
+    organization — from boot, which is the only honest way to hand someone a
+    machine.
     """
-    if req.tier and settings.host_tier and req.tier != settings.host_tier:
-        raise HTTPException(
-            status_code=400,
-            detail=(
-                f"Tier mismatch: this orchestrator hosts tier '{settings.host_tier}', "
-                f"but the request asked for '{req.tier}'."
-            ),
-        )
-
-    from orchestrator import pool
-    template = req.template or await pool._warm_template()
-
-    # Warm-pool sandboxes are pre-booted with NO per-user env, and Docker
-    # cannot change the environment of a running container — so a /claim
-    # against a warm box would silently drop any `config.env` the caller
-    # supplied (user secrets from aidream's vault, sandbox-prefs env).
-    # When the caller has secrets to inject, skip the warm fast path and
-    # cold-create with the full env. This costs the warm-pool latency
-    # benefit but keeps the contract honest: every secret a user has set
-    # is in the container env from boot.
-    config_env = (req.config or {}).get("env") if isinstance(req.config, dict) else None
-    has_inject_env = isinstance(config_env, dict) and len(config_env) > 0
-    # An organization-scoped create may resolve shared Vault entries inside
-    # create_sandbox(). A running warm container cannot accept those values,
-    # so org-scoped requests must cold-create even when config.env is empty.
-    if has_inject_env or req.organization_id:
-        logger.info(
-            "Skipping warm pool for user %s — scoped/caller env must be "
-            "injected at boot (organization_id=%s, config_env_keys=%d)",
-            req.user_id,
-            req.organization_id,
-            len(config_env) if isinstance(config_env, dict) else 0,
-        )
-        return await create_sandbox(req)
-
-    claimed = await pool.claim_warm(
-        user_id=req.user_id,
-        organization_id=req.organization_id,
-        template=template,
-        ttl_seconds=req.ttl_seconds,
+    logger.info(
+        "Cold-creating for user %s (template=%s): %s",
+        req.user_id, req.template, pool.RETIRED_NOTICE,
     )
-    if claimed is not None:
-        if req.name:
-            claimed.name = req.name
-            await sandbox_manager._get_store().save(claimed)
-        logger.info("Claimed warm sandbox %s for user %s", claimed.sandbox_id, req.user_id)
-        return claimed
-
-    # No warm box available — cold create with the same parameters.
-    logger.info("No warm box for template=%s; cold-creating for user %s", template, req.user_id)
     return await create_sandbox(req)
 
 

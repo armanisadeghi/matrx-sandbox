@@ -22,6 +22,7 @@ from types import SimpleNamespace
 import docker
 from docker.errors import DockerException, NotFound, APIError
 
+from orchestrator.bridge_headers import identity_headers
 from orchestrator.config import settings
 from orchestrator.knobs import knob_float, knob_int, knob_str
 from orchestrator.runtime_isolation import container_runtime_isolation
@@ -865,19 +866,21 @@ async def _create_sandbox_unleased(
                     resp = await hx.get(
                         f"{resolved_aidream_url.rstrip('/')}/api/user-secrets/internal/sandbox-env-for-user",
                         params={"organization_id": organization_id},
-                        headers={
-                            "Authorization": f"Bearer {resolved_aidream_token}",
-                            "X-Matrx-User-Id": str(user_id),
-                            # aidream's AuthMiddleware refuses every
-                            # authenticated request that names no
-                            # organization (400 organization_required)
-                            # before it routes — the gate reads THIS header,
-                            # not the query param above (kept for the
-                            # route's own use).
-                            "X-Organization-Id": str(organization_id),
-                            "Accept": "application/json",
-                            "User-Agent": "matrx-sandbox-orchestrator",
-                        },
+                        # ONE builder, never a hand-written pair: aidream's
+                        # AuthMiddleware refuses every authenticated request
+                        # that names no organization (400
+                        # organization_required) before it routes — the gate
+                        # reads the HEADER, not the query param above (kept
+                        # for the route's own use) — and the builder refuses
+                        # to omit it. Mirror of the image's one builder; the
+                        # two are held together by
+                        # tests/test_bridge_header_parity.py.
+                        headers=identity_headers(
+                            token=resolved_aidream_token,
+                            user_id=str(user_id),
+                            organization_id=str(organization_id),
+                            extra={"User-Agent": "matrx-sandbox-orchestrator"},
+                        ),
                     )
                 diag["status_code"] = resp.status_code
                 diag["fetched_at"] = datetime.now(timezone.utc).isoformat()

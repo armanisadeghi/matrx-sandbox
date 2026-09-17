@@ -505,7 +505,21 @@ Should show 25+ keys with `SUPABASE_MATRIX_JWT_SECRET` among them. If it doesn't
 
 Everything below is **live state that is NOT captured by the matrx-sandbox repo**. If this server were rebuilt from the repos alone, these would be missing. Recorded here so they're replicable.
 
-### 1. Warm-pool config — now a SETTING, not host state (2026-09-11)
+### 1. Warm pool — RETIRED (2026-09-17)
+
+There is no warm pool. A box pre-booted before anyone knows whose it is carries
+a sentinel user and no organization, and Docker cannot change a running
+container's environment, so a claim could never give it the real identity every
+AI Dream call must carry — while the claim path had in fact been unreachable
+since `organization_id` became required, so the loop booted and retired
+containers for nobody. `POST /sandboxes/claim` still answers and cold-creates.
+On boot the orchestrator sweeps leftover UNCLAIMED warm containers away and
+logs a WARNING if the `warm_pool_size` / `warm_pool_templates` settings still
+ask for boxes — set them to 0/empty. Reasoning: `orchestrator/pool.py`.
+
+The historical note below is kept because the SETTINGS rows still exist.
+
+### 1a. Warm-pool config — a SETTING since 2026-09-11 (now inert)
 
 Historically appended to `/srv/apps/sandbox-orchestrator/.env` as
 `MATRX_WARM_POOL_SIZE=2` / `MATRX_WARM_POOL_TEMPLATE=slim` (and mirrored in the
@@ -516,8 +530,10 @@ seeded by aidream migration 0636 at the values both tiers were running). Both
 orchestrators read the same rows through `orchestrator/knobs.py`, so this is
 no longer "live state not captured by the repo": rebuild a host and it inherits
 the setting. The env lines still present in the hosted `.env` and the EC2 unit
-are inert and can be deleted at the next touch. Code: `orchestrator/pool.py`,
-wired in `orchestrator/main.py` lifespan.
+are inert and can be deleted at the next touch. Since the retirement above,
+the SETTING is inert too — nothing reads it to warm anything. Code:
+`orchestrator/pool.py` (retirement sweep), wired in `orchestrator/main.py`
+lifespan.
 
 ### 2. `user_memory` migration applied to Supabase
 

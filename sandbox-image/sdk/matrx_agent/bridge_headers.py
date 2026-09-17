@@ -23,6 +23,16 @@ missing either is a provisioning defect: this module RAISES and names the
 variable — it never omits a header and never substitutes a default
 organization.
 
+Where the values come from when the process was not started by the entrypoint:
+sshd passes the container environment to nothing it launches, so `mtx` run from
+an SSH session used to see no identity at all and announced "AI Dream not
+configured for this sandbox" on a fully wired box. Every entrypoint therefore
+publishes the same identity the daemon holds to ``/etc/matrx/bridge-env.sh``
+(``sandbox-image/scripts/write-bridge-env.sh``, which carries the ruling on why
+a shell may hold the service token), and this module reads that file when — and
+only when — a required variable is absent from the process environment. The
+process environment always wins.
+
 Every outbound AI Dream call in this image builds its headers here: the
 cloud-files bridge clients (``matrx_agent.cloud_sync.client``), the ``mtx
 files`` CLI, and the Browser Manager client (``matrx_tools.browser_manager``).
@@ -33,6 +43,8 @@ Shell callers get the same contract from
 from __future__ import annotations
 
 import os
+import shlex
+from pathlib import Path
 from typing import Mapping, Optional
 
 USER_ID_HEADER = "X-Matrx-User-Id"
@@ -62,9 +74,63 @@ class BridgeIdentityMissing(RuntimeError):
     """Raised instead of sending a bridge call that drops half the context."""
 
 
+#: The identity every entrypoint publishes out of the container environment for
+#: callers sshd handed nothing (see the module docstring).
+PUBLISHED_IDENTITY_FILE = Path(
+    os.environ.get("MATRX_BRIDGE_ENV_FILE", "/etc/matrx/bridge-env.sh")
+)
+
+
+def load_published_identity(
+    path: Optional[Path] = None, env: Optional[dict] = None
+) -> list[str]:
+    """Fill absent bridge variables from the published identity file.
+
+    Returns the names it filled in. A value already present in the environment
+    is never overridden, an unreadable or absent file is simply nothing to add
+    (an unwired image is not a defect), and a line this parser does not
+    understand is skipped rather than guessed at.
+    """
+    target = os.environ if env is None else env
+    source = PUBLISHED_IDENTITY_FILE if path is None else path
+    try:
+        text = Path(source).read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return []
+    filled: list[str] = []
+    for line in text.splitlines():
+        line = line.strip()
+        if not line.startswith("export "):
+            continue
+        try:
+            parts = shlex.split(line)
+        except ValueError:
+            continue
+        if len(parts) != 2 or "=" not in parts[1]:
+            continue
+        name, _, value = parts[1].partition("=")
+        if name not in REQUIRED_BRIDGE_ENV or not value.strip():
+            continue
+        if (target.get(name) or "").strip():
+            continue
+        target[name] = value
+        filled.append(name)
+    return filled
+
+
 def missing_bridge_env(env: Optional[Mapping[str, str]] = None) -> list[str]:
-    """Names of the required bridge environment variables that are unset."""
-    source = os.environ if env is None else env
+    """Names of the required bridge environment variables that are unset.
+
+    When something is missing from the process environment, the published
+    identity file is consulted first — that is what makes the ``mtx`` CLI work
+    in an SSH session, where the container env never arrives.
+    """
+    if env is None:
+        if [name for name in REQUIRED_BRIDGE_ENV if not (os.environ.get(name) or "").strip()]:
+            load_published_identity()
+        source: Mapping[str, str] = os.environ
+    else:
+        source = env
     return [name for name in REQUIRED_BRIDGE_ENV if not (source.get(name) or "").strip()]
 
 
@@ -111,6 +177,7 @@ def identity_headers(
 
 __all__ = [
     "BridgeIdentityMissing",
+    "PUBLISHED_IDENTITY_FILE",
     "ORGANIZATION_ID_ENV",
     "ORGANIZATION_ID_HEADER",
     "REMEDY",
@@ -118,5 +185,6 @@ __all__ = [
     "USER_ID_ENV",
     "USER_ID_HEADER",
     "identity_headers",
+    "load_published_identity",
     "missing_bridge_env",
 ]

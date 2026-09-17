@@ -6,9 +6,10 @@ those ops are sub-millisecond.
 
 Population strategy:
   1. **Cold boot** — full bootstrap from ``GET /api/cloud-files/list``.
-  2. **Live updates** — ``CloudFilesWatcher.RealtimeSubscriber`` (or its
-     polling fallback) calls ``upsert()`` / ``delete()`` on every cld_files
-     INSERT / UPDATE / DELETE event filtered by the user.
+  2. **Live updates** — the one downstream subscriber
+     (``cloud_sync.downstream.PollingSubscriber``, which polls the bridge's
+     change feed) calls ``upsert()`` / ``delete()`` for every change AI Dream
+     reports. A sandbox never subscribes to the platform database directly.
   3. **Cache miss** — if a FUSE op asks about a path we don't have, we
      re-query the bridge for just that path before returning ENOENT.
 """
@@ -60,7 +61,7 @@ class MetadataMirror:
     """Thread-safe wrapper over the SQLite mirror DB.
 
     Every method is sync — SQLite is fast enough for the per-FUSE-op metadata
-    lookups and the Realtime subscriber's per-event upserts. Async wrapping
+    lookups and the downstream subscriber's per-change upserts. Async wrapping
     would only buy us cooperative scheduling, not real parallelism, and the
     FUSE bindings ultimately need a sync answer."""
 
@@ -102,7 +103,7 @@ class MetadataMirror:
         for row in cur:
             yield _row_to_dataclass(row)
 
-    # ── Write (called by the Realtime subscriber + bridge writes) ──────────
+    # ── Write (called by the downstream subscriber + bridge writes) ────────
 
     def upsert(self, row: FileRow) -> None:
         self._conn.execute(

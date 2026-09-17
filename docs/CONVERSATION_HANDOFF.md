@@ -101,20 +101,25 @@ sync scripts, watcher, endpoints) is built and waiting.
 
 ## Operator action 2 — make EC2 launches actually fast (warm instances)
 
-The warm-pool controller warms *containers* on whatever host the orchestrator
-runs on. On this server that's the whole story. **On EC2**, the dominant launch
-cost is instance boot + image pull, which the controller can't remove. To get
-chat-speed claims on EC2:
+> **Superseded 2026-09-17: the warm-pool CONTROLLER is retired**
+> (`orchestrator/pool.py`) — a pre-booted container cannot be given a user and
+> an organization after boot. Every claim cold-creates. The instance-level
+> advice below (image already resident on the host) still stands and is where
+> the remaining launch latency lives.
+
+The warm-pool controller warmed *containers* on whatever host the orchestrator
+ran on. **On EC2**, the dominant launch cost is instance boot + image pull,
+which no container-level pool could remove. To get fast launches on EC2:
 
 - Keep 1–2 EC2 instances running with `matrx-sandbox:slim` **already resident**
   (CI pushes immutable `:slim-<commit-sha>` candidates to ECR and the SSM
   deploy pulls the approved revision and tags it locally; baking it into the
   AMI removes even the pull).
-- The warm pool is the `infrastructure.sandbox.warm_pool_size` setting (2 today,
-  shared by both tiers since 2026-09-11 — no per-host env var to set).
+- The `infrastructure.sandbox.warm_pool_size` setting is inert since the
+  retirement; set it to 0.
 
-Nothing in the orchestrator code needs to change for EC2 — claim/replenish is
-identical. This is purely an AWS provisioning step (instance + image presence).
+Nothing in the orchestrator code needs to change for EC2 — every claim is a
+cold create on both tiers. This is purely an AWS provisioning step (instance + image presence).
 
 ---
 
@@ -122,7 +127,7 @@ identical. This is purely an AWS provisioning step (instance + image presence).
 
 | Piece | State |
 |---|---|
-| Instant box (warm pool, claim ~0.5s) | ✅ live (hosted) |
+| Instant box (warm pool, claim ~0.5s) | ❌ retired 2026-09-17 — claims cold-create (`orchestrator/pool.py`) |
 | Memory hydrated into the box on claim/create | ✅ live |
 | Agent tools (fs/exec/git/...) reach the box via scoped token | ✅ live + verified |
 | `/agent-binding` turnkey handoff object | ✅ live + verified |

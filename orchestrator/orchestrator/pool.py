@@ -1,140 +1,81 @@
-"""Warm pool — pre-booted sandboxes ready to CLAIM, for chat-speed launch.
+"""The warm pool is RETIRED (2026-09-17). This module is its tombstone + sweep.
 
-The user's spec: "2 warm instances ready at any moment; when one is launched,
-prepare another." A cold create pays container start + (for heavier tiers) an
-image pull; a CLAIM just adopts an already-running, daemon-ready box, so launch
-drops to seconds — fast enough to fire from a chat window.
+WHY IT IS GONE
+--------------
+The pool pre-booted containers before anyone knew whose they were, so a warm
+box carried a SENTINEL identity: ``USER_ID=<warm_pool_sentinel_user>``, no
+``ORGANIZATION_ID``, no AI Dream URL or token. Claiming one was supposed to
+hand it to a real person.
 
-The hard part, designed around here: a box is warmed BEFORE we know who it's
-for, and Docker labels are immutable on a running container. So:
+Two facts make that unfixable in the shape it had:
 
-  - A warm box boots with a PRE-GENERATED ``sandbox_id`` baked into its labels
-    (``matrx.sandbox_id``), a ``matrx.warm_pool=1`` marker, and the sentinel
-    user (``settings.warm_pool_sentinel_user``). It has NO ``sandbox_instances``
-    row and NO per-user volume — it belongs to nobody yet.
-  - **Claim** creates the DB row (reusing that pre-generated sandbox_id) with
-    the REAL user_id + a fresh TTL, hydrates the user's memory into it, and
-    fires a replenish. From that moment the DB row — not the stale sentinel
-    label — is authoritative for ownership.
-  - Boot **reconcile** cooperates: it SKIPS warm boxes with no DB row (the pool
-    owns them) and, for any box that does have a row, trusts the row's user_id
-    over the label (so a claimed warm box isn't reverted to the sentinel).
+1. **Docker cannot change the environment of a running container.** Every
+   process a warm box already started — the API daemon, the cloud-files
+   watcher, the boot shells — has read ``os.environ`` by the time a claim
+   arrives. The actor and organization a sandbox carries into AI Dream are not
+   decoration: THE REQUEST CONTEXT IS CARRIED, NEVER REBUILT
+   (``common-docs/policies/context-is-carried-never-rebuilt.md``), and a claim
+   that patches identity in after boot means every already-running process
+   keeps the sentinel one. That is precisely the class the law forbids, and its
+   failure mode is writes landing in the wrong tenant.
+2. **The claim path was already dead.** ``routes/sandboxes.py::claim_sandbox``
+   skips the warm path whenever ``req.organization_id`` is set, and
+   ``organization_id`` is REQUIRED on ``CreateSandboxRequest`` — so from the day
+   the organization became mandatory, ``claim_warm`` was unreachable while
+   ``pool_loop`` went on booting and retiring containers every 30 seconds
+   forever. Nobody ever got a warm box; the fleet just paid for them.
 
-Disabled unless ``MATRX_WARM_POOL_SIZE > 0``. Hosted tier sets it to 2.
+So the pool is deleted rather than left running dead (no-legacy). ``POST
+/sandboxes/claim`` still exists and still answers — it cold-creates, which is
+what it already did in production for every real request.
 
-EC2 note: this manages warm CONTAINERS on whatever host the orchestrator runs.
-On EC2 the bigger latency is instance boot + image pull; pairing this with a
-warm INSTANCE (image pre-pulled / baked AMI) is the remaining infra step
-(docs/EC2_LIGHTWEIGHT_BOX.md §8 step 5). The claim/replenish logic is identical.
+WHAT REPLACING IT WOULD TAKE
+----------------------------
+A pre-warmed box that is genuinely claimable has to receive its identity
+BEFORE anything in it reads the environment — i.e. warm the expensive parts
+(image pull, layer warm, volume) and start the container's processes only at
+claim time, or hand the identity to a box whose daemon starts on demand. That
+is a design, not a patch; when someone builds it, it starts here.
+
+WHAT THIS MODULE STILL DOES
+---------------------------
+Retirement has to be visible and has to clean up: ``retire_warm_pool()`` runs
+once at boot, removes any leftover UNCLAIMED warm container (label
+``matrx.warm_pool=1`` with no ``sandbox_instances`` row — nobody's box, and now
+nothing will ever claim it), and SAYS SO. If the ``warm_pool_size`` /
+``warm_pool_templates`` settings still carry a non-zero target, it says that
+too, by name: a knob that no longer does anything must never look like it does.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
-import uuid
-from datetime import datetime, timedelta, timezone
 
-from orchestrator.config import settings
-from orchestrator.knobs import knob_float, knob_int, knob_str
-from orchestrator.models import SandboxResponse, SandboxStatus
-from orchestrator.runtime_isolation import warm_pool_supports_template
+from orchestrator.knobs import knob_int, knob_str
 
 logger = logging.getLogger(__name__)
 
 WARM_LABEL = "matrx.warm_pool"
-POOL_INTERVAL_SECONDS = 30
 
-# Serializes the select-a-candidate → save-the-row critical section of
-# claim_warm so two concurrent /claim requests can't both adopt the same warm
-# box (the second save would overwrite the first user's row, handing two users
-# one container). Process-local — sufficient because the orchestrator runs a
-# single uvicorn worker (see orchestrator/Dockerfile). If that ever changes,
-# this must become a DB-level atomic claim (UPDATE ... WHERE ... RETURNING).
-_claim_lock = asyncio.Lock()
-
-
-async def _warm_template() -> str:
-    return await knob_str("warm_pool_template") or "slim"
-
-
-async def _warm_targets() -> list[tuple[str, int]]:
-    """The (template, count) pairs to keep warmed.
-
-    Parsed from the ``infrastructure.sandbox.warm_pool_templates`` setting
-    ("slim:1,aidream:1"); a bare name uses ``warm_pool_size``. Falls back to
-    the single-template setting when the multi-template spec is empty. These
-    were MATRX_WARM_POOL_* env vars until 2026-09-11 (USD-5).
-    """
-    warm_pool_size = await knob_int("warm_pool_size")
-    spec = (await knob_str("warm_pool_templates")).strip()
-    if spec:
-        targets: list[tuple[str, int]] = []
-        for part in spec.split(","):
-            part = part.strip()
-            if not part:
-                continue
-            name, sep, cnt = part.partition(":")
-            name = name.strip()
-            if not name:
-                continue
-            try:
-                n = int(cnt) if sep else warm_pool_size
-            except ValueError:
-                n = warm_pool_size
-            if n > 0:
-                targets.append((name, n))
-        if targets:
-            return targets
-    if warm_pool_size > 0:
-        return [(await _warm_template(), warm_pool_size)]
-    return []
-
-
-async def _pool_enabled() -> bool:
-    return bool(await _warm_targets())
-
-
-def _current_image_id(template: str) -> str | None:
-    """Docker image ID currently backing ``template`` — used to detect warm
-    boxes booted from a now-superseded image (the version-refresh signal)."""
-    from orchestrator.sandbox_manager import _get_docker_client
-    from orchestrator.routes.templates import resolve_template_image
-    tag = resolve_template_image(template) or settings.sandbox_image
-    try:
-        return _get_docker_client().images.get(tag).id
-    except Exception as exc:
-        logger.warning("Pool: could not resolve current image for template=%s: %s", template, exc)
-        return None
-
-
-async def _retire_stale_warm(template: str, current_image_id: str | None) -> int:
-    """Remove UNCLAIMED warm boxes for ``template`` whose image no longer matches
-    ``current_image_id`` (i.e. the template image was rebuilt). Never touches a
-    claimed box. Returns how many were retired."""
-    if not current_image_id:
-        return 0
-    retired = 0
-    for c in await _unclaimed_warm(template):
-        try:
-            if c.image.id != current_image_id:
-                sid = (c.attrs.get("Config", {}) or {}).get("Labels", {}).get("matrx.sandbox_id", c.id[:12])
-                await asyncio.to_thread(c.remove, force=True)
-                retired += 1
-                logger.info("Pool: retired stale warm %s (template=%s, image upgraded)", sid, template)
-        except Exception as exc:
-            logger.warning("Pool: failed to retire stale warm box (%s): %s", template, exc)
-    return retired
+RETIRED_NOTICE = (
+    "The warm pool is RETIRED: a pre-booted box cannot receive a user and an "
+    "organization after boot (Docker cannot change a running container's "
+    "environment), so every /sandboxes/claim cold-creates. See "
+    "orchestrator/pool.py for the full reasoning."
+)
 
 
 def list_warm_containers(template: str | None = None) -> list:
-    """Running, unclaimed warm containers (optionally filtered by template)."""
+    """Running containers still carrying the warm-pool label (optionally one
+    template's). Used by the retirement sweep and by nothing else."""
     from orchestrator.sandbox_manager import _get_docker_client
+
     client = _get_docker_client()
     try:
         containers = client.containers.list(filters={"label": f"{WARM_LABEL}=1"})
-    except Exception as exc:
-        logger.warning("Pool: list warm containers failed: %s", exc)
+    except Exception as exc:  # noqa: BLE001 — announced, never silent
+        logger.warning("Warm-pool retirement: listing containers failed: %s", exc)
         return []
     out = []
     for c in containers:
@@ -147,270 +88,89 @@ def list_warm_containers(template: str | None = None) -> list:
     return out
 
 
-def _warm_run_container(
-    template: str,
-    *,
-    shutdown_timeout_seconds: int,
-    container_cpu_limit: float,
-    container_memory_limit: str,
-):
-    """Boot one unclaimed warm container. Returns the docker container or None.
+async def _configured_target() -> str | None:
+    """The warm-pool target the settings still ask for, or None.
 
-    Minimal sibling of ``create_sandbox``'s run block: warm labels, sentinel
-    user, NO DB row, NO per-user volume (slim is git-persistence; a warm box
-    has no owner to mount for). The three fleet settings are resolved by the
-    async caller (``ensure_warm_pool``) because this runs in a thread.
+    A settings read that fails is reported, never swallowed — an unreadable
+    knob must not read as "nothing configured".
     """
-    if not warm_pool_supports_template(template):
-        logger.error(
-            "Pool: refusing to pre-warm template=%s; owner-bound templates require runtime env and storage",
-            template,
-        )
-        return None
-
-    from orchestrator.sandbox_manager import _get_docker_client
-    from orchestrator.routes.templates import resolve_template_image
-
-    client = _get_docker_client()
-    sandbox_id = f"sbx-{uuid.uuid4().hex[:12]}"
-    image = resolve_template_image(template) or settings.sandbox_image
-    created_at = datetime.now(timezone.utc)
-
-    env = {
-        "SANDBOX_ID": sandbox_id,
-        "USER_ID": settings.warm_pool_sentinel_user,
-        "HOT_PATH": "/home/agent",
-        "MATRX_TIER": settings.host_tier or "",
-        "SHUTDOWN_TIMEOUT_SECONDS": str(shutdown_timeout_seconds),
-    }
-    if template:
-        env["SANDBOX_TEMPLATE"] = template
-
-    # Per-sandbox daemon secret (fail-open when no access-token secret is set).
-    # A warm box has its sandbox_id pre-generated, so the token is stable from
-    # boot — the orchestrator forwards the same value once the box is claimed.
-    from orchestrator.sandbox_manager import agent_token_for
-    _agent_tok = agent_token_for(sandbox_id)
-    if _agent_tok:
-        env["MATRX_AGENT_TOKEN"] = _agent_tok
-
     try:
-        container = client.containers.run(
-            image=image,
-            name=sandbox_id,
-            detach=True,
-            environment=env,
-            cpu_period=100000,
-            cpu_quota=int(container_cpu_limit * 100000),
-            mem_limit=container_memory_limit,
-            cap_add=["SYS_ADMIN"],
-            devices=["/dev/fuse"],
-            cap_drop=[],
-            ports={"22/tcp": None},
-            network=settings.docker_network,
-            extra_hosts={"host.docker.internal": "host-gateway"},
-            labels={
-                "matrx.sandbox_id": sandbox_id,
-                "matrx.user_id": settings.warm_pool_sentinel_user,
-                "matrx.created_at": created_at.isoformat(),
-                WARM_LABEL: "1",
-                "matrx.template": template,
-                **({"matrx.tier": settings.host_tier} if settings.host_tier else {}),
-            },
-            restart_policy={"Name": "no", "MaximumRetryCount": 0},
-        )  # type: ignore[call-overload]
-        logger.info("Pool: warmed %s (image=%s, template=%s)", sandbox_id, image, template)
-        return container
-    except Exception as exc:
-        logger.warning("Pool: failed to warm a %s container: %s", template, exc)
-        return None
+        size = await knob_int("warm_pool_size")
+        spec = (await knob_str("warm_pool_templates")).strip()
+    except Exception as exc:  # noqa: BLE001
+        return f"unreadable ({exc})"
+    if spec:
+        return spec
+    if size:
+        return f"warm_pool_size={size}"
+    return None
 
 
-async def _unclaimed_warm(template: str) -> list:
-    """Warm containers that are still UNCLAIMED.
+async def retire_warm_pool() -> dict:
+    """Announce the retirement and remove leftover unclaimed warm containers.
 
-    A claimed warm box keeps its (immutable) ``warm_pool=1`` label forever, so
-    the label alone can't tell claimed from unclaimed — we also require that no
-    ``sandbox_instances`` row exists for its sandbox_id. This is what stops a
-    box being double-claimed and what makes replenishment count correctly.
+    A warm container with no ``sandbox_instances`` row belongs to nobody and
+    nothing will ever claim it, so it is removed. A warm-LABELLED container
+    that DOES have a row was claimed while the pool still worked — it belongs
+    to a user and is never touched.
     """
+    summary = {"removed": [], "kept_claimed": 0, "configured_target": None}
+
+    target = await _configured_target()
+    summary["configured_target"] = target
+    if target is not None:
+        logger.warning(
+            "WARM POOL SETTINGS IGNORED: infrastructure.sandbox still asks for "
+            "%s, and nothing will act on it. %s Set the setting to 0/empty so "
+            "the fleet's configuration stops describing a system that is gone.",
+            target,
+            RETIRED_NOTICE,
+        )
+
     from orchestrator.sandbox_manager import _get_store
+
     store = _get_store()
-    out = []
-    for c in await asyncio.to_thread(list_warm_containers, template):
+    try:
+        containers = await asyncio.to_thread(list_warm_containers)
+    except Exception as exc:  # noqa: BLE001
+        logger.warning("Warm-pool retirement sweep could not list containers: %s", exc)
+        return summary
+
+    for c in containers:
         labels = (c.attrs.get("Config", {}) or {}).get("Labels") or {}
         sid = labels.get("matrx.sandbox_id")
         if not sid:
             continue
         try:
-            if await store.get(sid) is None:
-                out.append(c)
-        except Exception as exc:
-            logger.warning("Pool: store.get(%s) failed while counting warm: %s", sid, exc)
-    return out
+            if await store.get(sid) is not None:
+                summary["kept_claimed"] += 1
+                continue
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Warm-pool retirement: store.get(%s) failed; leaving the "
+                "container alone rather than removing a box that may be owned: %s",
+                sid, exc,
+            )
+            continue
+        try:
+            await asyncio.to_thread(c.remove, force=True)
+            summary["removed"].append(sid)
+            logger.warning(
+                "Warm-pool retirement: removed unclaimed warm container %s "
+                "(no sandbox_instances row; the pool that made it is gone)", sid,
+            )
+        except Exception as exc:  # noqa: BLE001
+            logger.warning(
+                "Warm-pool retirement: could not remove unclaimed warm container %s: %s",
+                sid, exc,
+            )
 
-
-async def ensure_warm_pool() -> dict:
-    """For every (template, count) target: retire warm boxes whose image was
-    superseded (version-refresh), then top the template up to its count."""
-    summary = {"per_template": {}, "warmed": 0, "retired": 0}
-    targets = await _warm_targets()
-    if not targets:
-        return summary
-    run_kwargs = {
-        "shutdown_timeout_seconds": await knob_int("shutdown_timeout_seconds"),
-        "container_cpu_limit": await knob_float("container_cpu_limit"),
-        "container_memory_limit": await knob_str("container_memory_limit"),
-    }
-    for template, target in targets:
-        retired = await _retire_stale_warm(template, await asyncio.to_thread(_current_image_id, template))
-        have = len(await _unclaimed_warm(template))  # post-retire count of fresh boxes
-        warmed = 0
-        for _ in range(max(0, target - have)):
-            if await asyncio.to_thread(_warm_run_container, template, **run_kwargs) is not None:
-                warmed += 1
-        summary["per_template"][template] = {"target": target, "have": have, "warmed": warmed, "retired": retired}
-        summary["warmed"] += warmed
-        summary["retired"] += retired
+    if summary["removed"] or summary["kept_claimed"]:
+        logger.info(
+            "Warm-pool retirement sweep: removed %d unclaimed, left %d claimed box(es) alone",
+            len(summary["removed"]), summary["kept_claimed"],
+        )
     return summary
 
 
-async def claim_warm(
-    user_id: str,
-    organization_id: str,
-    template: str | None = None,
-    ttl_seconds: int | None = None,
-) -> SandboxResponse | None:
-    """Adopt a warm box for ``user_id``. Returns the SandboxResponse, or None
-    if no warm box of the right template is available (caller cold-creates).
-    """
-    if not await _pool_enabled():
-        return None
-    # An unclaimed EC2 warm box has a writable-layer /home/agent and cannot
-    # acquire an owner-bound durable volume without replacing the container.
-    # Returning None sends the caller through canonical cold creation, which
-    # creates and labels the per-sandbox EC2 home before the first write.
-    if settings.host_tier == "ec2":
-        logger.info("Pool: refusing EC2 warm claim without a durable home; cold-create required")
-        return None
-    template = template or await _warm_template()
-
-    from orchestrator.sandbox_manager import _get_store, _proxy_url_for
-
-    store = _get_store()
-
-    # Critical section: pick an unclaimed box and reserve it (save its row)
-    # atomically, so a concurrent claim can't grab the same container. Once the
-    # row exists, _unclaimed_warm excludes it.
-    async with _claim_lock:
-        candidates = await _unclaimed_warm(template)
-        if not candidates:
-            return None
-
-        container = candidates[0]
-        await asyncio.to_thread(container.reload)
-        labels = (container.attrs.get("Config", {}) or {}).get("Labels") or {}
-        sandbox_id = labels.get("matrx.sandbox_id")
-        if not sandbox_id:
-            return None
-
-        # Read the SSH host port the warm box already mapped.
-        ssh_port = None
-        try:
-            bindings = (container.attrs["NetworkSettings"]["Ports"] or {}).get("22/tcp")
-            if bindings:
-                ssh_port = int(bindings[0]["HostPort"])
-        except (KeyError, TypeError, ValueError):
-            pass
-
-        sandbox = SandboxResponse(
-            sandbox_id=sandbox_id,
-            user_id=user_id,
-            organization_id=organization_id,
-            # The user capacity reservation is a durable creating row before
-            # this live warm runtime is adopted or hydrated.
-            status=SandboxStatus.CREATING,
-            container_id=container.id,
-            created_at=datetime.now(timezone.utc),
-            hot_path="/home/agent",
-            cold_path="/data/cold",
-            config={"warm_claimed": True, "organization_id": organization_id},
-            ttl_seconds=ttl_seconds or await knob_int("max_session_duration_seconds"),
-            tier=settings.host_tier or None,
-            template=template,
-            ssh_port=ssh_port,
-            proxy_url=_proxy_url_for(sandbox_id),
-        )
-        await store.reserve_active(sandbox)
-        sandbox.status = SandboxStatus.READY
-        # Persist the selected runtime only after the capacity reservation.
-        await store.save(sandbox)
-
-    try:
-        new_expires = await store.extend_ttl(sandbox_id, sandbox.ttl_seconds)
-        if new_expires:
-            sandbox.expires_at = new_expires
-        else:
-            raise RuntimeError("extend_ttl returned None (row vanished?)")
-    except Exception as exc:
-        # A claimed box with no persisted expires_at would never be reaped
-        # (expire_stale keys on expires_at) — a slow leak. Log loudly (not a
-        # silent warning) and stamp a local fallback so the returned response
-        # and the in-memory store are at least honest. NOTE: against Postgres
-        # the ROW may still lack expires_at until extend_ttl succeeds; the
-        # liveness sweep keeps the box visible, but operators should treat a
-        # recurring message here as a DB-write problem to investigate.
-        sandbox.expires_at = datetime.now(timezone.utc) + timedelta(seconds=sandbox.ttl_seconds)
-        await store.save(sandbox)
-        logger.error(
-            "Pool: claim could NOT persist expires_at for %s (%s); applied a "
-            "local fallback expiry — investigate the store write path",
-            sandbox_id, exc,
-        )
-
-    # Hydrate this user's central memory into the freshly-claimed box.
-    try:
-        from orchestrator.memory_sync import hydrate_memory_into_container
-        await hydrate_memory_into_container(container, user_id, store)
-    except Exception as exc:
-        logger.warning("Pool: memory hydrate on claim failed for %s: %s", sandbox_id, exc)
-
-    logger.info("Pool: claimed warm %s for user %s (template=%s)", sandbox_id, user_id, template)
-
-    # Replenish in the background so the pool is topped up for the next launch.
-    asyncio.create_task(_replenish_async())
-    return sandbox
-
-
-async def _replenish_async() -> None:
-    try:
-        await ensure_warm_pool()
-    except Exception as exc:
-        logger.warning("Pool: async replenish failed: %s", exc)
-
-
-async def pool_loop(stop_event: asyncio.Event) -> None:
-    """Maintain the warm pool on an interval until stop_event is set."""
-    if not await _pool_enabled():
-        logger.info(
-            "Warm pool disabled (infrastructure.sandbox.warm_pool_size is 0 and "
-            "warm_pool_templates is empty — settings, not env vars)"
-        )
-        return
-    logger.info(
-        "Warm pool started (targets=%s, interval=%ds)",
-        await _warm_targets(), POOL_INTERVAL_SECONDS,
-    )
-    while not stop_event.is_set():
-        try:
-            await ensure_warm_pool()
-        except Exception as exc:
-            logger.warning("Pool tick errored (continuing): %s", exc)
-        try:
-            await asyncio.wait_for(stop_event.wait(), timeout=POOL_INTERVAL_SECONDS)
-        except asyncio.TimeoutError:
-            pass
-    logger.info("Warm pool stopped")
-
-
-__all__ = ["pool_loop", "ensure_warm_pool", "claim_warm", "list_warm_containers", "WARM_LABEL"]
+__all__ = ["retire_warm_pool", "list_warm_containers", "WARM_LABEL", "RETIRED_NOTICE"]

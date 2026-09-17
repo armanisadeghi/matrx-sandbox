@@ -9,7 +9,8 @@ dependency. ``mount()`` raises a clean error if the binding is missing.
 
 Phase 6a ships ``MATRX_CLOUD_FILES_LAZY=1`` (env-flag in
 ``cloud-files-sync.sh``) which skips the eager boot copy and lets the
-existing ``CloudFilesWatcher`` keep ``~/cloud-files/`` fresh via Realtime.
+existing ``CloudFilesWatcher`` keep ``~/cloud-files/`` fresh from the bridge's
+change feed.
 That bridges to the world where cldfs is the production path."""
 
 from __future__ import annotations

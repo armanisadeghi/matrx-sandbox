@@ -104,10 +104,23 @@ class BridgeConfig:
 
 
 def report_missing(stream=sys.stderr) -> None:
-    """Say exactly which bridge variables are missing — never a vague skip."""
+    """Say exactly which bridge variables are missing — never a vague skip.
+
+    The headline distinguishes the two cases, because they have different
+    remedies and calling both "not configured" is how a wired box got reported
+    as an unwired one: nothing set at all is an unwired image, while a PARTIAL
+    identity is a provisioning defect on a box that was meant to work.
+    """
     missing = missing_bridge_env() or list(REQUIRED_BRIDGE_ENV)
+    if len(missing) == len(REQUIRED_BRIDGE_ENV):
+        headline = "AI Dream is not configured for this sandbox (no identity at all)."
+    else:
+        headline = (
+            "This sandbox IS wired to AI Dream, but its identity is incomplete — "
+            "that is a provisioning defect, not a missing feature."
+        )
     print(
-        "AI Dream not configured for this sandbox.\n"
+        headline + "\n"
         "Missing: " + ", ".join(missing) + "\n"
         "Needs all of: " + ", ".join(REQUIRED_BRIDGE_ENV) + "\n"
         "Run `mtx whoami` to see what's set.",

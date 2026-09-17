@@ -57,6 +57,9 @@ fi
 # when the probe positively reports configured=false, since that's the one
 # case where the env vars are present on this side but the bridge is known
 # disabled on AI Dream's side and any sync attempt is guaranteed to 401.
+# bridge-headers: exempt — this endpoint is PUBLIC and takes no identity (it
+# answers whether the bridge is configured on AI Dream's side). Every
+# identity-carrying call below uses "${MATRX_BRIDGE_HEADERS[@]}".
 PROBE_URL="${MATRX_AIDREAM_URL%/}/api/cloud-files/integrations.aidream"
 PROBE_BODY="$(curl -fsS --max-time 5 "$PROBE_URL" 2>/dev/null || true)"
 if [ -n "$PROBE_BODY" ] && echo "$PROBE_BODY" | grep -q '"configured":[[:space:]]*false'; then

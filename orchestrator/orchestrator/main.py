@@ -190,7 +190,7 @@ async def lifespan(app: FastAPI):
         _logger.warning("DEGRADED CONFIG: %s", line)
 
     # The fleet's settings (infrastructure.sandbox knobs) must resolve through
-    # the store before the reaper and warm pool start reading them every tick.
+    # the store before the reaper starts reading them every tick.
     # A postgres store with the rows missing, or a memory store nobody seeded,
     # is named here once, loudly, instead of once per sweep. The orchestrator
     # still boots — a running fleet must not be bricked by a settings read —
@@ -200,7 +200,8 @@ async def lifespan(app: FastAPI):
     try:
         _logger.info(
             "Fleet settings (infrastructure.sandbox): cpu=%s mem=%s session=%ss "
-            "warm_pool=%s/%s auto_migrate=%s retention=%sd",
+            "warm_pool=%s/%s (RETIRED — the setting does nothing) "
+            "auto_migrate=%s retention=%sd",
             await knobs.knob_float("container_cpu_limit"),
             await knobs.knob_str("container_memory_limit"),
             await knobs.knob_int("max_session_duration_seconds"),
@@ -211,7 +212,7 @@ async def lifespan(app: FastAPI):
         )
     except Exception as exc:  # noqa: BLE001 — announced, never silent
         _logger.error(
-            "FLEET SETTINGS UNREADABLE: %s — sandbox creates, the warm pool, the "
+            "FLEET SETTINGS UNREADABLE: %s — sandbox creates, the "
             "retention sweep and auto-migrate will each fail on their own read "
             "until platform.feature_knob rows for 'infrastructure.sandbox' can be "
             "read through this store (aidream db/migrations/0636 seeds them).",
@@ -259,13 +260,13 @@ async def lifespan(app: FastAPI):
     reaper_stop = asyncio.Event()
     reaper_task = asyncio.create_task(reaper_loop(reaper_stop))
 
-    # Warm pool — keep N pre-booted boxes ready so a launch is a fast CLAIM
-    # instead of a cold create. No-op unless MATRX_WARM_POOL_SIZE > 0. See
-    # orchestrator/pool.py.
-    from orchestrator.pool import pool_loop
+    # Warm pool — RETIRED (orchestrator/pool.py). There is no loop any more:
+    # a one-shot sweep announces the retirement, says so loudly if the fleet
+    # settings still ask for warm boxes, and removes any leftover unclaimed
+    # warm container so the pool's last boxes do not run forever unowned.
+    from orchestrator.pool import retire_warm_pool
 
-    pool_stop = asyncio.Event()
-    pool_task = asyncio.create_task(pool_loop(pool_stop))
+    pool_task = asyncio.create_task(retire_warm_pool())
 
     try:
         yield
@@ -273,7 +274,6 @@ async def lifespan(app: FastAPI):
         # Shutdown: stop background loops, then close store and Docker client.
         await _cancel_boot_reconciliation(boot_reconcile_task)
         reaper_stop.set()
-        pool_stop.set()
         for task in (reaper_task, pool_task):
             if task is None:
                 continue

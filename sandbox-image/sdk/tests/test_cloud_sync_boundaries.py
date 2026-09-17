@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from pathlib import Path
 
 import httpx
@@ -184,22 +185,77 @@ def test_every_bridge_request_carries_the_organization_on_the_wire() -> None:
         assert headers["x-matrx-user-id"] == "user"
 
 
-def test_no_second_header_builder_exists_in_the_image() -> None:
-    """Fix the class: identity headers are built in ONE place. A new call site
-    that hand-writes X-Matrx-User-Id would drop the organization again the next
-    time somebody adds an endpoint."""
-    sdk_root = Path(__file__).resolve().parents[1]
-    scripts_root = sdk_root.parent / "scripts"
-    allowed = {
-        sdk_root / "matrx_agent" / "bridge_headers.py",
-        scripts_root / "bridge-headers.sh",
-    }
-    offenders = []
-    for root in (sdk_root, scripts_root):
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+#: Everything that can talk to AI Dream: the image (SDK + lifecycle scripts),
+#: the orchestrator, and the local-tier scripts. Until 2026-09-17 this guard
+#: scanned only the first two directories of the image, so the orchestrator's
+#: hand-written X-Matrx-User-Id / X-Organization-Id pair in
+#: ``sandbox_manager.create_sandbox`` sat outside every check, and so did
+#: everything under ``sandbox-local/``.
+SCAN_ROOTS = (
+    REPO_ROOT / "sandbox-image" / "sdk",
+    REPO_ROOT / "sandbox-image" / "scripts",
+    REPO_ROOT / "orchestrator" / "orchestrator",
+    REPO_ROOT / "sandbox-local" / "scripts",
+    REPO_ROOT / "scripts",
+)
+
+#: The builders. Everything else asks one of them for its headers.
+HEADER_BUILDERS = (
+    REPO_ROOT / "sandbox-image" / "sdk" / "matrx_agent" / "bridge_headers.py",
+    REPO_ROOT / "sandbox-image" / "scripts" / "bridge-headers.sh",
+    REPO_ROOT / "orchestrator" / "orchestrator" / "bridge_headers.py",
+)
+
+#: How a caller proves it used a builder (Python or shell).
+BUILDER_MARKERS = (
+    "identity_headers",
+    "bridge_headers",
+    "MATRX_BRIDGE_HEADERS",
+    "matrx_bridge_ready",
+    ".headers(",
+)
+
+#: Naming the aidream base URL. A call site that has this and makes a request
+#: is a bridge call, whatever it calls itself.
+AIDREAM_URL_MARKERS = ("MATRX_AIDREAM_URL", "aidream_url", "resolve_aidream_url")
+
+#: An unauthenticated call that deliberately carries no identity (a public
+#: probe) declares itself on the line or in its window.
+EXEMPT_MARKER = "bridge-headers: exempt"
+
+
+def _scan_files():
+    for root in SCAN_ROOTS:
+        if not root.exists():
+            continue
         for path in root.rglob("*"):
             if not path.is_file() or path.suffix in {".pyc"}:
                 continue
-            if path in allowed or "tests" in path.parts:
+            if "__pycache__" in path.parts or "tests" in path.parts:
+                continue
+            try:
+                yield path, path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+
+
+def test_no_second_header_builder_exists_anywhere_that_calls_ai_dream() -> None:
+    """Fix the class: identity headers are built in ONE place per language. A
+    new call site that hand-writes X-Matrx-User-Id would drop the organization
+    again the next time somebody adds an endpoint."""
+    sdk_root = Path(__file__).resolve().parents[1]
+    scripts_root = sdk_root.parent / "scripts"
+    allowed = set(HEADER_BUILDERS)
+    offenders = []
+    for root in SCAN_ROOTS:
+        if not root.exists():
+            continue
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix in {".pyc"}:
+                continue
+            if path in allowed or "tests" in path.parts or "__pycache__" in path.parts:
                 continue
             try:
                 text = path.read_text(encoding="utf-8")
@@ -218,6 +274,141 @@ def test_no_second_header_builder_exists_in_the_image() -> None:
                     offenders.append(f"{path}:{lineno}")
 
     assert not offenders, (
-        "identity headers must come from matrx_agent.bridge_headers (Python) or "
-        "scripts/bridge-headers.sh (shell): " + ", ".join(offenders)
+        "identity headers must come from matrx_agent.bridge_headers / "
+        "orchestrator.bridge_headers (Python) or scripts/bridge-headers.sh "
+        "(shell): " + ", ".join(offenders)
+    )
+
+
+def _function_nodes(tree):
+    import ast
+
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            yield node
+
+
+#: A real outbound request, not ``dict.get`` / ``os.environ.get``. Kept narrow
+#: on purpose: a guard that flags every ``.get(`` gets switched off.
+_HTTP_CALL_RE = re.compile(
+    r"""(
+        httpx\. | requests\. | aiohttp\. | urlopen\( | urlretrieve\( |
+        \b\w*(?:client|hx|session|http|conn|transport)\w*\s*\.\s*
+        (?:get|post|put|patch|delete|request|stream|send)\s*\(
+    )""",
+    re.IGNORECASE | re.VERBOSE,
+)
+
+
+def _makes_http_call(segment: str) -> bool:
+    return bool(_HTTP_CALL_RE.search(segment))
+
+
+def test_every_aidream_call_site_builds_its_identity_in_the_same_function() -> None:
+    """The stronger half of the class fix.
+
+    The builder-only check above can only see a call site that hand-writes the
+    header. It cannot see the worse case: a request to AI Dream that names NO
+    identity at all. So: any Python function that names the aidream base URL
+    and makes an HTTP request must reference a header builder in that same
+    function, or say why it does not need one.
+    """
+    import ast
+
+    offenders = []
+    for path, text in _scan_files():
+        if path.suffix != ".py":
+            continue
+        if not any(m in text for m in AIDREAM_URL_MARKERS):
+            continue
+        if path in set(HEADER_BUILDERS):
+            continue
+        try:
+            tree = ast.parse(text)
+        except SyntaxError:  # pragma: no cover — check:parse's job, not ours
+            continue
+        lines = text.splitlines()
+        for fn in _function_nodes(tree):
+            start, end = fn.lineno - 1, (fn.end_lineno or fn.lineno)
+            segment = "\n".join(lines[start:end])
+            if not any(m in segment for m in AIDREAM_URL_MARKERS):
+                continue
+            if not _makes_http_call(segment):
+                continue
+            if any(m in segment for m in BUILDER_MARKERS):
+                continue
+            if EXEMPT_MARKER in segment:
+                continue
+            offenders.append(f"{path}:{fn.lineno} ({fn.name})")
+
+    assert not offenders, (
+        "these functions call AI Dream without building identity headers in the "
+        "same function — a bridge call with no actor and no organization is "
+        "worse than one with half the context: " + ", ".join(offenders)
+    )
+
+
+def _shell_aidream_url_names(text: str) -> set[str]:
+    """Every shell variable in this file that holds the aidream base URL.
+
+    A curl rarely names ``MATRX_AIDREAM_URL`` inline — it names
+    ``$PROBE_URL`` or ``$EXPECTED_AIDREAM_URL``, assigned a line or two above.
+    Following the assignment is what keeps this guard from being fooled by a
+    rename, and what keeps it from flagging the curl to localhost that merely
+    sits near one.
+    """
+    names = {"MATRX_AIDREAM_URL"}
+    for _ in range(3):  # resolve chains: A=$MATRX_AIDREAM_URL…; B=$A…
+        for line in text.splitlines():
+            assign = re.match(r"\s*(?:export\s+)?([A-Za-z_][A-Za-z0-9_]*)=(.*)", line)
+            if not assign:
+                continue
+            name, value = assign.group(1), assign.group(2)
+            if any(n in value for n in names) or re.search(r"aidream.*url", name, re.I):
+                names.add(name)
+    return names
+
+
+def _shell_command_at(lines: list[str], idx: int) -> str:
+    """The whole command starting at ``idx`` — continuation lines included."""
+    out = [lines[idx]]
+    j = idx
+    while j < len(lines) - 1 and lines[j].rstrip().endswith("\\"):
+        j += 1
+        out.append(lines[j])
+    return "\n".join(out)
+
+
+def test_every_shell_aidream_curl_carries_the_builder_or_declares_why_not() -> None:
+    """Shell half: AST is not available, so the rule is the COMMAND plus a
+    short window above it.
+
+    A ``curl`` that names the aidream base URL — directly or through a variable
+    assigned from it — must use the builder's header array, or carry
+    ``# bridge-headers: exempt <why>`` nearby, which is how a genuinely public,
+    unauthenticated probe says so out loud instead of looking like a forgotten
+    identity.
+    """
+    lookback = 8
+    offenders = []
+    for path, text in _scan_files():
+        if path.suffix not in {".sh", ""}:
+            continue
+        lines = text.splitlines()
+        url_names = _shell_aidream_url_names(text)
+        for idx, line in enumerate(lines):
+            if "curl" not in line:
+                continue
+            command = _shell_command_at(lines, idx)
+            if not any(n in command for n in url_names):
+                continue
+            context = "\n".join(lines[max(0, idx - lookback):idx]) + "\n" + command
+            if "MATRX_BRIDGE_HEADERS" in context or EXEMPT_MARKER in context:
+                continue
+            offenders.append(f"{path}:{idx + 1}")
+
+    assert not offenders, (
+        "these shell curls reach AI Dream without the one header builder "
+        "(source scripts/bridge-headers.sh and use \"${MATRX_BRIDGE_HEADERS[@]}\"), "
+        "and do not declare themselves exempt: " + ", ".join(offenders)
     )

@@ -380,7 +380,7 @@ All other endpoints require `X-API-Key: <key>` (or `Authorization: Bearer <key>`
 }
 ```
 
-Powers the **Sandbox Infrastructure** admin panel in matrx-frontend (`/administration/sandbox-infra`). Unclaimed warm-pool containers have no database row and are deliberately excluded from both Docker counts; a claimed warm container remains included even though Docker retains its immutable `matrx.warm_pool=1` label. When `sandboxes_active != sandbox_containers_running`, the orchestrator's claimed-sandbox view has genuinely drifted from Docker — investigate (usually the orchestrator restarted but the store didn't reconcile).
+Powers the **Sandbox Infrastructure** admin panel in matrx-frontend (`/administration/sandbox-infra`). Unclaimed warm-pool containers (a retired mechanism — the boot sweep removes any that survive) have no database row and are deliberately excluded from both Docker counts; a claimed warm container remains included even though Docker retains its immutable `matrx.warm_pool=1` label. When `sandboxes_active != sandbox_containers_running`, the orchestrator's claimed-sandbox view has genuinely drifted from Docker — investigate (usually the orchestrator restarted but the store didn't reconcile).
 
 ---
 
