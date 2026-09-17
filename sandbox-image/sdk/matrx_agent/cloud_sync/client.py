@@ -49,6 +49,12 @@ from typing import Any, Optional, Protocol, runtime_checkable
 
 import httpx
 
+from matrx_agent.bridge_headers import (
+    REQUIRED_BRIDGE_ENV,
+    identity_headers,
+    missing_bridge_env,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -61,38 +67,49 @@ class BridgeConfig:
 
     @classmethod
     def from_env(cls) -> Optional["BridgeConfig"]:
-        url = os.environ.get("MATRX_AIDREAM_URL", "").rstrip("/")
-        token = os.environ.get("MATRX_AIDREAM_SERVICE_TOKEN", "")
-        user_id = os.environ.get("USER_ID", "")
-        organization_id = os.environ.get("ORGANIZATION_ID", "")
-        # Fail closed, same as the other required env vars above: aidream's
-        # AuthMiddleware refuses every authenticated request that names no
-        # organization (400 organization_required) before it routes, and the
-        # orchestrator already injects ORGANIZATION_ID into every sandbox
-        # container (sandbox_manager.py). A container missing it is a
-        # provisioning defect, not something this client papers over with a
-        # fallback organization.
-        if not (url and token and user_id and organization_id):
-            return None
-        return cls(url=url, token=token, user_id=user_id, organization_id=organization_id)
+        """Build the config, or None when this container is not bridge-wired.
 
-    def headers(self, extra: Optional[dict[str, str]] = None) -> dict[str, str]:
-        h = {
-            "Authorization": f"Bearer {self.token}",
-            "X-Matrx-User-Id": self.user_id,
-            "X-Organization-Id": self.organization_id,
-            "Accept": "application/json",
-        }
-        if extra:
-            h.update(extra)
-        return h
+        Fail closed on ALL FOUR variables (``REQUIRED_BRIDGE_ENV``): the
+        organization is half the request context, and AI Dream refuses a bridge
+        call that names no organization (400 ``organization_required``). The
+        orchestrator injects ``ORGANIZATION_ID`` into every sandbox container
+        (``sandbox_manager.py``), so a container missing it is a provisioning
+        defect — never something this client papers over with a fallback
+        organization. Callers print :func:`report_missing`, which names exactly
+        which variables are absent.
+        """
+        if missing_bridge_env():
+            return None
+        return cls(
+            url=os.environ["MATRX_AIDREAM_URL"].rstrip("/"),
+            token=os.environ["MATRX_AIDREAM_SERVICE_TOKEN"],
+            user_id=os.environ["USER_ID"],
+            organization_id=os.environ["ORGANIZATION_ID"],
+        )
+
+    def headers(
+        self,
+        extra: Optional[dict[str, str]] = None,
+        *,
+        accept: Optional[str] = "application/json",
+    ) -> dict[str, str]:
+        """Identity headers for one bridge call — built in ONE place."""
+        return identity_headers(
+            token=self.token,
+            user_id=self.user_id,
+            organization_id=self.organization_id,
+            accept=accept,
+            extra=extra,
+        )
 
 
 def report_missing(stream=sys.stderr) -> None:
+    """Say exactly which bridge variables are missing — never a vague skip."""
+    missing = missing_bridge_env() or list(REQUIRED_BRIDGE_ENV)
     print(
         "AI Dream not configured for this sandbox.\n"
-        "Need: MATRX_AIDREAM_URL, MATRX_AIDREAM_SERVICE_TOKEN, USER_ID, "
-        "ORGANIZATION_ID env vars.\n"
+        "Missing: " + ", ".join(missing) + "\n"
+        "Needs all of: " + ", ".join(REQUIRED_BRIDGE_ENV) + "\n"
         "Run `mtx whoami` to see what's set.",
         file=stream,
     )
@@ -107,13 +124,8 @@ class AsyncBridgeClient:
 
     def __init__(self, cfg: BridgeConfig):
         self._cfg = cfg
-        self._client = httpx.AsyncClient(
-            headers={
-                "Authorization": f"Bearer {cfg.token}",
-                "X-Matrx-User-Id": cfg.user_id,
-                "X-Organization-Id": cfg.organization_id,
-            },
-        )
+        # ONE header builder for every sandbox → AI Dream call.
+        self._client = httpx.AsyncClient(headers=cfg.headers(accept=None))
 
     async def put_one(self, local_path: Path, remote_path: str) -> dict[str, Any]:
         """Multipart PUT a single file. Raises on non-2xx."""
@@ -278,13 +290,8 @@ class LocalFilesClient:
 
     def __init__(self, cfg: BridgeConfig):
         self._cfg = cfg
-        self._client = httpx.AsyncClient(
-            headers={
-                "Authorization": f"Bearer {cfg.token}",
-                "X-Matrx-User-Id": cfg.user_id,
-                "X-Organization-Id": cfg.organization_id,
-            },
-        )
+        # ONE header builder for every sandbox → AI Dream call.
+        self._client = httpx.AsyncClient(headers=cfg.headers(accept=None))
 
     # ── Core ────────────────────────────────────────────────────────────────
 

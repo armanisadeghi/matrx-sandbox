@@ -108,6 +108,17 @@ container creation. Clients must supply the organization carried by the
 initiating request; the orchestrator never selects a personal, active, or
 system organization.
 
+🚨 **The organization you send here is the tenant every call the sandbox makes
+back into AI Dream will write into.** The orchestrator injects it as the
+container's `ORGANIZATION_ID`, and the in-container SDK sends it as
+`X-Organization-Id` beside `X-Matrx-User-Id` on every bridge call (cloud files,
+cloud browser, user secrets, GitHub tokens) — AI Dream refuses a call that
+names no organization with `400 organization_required`. Send the organization
+the person is actually working in, never a default: a wrong value here is a
+file saved into the wrong tenant, not an error anyone sees. Contract:
+[docs/AIDREAM_INTEGRATION.md](docs/AIDREAM_INTEGRATION.md) § Authentication
+model; law: `common-docs/policies/context-is-carried-never-rebuilt.md`.
+
 ### Read / list
 
 ```

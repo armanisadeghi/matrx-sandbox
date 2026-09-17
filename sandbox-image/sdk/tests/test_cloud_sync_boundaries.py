@@ -130,3 +130,94 @@ def test_cli_refuses_system_path_before_network(tmp_path: Path) -> None:
     )
 
     assert cmd_put(cfg, str(local), "system-files/scraper/body.html") == 2
+
+
+def test_identity_headers_refuse_to_omit_the_organization() -> None:
+    """The ONE header builder never sends half the request context: it names
+    the missing environment variable instead (law: context-is-carried-never-
+    rebuilt, rule 1 — a server-to-server call forwards BOTH)."""
+    from matrx_agent.bridge_headers import BridgeIdentityMissing, identity_headers
+
+    with pytest.raises(BridgeIdentityMissing, match="ORGANIZATION_ID"):
+        identity_headers(token="token", user_id="user", organization_id="")
+
+
+def test_every_bridge_request_carries_the_organization_on_the_wire() -> None:
+    """Forcing function: drive a real put through the transport and read the
+    headers the server would receive — a per-call header copy that dropped the
+    organization would pass a config-level assertion and fail here."""
+    seen: list[httpx.Headers] = []
+
+    def handler(request: httpx.Request) -> httpx.Response:
+        seen.append(request.headers)
+        return httpx.Response(200, json={})
+
+    cfg = BridgeConfig(
+        url="https://server.example",
+        token="token",
+        user_id="user",
+        organization_id="org-1",
+    )
+
+    async def run() -> None:
+        from matrx_agent.cloud_sync.client import AsyncBridgeClient
+
+        client = AsyncBridgeClient(cfg)
+        client._client = httpx.AsyncClient(
+            headers=client._client.headers,
+            transport=httpx.MockTransport(handler),
+        )
+        import tempfile
+
+        with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
+            fh.write("body")
+            local = Path(fh.name)
+        await client.put_one(local, "notes.md")
+        await client.delete_one("notes.md")
+        await client.close()
+
+    asyncio.run(run())
+
+    assert seen, "no request reached the transport"
+    for headers in seen:
+        assert headers["x-organization-id"] == "org-1"
+        assert headers["x-matrx-user-id"] == "user"
+
+
+def test_no_second_header_builder_exists_in_the_image() -> None:
+    """Fix the class: identity headers are built in ONE place. A new call site
+    that hand-writes X-Matrx-User-Id would drop the organization again the next
+    time somebody adds an endpoint."""
+    sdk_root = Path(__file__).resolve().parents[1]
+    scripts_root = sdk_root.parent / "scripts"
+    allowed = {
+        sdk_root / "matrx_agent" / "bridge_headers.py",
+        scripts_root / "bridge-headers.sh",
+    }
+    offenders = []
+    for root in (sdk_root, scripts_root):
+        for path in root.rglob("*"):
+            if not path.is_file() or path.suffix in {".pyc"}:
+                continue
+            if path in allowed or "tests" in path.parts:
+                continue
+            try:
+                text = path.read_text(encoding="utf-8")
+            except (UnicodeDecodeError, OSError):
+                continue
+            for lineno, line in enumerate(text.splitlines(), start=1):
+                # A header BEING BUILT is a quoted key or a curl -H argument;
+                # prose naming the header in a docstring uses backticks.
+                built = (
+                    '"X-Matrx-User-Id"' in line
+                    or "'X-Matrx-User-Id'" in line
+                    or '-H "X-Matrx-User-Id' in line
+                    or "X-Matrx-User-Id: $" in line
+                )
+                if built:
+                    offenders.append(f"{path}:{lineno}")
+
+    assert not offenders, (
+        "identity headers must come from matrx_agent.bridge_headers (Python) or "
+        "scripts/bridge-headers.sh (shell): " + ", ".join(offenders)
+    )

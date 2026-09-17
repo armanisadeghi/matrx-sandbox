@@ -36,8 +36,16 @@ git config --global --add credential.helper "cache --socket=$CACHE_SOCKET --time
 git config --global --add credential.helper "$ENV_HELPER"
 git config --global credential.https://github.com.username "$GITHUB_USERNAME_DEFAULT"
 
-if [ -n "${MATRX_AIDREAM_URL:-}" ] && [ -n "${MATRX_AIDREAM_SERVICE_TOKEN:-}" ] && [ -n "${USER_ID:-}" ]; then
+# The bridge needs the WHOLE request context — actor and organization — so say
+# plainly which half is missing rather than announcing a helper that will refuse
+# at first use (bridge-headers.sh owns the variable list).
+# shellcheck source=bridge-headers.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bridge-headers.sh"
+_bridge_missing="$(matrx_bridge_missing_env)"
+if [ -z "$_bridge_missing" ]; then
     echo "[git-credentials] Refreshable AI Matrx GitHub connection helper configured."
+elif [ -n "${MATRX_AIDREAM_URL:-}" ] || [ -n "${MATRX_AIDREAM_SERVICE_TOKEN:-}" ]; then
+    echo "[git-credentials] AI Matrx GitHub connection UNAVAILABLE: missing ${_bridge_missing}. ${MATRX_BRIDGE_REMEDY}" >&2
 elif [ -n "${GITHUB_TOKEN:-${GH_TOKEN:-${GITHUB_PAT:-${MATRX_GITHUB_TOKEN:-}}}}" ]; then
     echo "[git-credentials] GitHub HTTPS credential helper configured from injected env fallback."
 else

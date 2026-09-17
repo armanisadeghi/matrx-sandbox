@@ -31,15 +31,19 @@ AGENT_HOME="${AGENT_HOME:-/home/agent}"
 export HOME="$AGENT_HOME"
 CLOUD_DIR="$AGENT_HOME/cloud-files"
 
-# Required for the bridge — quiet skip if absent so the rest of startup
-# isn't blocked.
-if [ -z "${MATRX_AIDREAM_URL:-}" ] || [ -z "${MATRX_AIDREAM_SERVICE_TOKEN:-}" ]; then
-    echo "[cloud-files-sync] AI Dream not configured, skipping ${DIRECTION} sync"
-    exit 0
-fi
-
-if [ -z "${USER_ID:-}" ]; then
-    echo "[cloud-files-sync] USER_ID not set, skipping"
+# Required for the bridge. An image with NO AI Dream wiring at all skips
+# quietly (it was never meant to sync); a box that is wired but missing half
+# the request context — the actor or the organization — SAYS SO and skips,
+# because AI Dream refuses such a call (HTTP 400) rather than syncing the
+# user's files into whichever tenant the code below it would have defaulted to.
+# shellcheck source=bridge-headers.sh
+. "$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)/bridge-headers.sh"
+if ! matrx_bridge_ready "cloud-files-sync"; then
+    if [ -z "${MATRX_AIDREAM_URL:-}" ] && [ -z "${MATRX_AIDREAM_SERVICE_TOKEN:-}" ]; then
+        echo "[cloud-files-sync] AI Dream not configured, skipping ${DIRECTION} sync"
+    else
+        echo "[cloud-files-sync] skipping ${DIRECTION} sync — see the refusal above"
+    fi
     exit 0
 fi
 

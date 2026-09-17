@@ -10,8 +10,11 @@ schema. AI Dream is expected to expose endpoints like:
   DELETE {AIDREAM_URL}/api/cloud-files/delete?path=…  → 204
 
 Authentication: ``Authorization: Bearer <MATRX_AIDREAM_SERVICE_TOKEN>``
-+ ``X-Matrx-User-Id: <USER_ID>``. AI Dream verifies the token then trusts the
-header — sandboxes can only call the bridge API, not arbitrary AI Dream routes.
++ ``X-Matrx-User-Id: <USER_ID>`` + ``X-Organization-Id: <ORGANIZATION_ID>`` —
+both halves of the request context, built once in ``matrx_agent.bridge_headers``.
+AI Dream verifies the token, then trusts the headers and installs that identity
+on the request context; a call missing the organization is REFUSED (HTTP 400).
+Sandboxes can only call the bridge API, not arbitrary AI Dream routes.
 
 If the AI Dream cld_files endpoints aren't deployed yet, this CLI fails with a
 clear "AI Dream cloud-files API not reachable" message rather than crashing.

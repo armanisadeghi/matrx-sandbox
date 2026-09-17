@@ -72,9 +72,28 @@ That's the full story. Everything below is plumbing for that one user need.
 
 ---
 
-## Authentication model — service token + user header
+## Authentication model — service token + the forwarded request context
 
-**Goal:** sandboxes can act on behalf of a specific user without holding the user's actual credential.
+**Goal:** sandboxes can act on behalf of a specific user, in the organization that
+user is working in, without holding the user's actual credential.
+
+🚨 **Every sandbox → AI Dream call carries BOTH halves of the request context**:
+`X-Matrx-User-Id` (who) **and** `X-Organization-Id` (which tenant). AI Dream
+REFUSES a bridge call missing the organization with `400 organization_required`
+— it is not optional and there is no warn path. Until 2026-09-17 only the user
+crossed the boundary, so every write below fell back to the person's PERSONAL
+organization: a sandbox editing a file that belongs to a team workspace stamped
+the change into the wrong tenant, silently. Law:
+`common-docs/policies/context-is-carried-never-rebuilt.md` rule 1.
+
+Both values are orchestrator-injected container env (`USER_ID`,
+`ORGANIZATION_ID`), taken from the organization the `POST /sandboxes` request
+named. Inside the image the headers are built in ONE place —
+`sandbox-image/sdk/matrx_agent/bridge_headers.py` for Python (cloud-files
+clients, `mtx files`, the Browser Manager client) and
+`sandbox-image/scripts/bridge-headers.sh` for shell (git credential helper,
+cloud-files sync). A container missing either variable REFUSES the call and
+names the missing variable; it never sends half the context.
 
 **How it works:**
 
@@ -83,11 +102,15 @@ That's the full story. Everything below is plumbing for that one user need.
    ```
    GET https://api.aidream.ai/api/cloud-files/list
      Authorization: Bearer <service_token>
-     X-Matrx-User-Id: <user_uuid>      ← orchestrator-injected USER_ID env var
+     X-Matrx-User-Id: <user_uuid>          ← orchestrator-injected USER_ID env var
+     X-Organization-Id: <organization_uuid> ← orchestrator-injected ORGANIZATION_ID
    ```
 3. AI Dream verifies:
    - `Authorization` token matches `AIDREAM_SANDBOX_SERVICE_TOKEN` (constant-time compare).
    - `X-Matrx-User-Id` is a valid UUID and corresponds to a real user.
+   - `X-Organization-Id` is present and a valid UUID; it is installed on the
+     request context, and every route below READS it from there
+     (`context_organization_id`) instead of resolving a default.
 4. AI Dream queries `cld_files` scoped to `WHERE owner_id = <X-Matrx-User-Id>`. RLS bypassed because we're using a service-role connection — but we re-impose ownership in the WHERE clause.
 
 **Why not a per-user JWT?**
@@ -102,6 +125,8 @@ That's the full story. Everything below is plumbing for that one user need.
 |---|---|
 | Missing or wrong service token | 401 |
 | Missing `X-Matrx-User-Id` | 400 |
+| Missing `X-Organization-Id` | 400 `organization_required` — remedy: rebuild/redeploy the sandbox image with the organization-forwarding SDK, then recreate the sandbox |
+| `X-Organization-Id` is not a UUID | 400 `organization_id_invalid` |
 | Header user_id is not a UUID | 400 |
 | Header user_id doesn't exist in `auth.users` | 404 (don't leak existence) |
 | User exists but is disabled | 403 |
@@ -114,9 +139,11 @@ Sandbox creation also uses this service-token boundary for secret injection. Eve
 GET /api/user-secrets/internal/sandbox-env-for-user?organization_id=<org_uuid>
 Authorization: Bearer <service_token>
 X-Matrx-User-Id: <user_uuid>
+X-Organization-Id: <org_uuid>
 ```
 
-AI Dream revalidates that the user is an active member and may use each shared value, resolves organization entries, then overlays personal entries with the same key. Plaintext returns only to the orchestrator and is injected at container boot. The user-JWT `/api/user-secrets/sandbox-env` route remains personal-only, so it cannot be called as an organization-secret reveal endpoint.
+The query parameter is legacy: AI Dream reads the organization from the header
+and refuses the call when the two disagree. AI Dream revalidates that the user is an active member and may use each shared value, resolves organization entries, then overlays personal entries with the same key. Plaintext returns only to the orchestrator and is injected at container boot. The user-JWT `/api/user-secrets/sandbox-env` route remains personal-only, so it cannot be called as an organization-secret reveal endpoint.
 
 The orchestrator records `organization_id` as a required persistent model field, in sandbox config, and on the container label so reset, resume, and reconcile preserve it. It never selects a personal, active, or system organization. Organization-scoped claims skip the warm pool because a running container cannot accept new environment variables.
 
@@ -281,7 +308,7 @@ In every sandbox container:
   - `entrypoint.sh` (production EC2) → calls `cloud-files-sync.sh down` after the daemon is up.
   - `entrypoint-local.sh` (hosted tier) → same.
   - `shutdown.sh` / `shutdown-local.sh` → calls `cloud-files-sync.sh up` before container stop.
-- **Orchestrator passes:** `MATRX_AIDREAM_URL`, `MATRX_AIDREAM_SERVICE_TOKEN`, `USER_ID`, plus AWS creds (hosted tier).
+- **Orchestrator passes:** `MATRX_AIDREAM_URL`, `MATRX_AIDREAM_SERVICE_TOKEN`, `USER_ID`, `ORGANIZATION_ID`, plus AWS creds (hosted tier).
 
 The April rollout initially left the bridge unconfigured. That historical condition is not the current deployment state; inspect the running tier's configuration and perform a real authorized file canary before claiming the bridge is enabled or disabled.
 
@@ -306,7 +333,7 @@ Add to AI Dream's production `.env`:
 AIDREAM_SANDBOX_SERVICE_TOKEN=<value from step 1>
 ```
 
-Then redeploy AI Dream. The bridge endpoints `GET /api/cloud-files/list|get|quota`, `PUT /api/cloud-files/put`, `DELETE /api/cloud-files/delete` flip from 503 to active. Routes are public (no JWT required); the token + `X-Matrx-User-Id` header is the auth.
+Then redeploy AI Dream. The bridge endpoints `GET /api/cloud-files/list|get|quota`, `PUT /api/cloud-files/put`, `DELETE /api/cloud-files/delete` flip from 503 to active. Routes are public (no JWT required); the token + `X-Matrx-User-Id` + `X-Organization-Id` headers are the auth.
 
 ### 3. Set it + the tier-appropriate AI Dream URL on the orchestrator side
 

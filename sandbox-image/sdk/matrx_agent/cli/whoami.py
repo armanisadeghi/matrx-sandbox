@@ -39,6 +39,8 @@ def _probe_bridge(url: str) -> dict:
 
 
 def run() -> int:
+    from matrx_agent.bridge_headers import missing_bridge_env
+
     aidream_url = os.environ.get("MATRX_AIDREAM_URL", "")
     # The SDK version on disk is NOT the image's baked version once a binding-time
     # refresh has run (matrx_agent/selfupdate.py) — read the real one.
@@ -56,12 +58,17 @@ def run() -> int:
         "sandbox_id": os.environ.get("SANDBOX_ID", "unknown"),
         "sdk": sdk,
         "user_id": os.environ.get("USER_ID", "unknown"),
+        # Both halves of the request context every AI Dream call carries. A
+        # box with no organization cannot call the bridge at all (AI Dream
+        # refuses it), so show it here where a person goes to diagnose.
+        "organization_id": os.environ.get("ORGANIZATION_ID", "unknown"),
         "tier": os.environ.get("MATRX_TIER", "unknown"),
         "hostname": socket.gethostname(),
         "home": os.environ.get("HOT_PATH", os.path.expanduser("~")),
         "aidream": {
             "url": aidream_url,
-            "configured": bool(aidream_url) and bool(os.environ.get("MATRX_AIDREAM_SERVICE_TOKEN")),
+            "configured": not missing_bridge_env(),
+            "missing_env": missing_bridge_env(),
             "bridge": _probe_bridge(aidream_url),
         },
         "s3": {

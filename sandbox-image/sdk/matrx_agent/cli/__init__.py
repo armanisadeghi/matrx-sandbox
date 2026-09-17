@@ -23,8 +23,12 @@ Authentication: orchestrator-injected env vars
   MATRX_AIDREAM_URL              — base URL of the AI Dream backend
   MATRX_AIDREAM_SERVICE_TOKEN    — service token (sandbox-internal, never user-visible)
   USER_ID                        — UUID of the user this sandbox belongs to
+  ORGANIZATION_ID                — UUID of the organization that user is
+                                   working in (the create request named it)
 
 The CLI authenticates as a service to AI Dream and identifies the user via
-``X-Matrx-User-Id``. AI Dream verifies the service token matches its expected
-value and trusts the header.
+``X-Matrx-User-Id`` + ``X-Organization-Id`` — both halves of the request
+context, built once in ``matrx_agent.bridge_headers``. AI Dream verifies the
+service token matches its expected value, trusts the headers, and REFUSES
+(HTTP 400) a call that names no organization.
 """

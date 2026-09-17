@@ -14,6 +14,8 @@ from typing import Any
 
 import httpx
 
+from matrx_agent.bridge_headers import identity_headers
+
 
 class BrowserManagerNotConfiguredError(RuntimeError):
     """Raised rather than silently creating a second browser implementation."""
@@ -73,12 +75,13 @@ class BrowserManagerConfig:
         return cls(**values)
 
     def headers(self) -> dict[str, str]:
-        return {
-            "Authorization": f"Bearer {self.service_token}",
-            "X-Matrx-User-Id": self.user_id,
-            "X-Organization-Id": self.organization_id,
-            "Accept": "application/json",
-        }
+        """Identity headers for one AI Dream call — built in ONE place
+        (``matrx_agent.bridge_headers``), same as Cloud Files and the CLI."""
+        return identity_headers(
+            token=self.service_token,
+            user_id=self.user_id,
+            organization_id=self.organization_id,
+        )
 
 
 class BrowserManagerClient:
