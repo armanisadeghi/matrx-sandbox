@@ -57,6 +57,7 @@ from typing import Any, Awaitable, Callable, Optional
 import httpx
 
 from matrx_agent.cloud_sync.client import AsyncBridgeClient, BridgeConfig
+from matrx_agent.cloud_sync.refusals import describe_bridge_failure, refusal_sentence
 
 _logger = logging.getLogger("matrx_agent.cloud_sync.downstream")
 
@@ -126,6 +127,14 @@ class PollingSubscriber:
         #: the first answer — never per poll, never not at all.
         self._deletions_supported: Optional[bool] = None
         self._announced_deletion_support = False
+        #: The last failure this loop hit, in the one refusal shape, plus the
+        #: consecutive-failure count. A 4xx here means the box is being REFUSED
+        #: the change feed — it stops receiving the user's cloud edits — and
+        #: that may not live only in a log line: the watcher publishes it on
+        #: /internal/cloud-sync-status next to ``held_writes``.
+        self._last_refusal: Optional[dict[str, Any]] = None
+        self._consecutive_failures = 0
+        self._last_success_ts: Optional[float] = None
 
     async def start(self, on_change: OnChange) -> None:
         if self._task is not None:
@@ -186,9 +195,11 @@ class PollingSubscriber:
                 self._cursor_iso = next_cursor
                 self._adopt_server_interval(envelope.get("poll_after_seconds"))
                 backoff = POLL_BACKOFF_INITIAL
+                self._note_success()
             except asyncio.CancelledError:
                 return
             except (httpx.HTTPError, Exception) as e:  # noqa: BLE001
+                self._note_failure(e)
                 retry_after = _retry_after_seconds(e)
                 # Jittered in BOTH branches: the server randomises Retry-After per
                 # response today, but this loop must not depend on that staying true.
@@ -214,6 +225,59 @@ class PollingSubscriber:
                 return  # stop signal
             except asyncio.TimeoutError:
                 pass
+
+    def _note_success(self) -> None:
+        if self._last_refusal is not None:
+            _logger.info(
+                "cloud-files: the change feed is answering again (after %d "
+                "failed cycle(s)); this sandbox is receiving cloud edits.",
+                self._consecutive_failures,
+            )
+        self._last_refusal = None
+        self._consecutive_failures = 0
+        self._last_success_ts = time.time()
+
+    def _note_failure(self, error: BaseException) -> None:
+        """Record — and for a refusal, SAY — why the down direction stopped.
+
+        A 429/503 is the server pacing us and the loop already honours its
+        Retry-After. Any other 4xx is the server refusing this box (403
+        ``organization_membership_required`` is the one that matters now that
+        the bridge is organization-scoped): the user's cloud edits stop
+        arriving here, so it is stated with the server's own remedy and put on
+        the status surface rather than left as one WARNING per cycle.
+        """
+        described = describe_bridge_failure(error)
+        described["ts"] = time.time()
+        described["consecutive_failures"] = self._consecutive_failures + 1
+        self._consecutive_failures += 1
+        was_refusal = (self._last_refusal or {}).get("code") == described.get("code")
+        self._last_refusal = described
+        status = described.get("status")
+        if isinstance(status, int) and 400 <= status < 500 and status not in (429,):
+            if not was_refusal:
+                _logger.error(
+                    "cloud-files: AI Dream REFUSED this sandbox's change feed "
+                    "(%s). Cloud edits are NOT reaching this box while that "
+                    "stands; local files are untouched and nothing is deleted. "
+                    "It is reported as downstream.last_refusal on "
+                    "/internal/cloud-sync-status.",
+                    refusal_sentence(described),
+                )
+
+    def status(self) -> dict[str, Any]:
+        """What the watcher publishes about the down direction."""
+        return {
+            "poll_interval_seconds": self._interval_seconds,
+            "deletions_supported": self._deletions_supported,
+            "last_success_ts": self._last_success_ts,
+            "consecutive_failures": self._consecutive_failures,
+            "last_refusal": (
+                {**self._last_refusal, "sentence": refusal_sentence(self._last_refusal)}
+                if self._last_refusal
+                else None
+            ),
+        }
 
     def _note_deletion_support(self, raw: Any) -> None:
         """Say — once — whether deletions reach this sandbox at all.

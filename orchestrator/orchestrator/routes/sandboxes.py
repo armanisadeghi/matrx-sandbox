@@ -513,7 +513,7 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
                         )
                     else:
                         wiped = await sandbox_manager.delete_user_volume(
-                            user_id, _lifecycle_lease_held=True,
+                            user_id, old.organization_id, _lifecycle_lease_held=True,
                         )
                     logger.info("Reset wiped exact persistent home for %s: %s", sandbox_id, wiped)
                 except Exception as exc:
@@ -845,9 +845,39 @@ async def refresh_sandbox_platform_env(sandbox_id: str):
     raise HTTPException(status_code=502, detail=result)
 
 
+def _verify_sandbox_caller(sandbox, request: Request) -> str:
+    """The caller must be the sandbox it claims to be — or say it cannot prove it.
+
+    A lifecycle signal used to be authenticated by nothing but the sandbox id in
+    the path. The SDK now forwards the acting user and the organization through
+    its one header builder; this checks them against the row and REFUSES a
+    mismatch (log-only would be no check at all). An image that predates the
+    contract sends neither header: that is accepted and reported as unverified,
+    never quietly counted as a match.
+    """
+    from orchestrator.bridge_headers import (
+        SandboxIdentityMismatch,
+        verify_forwarded_identity,
+    )
+
+    try:
+        return verify_forwarded_identity(sandbox, request.headers)
+    except SandboxIdentityMismatch as e:
+        logger.warning(
+            "Refused a lifecycle signal for sandbox %s: forwarded identity does "
+            "not match its row",
+            getattr(sandbox, "sandbox_id", "?"),
+        )
+        raise HTTPException(status_code=403, detail=str(e))
+
+
 @router.post("/{sandbox_id}/heartbeat", response_model=HeartbeatResponse)
-async def sandbox_heartbeat(sandbox_id: str):
+async def sandbox_heartbeat(sandbox_id: str, request: Request):
     """Record a heartbeat from a sandbox."""
+    sandbox = await sandbox_manager.get_sandbox(sandbox_id)
+    if not sandbox:
+        raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _verify_sandbox_caller(sandbox, request)
     ack = await sandbox_manager.heartbeat(sandbox_id)
     if not ack:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
@@ -855,11 +885,14 @@ async def sandbox_heartbeat(sandbox_id: str):
 
 
 @router.post("/{sandbox_id}/complete", response_model=CompletionResponse)
-async def sandbox_complete(sandbox_id: str, req: CompletionRequest | None = None):
+async def sandbox_complete(
+    sandbox_id: str, request: Request, req: CompletionRequest | None = None
+):
     """Agent signals that its task is complete. Triggers graceful shutdown."""
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _verify_sandbox_caller(sandbox, request)
 
     logger.info("Sandbox %s signaled completion", sandbox_id)
     await sandbox_manager.destroy_sandbox(sandbox_id, graceful=True, reason="graceful_shutdown")
@@ -867,11 +900,12 @@ async def sandbox_complete(sandbox_id: str, req: CompletionRequest | None = None
 
 
 @router.post("/{sandbox_id}/error", response_model=ErrorResponse)
-async def sandbox_error(sandbox_id: str, req: ErrorReport):
+async def sandbox_error(sandbox_id: str, request: Request, req: ErrorReport):
     """Agent signals an error. Logs the error and triggers graceful shutdown."""
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
+    _verify_sandbox_caller(sandbox, request)
 
     logger.error(
         "Sandbox %s (user=%s) reported error: %s",

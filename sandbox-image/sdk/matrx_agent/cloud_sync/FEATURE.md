@@ -1,7 +1,7 @@
 # Cloud-files sandbox replica
 
-Verified against `watcher.py`, `client.py`, `paths.py`, `cli/files.py`, and the
-AI Dream bridge on 2026-08-17.
+Verified against `watcher.py`, `client.py`, `downstream.py`, `refusals.py`,
+`paths.py`, `cli/files.py`, and the AI Dream bridge on 2026-09-17.
 
 ## Contract
 
@@ -29,10 +29,35 @@ below it would otherwise land in the person's PERSONAL organization — which is
 what happened to every sandbox write before 2026-09-17. Law:
 `common-docs/policies/context-is-carried-never-rebuilt.md` rule 1.
 
-**Permanent rejections are attempted once.** The watcher retries timeouts,
-rate limits, and 5xx responses. Other 4xx responses are caller/policy conflicts;
-retrying the identical request cannot heal them and is forbidden. The event is
-retired from the durable queue after the one loud error record.
+**Permanent rejections are attempted once — and then HELD, never dropped.** The
+watcher retries timeouts, rate limits and 5xx on the hot ladder. Other 4xx
+responses are caller/policy conflicts; retrying the identical request
+immediately cannot heal them and is forbidden. But a refusal is not a
+completion: until 2026-09-17 the flush logged one warning and called
+`queue.mark_done`, so `replay_pending` never returned the event again and the
+user's edit was gone from the durable queue with nothing on any surface they
+read — the file on disk still looked right, so nobody could tell.
+
+A write the bridge would not accept — refused OR unreachable after the ladder —
+now:
+
+- stays PENDING in `cloud-sync-queue.jsonl` (a restart replays it);
+- is parked in the watcher's **held** index and retried every ~5 minutes,
+  jittered (`HELD_RETRY_SECONDS`) — the slow cadence, never the hot loop;
+- is published on `GET /internal/cloud-sync-status` as `held_writes`, carrying
+  the server's own `status`, `code`, `message` and `remedy`
+  (`refusals.py::describe_bridge_failure` is the one place a failure becomes
+  those four fields), plus `held_writes` and `held_last_refusal` in the session
+  manifest's compact stats;
+- never touches the local file. Nothing is deleted or overwritten.
+
+A hold clears when the path is accepted, or when a newer edit to the same path
+supersedes it. A 404 from a DELETE is still idempotent success (the client
+swallows it), so it retires normally. `downstream.PollingSubscriber` follows the
+same rule in the down direction: a 4xx on the change feed means the box has
+stopped receiving cloud edits, so it is stated once with the remedy and appears
+as `downstream.last_refusal` on the same status object — not one WARNING per
+cycle and nothing anyone reads.
 
 **Local blocking work stays off the event loop.** Tree hashing and per-file
 hashes run through `asyncio.to_thread`. Filesystem observer callbacks hand work
@@ -95,20 +120,51 @@ image rebuild ordering problem, and the sandbox's log line flips to the INFO for
 
 - `watcher.py::CloudFilesWatcher` — live bidirectional replica and durable event replay.
 - `client.py::AsyncBridgeClient` — authenticated AI Dream bridge client.
-- `bridge_headers.py::identity_headers` — THE ONE builder of the identity
-  headers for every AI Dream call in this image (shell half:
-  `scripts/bridge-headers.sh`).
+- `bridge_headers.py::identity_headers` / `actor_headers` — THE ONE builder of
+  the identity headers for every AI Dream call in this image, and of the
+  acting-user/organization pair `client.py::SandboxClient` sends to the
+  ORCHESTRATOR on heartbeat/complete/error (shell half:
+  `scripts/bridge-headers.sh`). `published_identity_failure()` reads
+  `/etc/matrx/bridge-env.FAILED`, the marker `write-bridge-env.sh` leaves when it
+  could not publish the identity, so a wired-but-invisible box says so instead of
+  looking unwired.
+- `refusals.py::describe_bridge_failure` — one shape for a failed bridge call
+  (status, code, message, remedy, retryable), used by the held-write surface and
+  the downstream subscriber.
 - `cli/files.py` — `mtx files` commands and bulk startup/shutdown safety passes.
 - `scripts/cloud-files-sync.sh` — lifecycle wrapper installed in the sandbox image.
 
 ## Verification
 
 - `pytest sandbox-image/sdk/tests/test_cloud_sync_boundaries.py`
+- `pytest sandbox-image/sdk/tests/test_held_writes.py`
+- `pytest sandbox-image/sdk/tests/test_orchestrator_identity.py`
 - `pytest sandbox-image/sdk/tests/test_downstream_retry_after.py`
 - `pytest sandbox-image/sdk/tests/test_downstream_deletions.py`
 
 ## Change log
 
+- 2026-09-17 — **A refused write is HELD, not finished.** `_is_retryable_bridge_error`
+  still judges the hot ladder, but the terminal path no longer marks the event
+  done: `_hold` keeps it PENDING, parks it for a jittered 5-minute retry and
+  publishes `held_writes` (with the server's status/code/message/remedy) on
+  `/internal/cloud-sync-status`; the local file is never touched. The down
+  direction gained `PollingSubscriber.status()` so a 4xx refusal of the change
+  feed is named on the same object. Guard: `tests/test_held_writes.py` (proven
+  failing-then-passing against the previous `mark_done` behaviour).
+- 2026-09-17 — **The box says when it could not publish its identity.** The
+  entrypoints no longer run `write-bridge-env.sh || true`; on failure the writer
+  leaves `/etc/matrx/bridge-env.FAILED`, the box still starts, and
+  `bridge-headers.sh` + `bridge_headers.published_identity_failure()` refuse
+  loudly instead of taking the quiet "unwired image" path. Guard:
+  `tests/test_cloud_sync_boundaries.py::test_no_entrypoint_swallows_the_identity_writer`
+  and the marker round-trip beside it.
+- 2026-09-17 — **Orchestrator signals carry the same identity.** `SandboxClient`
+  heartbeat/complete/error send `X-Matrx-User-Id` + `X-Organization-Id` through
+  `actor_headers`; the orchestrator refuses a mismatch (403) and reports an
+  image that sends neither as unverified. Guards:
+  `tests/test_orchestrator_identity.py`,
+  `orchestrator/tests/test_sandbox_signal_identity.py`.
 - 2026-09-17 — **One downstream transport, and deletions are a contract, not a
   hope.** The direct Supabase-Realtime subscriber and its five-name Supabase key
   ladder were DELETED (a sandbox never talks to the platform database; the bridge

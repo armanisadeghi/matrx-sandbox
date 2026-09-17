@@ -142,7 +142,15 @@ async def test_create_wrapper_refuses_fenced_home_before_internal_create(monkeyp
         nonlocal called; called = True
         raise AssertionError("store/Docker create must not begin")
     monkeypatch.setattr(sandbox_manager, "_create_sandbox_unleased", internal)
-    hosted.write(_record("old", "matrx-user-12345678-1234-1234-1234-123456789abc"))
+    # The hosted home is per (user, organization) — the fence is on that exact key.
+    hosted.write(_record(
+        "old",
+        "matrx-user-12345678-1234-1234-1234-123456789abc"
+        "-org-33333333-3333-4333-8333-333333333333",
+    ))
     with pytest.raises(HostedOperationDenied):
-        await sandbox_manager.create_sandbox("12345678-1234-1234-1234-123456789abc", "org")
+        await sandbox_manager.create_sandbox(
+            "12345678-1234-1234-1234-123456789abc",
+            "33333333-3333-4333-8333-333333333333",
+        )
     assert called is False

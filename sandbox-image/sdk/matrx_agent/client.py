@@ -54,6 +54,14 @@ class SandboxClient:
             hot_path=Path(os.environ.get("HOT_PATH", "/home/agent")),
             cold_path=Path(os.environ.get("COLD_PATH", "/data/cold")),
         )
+        # The other half of this sandbox's identity. The orchestrator injects
+        # both at create time; neither is ever defaulted here.
+        # Read from the environment, not from ``info``: ``SandboxInfo.user_id``
+        # carries the literal "unknown" when USER_ID is unset, and sending
+        # "unknown" as an identity is worse than sending none.
+        self._identity_user_id = (os.environ.get("USER_ID") or "").strip()
+        self._organization_id = (os.environ.get("ORGANIZATION_ID") or "").strip()
+        self._identity_warned = False
 
     def info(self) -> SandboxInfo:
         """Return metadata about the current sandbox."""
@@ -67,11 +75,44 @@ class SandboxClient:
         """Return the cold storage path."""
         return self._info.cold_path
 
+    def _identity_headers(self) -> dict[str, str]:
+        """Say who this sandbox is acting for, through THE ONE builder.
+
+        Until 2026-09-17 heartbeat/complete/error posted to the orchestrator
+        with NO headers at all — identified by the sandbox id in the path — so
+        anything that could reach the orchestrator with an id could end
+        somebody else's session. The orchestrator now checks these two against
+        the sandbox's row and refuses a mismatch.
+
+        A container missing either value is a provisioning defect. We say so
+        once, loudly, and send nothing rather than half an identity (which the
+        orchestrator refuses outright): the box stays reachable and the reason
+        is on the record.
+        """
+        from matrx_agent.bridge_headers import BridgeIdentityMissing, actor_headers
+
+        try:
+            return actor_headers(
+                user_id=self._identity_user_id,
+                organization_id=self._organization_id,
+            )
+        except BridgeIdentityMissing as e:
+            if not self._identity_warned:
+                self._identity_warned = True
+                logger.warning(
+                    "This sandbox cannot identify itself to the orchestrator, so "
+                    "its lifecycle signals cannot be verified as coming from it: %s",
+                    e,
+                )
+            return {}
+
     async def _request_with_retry(
         self, method: str, path: str, timeout: float = 5.0, **kwargs
     ) -> httpx.Response:
         """Make an HTTP request with retry logic (H1)."""
         url = f"{self._orchestrator_url}{path}"
+        headers = {**self._identity_headers(), **(kwargs.pop("headers", None) or {})}
+        kwargs["headers"] = headers
         last_error: Exception | None = None
 
         for attempt in range(1, MAX_RETRIES + 1):

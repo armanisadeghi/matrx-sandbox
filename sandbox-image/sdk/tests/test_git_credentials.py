@@ -39,6 +39,29 @@ def _run_helper(stdin: str, env: dict[str, str] | None = None) -> subprocess.Com
     )
 
 
+def _matching_curl(tmp_path: Path, pattern_body: str) -> Path:
+    """A curl stub shaped like the real one.
+
+    The script asks for ``-o <file> -w '%{http_code}'``, so the BODY goes to
+    the file and only the STATUS reaches stdout. A stub that printed the token
+    on stdout would be testing a transport we do not use.
+    """
+    fake_curl = tmp_path / "curl"
+    fake_curl.write_text(
+        "#!/usr/bin/env bash\n"
+        "out=''; prev=''\n"
+        "for arg in \"$@\"; do\n"
+        "  if [ \"$prev\" = '-o' ]; then out=\"$arg\"; fi\n"
+        "  prev=\"$arg\"\n"
+        "done\n"
+        "emit() { if [ -n \"$out\" ]; then printf '%s' \"$1\" > \"$out\"; "
+        "else printf '%s' \"$1\"; fi; printf '%s' \"$2\"; }\n"
+        + pattern_body
+    )
+    fake_curl.chmod(0o755)
+    return fake_curl
+
+
 def test_env_helper_returns_github_token():
     proc = _run_helper(
         "protocol=https\nhost=github.com\n\n",
@@ -94,16 +117,14 @@ def test_helper_reads_the_published_identity_when_the_shell_has_none(tmp_path: P
         'export MATRX_AIDREAM_URL="https://server.example.test"\n'
         'export MATRX_AIDREAM_SERVICE_TOKEN="bridge-secret"\n'
     )
-    fake_curl = tmp_path / "curl"
-    fake_curl.write_text(
-        "#!/usr/bin/env bash\n"
+    _matching_curl(
+        tmp_path,
         "case \"$*\" in\n"
         "  *'Bearer bridge-secret'*'X-Matrx-User-Id: user-123'*'X-Organization-Id: org-9'*)"
-        " printf 'ghu_fresh' ;;\n"
-        "  *) exit 22 ;;\n"
-        "esac\n"
+        " emit ghu_fresh 200 ;;\n"
+        "  *) emit '' 401 ;;\n"
+        "esac\n",
     )
-    fake_curl.chmod(0o755)
 
     proc = _run_helper(
         "protocol=https\nhost=github.com\n\n",
@@ -129,15 +150,13 @@ def test_published_identity_never_overrides_the_process_environment(tmp_path: Pa
         'export MATRX_AIDREAM_URL="https://stale.example.test"\n'
         'export MATRX_AIDREAM_SERVICE_TOKEN="stale-secret"\n'
     )
-    fake_curl = tmp_path / "curl"
-    fake_curl.write_text(
-        "#!/usr/bin/env bash\n"
+    _matching_curl(
+        tmp_path,
         "case \"$*\" in\n"
-        "  *'X-Matrx-User-Id: live-user'*'X-Organization-Id: live-org'*) printf 'ghu_live' ;;\n"
-        "  *) printf 'ghu_stale' ;;\n"
-        "esac\n"
+        "  *'X-Matrx-User-Id: live-user'*'X-Organization-Id: live-org'*) emit ghu_live 200 ;;\n"
+        "  *) emit ghu_stale 200 ;;\n"
+        "esac\n",
     )
-    fake_curl.chmod(0o755)
 
     proc = _run_helper(
         "protocol=https\nhost=github.com\n\n",
@@ -170,16 +189,14 @@ def test_partial_identity_is_loud_even_when_the_file_is_absent(tmp_path: Path):
 def test_helper_prefers_refreshable_aimatrx_connection(tmp_path: Path):
     """The bridge call carries BOTH halves of the request context; the fake
     curl refuses to answer unless it sees the organization header too."""
-    fake_curl = tmp_path / "curl"
-    fake_curl.write_text(
-        "#!/usr/bin/env bash\n"
+    _matching_curl(
+        tmp_path,
         "case \"$*\" in\n"
         "  *'X-Organization-Id: org-9'*'/api/github-integrations/internal/access-token'*)"
-        " printf 'ghu_fresh' ;;\n"
-        "  *) exit 22 ;;\n"
-        "esac\n"
+        " emit ghu_fresh 200 ;;\n"
+        "  *) emit '' 401 ;;\n"
+        "esac\n",
     )
-    fake_curl.chmod(0o755)
     proc = _run_helper(
         "protocol=https\nhost=github.com\n\n",
         {
@@ -226,9 +243,7 @@ def test_helper_refuses_the_bridge_call_without_an_organization(tmp_path: Path):
     caused on the other side landed in whatever organization the code below
     defaulted to. The fake curl here answers ANY request, so a silent omission
     would show up as ``ghu_fresh``."""
-    fake_curl = tmp_path / "curl"
-    fake_curl.write_text("#!/usr/bin/env bash\nprintf 'ghu_fresh'\n")
-    fake_curl.chmod(0o755)
+    _matching_curl(tmp_path, "emit ghu_fresh 200\n")
     proc = _run_helper(
         "protocol=https\nhost=github.com\n\n",
         {
@@ -244,3 +259,94 @@ def test_helper_refuses_the_bridge_call_without_an_organization(tmp_path: Path):
     assert "ORGANIZATION_ID" in proc.stderr
     # Fell back to the injected token instead of a wrong-tenant bridge call.
     assert proc.stdout == "username=x-access-token\npassword=ghp_fallback\n"
+
+
+# ── The server's refusal is the server's words ──────────────────────────────
+# Until 2026-09-17 the bridge call was `curl -fsS … 2>/dev/null || true`, which
+# throws away the status AND the body. Every refusal — including the two the
+# organization-scoped bridge now returns, 403 organization_membership_required
+# and 503 membership_unverifiable — therefore landed in the "Connect a GitHub
+# account" branch: a remedy the person cannot act on for a problem they do not
+# have.
+
+
+def _identity_env(tmp_path: Path) -> dict[str, str]:
+    return {
+        "PATH": f"{tmp_path}:{os.environ.get('PATH', '')}",
+        "MATRX_AIDREAM_URL": "https://server.example.test",
+        "MATRX_AIDREAM_SERVICE_TOKEN": "bridge-secret",
+        "USER_ID": "user-123",
+        "ORGANIZATION_ID": "org-9",
+    }
+
+
+def _stub_curl(tmp_path: Path, status: str, body: str) -> None:
+    """One fixed answer from the bridge: ``body`` with HTTP ``status``."""
+    _matching_curl(tmp_path, f"emit {body!r} {status}\n")
+
+
+def test_a_membership_refusal_prints_the_servers_message_and_remedy(tmp_path: Path):
+    _stub_curl(
+        tmp_path,
+        "403",
+        '{"detail":{"code":"organization_membership_required",'
+        '"message":"user-123 is not a member of org-9",'
+        '"remedy":"Ask an admin of that organization to add you."}}',
+    )
+
+    proc = _run_helper("protocol=https\nhost=github.com\n\n", _identity_env(tmp_path))
+
+    assert proc.returncode == 0
+    assert proc.stdout == ""
+    assert "403" in proc.stderr
+    assert "organization_membership_required" in proc.stderr
+    assert "not a member of org-9" in proc.stderr
+    assert "Ask an admin of that organization to add you." in proc.stderr
+    # The WRONG remedy must not appear.
+    assert "Connect a GitHub account" not in proc.stderr
+
+
+def test_an_unverifiable_membership_is_reported_as_the_server_stated_it(tmp_path: Path):
+    _stub_curl(
+        tmp_path,
+        "503",
+        '{"detail":{"code":"membership_unverifiable",'
+        '"message":"membership lookup is unavailable",'
+        '"remedy":"Try again in a few minutes."}}',
+    )
+
+    proc = _run_helper("protocol=https\nhost=github.com\n\n", _identity_env(tmp_path))
+
+    assert "membership_unverifiable" in proc.stderr
+    assert "Try again in a few minutes." in proc.stderr
+    assert "Connect a GitHub account" not in proc.stderr
+
+
+def test_a_404_still_means_connect_a_github_account(tmp_path: Path):
+    """The pre-existing case is kept: the endpoint answering 'no connection'
+    is the one thing 'Connect a GitHub account' is the right remedy for."""
+    _stub_curl(tmp_path, "404", '{"detail":"no github integration"}')
+
+    proc = _run_helper("protocol=https\nhost=github.com\n\n", _identity_env(tmp_path))
+
+    assert "Connect a GitHub account" in proc.stderr
+
+
+def test_a_2xx_body_is_still_the_token(tmp_path: Path):
+    """Positive control for the -o/-w rewrite: the happy path is unchanged."""
+    _stub_curl(tmp_path, "200", "ghu_fresh")
+
+    proc = _run_helper("protocol=https\nhost=github.com\n\n", _identity_env(tmp_path))
+
+    assert proc.stdout == "username=x-access-token\npassword=ghu_fresh\n"
+    assert proc.stderr == ""
+
+
+def test_a_refusal_still_prefers_an_explicit_token_when_one_exists(tmp_path: Path):
+    _stub_curl(tmp_path, "403", '{"detail":{"code":"organization_membership_required"}}')
+    env = _identity_env(tmp_path)
+    env["GITHUB_PAT"] = "ghp_local"
+
+    proc = _run_helper("protocol=https\nhost=github.com\n\n", env)
+
+    assert proc.stdout == "username=x-access-token\npassword=ghp_local\n"

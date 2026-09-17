@@ -73,7 +73,7 @@ There is **no separate bucket** for `repos/` vs `.matrx/` — everything under `
 |---|---|
 | **EC2** | `s3://{bucket}/users/{user_id}/hot/` — full `/home/agent/` tree synced at boot/shutdown |
 | **EC2 cold** | `s3://{bucket}/users/{user_id}/cold/` → `/data/cold/` (FUSE, large files) |
-| **Hosted** | Docker volume `matrx-user-{user_id}` on the host → `/home/agent` (survives container destroy) |
+| **Hosted** | Docker volume `matrx-user-{user_id}-org-{organization_id}` on the host → `/home/agent` (survives container destroy). One home per TENANT since 2026-09-17 — `~/cloud-files` mirrors one organization's files; pre-organization `matrx-user-<uid>` volumes are preserved, see docs/OPERATIONS.md § Pre-organization per-user volumes |
 
 Git remotes (GitHub, etc.) are separate; only the local checkout lives in hot storage.
 

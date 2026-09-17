@@ -98,3 +98,70 @@ __all__ = [
     "USER_ID_HEADER",
     "identity_headers",
 ]
+
+
+# ──────────────────────────────────────────────────────────────────────────
+# The other direction: a sandbox calling the ORCHESTRATOR
+# ──────────────────────────────────────────────────────────────────────────
+#
+# ``heartbeat`` / ``complete`` / ``error`` used to be identified by the sandbox
+# id in the path and nothing else, so anything that could reach the
+# orchestrator with a sandbox id could end somebody else's session. The SDK now
+# forwards the SAME two headers through its one builder
+# (``matrx_agent.client.SandboxClient``), and these routes check them against
+# the sandbox's own row.
+#
+# An old image sends neither header. The live fleet is on that image, so
+# absence is ACCEPTED and named (``identity: "unverified"`` in the answer) —
+# never silently treated as a match. Anything else is refused: a mismatch is
+# one box acting for another, and half an identity is a provisioning defect.
+
+_UNVERIFIED_NOTE = (
+    "This sandbox's image predates forwarded identity (2026-09-17), so the "
+    "orchestrator cannot check that the caller is the sandbox it claims to be. "
+    "Recreate the box on the current image to get the check."
+)
+
+
+class SandboxIdentityMismatch(RuntimeError):
+    """Raised when a forwarded identity disagrees with the sandbox's row."""
+
+
+def verify_forwarded_identity(sandbox, headers: Mapping[str, str]) -> str:
+    """Check a sandbox's forwarded identity against its row.
+
+    Returns ``"verified"`` when both headers match the row, or ``"unverified"``
+    when the caller sent neither (an image that predates this contract).
+
+    Raises:
+        SandboxIdentityMismatch: on any disagreement, and on a half-sent
+            identity — both name the remedy.
+    """
+    forwarded_user = (headers.get(USER_ID_HEADER) or "").strip()
+    forwarded_org = (headers.get(ORGANIZATION_ID_HEADER) or "").strip()
+    if not forwarded_user and not forwarded_org:
+        return "unverified"
+    if not forwarded_user or not forwarded_org:
+        missing = USER_ID_HEADER if not forwarded_user else ORGANIZATION_ID_HEADER
+        raise SandboxIdentityMismatch(
+            f"This call named only half its identity ({missing} is missing). A "
+            "sandbox forwards BOTH the acting user and the organization, from "
+            "the container environment the orchestrator injected. A container "
+            "missing one is a provisioning defect: recreate the sandbox from a "
+            "create request that carries its organization."
+        )
+    row_user = (getattr(sandbox, "user_id", "") or "").strip()
+    row_org = (getattr(sandbox, "organization_id", "") or "").strip()
+    if forwarded_user != row_user or forwarded_org != row_org:
+        raise SandboxIdentityMismatch(
+            "The identity this call forwarded is not the identity this sandbox "
+            "was created with, so the orchestrator will not act on it. The "
+            "sandbox's own USER_ID and ORGANIZATION_ID are injected by the "
+            "orchestrator at create time and must be sent unchanged; if this "
+            "box was reassigned, destroy it and create a new one for the "
+            "intended user and organization."
+        )
+    return "verified"
+
+
+UNVERIFIED_IDENTITY_NOTE = _UNVERIFIED_NOTE

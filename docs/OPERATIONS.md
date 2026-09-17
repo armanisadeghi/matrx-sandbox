@@ -352,7 +352,7 @@ User data persists across sandbox lifecycle. Two storage backends, depending on 
 | Tier | Backend | Path |
 |---|---|---|
 | EC2 | Template-specific retained home | Inspect the exact sandbox mounts; a tier label or S3 bucket is not proof of home backup |
-| Hosted | Per-user Docker volume | `matrx-user-<uid>` mounted at `/home/agent` |
+| Hosted | Docker volume per (user, ORGANIZATION) | `matrx-user-<uid>-org-<oid>` mounted at `/home/agent` |
 
 Both tiers also run an in-container persistence module that:
 - Writes `~/.matrx/session.json` every 5 min and on shutdown
@@ -361,19 +361,87 @@ Both tiers also run an in-container persistence module that:
 
 **Inspecting a user's persistence:**
 ```bash
-# Hosted tier — Docker
+# Hosted tier — Docker. One user has one home PER ORGANIZATION.
 docker volume ls --filter label=matrx.user_id=<uuid>
-docker run --rm -v matrx-user-<uuid>:/home/agent:ro alpine du -sh /home/agent
+docker volume ls --filter label=matrx.organization_id=<org-uuid>
+docker run --rm -v matrx-user-<uuid>-org-<org-uuid>:/home/agent:ro alpine du -sh /home/agent
 
-# Either tier (via orchestrator API)
-curl -H "X-API-Key: $KEY" https://<orch>/users/<uuid>/persistence | jq
+# Either tier (via orchestrator API). organization_id is REQUIRED — nothing
+# picks a tenant for you.
+curl -H "X-API-Key: $KEY" "https://<orch>/users/<uuid>/persistence?organization_id=<org-uuid>" | jq
 ```
 
 **Wiping a user's data (destructive):**
 ```bash
-# Hosted tier only — refuses if any container still mounts the volume, even stopped
-curl -X DELETE -H "X-API-Key: $KEY" https://<orch>/users/<uuid>/volume
+# Hosted tier only — refuses if any container still mounts the volume, even stopped.
+# organization_id is required: it names WHICH of that user's homes to destroy.
+curl -X DELETE -H "X-API-Key: $KEY" "https://<orch>/users/<uuid>/volume?organization_id=<org-uuid>"
 # EC2 has no user-volume wipe endpoint; use the exact sandbox's supported lifecycle action.
+```
+
+### Pre-organization per-user volumes (`matrx-user-<uid>`, no `-org-` suffix)
+
+Until 2026-09-17 the hosted home was keyed by user alone. Every hosted sandbox
+alive today mounts one of those: 213 of the 226 `running` rows in
+`public.sandbox_instances` carry a `persistence_volume` of the form
+`matrx-user-<uid>` (created between 2026-07-07 and 2026-08-20; verified by query
+on 2026-09-17). The key gained the organization because `/home/agent/cloud-files`
+mirrors AI Dream files and the bridge now answers per organization — a home keyed
+by user alone mixes tenants, so a file from another of that user's organizations
+sits on disk unlisted, unreported and refused 409 on its next edit.
+
+**Those volumes are LEFT IN PLACE — never renamed, never adopted, never deleted**
+("unreferenced means unfinished, never deletable"). Consequences an operator must
+know:
+
+- A hosted sandbox created from now on mounts a NEW, EMPTY `matrx-user-<uid>-org-<oid>`
+  home. The user's previous `~/projects`, repos and scratch files are not gone —
+  they are in the legacy volume, simply not mounted.
+- **Migration does not move a box across homes.** `migrate_sandbox` re-mounts the
+  binds the old container had, so a migrated box keeps its legacy volume. Only a
+  CREATE produces an org-keyed home.
+- **The cloud-sync queue lives on the volume, not in the container layer**:
+  `/home/agent/.matrx/runtime/cloud-sync-queue.jsonl` (`cloud_sync/queue.py`
+  `DEFAULT_PATH`), under the `/home/agent` mount. So do `~/.matrx/session.json`
+  and the session report. A box that starts on a new org-keyed home therefore
+  starts with an empty queue; anything still PENDING on the legacy volume is
+  neither replayed nor lost — it stays in that file until someone reads it.
+
+Inspect or recover one, read-only first:
+
+```bash
+# Find them: the old name has no -org- segment.
+docker volume ls --format '{{.Name}}' | grep '^matrx-user-' | grep -v -- '-org-'
+
+# Look inside without mounting it into anything live.
+docker run --rm -v matrx-user-<uuid>:/legacy:ro alpine sh -c 'du -sh /legacy; ls -la /legacy'
+
+# Read what the sync queue still held.
+docker run --rm -v matrx-user-<uuid>:/legacy:ro alpine \
+  cat /legacy/.matrx/runtime/cloud-sync-queue.jsonl
+
+# Copy work forward into the user's new tenant home (deliberate, one direction).
+docker run --rm -v matrx-user-<uuid>:/from:ro \
+  -v matrx-user-<uuid>-org-<org-uuid>:/to alpine \
+  sh -c 'cp -a /from/projects /to/ 2>/dev/null; ls /to'
+```
+
+The `DELETE /users/{id}/volume` endpoint cannot reach a legacy volume: it names
+`matrx-user-<uid>-org-<oid>`. Removing one is a deliberate `docker volume rm`
+that nobody is authorised to run on a user's work without Arman naming it dead.
+
+### The identity marker (`/etc/matrx/bridge-env.FAILED`)
+
+Every entrypoint publishes the container identity for shells with
+`write-bridge-env.sh`. If that write fails the box still STARTS (an unreachable
+container cannot be debugged) but leaves `/etc/matrx/bridge-env.FAILED` naming
+the failure; `bridge-headers.sh` and `matrx_agent.bridge_headers` read it and
+refuse loudly instead of taking the quiet "unwired image" path. If a user reports
+`git push` or `mtx` failing with "not configured", read that file first:
+
+```bash
+docker exec <sbx-id> cat /etc/matrx/bridge-env.FAILED     # absent = the writer succeeded
+docker exec <sbx-id> /opt/sandbox/scripts/write-bridge-env.sh   # re-run it; success clears the marker
 ```
 
 **Inside a sandbox** (the user's own POV):

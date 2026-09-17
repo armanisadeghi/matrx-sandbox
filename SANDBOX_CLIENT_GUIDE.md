@@ -388,16 +388,21 @@ Powers the **Sandbox Infrastructure** admin panel in matrx-frontend (`/administr
 
 **Auth required.** Used by the matrx-frontend admin panel and end-user "Storage" page.
 
+`organization_id` is a REQUIRED query parameter on both: since 2026-09-17 a user
+has one hosted home PER ORGANIZATION (`matrx-user-<uid>-org-<oid>`), because
+`~/cloud-files` mirrors that organization's AI Dream files. Omitting it is 422;
+a non-UUID is 400. Nothing picks a tenant for the caller.
+
 ```
-GET /users/{user_id}/persistence
+GET /users/{user_id}/persistence?organization_id=<uuid>
 → {
-    "user_id": "...", "tier": "hosted" | "ec2",
-    "volume_name": "matrx-user-...", "volume_bytes": 134217728, "volume_bytes_known": true,
+    "user_id": "...", "organization_id": "...", "tier": "hosted" | "ec2",
+    "volume_name": "matrx-user-...-org-...", "volume_bytes": 134217728, "volume_bytes_known": true,
     "s3_bucket": null, "s3_hot_prefix": null, "s3_cold_prefix": null,
     "sandboxes_total": 5, "sandboxes_active": 1
   }
 
-DELETE /users/{user_id}/volume    → 204
+DELETE /users/{user_id}/volume?organization_id=<uuid>    → 204
 ```
 
 DELETE is hosted-tier only. EC2 durable homes are retained per sandbox and are managed through that sandbox's lifecycle/persistence actions, not a user-wide S3 wipe. The hosted endpoint refuses with HTTP 409 if any container still uses the volume, including a stopped container. Unknown `volume_bytes` is `null`, not zero; counts are independent of whether byte size is known.

@@ -40,6 +40,10 @@
 
 MATRX_BRIDGE_REQUIRED_ENV="MATRX_AIDREAM_URL MATRX_AIDREAM_SERVICE_TOKEN USER_ID ORGANIZATION_ID"
 MATRX_BRIDGE_ENV_FILE="${MATRX_BRIDGE_ENV_FILE:-/etc/matrx/bridge-env.sh}"
+# Left behind by write-bridge-env.sh when it could not publish the identity.
+# Its existence means "this box LOOKS unwired but is not" — so the quiet branch
+# below is never taken while it is there.
+MATRX_BRIDGE_ENV_FAILED_FILE="${MATRX_BRIDGE_ENV_FAILED_FILE:-/etc/matrx/bridge-env.FAILED}"
 MATRX_BRIDGE_REMEDY="The orchestrator injects USER_ID and ORGANIZATION_ID into every sandbox container from the organization the create request named; a container missing one is a provisioning defect. Recreate the sandbox from a create request that carries its organization."
 
 matrx_bridge_load_env() {
@@ -97,6 +101,15 @@ matrx_bridge_ready() {
     fi
     MATRX_BRIDGE_HEADERS=()
     if matrx_bridge_has_no_identity; then
+        if [ -r "$MATRX_BRIDGE_ENV_FAILED_FILE" ]; then
+            # NOT an unwired image: the identity writer failed at boot, so this
+            # shell sees nothing on a box that is wired. Never quiet.
+            echo "[$label] This sandbox failed to publish its identity at start-up, so this shell has none of it — the box is NOT unwired, its identity file was never written:" >&2
+            while IFS= read -r matrx_bridge_failed_line; do
+                echo "[$label] $matrx_bridge_failed_line" >&2
+            done < "$MATRX_BRIDGE_ENV_FAILED_FILE"
+            return 1
+        fi
         # NOTHING is set — an unwired image, not a defect. Any partial
         # identity falls through to the loud refusal below.
         return 1

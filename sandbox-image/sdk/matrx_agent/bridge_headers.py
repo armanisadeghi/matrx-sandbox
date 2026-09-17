@@ -80,6 +80,25 @@ PUBLISHED_IDENTITY_FILE = Path(
     os.environ.get("MATRX_BRIDGE_ENV_FILE", "/etc/matrx/bridge-env.sh")
 )
 
+#: Written by ``write-bridge-env.sh`` when it could NOT publish the identity.
+#: Its presence is the difference between "this image was never wired" (fine)
+#: and "this box is wired but nothing outside the daemon can see it" (a defect
+#: that used to be invisible, because the entrypoints called the writer with
+#: ``|| true``). Every refusal message reads it, so the box says which one it is.
+PUBLISHED_IDENTITY_FAILURE_FILE = Path(
+    os.environ.get("MATRX_BRIDGE_ENV_FAILED_FILE", "/etc/matrx/bridge-env.FAILED")
+)
+
+
+def published_identity_failure(path: Optional[Path] = None) -> Optional[str]:
+    """What the identity writer said when it failed, or None if it did not."""
+    target = PUBLISHED_IDENTITY_FAILURE_FILE if path is None else Path(path)
+    try:
+        text = target.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return text or None
+
 
 def load_published_identity(
     path: Optional[Path] = None, env: Optional[dict] = None
@@ -134,6 +153,42 @@ def missing_bridge_env(env: Optional[Mapping[str, str]] = None) -> list[str]:
     return [name for name in REQUIRED_BRIDGE_ENV if not (source.get(name) or "").strip()]
 
 
+def actor_headers(
+    *,
+    user_id: str,
+    organization_id: str,
+    extra: Optional[Mapping[str, str]] = None,
+) -> dict[str, str]:
+    """Who this sandbox is acting as — both halves, no Authorization.
+
+    The AI Dream bridge needs the bearer token too; a call to our OWN
+    orchestrator is authenticated by its API key instead, but it still has to
+    SAY who it is acting for, so the orchestrator can refuse a box signalling
+    for somebody else's sandbox. Same two header names, same refusal, same
+    file: the point of one builder is that a second call site cannot invent a
+    third spelling or quietly send half of it.
+    """
+    missing = [
+        name
+        for name, value in ((USER_ID_ENV, user_id), (ORGANIZATION_ID_ENV, organization_id))
+        if not (value or "").strip()
+    ]
+    if missing:
+        raise BridgeIdentityMissing(
+            "This sandbox cannot say who it is acting for: missing "
+            + ", ".join(missing)
+            + ". "
+            + REMEDY
+        )
+    headers = {
+        USER_ID_HEADER: user_id,
+        ORGANIZATION_ID_HEADER: organization_id,
+    }
+    if extra:
+        headers.update(extra)
+    return headers
+
+
 def identity_headers(
     *,
     token: str,
@@ -165,8 +220,7 @@ def identity_headers(
 
     headers = {
         "Authorization": f"Bearer {token}",
-        USER_ID_HEADER: user_id,
-        ORGANIZATION_ID_HEADER: organization_id,
+        **actor_headers(user_id=user_id, organization_id=organization_id),
     }
     if accept:
         headers["Accept"] = accept
@@ -177,6 +231,7 @@ def identity_headers(
 
 __all__ = [
     "BridgeIdentityMissing",
+    "PUBLISHED_IDENTITY_FAILURE_FILE",
     "PUBLISHED_IDENTITY_FILE",
     "ORGANIZATION_ID_ENV",
     "ORGANIZATION_ID_HEADER",
@@ -184,7 +239,9 @@ __all__ = [
     "REQUIRED_BRIDGE_ENV",
     "USER_ID_ENV",
     "USER_ID_HEADER",
+    "actor_headers",
     "identity_headers",
     "load_published_identity",
     "missing_bridge_env",
+    "published_identity_failure",
 ]

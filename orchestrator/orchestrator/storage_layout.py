@@ -8,11 +8,26 @@ The two tiers persist user data differently today:
     container, which the in-container ``hot-sync.sh`` and ``cold-mount.sh`` scripts
     read at startup/shutdown.
 
-  - **Hosted tier (this server):** named Docker volume per user (``matrx-user-{user_id}``).
-    The volume lives at ``/var/lib/docker/volumes/matrx-user-<uuid>/_data`` on the host,
-    mounted into the spawned container at ``/home/agent``. Volumes survive container
-    destruction; they're deleted only via the explicit ``DELETE /users/{uid}/volume``
-    admin endpoint.
+  - **Hosted tier (this server):** named Docker volume per (user, ORGANIZATION) —
+    ``matrx-user-{user_id}-org-{organization_id}``. The volume lives at
+    ``/var/lib/docker/volumes/<name>/_data`` on the host, mounted into the spawned
+    container at ``/home/agent``. Volumes survive container destruction; they're
+    deleted only via the explicit ``DELETE /users/{uid}/volume`` admin endpoint.
+
+    **Why the organization is part of the key (2026-09-17).** ``/home/agent/cloud-files``
+    is a MIRROR of the user's AI Dream files, and since the bridge became
+    organization-scoped, ``/list`` and ``/changes`` answer for ONE organization. A
+    volume keyed by user alone therefore mixed tenants: a file belonging to another
+    of that user's organizations stayed on disk, was never listed and never reported
+    deleted, and its next edit was refused 409 by the server — with the sandbox
+    side unable to explain why (7 users hold files spanning more than one
+    organization). The mirror is a TENANT VIEW: one home per (user, organization),
+    which is also what the bridge's answers actually describe.
+
+    Volumes created before that change (``matrx-user-<uuid>``, no org suffix) are
+    LEFT IN PLACE, untouched and undeleted — "unreferenced means unfinished, never
+    deletable". ``docs/OPERATIONS.md`` § Pre-organization per-user volumes says how
+    an operator inspects or recovers one.
 
 Both tiers eventually converge on S3 as the authoritative store (see Phase 1.5 of
 ``docs/PERSISTENCE_PLAN.md``); the hosted-tier volume is a fast local cache + offline
@@ -35,16 +50,35 @@ _USER_ID_RE = re.compile(r"^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f
 _SANDBOX_ID_RE = re.compile(r"^sbx-[a-f0-9]{12}$")
 
 
-def user_volume_name(user_id: str) -> str:
-    """Stable Docker volume name for a user's hosted-tier home directory.
+#: Volumes made before the mirror became a tenant view. Never created, never
+#: deleted, never adopted — recognised only so tooling can NAME them.
+LEGACY_USER_VOLUME_PREFIX = "matrx-user-"
 
-    Format: ``matrx-user-<uuid>`` — readable in ``docker volume ls``. Refusing to
-    return anything for an invalid user_id prevents path-traversal-shaped values
-    from making it into the volume name.
+
+def user_volume_name(user_id: str, organization_id: str) -> str:
+    """Stable Docker volume name for one user's home IN ONE ORGANIZATION.
+
+    Format: ``matrx-user-<uuid>-org-<uuid>`` — readable in ``docker volume ls``.
+    Both halves are required and both are validated: refusing anything that is
+    not a UUID keeps path-traversal-shaped values out of the volume name, and
+    refusing a missing organization is the same rule the rest of the platform
+    runs on — every write carries an explicit organization, nothing defaults one.
     """
     if not _USER_ID_RE.match(user_id or ""):
         raise ValueError(f"user_id must be a UUID, got: {user_id!r}")
-    return f"matrx-user-{user_id.lower()}"
+    if not _USER_ID_RE.match(organization_id or ""):
+        raise ValueError(
+            "organization_id must be a UUID: the hosted home is one tenant's "
+            f"view of that user's files, never a cross-organization mixture. Got: {organization_id!r}"
+        )
+    return f"matrx-user-{user_id.lower()}-org-{organization_id.lower()}"
+
+
+def is_legacy_user_volume(name: str) -> bool:
+    """True for a pre-2026-09-17 per-user volume (no organization in the key)."""
+    if not isinstance(name, str) or not name.startswith(LEGACY_USER_VOLUME_PREFIX):
+        return False
+    return "-org-" not in name[len(LEGACY_USER_VOLUME_PREFIX):]
 
 
 def ec2_home_volume_name(sandbox_id: str) -> str:
@@ -121,7 +155,9 @@ class StorageLocation:
     s3_cold_prefix: str | None = None
 
 
-def resolve_user_storage(user_id: str, tier: str | None) -> StorageLocation:
+def resolve_user_storage(
+    user_id: str, tier: str | None, organization_id: str | None = None
+) -> StorageLocation:
     """Single function for "where does this user's data live, for this tier."
 
     Both tiers always set up storage — there is no "ephemeral sandbox" path for
@@ -135,9 +171,15 @@ def resolve_user_storage(user_id: str, tier: str | None) -> StorageLocation:
     effective_tier = settings.resolve_host_tier(tier)
 
     if effective_tier == "hosted":
+        if not organization_id:
+            raise ValueError(
+                "resolve_user_storage needs the organization on the hosted tier: "
+                "the home is per (user, organization), and nothing here may pick "
+                "one for the caller."
+            )
         return StorageLocation(
             tier="hosted",
-            volume_name=user_volume_name(user_id),
+            volume_name=user_volume_name(user_id, organization_id),
             # Optional async S3 backup — Phase 1.5; off until AWS creds are
             # provisioned on this server.
             s3_bucket=settings.s3_bucket or None,
@@ -156,14 +198,15 @@ def resolve_user_storage(user_id: str, tier: str | None) -> StorageLocation:
     )
 
 
-def ensure_user_volume(docker_client, user_id: str) -> str:
-    """Idempotently ensure the per-user Docker volume exists. Returns its name.
+def ensure_user_volume(docker_client, user_id: str, organization_id: str) -> str:
+    """Idempotently ensure the (user, organization) Docker volume exists.
 
     Docker's ``volumes.create`` is idempotent — calling it on an existing volume
     is a no-op. We tag with labels so an admin can find/clean orphan volumes via
-    ``docker volume ls --filter label=matrx.kind=user-home``.
+    ``docker volume ls --filter label=matrx.kind=user-home`` and can select one
+    tenant with ``--filter label=matrx.organization_id=<uuid>``.
     """
-    name = user_volume_name(user_id)
+    name = user_volume_name(user_id, organization_id)
     try:
         docker_client.volumes.get(name)
         return name
@@ -174,9 +217,13 @@ def ensure_user_volume(docker_client, user_id: str) -> str:
         driver="local",
         labels={
             "matrx.user_id": user_id,
+            "matrx.organization_id": organization_id,
             "matrx.kind": "user-home",
             "matrx.tier": "hosted",
         },
     )
-    logger.info("Created per-user Docker volume %s for user %s", name, user_id)
+    logger.info(
+        "Created per-(user, organization) Docker volume %s for user %s in organization %s",
+        name, user_id, organization_id,
+    )
     return name

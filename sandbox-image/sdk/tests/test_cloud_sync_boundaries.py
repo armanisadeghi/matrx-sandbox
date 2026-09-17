@@ -412,3 +412,91 @@ def test_every_shell_aidream_curl_carries_the_builder_or_declares_why_not() -> N
         "(source scripts/bridge-headers.sh and use \"${MATRX_BRIDGE_HEADERS[@]}\"), "
         "and do not declare themselves exempt: " + ", ".join(offenders)
     )
+
+
+# ── The identity writer is never swallowed ──────────────────────────────────
+# Every entrypoint used to run `write-bridge-env.sh || true`. The writer runs
+# under `set -euo pipefail`, so any failure inside it aborted it halfway and the
+# `|| true` hid that: the box came up fully wired while every SHELL on it took
+# bridge-headers.sh's quiet "unwired image" branch, and `git push` failed with
+# no explanation. The box must still START (an unreachable container cannot be
+# debugged) — but it must never be silently unwired.
+
+ENTRYPOINTS = (
+    REPO_ROOT / "sandbox-image" / "scripts" / "entrypoint.sh",
+    REPO_ROOT / "sandbox-image" / "scripts" / "entrypoint-slim.sh",
+    REPO_ROOT / "sandbox-local" / "scripts" / "entrypoint-local.sh",
+)
+
+
+def test_no_entrypoint_swallows_the_identity_writer() -> None:
+    offenders = []
+    for path in ENTRYPOINTS:
+        assert path.exists(), path
+        for lineno, line in enumerate(path.read_text(encoding="utf-8").splitlines(), 1):
+            if "write-bridge-env.sh" not in line:
+                continue
+            if "||" in line and "true" in line.split("||", 1)[1]:
+                offenders.append(f"{path}:{lineno}: {line.strip()}")
+    assert not offenders, (
+        "an entrypoint is discarding the identity writer's failure; the box "
+        "would run wired-but-invisible to every shell on it: " + "; ".join(offenders)
+    )
+
+
+def test_every_entrypoint_still_starts_the_box_when_the_writer_fails() -> None:
+    """The other half of the ruling: report it, don't abort the boot."""
+    for path in ENTRYPOINTS:
+        text = path.read_text(encoding="utf-8")
+        assert "if ! /opt/sandbox/scripts/write-bridge-env.sh; then" in text, path
+        assert "bridge-env.FAILED" in text, path
+
+
+def test_the_writer_leaves_a_marker_a_reader_can_scream_about(tmp_path) -> None:
+    """Forcing function: run the real script with an unwritable target and
+    prove BOTH readers (the shell builder and the SDK) refuse loudly."""
+    import os
+    import subprocess
+
+    writer = REPO_ROOT / "sandbox-image" / "scripts" / "write-bridge-env.sh"
+    env_dir = tmp_path / "matrx"
+    env_dir.mkdir()
+    marker = env_dir / "bridge-env.FAILED"
+    env = {
+        **os.environ,
+        "MATRX_BRIDGE_ENV_DIR": str(env_dir),
+        # A DIRECTORY where the identity file should go: the write fails.
+        "MATRX_BRIDGE_ENV_FILE": str(env_dir / "occupied"),
+        "MATRX_BRIDGE_ENV_FAILED_FILE": str(marker),
+        "MATRX_BRIDGE_PROFILE_DROPIN": str(tmp_path / "profile.d" / "00-matrx.sh"),
+        "MATRX_BRIDGE_ENV_OWNER": "root:root",
+        "USER_ID": "user-123",
+        "ORGANIZATION_ID": "org-9",
+        "MATRX_AIDREAM_URL": "https://server.example.test",
+        "MATRX_AIDREAM_SERVICE_TOKEN": "bridge-secret",
+    }
+    (env_dir / "occupied").mkdir()
+
+    proc = subprocess.run([str(writer)], env=env, capture_output=True, text=True)
+
+    assert proc.returncode != 0, "the writer must not pretend it succeeded"
+    assert marker.exists(), "no marker: the failure would be invisible"
+    assert "could not publish its identity" in marker.read_text(encoding="utf-8")
+
+    # Reader 1 — the SDK. A shell with no identity at all is normally quiet;
+    # with the marker present it names the failure instead.
+    from matrx_agent.bridge_headers import published_identity_failure
+
+    assert "could not publish" in (published_identity_failure(marker) or "")
+
+    # Reader 2 — the shell builder. Nothing exported, marker present.
+    probe = (
+        f'MATRX_BRIDGE_ENV_FILE=/nonexistent/x '
+        f'MATRX_BRIDGE_ENV_FAILED_FILE={marker} '
+        f'bash -c \'unset MATRX_AIDREAM_URL MATRX_AIDREAM_SERVICE_TOKEN USER_ID '
+        f'ORGANIZATION_ID; . {REPO_ROOT}/sandbox-image/scripts/bridge-headers.sh; '
+        f'matrx_bridge_ready probe\''
+    )
+    shell = subprocess.run(["bash", "-c", probe], capture_output=True, text=True)
+    assert shell.returncode == 1
+    assert "failed to publish its identity" in shell.stderr

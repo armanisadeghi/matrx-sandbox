@@ -323,7 +323,8 @@ async def test_missing_row_reaches_router_404_but_store_failure_is_sanitized_503
 @pytest.mark.asyncio
 async def test_legacy_null_volume_derives_authoritative_user_home(hosted, monkeypatch):
     user_id = "12345678-1234-1234-1234-123456789abc"
-    rows = {"box": SimpleNamespace(persistence_volume=None, user_id=user_id)}
+    rows = {"box": SimpleNamespace(persistence_volume=None, user_id=user_id,
+                                   organization_id="33333333-3333-4333-8333-333333333333")}
     _wire(monkeypatch, hosted, rows)
     async def good(scope, receive, send): await send({"type": "http.response.start", "status": 200, "headers": []})
     assert (await _call(HostedOperationLeaseMiddleware(good), {"type": "http", "path": "/sandboxes/box/exec"}))[0]["status"] == 200

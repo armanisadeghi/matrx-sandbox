@@ -13,6 +13,8 @@ class _Row:
     def __init__(self, hb):
         self.last_heartbeat_at = hb
         self.user_id = "22222222-2222-2222-2222-222222222222"
+        # A hosted row's home identity is per (user, organization).
+        self.organization_id = "33333333-3333-4333-8333-333333333333"
         self.tier = "hosted"
 
 

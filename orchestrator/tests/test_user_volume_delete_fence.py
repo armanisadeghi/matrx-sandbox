@@ -10,6 +10,8 @@ import pytest
 from orchestrator.hosted_migration import HostedMigrationJournal
 
 USER = "00000000-0000-4000-8000-000000000001"
+# The hosted home is one tenant's view: the volume key carries both.
+ORG = "00000000-0000-4000-8000-000000000002"
 
 
 def _record(volume: str) -> dict:
@@ -46,10 +48,10 @@ def _client(*, in_use=False, missing=False):
 async def test_pending_migration_denies_volume_delete_before_docker(hosted, monkeypatch):
     from orchestrator import sandbox_manager
     from orchestrator.storage_layout import user_volume_name
-    volume = user_volume_name(USER); hosted.write(_record(volume))
+    volume = user_volume_name(USER, ORG); hosted.write(_record(volume))
     client = _client(); monkeypatch.setattr(sandbox_manager, "_get_docker_client", lambda: client)
     with pytest.raises(RuntimeError, match="migration is pending"):
-        await sandbox_manager.delete_user_volume(USER)
+        await sandbox_manager.delete_user_volume(USER, ORG)
     client.containers.list.assert_not_called()
 
 
@@ -58,11 +60,11 @@ async def test_held_exclusive_home_lock_denies_delete_before_docker(hosted, monk
     """Break caught: delete checks migration once, then races an admitted migration."""
     from orchestrator import sandbox_manager
     from orchestrator.storage_layout import user_volume_name
-    volume = user_volume_name(USER)
+    volume = user_volume_name(USER, ORG)
     client = _client(); monkeypatch.setattr(sandbox_manager, "_get_docker_client", lambda: client)
     with hosted.lock(f"volume-{volume}"):
         with pytest.raises(RuntimeError, match="lease unavailable"):
-            await sandbox_manager.delete_user_volume(USER)
+            await sandbox_manager.delete_user_volume(USER, ORG)
     client.containers.list.assert_not_called()
 
 
@@ -73,7 +75,7 @@ async def test_release_exclusive_lock_denies_volume_delete_before_docker(hosted,
     client = _client(); monkeypatch.setattr(sandbox_manager, "_get_docker_client", lambda: client)
     with hosted.lock("deployment"):
         with pytest.raises(RuntimeError, match="lease unavailable"):
-            await sandbox_manager.delete_user_volume(USER)
+            await sandbox_manager.delete_user_volume(USER, ORG)
     client.containers.list.assert_not_called()
 
 
@@ -82,7 +84,7 @@ async def test_delete_refuses_attached_volume(hosted, monkeypatch):
     from orchestrator import sandbox_manager
     client = _client(in_use=True); monkeypatch.setattr(sandbox_manager, "_get_docker_client", lambda: client)
     with pytest.raises(RuntimeError, match="still in use"):
-        await sandbox_manager.delete_user_volume(USER)
+        await sandbox_manager.delete_user_volume(USER, ORG)
     client.volume.remove.assert_not_called()
 
 
@@ -90,7 +92,7 @@ async def test_delete_refuses_attached_volume(hosted, monkeypatch):
 async def test_delete_unused_and_missing_volume_are_safe(hosted, monkeypatch):
     from orchestrator import sandbox_manager
     client = _client(); monkeypatch.setattr(sandbox_manager, "_get_docker_client", lambda: client)
-    assert await sandbox_manager.delete_user_volume(USER) is True
+    assert await sandbox_manager.delete_user_volume(USER, ORG) is True
     client.volume.remove.assert_called_once_with(force=False)
     monkeypatch.setattr(sandbox_manager, "_get_docker_client", lambda: _client(missing=True))
-    assert await sandbox_manager.delete_user_volume(USER) is True
+    assert await sandbox_manager.delete_user_volume(USER, ORG) is True

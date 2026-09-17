@@ -16,7 +16,9 @@ def home_key(sandbox) -> str:
     tier = getattr(sandbox, "tier", None) or settings.host_tier
     tier = getattr(tier, "value", tier)
     if tier == "hosted":
-        return user_volume_name(sandbox.user_id)
+        # Per (user, organization) since 2026-09-17 — the hosted home is one
+        # tenant's mirror, so its lock identity is too.
+        return user_volume_name(sandbox.user_id, getattr(sandbox, "organization_id", None) or "")
     if tier == "ec2" and getattr(sandbox, "sandbox_id", None):
         return "layer-" + sandbox.sandbox_id
     raise ValueError("sandbox has no authoritative home identity")

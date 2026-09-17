@@ -69,7 +69,15 @@ echo "[3/5] Preparing agent environment..."
 # ruling on the service token. /etc is the container layer, never the user's
 # home volume, and it is rewritten from the live env on every boot (so it runs
 # on the migration-activation path too, which preserves the mounted home).
-/opt/sandbox/scripts/write-bridge-env.sh || true
+# A failure in here is NOT swallowed: `|| true` used to hide it, and the box
+# then ran fully wired while every shell on it behaved as if it were unwired
+# (bridge-headers.sh's quiet branch). The box still starts — an unreachable
+# container cannot be debugged — but the writer leaves
+# /etc/matrx/bridge-env.FAILED, which bridge-headers.sh and the SDK read and
+# scream about, so nothing about this is silent.
+if ! /opt/sandbox/scripts/write-bridge-env.sh; then
+    echo "[entrypoint] write-bridge-env.sh failed; this box is starting UNWIRED for shells. See /etc/matrx/bridge-env.FAILED." >&2
+fi
 
 if [ "$MATRX_MIGRATION_ACTIVATION" = "0" ]; then
 /opt/sandbox/scripts/prepare-agent-home.sh
