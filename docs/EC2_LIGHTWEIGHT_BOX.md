@@ -17,7 +17,7 @@ volume and not S3**. Everything below follows from that.
 
 | | Hosted tier | Current EC2 tier | **Lightweight box** |
 |---|---|---|---|
-| "The data" lives in | per-user Docker volume (`matrx-user-<uid>`) | `s3://…/users/{uid}/hot/` synced to `/home/agent` | **the git remote** |
+| "The data" lives in | per-(user, organization) Docker volume (`matrx-user-<uid>-org-<oid>`) | `s3://…/users/{uid}/hot/` synced to `/home/agent` | **the git remote** |
 | On boot | mount volume | `aws s3 sync` DOWN (5–30s, [hot-sync.sh:53](../sandbox-image/scripts/hot-sync.sh#L53)) | `git clone --depth` (1–5s) |
 | On teardown | keep volume | `aws s3 sync` UP + FUSE flush | nothing — work was pushed |
 | Output of a run | long-lived workspace | long-lived workspace | **a pushed branch / a PR** |

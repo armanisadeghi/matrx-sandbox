@@ -105,6 +105,24 @@ HELD_RETRY_JITTER_FRACTION = 0.2
 HELD_MAX_TRACKED = 1000  # index cap; the QUEUE, not this dict, is the truth
 HELD_STATUS_SAMPLE = 20  # how many held paths the status endpoint names
 
+# ─── Backpressure ────────────────────────────────────────────────────────────
+# ``_pending`` is a WORKING SET, not the record. The record is the durable
+# queue on disk. Until 2026-09-17 hitting ``MAX_PENDING`` popped the OLDEST
+# pending event, cancelled its timer and called ``mark_done`` — retiring from
+# the durable queue an edit whose file had never been put. That is the same
+# "the queue loses work" shape a refusal used to have, reached instead by a
+# burst: an unpack, a checkout, a build output directory.
+#
+# Now the cap only stops ADMISSION. The event is written to the durable queue
+# first and then either indexed here for re-admission as soon as a slot frees,
+# or — if even that index is full — left for ``replay_pending`` to return at
+# the next start. Either way it stays PENDING and nothing is ever marked done
+# that was not put. ``_pending`` never exceeds ``MAX_PENDING`` and the deferred
+# index never exceeds ``MAX_DEFERRED``, so memory stays bounded.
+MAX_DEFERRED = MAX_PENDING  # index cap; the QUEUE, not this dict, is the truth
+READMIT_SECONDS = 30.0  # slow cadence — a deferred event is not urgent
+READMIT_JITTER_FRACTION = 0.2
+
 
 def _is_ignored_scratch(path: str) -> bool:
     return path.endswith(CLOUD_FILES_TMP_SUFFIX)
@@ -121,6 +139,12 @@ def _held_retry_delay() -> float:
     """``HELD_RETRY_SECONDS`` ± jitter — 226 boxes must not retry in lockstep."""
     spread = HELD_RETRY_SECONDS * HELD_RETRY_JITTER_FRACTION
     return max(1.0, HELD_RETRY_SECONDS + random.uniform(-spread, spread))
+
+
+def _readmit_delay() -> float:
+    """``READMIT_SECONDS`` ± jitter — same anti-lockstep rule as a held retry."""
+    spread = READMIT_SECONDS * READMIT_JITTER_FRACTION
+    return max(1.0, READMIT_SECONDS + random.uniform(-spread, spread))
 
 
 @dataclass
@@ -286,6 +310,13 @@ class CloudFilesWatcher:
         # Writes AI Dream refused, still PENDING in the durable queue.
         self._held: "OrderedDict[str, HeldWrite]" = OrderedDict()
         self._held_total = 0
+        # Events written to the durable queue but NOT admitted to the working
+        # set because it was full. rel_path → (kind, event_id). Never marked
+        # done; re-admitted as soon as a slot frees.
+        self._deferred: "OrderedDict[str, tuple[str, str]]" = OrderedDict()
+        self._backpressure_events = 0
+        self._backpressure_unindexed = 0
+        self._readmit_handle: Optional[asyncio.TimerHandle] = None
 
     @property
     def mode(self) -> str:
@@ -361,9 +392,15 @@ class CloudFilesWatcher:
                 _logger.warning("cloud-files: subscriber stop error: %s", e)
             self._subscriber = None
 
+        if self._readmit_handle is not None:
+            self._readmit_handle.cancel()
+            self._readmit_handle = None
         for handle, _eid in list(self._pending.values()):
             handle.cancel()
         self._pending.clear()
+        # Deferred events are NOT cleared out of the queue — they were never
+        # marked done, so replay_pending returns them on the next start.
+        self._deferred.clear()
 
         if self._observer is not None:
             try:
@@ -539,21 +576,12 @@ class CloudFilesWatcher:
             if is_system_path(evt.rel_path):
                 self._safe_mark_done(evt.event_id)
                 continue
-            handle = self._loop.call_later(
-                0.0,
-                (
-                    lambda r=evt.rel_path,
-                    eid=evt.event_id,
-                    k=evt.kind: asyncio.create_task(
-                        self._flush_upsert(r, eid)
-                        if k == "upsert"
-                        else self._flush_delete(r, eid)
-                    )
-                ),
-            )
             # Replays don't go through _persistent_queue.enqueue again — they're
-            # already on disk. We just track them in _pending for stop() cleanup.
-            self._pending[evt.rel_path] = (handle, evt.event_id)
+            # already on disk. They go through the SAME admission gate, so a
+            # queue holding more than MAX_PENDING events cannot blow the working
+            # set on start: the surplus is deferred, still PENDING, and admitted
+            # as slots free.
+            self._admit(evt.kind, evt.rel_path, evt.event_id, delay=0.0)
             self._event_arrivals.setdefault(evt.rel_path, time.monotonic())
 
     # ─── Setup helpers ───────────────────────────────────────────────────────
@@ -664,6 +692,10 @@ class CloudFilesWatcher:
                 return
 
             try:
+                # Free slots reached by the last flush belong to work that was
+                # deferred before this event existed.
+                self._readmit_deferred()
+
                 p = Path(abs_path)
                 rel = self._rel_path(p)
                 if rel is None:
@@ -697,21 +729,16 @@ class CloudFilesWatcher:
                     # the one that will be accepted or held.
                     self._safe_mark_done(old[1], rel)
 
-                # Backpressure cap.
-                if len(self._pending) >= MAX_PENDING:
-                    drop_rel, (drop_handle, drop_eid) = self._pending.popitem(
-                        last=False
-                    )
-                    drop_handle.cancel()
-                    self._safe_mark_done(drop_eid, drop_rel)
-                    _logger.warning(
-                        "cloud-files: backpressure cap reached, dropping pending %s",
-                        drop_rel,
-                    )
+                # A newer edit to this path also supersedes any DEFERRED event
+                # for it — same rule as the pending one above.
+                stale = self._deferred.pop(rel, None)
+                if stale is not None:
+                    self._safe_mark_done(stale[1], rel)
 
                 self._event_arrivals.setdefault(rel, t_arrival)
 
-                # Persist + schedule.
+                # Persist FIRST — the durable queue is the record, and it holds
+                # the event whether or not the working set has room for it.
                 evt = (
                     self._persistent_queue.enqueue(kind, rel)
                     if self._persistent_queue
@@ -719,23 +746,89 @@ class CloudFilesWatcher:
                 )
                 event_id = evt.event_id if evt else f"mem-{id(rel):x}"
 
-                if kind == "delete":
-                    handle = self._loop.call_later(
-                        DEBOUNCE_SECONDS,
-                        lambda r=rel, eid=event_id: asyncio.create_task(
-                            self._flush_delete(r, eid)
-                        ),
-                    )
-                else:
-                    handle = self._loop.call_later(
-                        DEBOUNCE_SECONDS,
-                        lambda r=rel, eid=event_id: asyncio.create_task(
-                            self._flush_upsert(r, eid)
-                        ),
-                    )
-                self._pending[rel] = (handle, event_id)
+                self._admit(kind, rel, event_id, delay=DEBOUNCE_SECONDS)
             except Exception as e:  # noqa: BLE001
                 _logger.exception("cloud-files: drain error: %s", e)
+
+    # ─── Admission (the cap stops admission, never the work) ─────────────────
+
+    def _admit(self, kind: str, rel: str, event_id: str, *, delay: float) -> bool:
+        """Put one already-persisted event into the working set, if there is room.
+
+        Returns True when a timer was scheduled. When the working set is full
+        the event is DEFERRED, never dropped and never marked done: its file
+        was not put, so it is not finished.
+        """
+        if self._loop is None:
+            return False
+        if len(self._pending) >= MAX_PENDING and rel not in self._pending:
+            self._defer(kind, rel, event_id)
+            return False
+        handle = self._loop.call_later(
+            delay,
+            lambda r=rel, eid=event_id, k=kind: asyncio.create_task(
+                self._flush_upsert(r, eid) if k == "upsert" else self._flush_delete(r, eid)
+            ),
+        )
+        self._pending[rel] = (handle, event_id)
+        return True
+
+    def _defer(self, kind: str, rel: str, event_id: str) -> None:
+        """Hold an event OUT of the working set — it stays PENDING on disk."""
+        self._backpressure_events += 1
+        if len(self._deferred) >= MAX_DEFERRED:
+            self._backpressure_unindexed += 1
+            _logger.warning(
+                "cloud-files: working set (%d) and deferred index (%d) are both "
+                "full — %s %s stays PENDING in %s and is replayed at the next "
+                "start. Nothing is dropped; this box is behind.",
+                MAX_PENDING,
+                MAX_DEFERRED,
+                kind.upper(),
+                rel,
+                self._persistent_queue.path if self._persistent_queue else "the queue",
+            )
+        else:
+            self._deferred[rel] = (kind, event_id)
+            if len(self._deferred) == 1:
+                _logger.warning(
+                    "cloud-files: working set full (%d) — %s %s is deferred, not "
+                    "dropped. It stays PENDING in the sync queue and is admitted "
+                    "as soon as a slot frees; counted as backpressure_events on "
+                    "/internal/cloud-sync-status.",
+                    MAX_PENDING,
+                    kind.upper(),
+                    rel,
+                )
+        self._schedule_readmit()
+
+    def _schedule_readmit(self) -> None:
+        """One slow-cadence timer, so deferral converges with nobody watching."""
+        if self._loop is None or self._stop_requested or self._readmit_handle is not None:
+            return
+        self._readmit_handle = self._loop.call_later(
+            _readmit_delay(), self._on_readmit_timer
+        )
+
+    def _on_readmit_timer(self) -> None:
+        self._readmit_handle = None
+        self._readmit_deferred()
+
+    def _readmit_deferred(self) -> None:
+        """Move deferred events into the working set while there is room."""
+        if not self._deferred or self._loop is None or self._stop_requested:
+            return
+        while self._deferred and len(self._pending) < MAX_PENDING:
+            rel, (kind, event_id) = self._deferred.popitem(last=False)
+            if rel in self._pending:
+                # A newer edit to the same path owns it now — that event is the
+                # one that will be put, so this one is genuinely superseded.
+                self._safe_mark_done(event_id, rel)
+                continue
+            # Already aged in the queue; no second debounce.
+            self._admit(kind, rel, event_id, delay=0.0)
+        if self._deferred:
+            self._schedule_readmit()
 
     def _safe_mark_done(self, event_id: str, rel: Optional[str] = None) -> None:
         """Retire an event. ``rel`` also clears any hold parked on that path.
@@ -821,6 +914,16 @@ class CloudFilesWatcher:
         if self._loop is None or self._stop_requested:
             return
         kind, rel, eid = held.kind, held.rel_path, held.event_id
+        # A held retry takes a working-set slot like anything else: at the cap it
+        # waits another slow cycle rather than growing the map. The event stays
+        # PENDING in the queue either way, and the retry stays off the hot loop.
+        if len(self._pending) >= MAX_PENDING and rel not in self._pending:
+            held.next_attempt_ts = time.time() + delay
+            self._loop.call_later(
+                delay,
+                lambda h=held: self._schedule_held_retry(h, _held_retry_delay()),
+            )
+            return
         handle = self._loop.call_later(
             delay,
             lambda r=rel, e=eid, k=kind: asyncio.create_task(
@@ -1179,6 +1282,14 @@ class CloudFilesWatcher:
             "user_id": self._cfg.user_id if self._cfg else None,
             "pending": len(self._pending),
             "inflight_approx": inflight,
+            # The working set filled up. Every counted event is STILL PENDING in
+            # the durable queue — the cap stops admission, never the work.
+            "backpressure_events": {
+                "total": self._backpressure_events,
+                "deferred_now": len(self._deferred),
+                "awaiting_restart": self._backpressure_unindexed,
+                "working_set_cap": MAX_PENDING,
+            },
             "seeded_hashes": len(self._last_hash),
             "metrics": {
                 "puts": m.put_count,
@@ -1236,6 +1347,8 @@ class CloudFilesWatcher:
                 else 0
             ),
             "held_writes": len(self._held),
+            "backpressure_events": self._backpressure_events,
+            "backpressure_deferred": len(self._deferred),
             "held_last_refusal": (
                 refusal_sentence(
                     max(

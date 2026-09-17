@@ -391,21 +391,48 @@ by user alone mixes tenants, so a file from another of that user's organizations
 sits on disk unlisted, unreported and refused 409 on its next edit.
 
 **Those volumes are LEFT IN PLACE — never renamed, never adopted, never deleted**
-("unreferenced means unfinished, never deletable"). Consequences an operator must
-know:
+("unreferenced means unfinished, never deletable").
 
-- A hosted sandbox created from now on mounts a NEW, EMPTY `matrx-user-<uid>-org-<oid>`
-  home. The user's previous `~/projects`, repos and scratch files are not gone —
-  they are in the legacy volume, simply not mounted.
+**The user's FIRST organization home inherits the legacy one, automatically
+(2026-09-18).** Leaving the legacy volume mounted nowhere would have meant that
+all 213 hosted users' next sandbox opened an empty `/home/agent` while their
+projects, repos, scratch, `~/.matrx/session.json` and the durable cloud-sync
+queue sat on a volume nothing mounted — a silent loss from the person's seat.
+So when `ensure_user_volume` **creates** a user's first `matrx-user-<uid>-org-<oid>`
+home and a legacy `matrx-user-<uid>` volume exists, it copies the legacy contents
+forward once, in one direction, in a short-lived helper container running the
+orchestrator's own image (legacy mounted **read-only** at `/from`, the new home
+at `/to`, `cp -a`, no network), BEFORE the sandbox starts.
+
+- The new volume carries the label `matrx.inherited_from=<legacy name>`, so an
+  operator can see at a glance which homes were seeded:
+  `docker volume ls --filter label=matrx.inherited_from`. The orchestrator also
+  logs `HOME_INHERITED volume=… legacy=… user=… organization=…` (and the sandbox
+  create logs "home … was seeded from the pre-organization volume …").
+- **A failed copy REFUSES the sandbox create.** The half-copied new volume is
+  removed, the legacy volume is never modified or deleted, and the log carries
+  `HOME_INHERITANCE_FAILED` with the cause. A box never starts on an empty or
+  half-copied home. Re-running the create retries the copy from scratch.
+- **A user's SECOND organization's home starts EMPTY on purpose.** The home is
+  that organization's tenant view of their files, not a second copy of the first
+  tenant's drawer. Copying work forward into a later organization is a deliberate
+  operator act — the last command in the block below.
+- Because the copy runs once, on creation, an inherited home is treated as a
+  RETAINED home: memory hydration is skipped and `SANDBOX_MIGRATION=1` is set,
+  exactly as for a reused home.
+
+Other consequences an operator must know:
+
 - **Migration does not move a box across homes.** `migrate_sandbox` re-mounts the
   binds the old container had, so a migrated box keeps its legacy volume. Only a
-  CREATE produces an org-keyed home.
+  CREATE produces an org-keyed home — and only a CREATE inherits.
 - **The cloud-sync queue lives on the volume, not in the container layer**:
   `/home/agent/.matrx/runtime/cloud-sync-queue.jsonl` (`cloud_sync/queue.py`
   `DEFAULT_PATH`), under the `/home/agent` mount. So do `~/.matrx/session.json`
-  and the session report. A box that starts on a new org-keyed home therefore
-  starts with an empty queue; anything still PENDING on the legacy volume is
-  neither replayed nor lost — it stays in that file until someone reads it.
+  and the session report. On an inherited first home they come across with
+  everything else, so PENDING events replay; a home for a LATER organization
+  starts with an empty queue, and anything still PENDING on the legacy volume
+  stays in that file until someone reads it.
 
 Inspect or recover one, read-only first:
 
@@ -420,7 +447,11 @@ docker run --rm -v matrx-user-<uuid>:/legacy:ro alpine sh -c 'du -sh /legacy; ls
 docker run --rm -v matrx-user-<uuid>:/legacy:ro alpine \
   cat /legacy/.matrx/runtime/cloud-sync-queue.jsonl
 
-# Copy work forward into the user's new tenant home (deliberate, one direction).
+# Which homes were seeded from a legacy volume (first organization only).
+docker volume ls --filter label=matrx.inherited_from --format '{{.Name}}'
+
+# Copy work forward into a LATER organization's home — this one is manual and
+# deliberate, one direction; the first organization's home did it automatically.
 docker run --rm -v matrx-user-<uuid>:/from:ro \
   -v matrx-user-<uuid>-org-<org-uuid>:/to alpine \
   sh -c 'cp -a /from/projects /to/ 2>/dev/null; ls /to'

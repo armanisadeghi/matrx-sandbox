@@ -32,6 +32,7 @@ from orchestrator.storage_layout import (
     ec2_home_volume_name,
     ensure_ec2_home_volume,
     ensure_user_volume,
+    inherited_from,
     resolve_user_storage,
     user_volume_name,
     validate_ec2_home_volume,
@@ -634,9 +635,25 @@ async def _create_sandbox_unleased(
                 reusing_home = True
             except NotFound:
                 pass
+            # A failed inheritance copy raises here and REFUSES the create —
+            # a box never starts on an empty or half-copied home.
             volume_name = await asyncio.to_thread(
                 ensure_user_volume, client, user_id, organization_id
             )
+            if not reusing_home:
+                seeded_from = await asyncio.to_thread(
+                    inherited_from, client, volume_name
+                )
+                if seeded_from:
+                    # A home seeded from the user's pre-organization volume is a
+                    # RETAINED home: it already holds their projects, session
+                    # manifest and sync queue, so nothing may hydrate over it.
+                    reusing_home = True
+                    logger.warning(
+                        "Hosted-tier sandbox %s: home %s was seeded from the "
+                        "pre-organization volume %s",
+                        sandbox_id, volume_name, seeded_from,
+                    )
             volumes[volume_name] = {"bind": "/home/agent", "mode": "rw"}
             sandbox.persistence_volume = volume_name
             logger.info(

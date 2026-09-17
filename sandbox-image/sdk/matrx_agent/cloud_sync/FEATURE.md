@@ -59,6 +59,26 @@ stopped receiving cloud edits, so it is stated once with the remedy and appears
 as `downstream.last_refusal` on the same status object — not one WARNING per
 cycle and nothing anyone reads.
 
+**The backpressure cap stops ADMISSION, never the work.** `_pending` is a
+working set; `cloud-sync-queue.jsonl` is the record. Until 2026-09-18 reaching
+`MAX_PENDING` (10,000) popped the OLDEST pending event, cancelled its timer and
+called `mark_done` — retiring from the durable queue an edit whose file had
+never been put. Same "the queue loses work" shape as the refusal above, reached
+by a burst instead: an unpack, a `git checkout`, a build writing a tree.
+
+Every event is now written to the durable queue FIRST, then admitted through one
+gate (`_admit`). At the cap it is DEFERRED: indexed in `_deferred` and admitted
+as soon as a slot frees (opportunistically on the next drained event, and on a
+jittered ~30s `READMIT_SECONDS` timer so it converges with nobody watching). If
+even that index is full (`MAX_DEFERRED`) the event is simply left alone — still
+PENDING, returned by `replay_pending` at the next start, and the overflow is
+logged by name. Nothing is ever `mark_done`d that was not put; `_pending` never
+exceeds `MAX_PENDING`, so memory stays bounded. A replay and a held-write retry
+go through the same gate, so a queue larger than the cap cannot blow the working
+set on start. The count is published as `backpressure_events`
+(`total` / `deferred_now` / `awaiting_restart` / `working_set_cap`) on
+`/internal/cloud-sync-status`, beside `held_writes`.
+
 **Local blocking work stays off the event loop.** Tree hashing and per-file
 hashes run through `asyncio.to_thread`. Filesystem observer callbacks hand work
 to the loop with `call_soon_threadsafe` and never perform network I/O.
@@ -138,12 +158,21 @@ image rebuild ordering problem, and the sandbox's log line flips to the INFO for
 
 - `pytest sandbox-image/sdk/tests/test_cloud_sync_boundaries.py`
 - `pytest sandbox-image/sdk/tests/test_held_writes.py`
+- `pytest sandbox-image/sdk/tests/test_backpressure_never_loses_work.py`
 - `pytest sandbox-image/sdk/tests/test_orchestrator_identity.py`
 - `pytest sandbox-image/sdk/tests/test_downstream_retry_after.py`
 - `pytest sandbox-image/sdk/tests/test_downstream_deletions.py`
 
 ## Change log
 
+- 2026-09-18 — **The backpressure cap never loses work.** `MAX_PENDING` no longer
+  drops-and-`mark_done`s the oldest pending event. Admission runs through one
+  gate (`_admit`): at the cap an event is deferred (`_deferred`, re-admitted when
+  a slot frees or on a jittered ~30s timer) or left for `replay_pending`, always
+  still PENDING. Replays and held retries use the same gate. `backpressure_events`
+  is published on `/internal/cloud-sync-status`. Guard:
+  `tests/test_backpressure_never_loses_work.py` (proven failing-then-passing
+  against the previous drop behaviour, and carrying its own falsifiability test).
 - 2026-09-17 — **A refused write is HELD, not finished.** `_is_retryable_bridge_error`
   still judges the hot ladder, but the terminal path no longer marks the event
   done: `_hold` keeps it PENDING, parks it for a jittered 5-minute retry and
