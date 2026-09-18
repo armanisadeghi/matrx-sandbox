@@ -190,16 +190,36 @@ echo "[build-aidream] verifying the pinned Codex CLI in $TAG"
 # runtime reports "this image does not ship the Codex CLI". The stamp is what
 # the capability verdict reads, so the stamp and the binary are checked to
 # agree, and the agent is proven able to run it and unable to replace it.
+#
+# RUNS AS THE IMAGE'S OWN DEFAULT USER, WHICH IS `agent`, AND THAT IS THE POINT
+# (fixed 2026-09-18). Every probe here is a statement about what the AGENT can
+# do, so the agent is who must run it. The original wrapped two of them in
+# `su … agent` as though the container were root; `Dockerfile.aidream` ends with
+# `USER agent`, so it never was, and `su` answered `Password: su: Authentication
+# failure`. That failure took down EVERY hosted aidream image build from 07:56
+# UTC on 2026-09-18 — zero promotions all day, the live tag stuck on an image
+# from five days earlier — while the CLI and the stamp were perfectly fine
+# (measured: `codex-cli 0.155.0` on the candidate image).
+#
+# `--user root` is NOT the fix, and that is worth knowing before someone tries
+# it: root bypasses file modes, so `test ! -w` reports the pinned binary as
+# WRITABLE and the check fails for a second, opposite reason (measured the same
+# day). Two of these probes only mean anything as a non-root user.
+#
+# Dropping `su` also closes a FALSE PASS: `! su … "touch …"` succeeded whenever
+# `su` itself failed, so an agent-writable codex prefix would have satisfied the
+# guard. Now the touch is attempted by the agent directly, and only a real
+# permission denial passes.
 docker run --rm --entrypoint /bin/sh "$TAG" -c \
     'set -eu \
+    && test "$(id -un)" = agent \
     && stamped=$(cat /etc/matrx-codex-version) \
     && reported=$(PATH=/usr/local/bin:/usr/bin:/bin codex --version) \
     && test "$stamped" = "$reported" \
     && case "$stamped" in codex-cli\ *) : ;; *) echo "bad codex stamp: $stamped" >&2; exit 1 ;; esac \
     && test ! -w /opt/matrx-codex/bin/codex \
-    && su -s /bin/sh -c "PATH=/usr/local/bin:/usr/bin:/bin codex --version >/dev/null" agent \
-    && ! su -s /bin/sh -c "touch /opt/matrx-codex/bin/.probe" agent 2>/dev/null \
-    && echo "[build-aidream] codex ok: $stamped"'
+    && ! touch /opt/matrx-codex/bin/.probe 2>/dev/null \
+    && echo "[build-aidream] codex ok as $(id -un): $stamped"'
 
 echo "[build-aidream] verifying Claude Linux sandbox prerequisites in $TAG"
 docker run --rm --entrypoint /bin/sh "$TAG" -c \
