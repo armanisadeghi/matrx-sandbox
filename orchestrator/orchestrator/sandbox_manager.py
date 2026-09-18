@@ -197,6 +197,33 @@ PLATFORM_PASSTHROUGH_TEMPLATES: frozenset[str] = frozenset({"aidream"})
 #: Where the binding-time vault refresh publishes the person's CURRENT vault
 #: values (orchestrator/vault_env_refresh.py owns the writing). Named here so
 #: the exec wrapper does not import that module for one string.
+#: Every env name the ORCHESTRATOR itself puts in a container (see the `env`
+#: dict in ``create_sandbox``). The binding-time refresh must never clear one of
+#: these while trying to clear a leaked platform credential: several of them
+#: MATCH the master-credential patterns on purpose (MATRX_AIDREAM_SERVICE_TOKEN,
+#: AWS_SECRET_ACCESS_KEY), and a hosted box loses its S3 sync without them.
+#: ``create_sandbox`` asserts its own keys are a subset of this set, so the two
+#: cannot drift (tests/test_github_credential_and_vault_env.py).
+ORCHESTRATOR_MANAGED_ENV: frozenset[str] = frozenset({
+    "SANDBOX_ID", "USER_ID", "ORGANIZATION_ID",
+    "S3_BUCKET", "S3_REGION", "HOT_PATH", "COLD_PATH",
+    "SHUTDOWN_TIMEOUT_SECONDS",
+    "MATRX_TIER", "MATRX_HOT_PREFIX", "MATRX_COLD_PREFIX",
+    "SANDBOX_TEMPLATE", "SANDBOX_TEMPLATE_VERSION", "SANDBOX_MIGRATION",
+    "MATRX_AGENT_TOKEN",
+    "MATRX_AIDREAM_URL", "MATRX_AIDREAM_SERVICE_TOKEN",
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    "AWS_DEFAULT_REGION", "AWS_REGION",
+})
+
+#: Names the platform has RETIRED as git credentials (2026-09-18). They are not
+#: master-credential shaped, so the pattern filter alone would leave them in a
+#: box forever; the credential helper no longer reads them, and a name nothing
+#: reads should not sit in a user's environment looking like a credential.
+RETIRED_GIT_CREDENTIAL_NAMES: frozenset[str] = frozenset({
+    "GH_TOKEN", "GITHUB_PAT", "MATRX_GITHUB_TOKEN",
+})
+
 VAULT_ENV_FILE = "/etc/matrx/vault-env.sh"
 #: Where the box's identity lives (write-bridge-env.sh at boot on a current
 #: image; republished at binding by vault_env_refresh for boxes older than that
@@ -747,6 +774,21 @@ async def _create_sandbox_unleased(
             region = config.get("s3_region", settings.s3_region)
             env["AWS_DEFAULT_REGION"] = region
             env["AWS_REGION"] = region
+
+        # The refresh's protected set and the dict above are ONE contract: a
+        # name the orchestrator manages but that is missing from
+        # ORCHESTRATOR_MANAGED_ENV would be CLEARED out of every live box by the
+        # binding-time leak sweep (vault_env_refresh.leaked_platform_names).
+        # Checked HERE — after the orchestrator's own block and before the
+        # caller's config.env, the vault and the passthrough merge in, so this
+        # sees exactly the set it is about.
+        _unregistered = sorted(set(env) - ORCHESTRATOR_MANAGED_ENV)
+        if _unregistered:
+            raise RuntimeError(
+                f"orchestrator-managed env names missing from "
+                f"ORCHESTRATOR_MANAGED_ENV: {_unregistered}. Add them there, or the "
+                f"binding-time leak sweep will clear them out of live boxes."
+            )
 
         # ── aidream-in-sandbox env passthrough (aidream template ONLY) ────────
         # Forward env vars named in EITHER (a) the file at

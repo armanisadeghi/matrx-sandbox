@@ -439,3 +439,104 @@ def test_the_refresh_writes_the_same_paths_write_bridge_env_owns() -> None:
     assert "00-matrx-bridge.sh" in writer and v.BRIDGE_PROFILE_DROPIN.endswith(
         "00-matrx-bridge.sh"
     )
+
+
+# ── 6. Boxes created before the platform-env leak fix get cleaned ────────────
+#
+# Incident 2026-09-13 stopped the passthrough reaching non-`aidream` templates
+# for boxes created AFTERWARDS. Nothing cleaned the ones already running. Admin's
+# hosted sbx-5515667942bd (created 2026-08-17), read live on 2026-09-18, still
+# held GITHUB_PAT, GITHUB_CLIENT_SECRET, GITHUB_CLIENT_ID and the bot identity.
+
+
+def _leaked(names, *, template="bare", vault=()):
+    from orchestrator.vault_env_refresh import leaked_platform_names
+
+    return leaked_platform_names(list(names), template=template, vault_names=set(vault))
+
+
+def test_the_platform_credentials_a_pre_fix_box_still_holds_are_cleared() -> None:
+    """The exact name set read off admin's hosted box on 2026-09-18."""
+    observed = [
+        "GITHUB_PAT",
+        "GITHUB_CLIENT_SECRET",
+        "GITHUB_CLIENT_ID",
+        "GITHUB_BOT_ACCOUNT_USERNAME",
+        "GITHUB_BOT_EMAIL",
+        "GITHUB_ORG_NAME",
+        "SANDBOX_ID",
+        "USER_ID",
+    ]
+    cleared = _leaked(observed)
+
+    assert "GITHUB_PAT" in cleared
+    assert "GITHUB_CLIENT_SECRET" in cleared, (
+        "a platform OAuth client secret in a user's box is the thing the "
+        "incident was about"
+    )
+
+
+def test_the_orchestrator_s_own_env_is_never_cleared() -> None:
+    """The one way this sweep could break a live box. MATRX_AIDREAM_SERVICE_TOKEN
+    and AWS_SECRET_ACCESS_KEY both MATCH the master-credential patterns and are
+    both put there by the orchestrator on purpose; a hosted box loses its S3
+    sync without the second."""
+    from orchestrator.sandbox_manager import ORCHESTRATOR_MANAGED_ENV
+
+    cleared = _leaked(sorted(ORCHESTRATOR_MANAGED_ENV))
+
+    assert cleared == [], f"the sweep would have broken a live box: {cleared}"
+
+
+def test_the_protected_set_cannot_drift_from_what_create_actually_sets() -> None:
+    """A managed name missing from the protected set would be cleared out of
+    every live box. create_sandbox refuses at CREATE rather than letting that
+    reach the sweep."""
+    source = (REPO / "orchestrator" / "orchestrator" / "sandbox_manager.py").read_text()
+    assert "ORCHESTRATOR_MANAGED_ENV" in source
+    assert "_unregistered = sorted(set(env) - ORCHESTRATOR_MANAGED_ENV)" in source
+    assert "binding-time leak sweep will clear them out of live boxes" in source
+
+
+def test_a_persons_own_vault_value_is_never_treated_as_a_leak() -> None:
+    """Somebody's own GITHUB_PAT vault item, marked inject, is theirs."""
+    assert _leaked(["GITHUB_PAT"], vault=["GITHUB_PAT"]) == []
+    assert _leaked(["OPENAI_API_KEY"], vault=["OPENAI_API_KEY"]) == []
+
+
+def test_the_aidream_template_keeps_the_platform_env_it_is_entitled_to() -> None:
+    """That template exists to run aidream itself inside a box. Sweeping it
+    would break the one lawful consumer."""
+    assert _leaked(["GITHUB_PAT", "SUPABASE_MATRIX_PASSWORD"], template="aidream") == []
+
+
+def test_an_ordinary_non_credential_name_is_left_alone() -> None:
+    """The sweep is not a general env cleaner. A box's own PATH, HOME, or a
+    tool's plain setting is none of its business."""
+    assert _leaked(["PATH", "HOME", "LANG", "NODE_ENV", "GITHUB_ORG_NAME"]) == []
+
+
+def test_the_cleared_names_are_reported_and_actually_unset() -> None:
+    """Reporting a clear that did not happen is worse than not clearing."""
+    from orchestrator.vault_env_refresh import render_env_file
+
+    script = render_env_file({"SERPAPI_API_KEY": "live"}, version="v", removed=["GITHUB_PAT"])
+    assert (
+        _run(
+            script,
+            'echo "${GITHUB_PAT-<unset>}"',
+            preset={"GITHUB_PAT": "the-platform-token"},
+        )
+        == "<unset>"
+    )
+
+
+def test_the_sweep_rides_its_own_knob() -> None:
+    from orchestrator import vault_env_refresh as v
+
+    assert v.LEAK_KNOB == "clear_leaked_platform_env_on_binding"
+    source = (REPO / "orchestrator" / "orchestrator" / "vault_env_refresh.py").read_text()
+    assert "await knob_bool(LEAK_KNOB)" in source
+    assert "LEAK SWEEP UNAVAILABLE" in source, (
+        "a missing knob row must say so rather than silently not sweeping"
+    )
