@@ -19,6 +19,8 @@
 **The Data Doctrine binds data work.** Custom data, table types, organizations, and access words are ruled by the AI Matrx Data Doctrine (Arman, 2026-09-10) — a doctrine document, presumed right against the code and any other doc, amended only by him (`common-docs/policies/doctrine-documents.md`). Its data rules live once at `common-docs/systems/platform/db-rules/DECISIONS.md`; the gap between them and the code is tracked in `common-docs/projects/data-doctrine-adoption/REGISTER.md`. Live names (scope, component, machinery, graveyard, is_personal…) stay until their convergence campaign runs — never rename on sight.
 <!-- nine-laws:end -->
 
+**Cloud task autonomy:** A task request authorizes routine in-scope edits, verification, exact-path commits, and pushes. Continue without a conversational confirmation pause; honor explicit hold points and human-only gates. [Completion policy](../common-docs/policies/defect-ownership.md).
+
 
 **Purpose of this file (per the [CLAUDE.md charter](/Users/armanisadeghi/code/common-docs/policies/claude-md-charter.md)):** you are doing sandbox work — the container image and/or the orchestrator for isolated agent machines on AWS (EC2 + hosted tiers). This file carries the sandbox-specific rules, the confusions that actually bite here, and pointers to the shared systems this repo integrates with. It does NOT carry feature detail (the docs table below does), API surfaces, deploy runbooks, or platform-rule bodies — those live in their canonical docs, one-liner + link here. Adding a line requires: "would removing it cause an agent to make a mistake in THIS repo?" Budget: ≤200 lines.
 
