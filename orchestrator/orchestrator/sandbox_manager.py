@@ -198,6 +198,11 @@ PLATFORM_PASSTHROUGH_TEMPLATES: frozenset[str] = frozenset({"aidream"})
 #: values (orchestrator/vault_env_refresh.py owns the writing). Named here so
 #: the exec wrapper does not import that module for one string.
 VAULT_ENV_FILE = "/etc/matrx/vault-env.sh"
+#: Where the box's identity lives (write-bridge-env.sh at boot on a current
+#: image; republished at binding by vault_env_refresh for boxes older than that
+#: script). Sourced BEFORE the vault file so a vault value the person happened
+#: to name USER_ID still wins in their own shell.
+BRIDGE_ENV_FILE = "/etc/matrx/bridge-env.sh"
 
 MASTER_CREDENTIALS_KNOB = "aidream_template_forwards_master_credentials"
 
@@ -1280,7 +1285,15 @@ async def exec_in_sandbox(
         # no bashrc: without this line the file would reach ssh sessions and
         # miss the tool path entirely. MATRX_VAULT_ENV_SKIP protects names this
         # caller set on purpose for this one exec.
-        vault_line = f"[ -r {shlex.quote(VAULT_ENV_FILE)} ] && . {shlex.quote(VAULT_ENV_FILE)}; "
+        # Identity first, vault second. `docker exec` injects only the env the
+        # CONTAINER was created with, and a box older than write-bridge-env.sh
+        # was created without ORGANIZATION_ID at all — proven on admin's
+        # sbx-cd6d53863995, 2026-09-18, where the login shell had the
+        # organization and the tool path did not.
+        vault_line = (
+            f"[ -r {shlex.quote(BRIDGE_ENV_FILE)} ] && . {shlex.quote(BRIDGE_ENV_FILE)}; "
+            f"[ -r {shlex.quote(VAULT_ENV_FILE)} ] && . {shlex.quote(VAULT_ENV_FILE)}; "
+        )
         wrapped = (
             f"MATRX_VAULT_ENV_SKIP={shlex.quote(' '.join(sorted(env or {})))}; "
             f"export MATRX_VAULT_ENV_SKIP; "

@@ -230,6 +230,15 @@ def test_the_exec_wrapper_sources_the_vault_file() -> None:
     source = (REPO / "orchestrator" / "orchestrator" / "sandbox_manager.py").read_text()
     wrapper = source[source.index("        vault_line = ") :][:1200]
     assert "VAULT_ENV_FILE" in wrapper
+    assert "BRIDGE_ENV_FILE" in wrapper, (
+        "the identity belongs to the tool path too: on admin's sbx-cd6d53863995 "
+        "(2026-09-18) the login shell had ORGANIZATION_ID and `docker exec` did "
+        "not, because only the profile drop-in published it"
+    )
+    assert wrapper.index("BRIDGE_ENV_FILE") < wrapper.index("VAULT_ENV_FILE"), (
+        "identity is sourced first so a person's own vault value of the same "
+        "name still wins in their shell"
+    )
     assert "MATRX_VAULT_ENV_SKIP" in wrapper, (
         "the wrapper must tell the file which names this exec set on purpose"
     )
