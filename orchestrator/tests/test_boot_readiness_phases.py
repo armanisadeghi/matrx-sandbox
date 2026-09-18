@@ -395,3 +395,17 @@ def test_an_unrefreshed_progress_line_expires_instead_of_lying():
     assert boot is None, "a stale progress line is still being asserted"
     # And the caller's own config is handed back untouched either way.
     assert config == {"env": {"A": "1"}}
+
+
+@pytest.mark.asyncio
+async def test_a_failed_box_carries_no_progress_line(monkeypatch):
+    """Break caught: a dead row still advertises a home sync in progress."""
+    container = FakeContainer([{"phase": br.PHASE_HOME_SYNC, "progress": "4210/8630"}])
+    install(monkeypatch, container)
+    store = seeded_store(monkeypatch, home_sync_timeout_seconds=30)
+
+    result = await sandbox_manager._wait_for_ready(row(), store=store, poll_interval=2.0)
+    assert result.status is SandboxStatus.FAILED
+    assert result.boot is None
+    # The count is not lost — it moved to where a dead box belongs.
+    assert "4210/8630 files" in result.stop_reason
