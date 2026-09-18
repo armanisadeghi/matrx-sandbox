@@ -489,13 +489,38 @@ def test_the_orchestrator_s_own_env_is_never_cleared() -> None:
 
 
 def test_the_protected_set_cannot_drift_from_what_create_actually_sets() -> None:
-    """A managed name missing from the protected set would be cleared out of
-    every live box. create_sandbox refuses at CREATE rather than letting that
-    reach the sweep."""
+    """The guard that keeps this sweep from eating a live box.
+
+    Two failure directions, both real:
+      * a name create_sandbox sets but the protected set omits would be CLEARED
+        out of every live box on its next binding;
+      * the create-time check that catches that would itself fail EVERY sandbox
+        create if it ever disagreed with the set.
+
+    So this reads the names straight out of the `env` dict in the shipped
+    source and compares them, rather than trusting a comment or a grep.
+    """
+    import re
+
     source = (REPO / "orchestrator" / "orchestrator" / "sandbox_manager.py").read_text()
-    assert "ORCHESTRATOR_MANAGED_ENV" in source
-    assert "_unregistered = sorted(set(env) - ORCHESTRATOR_MANAGED_ENV)" in source
-    assert "binding-time leak sweep will clear them out of live boxes" in source
+    block = source[
+        source.index("        env = {\n") : source.index(
+            "        _unregistered = sorted(set(env) - ORCHESTRATOR_MANAGED_ENV)"
+        )
+    ]
+    set_by_create = set(re.findall(r'^\s+"([A-Z_0-9]+)":', block, re.M)) | set(
+        re.findall(r'env\["([A-Z_0-9]+)"\]\s*=', block)
+    )
+    assert set_by_create, "the parse found nothing — the check's anchor moved"
+
+    from orchestrator.sandbox_manager import ORCHESTRATOR_MANAGED_ENV
+
+    missing = sorted(set_by_create - ORCHESTRATOR_MANAGED_ENV)
+    assert missing == [], (
+        f"{missing} are set by create_sandbox but absent from "
+        "ORCHESTRATOR_MANAGED_ENV. Live: every create would raise, and the "
+        "binding-time sweep would clear them out of running boxes."
+    )
 
 
 def test_a_persons_own_vault_value_is_never_treated_as_a_leak() -> None:
