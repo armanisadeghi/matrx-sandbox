@@ -25,6 +25,7 @@ from docker.errors import DockerException, NotFound, APIError
 
 from orchestrator.bridge_headers import identity_headers
 from orchestrator.config import settings
+from orchestrator.boot_readiness import BOOT_FOLLOW_INTERVAL_SECONDS
 from orchestrator.knobs import knob_float, knob_int, knob_str
 from orchestrator.runtime_isolation import container_runtime_isolation
 from orchestrator.models import SandboxBoot, SandboxResponse, SandboxStatus
@@ -1260,6 +1261,11 @@ async def _wait_for_ready(
                         "Sandbox %s is usable with home sync still running (%s)",
                         sandbox.sandbox_id, snapshot.progress_text() or "no count",
                     )
+                    # ...and something must keep telling the truth after we
+                    # return, or the row would say "4210/8630" forever. The
+                    # follower runs the same probe until the box reports
+                    # `ready`, then clears the line.
+                    _follow_boot_to_completion(sandbox.sandbox_id, store)
                 else:
                     sandbox.boot = None
                 return sandbox
@@ -1284,6 +1290,80 @@ async def _wait_for_ready(
             return sandbox
 
         await asyncio.sleep(poll_interval)
+
+
+#: Detached boot followers, keyed by sandbox id, so one box never gets two.
+_boot_followers: dict[str, asyncio.Task] = {}
+
+
+def _follow_boot_to_completion(sandbox_id: str, store: "SandboxStore") -> None:
+    """Keep a handed-over box's boot line true until its boot really ends.
+
+    A box admitted mid home-sync carries a progress line. Without this, that
+    line would be frozen at whatever count it had when we returned — a screen
+    stating something that stopped being true, which is the quiet half of the
+    same defect the phase budgets fixed. The follower re-runs the same probe
+    and clears ``boot`` once the box reports ``ready``.
+
+    Detached and entirely best-effort: it never blocks a create, never fails
+    one, and an orchestrator restart that loses it cannot leave a lying row
+    either — ``SandboxBoot`` expires on age when it is read back.
+    """
+    existing = _boot_followers.get(sandbox_id)
+    if existing is not None and not existing.done():
+        return
+
+    async def follow() -> None:
+        from orchestrator import boot_readiness as br
+
+        client = _get_docker_client()
+        try:
+            budget = float(await knob_int("home_sync_timeout_seconds"))
+        except Exception:
+            return
+        deadline = time.monotonic() + budget
+        previous: br.BootSnapshot | None = None
+        while time.monotonic() < deadline:
+            await asyncio.sleep(BOOT_FOLLOW_INTERVAL_SECONDS)
+            try:
+                container = await asyncio.to_thread(client.containers.get, sandbox_id)
+                code, output = await asyncio.to_thread(
+                    container.exec_run, ["/bin/sh", "-c", br.PROBE_SCRIPT]
+                )
+            except (NotFound, APIError):
+                return
+            text = output.decode("utf-8", "replace") if isinstance(output, bytes) else str(output or "")
+            snapshot = br.parse_probe(text if code == 0 else "")
+            if not br.advanced(previous, snapshot):
+                continue
+            previous = snapshot
+
+            row = await store.get(sandbox_id)
+            if row is None or getattr(row.status, "value", row.status) not in {"ready", "running", "starting"}:
+                return
+            finished = snapshot.ready_marker or snapshot.phase == br.PHASE_READY
+            row.boot = None if finished else SandboxBoot(
+                phase=snapshot.budget_phase,
+                files_done=snapshot.files_done,
+                files_total=snapshot.files_total,
+                briefing=snapshot.briefing(),
+                updated_at=datetime.now(timezone.utc),
+            )
+            try:
+                await store.save(row)
+            except Exception as exc:
+                logger.warning("Boot follower could not update %s: %s", sandbox_id, exc)
+                return
+            if finished:
+                logger.info("Sandbox %s finished its boot; progress line cleared", sandbox_id)
+                return
+
+    try:
+        task = asyncio.get_running_loop().create_task(follow())
+    except RuntimeError:
+        return
+    _boot_followers[sandbox_id] = task
+    task.add_done_callback(lambda _t: _boot_followers.pop(sandbox_id, None))
 
 
 def _backfill_proxy_url(sb: SandboxResponse | None) -> SandboxResponse | None:

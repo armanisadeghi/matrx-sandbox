@@ -55,6 +55,28 @@ LONG_HAUL_PHASES = (PHASE_HOME_SYNC,)
 
 BOOT_DIR = "/tmp/matrx-boot"
 
+#: How often the follower re-reads a handed-over box's boot phase. The line on
+#: the screen is only honest if something keeps it current.
+BOOT_FOLLOW_INTERVAL_SECONDS = 10.0
+
+#: A boot line older than this is not shown at all. A screen is absent or
+#: honest, never stale: if the orchestrator that was following a box died
+#: mid-restore, its last progress line must expire rather than keep asserting
+#: a count that stopped being true.
+BOOT_STALE_AFTER_SECONDS = 600.0
+
+
+def is_stale(updated_at, *, now=None) -> bool:
+    """True when a stored boot line is too old to still be asserted."""
+    if updated_at is None:
+        return True
+    from datetime import datetime, timezone
+
+    now = now or datetime.now(timezone.utc)
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    return (now - updated_at).total_seconds() > BOOT_STALE_AFTER_SECONDS
+
 #: One exec, no dependency on anything the image has to provide. An image
 #: without the phase files answers with empty values rather than failing, so
 #: this probe works against every container in the fleet today.
@@ -193,7 +215,7 @@ def timeout_reason(snapshot: BootSnapshot | None, budget: float, elapsed: float)
 
 
 __all__ = [
-    "BOOT_DIR", "KNOWN_PHASES", "LONG_HAUL_PHASES", "PROBE_SCRIPT",
+    "BOOT_DIR", "BOOT_FOLLOW_INTERVAL_SECONDS", "BOOT_STALE_AFTER_SECONDS", "is_stale", "KNOWN_PHASES", "LONG_HAUL_PHASES", "PROBE_SCRIPT",
     "PHASE_CLOUD_FILES", "PHASE_COLD_MOUNT", "PHASE_CONTAINER",
     "PHASE_ENVIRONMENT", "PHASE_HOME_SYNC", "PHASE_READY", "PHASE_SDK",
     "BootSnapshot", "advanced", "parse_probe", "phase_budget", "timeout_reason",

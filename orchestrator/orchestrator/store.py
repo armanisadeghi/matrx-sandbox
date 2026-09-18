@@ -75,9 +75,16 @@ def _split_boot(config_val: Any) -> tuple[dict, SandboxBoot | None]:
     if not isinstance(raw, dict) or not raw.get("phase"):
         return payload, None
     try:
-        return payload, SandboxBoot(**raw)
+        boot = SandboxBoot(**raw)
     except Exception:  # a malformed row must never break a list call
         return payload, None
+    # A screen is absent or honest. If nothing has refreshed this line for a
+    # long time — the orchestrator that was following the box restarted, say —
+    # it stops being shown rather than going on asserting a count that has not
+    # been true for hours.
+    from orchestrator.boot_readiness import is_stale
+
+    return payload, (None if is_stale(boot.updated_at) else boot)
 
 
 class KnobSourceUnavailableError(RuntimeError):

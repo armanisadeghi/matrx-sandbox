@@ -336,3 +336,62 @@ async def test_a_refusal_names_the_boxes_and_how_to_free_one():
     assert {o["sandbox_id"] for o in refused.value.occupants} == {
         "sbx-aug-one", "sbx-aug-two",
     }
+
+
+@pytest.mark.asyncio
+async def test_the_progress_line_is_kept_current_after_hand_over(monkeypatch):
+    """Break caught: a box admitted mid-sync keeps saying '4210/8630' forever.
+
+    Admitting a box early is only honest if something goes on telling the
+    truth after the create returns. The follower must update the count and
+    then CLEAR the line when the box actually finishes.
+    """
+    container = FakeContainer([
+        {"phase": br.PHASE_HOME_SYNC, "progress": "4210/8630", "sdk": True},
+        {"phase": br.PHASE_HOME_SYNC, "progress": "7000/8630", "sdk": True},
+        {"phase": br.PHASE_READY, "sdk": True, "ready": True},
+    ])
+    install(monkeypatch, container)
+    store = seeded_store(monkeypatch)
+    monkeypatch.setattr(sandbox_manager, "BOOT_FOLLOW_INTERVAL_SECONDS", 0.0)
+
+    created = row()
+    await store.save(created)
+    result = await sandbox_manager._wait_for_ready(created, store=store, poll_interval=2.0)
+    assert result.status is SandboxStatus.READY
+    assert result.boot is not None and result.boot.files_done == 4210
+
+    follower = sandbox_manager._boot_followers.get(created.sandbox_id)
+    assert follower is not None, "nothing is keeping the progress line current"
+    await follower
+
+    assert (await store.get(created.sandbox_id)).boot is None, (
+        "the box finished its boot but the row still advertises a home sync"
+    )
+
+
+def test_an_unrefreshed_progress_line_expires_instead_of_lying():
+    """Break caught: an orchestrator restart freezes a count on the row forever.
+
+    A screen is absent or honest. A boot line nothing has refreshed for long
+    enough must not be handed back at all.
+    """
+    from orchestrator.store import BOOT_CONFIG_KEY, _split_boot
+
+    fresh = {
+        "phase": br.PHASE_HOME_SYNC, "files_done": 4210, "files_total": 8630,
+        "briefing": "home sync in progress: 4210/8630 files",
+        "updated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    _, boot = _split_boot({BOOT_CONFIG_KEY: fresh})
+    assert boot is not None and boot.files_done == 4210
+
+    from datetime import timedelta
+    stale = dict(fresh, updated_at=(
+        datetime.now(timezone.utc)
+        - timedelta(seconds=br.BOOT_STALE_AFTER_SECONDS + 60)
+    ).isoformat())
+    config, boot = _split_boot({BOOT_CONFIG_KEY: stale, "env": {"A": "1"}})
+    assert boot is None, "a stale progress line is still being asserted"
+    # And the caller's own config is handed back untouched either way.
+    assert config == {"env": {"A": "1"}}
