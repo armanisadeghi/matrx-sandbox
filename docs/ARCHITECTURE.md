@@ -109,6 +109,36 @@ rarely touched, so lazy loading is the right tradeoff.
       within ~60s rather than lingering as a phantom "running" sandbox.
 ```
 
+### Readiness is a phase the box reports, not a clock the host runs
+
+Step 3d above is a *phase report*, not a single flag. The box writes its live
+phase into `/tmp/matrx-boot/` via
+[`sandbox-image/scripts/boot-phase.sh`](../sandbox-image/scripts/boot-phase.sh) —
+`container` → `home_sync` → `cold_mount` → `environment` → `sdk` →
+`cloud_files` → `ready` — and `hot-sync.sh down` publishes its file counts as
+it copies. Every entrypoint on every tier reports; the files live in `/tmp`
+(the container layer), never in the home volume.
+
+[`orchestrator/boot_readiness.py`](../orchestrator/orchestrator/boot_readiness.py)
+and `_wait_for_ready` wait on that signal:
+
+- **Two operator knobs, no constants.** `infrastructure.sandbox.ready_timeout_seconds`
+  (900) and `…home_sync_timeout_seconds` (3600) are `platform.feature_knob` rows.
+- **They are liveness budgets.** The clock restarts on every phase change and
+  every batch of files copied, so a home of any size passes while a genuinely
+  wedged phase still fails on time.
+- **A box is handed over as soon as its SDK answers**, even mid-restore, and
+  says so: `SandboxResponse.boot` carries the phase, the counts and the line
+  `home sync in progress: N/M files` (persisted inside the row's `config` jsonb).
+- **A box that is given up on names the phase and the count it reached** in its
+  `stop_reason`.
+
+Why this exists: until 2026-09-18 the wait was a hardcoded `timeout = 120`, so
+any EC2 box whose S3 home restore took longer than two minutes was marked
+`failed` while it went on booting normally — and the dead row kept one of the
+user's active-sandbox slots, so the next create was refused too. A user with
+8,630 files could not get a box at all.
+
 ### Status reconciliation (boot + periodic liveness)
 
 The orchestrator keeps the `sandbox_instances` rows honest with two passes, both
