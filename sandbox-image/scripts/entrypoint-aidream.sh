@@ -54,24 +54,26 @@ template_mount_is_read_only() {
     [[ ",$options," == *,ro,* ]]
 }
 
+# uv editable installs use _editable_impl_<pkg>.pth files containing the
+# absolute path to the package source. After cp -a they still point at
+# /opt/aidream-template — meaning `import matrx_ai` resolves to the immutable
+# template, NOT the user's working copy, so edits never take effect.
+#
+# The rewrite used to live here as a loop that counted ITERATIONS, so a box on a
+# persistent volume with an older root-owned seed logged "retargeted 17 editable
+# .pth file(s)" after 17 Permission-denied failures (feedback 81cb4265,
+# 2026-09-18). It now lives in its own script that reports what it actually
+# wrote and refuses out loud when it wrote nothing.
 retarget_editables() {
-    # uv editable installs use _editable_impl_<pkg>.pth files containing the
-    # absolute path to the package source. After cp -a, those still point at
-    # /opt/aidream-template — meaning `import matrx_ai` resolves to the
-    # template, NOT the user's working copy, so edits don't take effect.
-    # Rewrite each .pth file in place to point at $WORK_DIR.
-    local site_pkgs="$WORK_DIR/.venv/lib/python3.13/site-packages"
-    if [ ! -d "$site_pkgs" ]; then
-        log "no .venv site-packages at $site_pkgs — skipping editable retarget"
-        return
+    local rc=0
+    /opt/sandbox/scripts/aidream-retarget-editables.sh "$TEMPLATE_DIR" "$WORK_DIR" || rc=$?
+    if [ "$rc" -ne 0 ]; then
+        # Non-fatal for the BOOT (the managed API serves the immutable template
+        # either way, so the box still works), but never silent: the user's own
+        # checkout is the thing that is broken and the remedy is on stderr.
+        log "WARNING: editable retarget failed (exit $rc) — $WORK_DIR imports will resolve to $TEMPLATE_DIR"
     fi
-    local count=0
-    for pth in "$site_pkgs"/_editable_impl_*.pth; do
-        [ -f "$pth" ] || continue
-        /bin/sed -i "s|$TEMPLATE_DIR|$WORK_DIR|g" "$pth"
-        count=$((count + 1))
-    done
-    log "retargeted $count editable .pth file(s) to $WORK_DIR"
+    return 0
 }
 
 if [ "$MATRX_MIGRATION_ACTIVATION" = "0" ]; then
@@ -92,7 +94,7 @@ if [ "$MATRX_MIGRATION_ACTIVATION" = "0" ]; then
         log "found existing $WORK_DIR — preserving user state"
         # Defensive: if the user's .pth files point at the template (because they
         # were created by an older entrypoint that didn't retarget), fix them now.
-        if /usr/bin/grep -q "$TEMPLATE_DIR" "$WORK_DIR/.venv/lib/python3.13/site-packages"/_editable_impl_*.pth 2>/dev/null; then
+        if /usr/bin/grep -q "$TEMPLATE_DIR" "$WORK_DIR"/.venv/lib/python*/site-packages/_editable_impl_*.pth 2>/dev/null; then
             log "detected stale editable .pth files from older seed — retargeting"
             retarget_editables
         fi
