@@ -56,6 +56,11 @@ SANDBOX_KNOB_TEST_VALUES = {
     # Platform-locked operational ceiling. Production is fail-closed until
     # the canonical platform row exists; this is the test database seam.
     "active_sandbox_capacity": 5,
+    # Boot readiness is a PHASE budget, not a wall clock (see
+    # orchestrator/boot_readiness.py). Generous on purpose: these bound a
+    # WEDGED phase, never a big one.
+    "ready_timeout_seconds": 900,
+    "home_sync_timeout_seconds": 3600,
 }
 
 

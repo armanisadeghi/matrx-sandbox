@@ -19,6 +19,11 @@ for var in SANDBOX_ID USER_ID S3_BUCKET; do
     fi
 done
 
+# Publish the boot phase for the orchestrator's phase-based readiness wait
+# (boot-phase.sh explains why a wall clock was a bug class). Never fatal.
+boot_phase() { /opt/sandbox/scripts/boot-phase.sh "$@" 2>/dev/null || true; }
+boot_phase container
+
 MATRX_MIGRATION_COMMIT_MARKER="${MATRX_MIGRATION_COMMIT_MARKER:-/var/lib/matrx-migration/committed}"
 MATRX_MIGRATION_ACTIVATED_MARKER="/tmp/.matrx-migration-activated"
 AGENT_API_STARTED="${MATRX_AGENT_API_STARTED:-0}"
@@ -50,16 +55,22 @@ if [ "${SANDBOX_MIGRATION:-}" = "1" ] || [ "$MATRX_MIGRATION_ACTIVATION" = "1" ]
     echo "[1/5] Migration boot — skipping hot storage download."
 else
     echo "[1/5] Syncing hot storage from S3..."
+    # The long pole for a big home. hot-sync.sh publishes its own file counts
+    # into the boot phase, so the orchestrator sees movement instead of a
+    # silent box it has to guess about.
+    boot_phase home_sync
     /opt/sandbox/scripts/hot-sync.sh down
     echo "[1/5] Hot storage sync complete."
 fi
 
 # ─── Step 2: Mount cold storage via FUSE ──────────────────────────────────────
+boot_phase cold_mount
 echo "[2/5] Mounting cold storage FUSE filesystem..."
 /opt/sandbox/scripts/cold-mount.sh mount
 echo "[2/5] Cold storage mounted."
 
 # ─── Step 3: Set up environment for agent ─────────────────────────────────────
+boot_phase environment
 echo "[3/5] Preparing agent environment..."
 
 # Publish the container identity (user, organization, AI Dream URL + token)
@@ -122,6 +133,7 @@ else
 fi
 
 # ─── Step 4: Start SSH server ────────────────────────────────────────────────
+boot_phase sdk
 echo "[4/5] Starting SSH server..."
 /usr/sbin/sshd
 echo "[4/5] SSH server running on port 22."
@@ -145,6 +157,7 @@ if [ "${SANDBOX_MIGRATION:-}" = "1" ] || [ "$MATRX_MIGRATION_ACTIVATION" = "1" ]
     # is wasteful and is the single biggest contributor to migration time. Skip.
     echo "[4.6/5] Migration boot — skipping cloud_files down-sync (data already on the volume)."
 else
+    boot_phase cloud_files
     echo "[4.6/5] Syncing AI Dream cloud_files (if configured)..."
     sudo -E -u agent /opt/sandbox/scripts/cloud-files-sync.sh down || true
     echo "[4.6/5] cloud_files sync complete."
@@ -152,6 +165,7 @@ fi
 
 # ─── Step 5: Signal readiness ────────────────────────────────────────────────
 echo "[5/5] Sandbox is READY."
+boot_phase ready
 touch /tmp/.sandbox_ready
 if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
     touch "$MATRX_MIGRATION_ACTIVATED_MARKER"

@@ -187,6 +187,11 @@ async def create_sandbox(req: CreateSandboxRequest):
         raise HTTPException(status_code=429, detail={
             "code": "admission_capacity_exceeded", "ceiling": exc.ceiling,
             "occupied": exc.occupied,
+            # Never a silent refusal: name the exact boxes holding the slots,
+            # say how to free one, and name the knob that moves the ceiling.
+            "message": exc.remedy(),
+            "occupants": exc.occupants,
+            "ceiling_setting": exc.KNOB,
         }) from exc
     except KnobSourceUnavailableError as exc:
         raise HTTPException(status_code=503, detail="sandbox admission configuration is unavailable") from exc
@@ -544,6 +549,11 @@ async def reset_sandbox(sandbox_id: str, wipe_volume: bool = False):
         raise HTTPException(status_code=429, detail={
             "code": "admission_capacity_exceeded", "ceiling": exc.ceiling,
             "occupied": exc.occupied,
+            # Never a silent refusal: name the exact boxes holding the slots,
+            # say how to free one, and name the knob that moves the ceiling.
+            "message": exc.remedy(),
+            "occupants": exc.occupants,
+            "ceiling_setting": exc.KNOB,
         }) from exc
     except KnobSourceUnavailableError as exc:
         raise HTTPException(status_code=503, detail="sandbox admission configuration is unavailable") from exc
@@ -639,6 +649,11 @@ async def resume_sandbox(sandbox_id: str):
         raise HTTPException(status_code=429, detail={
             "code": "admission_capacity_exceeded", "ceiling": exc.ceiling,
             "occupied": exc.occupied,
+            # Never a silent refusal: name the exact boxes holding the slots,
+            # say how to free one, and name the knob that moves the ceiling.
+            "message": exc.remedy(),
+            "occupants": exc.occupants,
+            "ceiling_setting": exc.KNOB,
         }) from exc
     except KnobSourceUnavailableError as exc:
         raise HTTPException(status_code=503, detail="sandbox admission configuration is unavailable") from exc

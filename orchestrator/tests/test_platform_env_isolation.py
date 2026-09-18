@@ -28,6 +28,14 @@ import pytest
 from orchestrator.store import InMemorySandboxStore
 from tests.conftest import seed_sandbox_knobs, seed_store_sandbox_knobs
 
+#: What the in-container boot probe answers on a healthy box. The readiness
+#: contract is a phase report now, not an exit code (orchestrator/boot_readiness.py
+#: has the incident); a mock that answers ``(0, b"")`` is a box that never
+#: says it is up, so these tests would sit out the whole operator budget.
+READY_PROBE = (0, b"phase=ready\nprogress=\nready=yes\nsdk=yes\n")
+
+
+
 ORG_ID = "22222222-2222-4222-8222-222222222222"
 
 # A representative slice of what the passthrough registry names in
@@ -98,7 +106,7 @@ def created_env(monkeypatch, tmp_path):
     container = MagicMock()
     container.id = "cid"
     container.status = "running"
-    container.exec_run.return_value = (0, b"")
+    container.exec_run.return_value = READY_PROBE
     client.containers.run.return_value = container
     client.containers.get.return_value = container
     monkeypatch.setattr(sandbox_manager, "_get_docker_client", lambda: client)

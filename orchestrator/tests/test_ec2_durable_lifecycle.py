@@ -81,7 +81,10 @@ async def test_legacy_ec2_destroy_retains_exact_layer_and_resume_restarts_it(mon
         def remove(self, **_): raise AssertionError("legacy EC2 layer must not be removed")
         def reload(self): pass
         def start(self): self.status = "running"
-        def exec_run(self, _): return (0, b"")
+        # The boot probe reads a PHASE report now, not an exit code — see
+        # orchestrator/boot_readiness.py. A box that answers nothing is a box
+        # that never says it is up.
+        def exec_run(self, _): return (0, b"phase=ready\nprogress=\nready=yes\nsdk=yes\n")
 
     container = Container()
     client = SimpleNamespace(containers=SimpleNamespace(get=lambda identity: container if identity in {SID, "container-exact"} else None))

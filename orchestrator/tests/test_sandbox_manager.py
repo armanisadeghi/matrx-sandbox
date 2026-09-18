@@ -15,6 +15,13 @@ from orchestrator.store import InMemorySandboxStore
 
 ORG_ID = "22222222-2222-4222-8222-222222222222"
 
+#: What the in-container boot probe answers on a healthy box. The readiness
+#: contract is a phase report now, not an exit code (orchestrator/boot_readiness.py
+#: has the incident); a mock that answers ``(0, b"")`` is a box that never
+#: says it is up, so these tests would sit out the whole operator budget.
+READY_PROBE = (0, b"phase=ready\nprogress=\nready=yes\nsdk=yes\n")
+
+
 
 class _FragmentedExecSocket:
     """A Docker exec socket whose multiplex frames cross recv boundaries."""
@@ -106,7 +113,7 @@ async def test_create_sandbox_generates_unique_id(mock_docker):
     container = MagicMock()
     container.id = "abc123"
     container.status = "running"
-    container.exec_run.return_value = (0, b"")  # ready check passes
+    container.exec_run.return_value = READY_PROBE
     mock_docker.containers.run.return_value = container
     mock_docker.containers.get.return_value = container
 
@@ -133,7 +140,7 @@ async def test_create_sandbox_fetches_vault_with_orchestrator_user_agent(
     container = MagicMock()
     container.id = "abc123"
     container.status = "running"
-    container.exec_run.return_value = (0, b"")
+    container.exec_run.return_value = READY_PROBE
     mock_docker.containers.run.return_value = container
     mock_docker.containers.get.return_value = container
 
@@ -185,7 +192,7 @@ async def test_create_sandbox_scopes_vault_fetch_to_organization(mock_docker, mo
     container = MagicMock()
     container.id = "org-container"
     container.status = "running"
-    container.exec_run.return_value = (0, b"")
+    container.exec_run.return_value = READY_PROBE
     mock_docker.containers.run.return_value = container
     mock_docker.containers.get.return_value = container
     captured: dict = {}
@@ -241,7 +248,7 @@ async def test_aidream_container_rootfs_is_read_only_with_explicit_runtime_tmpfs
     container = MagicMock()
     container.id = "abc123"
     container.status = "running"
-    container.exec_run.return_value = (0, b"")
+    container.exec_run.return_value = READY_PROBE
     mock_docker.containers.run.return_value = container
     mock_docker.containers.get.return_value = container
 
@@ -309,7 +316,7 @@ async def test_development_sandbox_mounts_workspace_and_restarts(
     container = MagicMock()
     container.id = "development-container"
     container.status = "running"
-    container.exec_run.return_value = (0, b"")
+    container.exec_run.return_value = READY_PROBE
     mock_docker.containers.run.return_value = container
     mock_docker.containers.get.return_value = container
 

@@ -14,6 +14,7 @@ import os
 import re
 from pathlib import Path
 import shlex
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -26,7 +27,7 @@ from orchestrator.bridge_headers import identity_headers
 from orchestrator.config import settings
 from orchestrator.knobs import knob_float, knob_int, knob_str
 from orchestrator.runtime_isolation import container_runtime_isolation
-from orchestrator.models import SandboxResponse, SandboxStatus
+from orchestrator.models import SandboxBoot, SandboxResponse, SandboxStatus
 from orchestrator.storage_layout import (
     StorageLocation,
     ec2_home_volume_name,
@@ -1168,35 +1169,121 @@ async def _create_sandbox_unleased(
         raise RuntimeError(f"Failed to create sandbox {sandbox_id}: {e}") from e
 
 
-async def _wait_for_ready(sandbox: SandboxResponse, timeout: int = 120) -> SandboxResponse:
-    """Poll container until it signals readiness or times out."""
-    client = _get_docker_client()
-    elapsed = 0
-    interval = 2
+async def _wait_for_ready(
+    sandbox: SandboxResponse,
+    *,
+    store: "SandboxStore | None" = None,
+    poll_interval: float = 2.0,
+) -> SandboxResponse:
+    """Wait on the box's own boot PHASE — never on a fixed wall clock.
 
-    while elapsed < timeout:
+    See :mod:`orchestrator.boot_readiness` for the incident this replaces: a
+    hardcoded 120s killed every EC2 create whose S3 home sync ran longer than
+    two minutes, including boxes whose entrypoints went on to log
+    ``Sandbox is READY`` minutes later.
+
+    The budgets are operator knobs, and they are *liveness* budgets: the clock
+    resets whenever the box changes phase or copies another file, so a big
+    home is never a reason to die while a wedged one still is. The box is
+    handed over as soon as its SDK answers, even mid home-sync; the sync's
+    progress rides along on the row (``sandbox.boot``) so the caller can say
+    "home sync in progress: N/M files" instead of the box disappearing.
+    """
+    from orchestrator import boot_readiness as br
+    from orchestrator.knobs import knob_int
+
+    client = _get_docker_client()
+    store = store or _get_store()
+
+    ready_budget = float(await knob_int("ready_timeout_seconds"))
+    home_sync_budget = float(await knob_int("home_sync_timeout_seconds"))
+
+    started = time.monotonic()
+    phase_started = started
+    previous: br.BootSnapshot | None = None
+    last_published: str | None = None
+
+    async def publish(snapshot: br.BootSnapshot) -> None:
+        """Surface the live phase on the row so a person can watch it."""
+        nonlocal last_published
+        sandbox.boot = SandboxBoot(
+            phase=snapshot.budget_phase,
+            files_done=snapshot.files_done,
+            files_total=snapshot.files_total,
+            briefing=snapshot.briefing(),
+            updated_at=datetime.now(timezone.utc),
+        )
+        signature = f"{snapshot.budget_phase}:{snapshot.files_done}"
+        if signature != last_published:
+            last_published = signature
+            try:
+                await store.save(sandbox)
+            except Exception as exc:  # never let a status write fail a create
+                logger.warning(
+                    "Could not publish boot phase for %s: %s", sandbox.sandbox_id, exc
+                )
+
+    while True:
         try:
             container = await asyncio.to_thread(client.containers.get, sandbox.sandbox_id)
             if container.status == "exited":
                 sandbox.status = SandboxStatus.FAILED
+                sandbox.stop_reason = br.timeout_reason(
+                    previous, 0.0, time.monotonic() - started
+                ).replace("stalled in", "exited during")
+                logger.error(
+                    "Sandbox %s container exited during boot (%s)",
+                    sandbox.sandbox_id, sandbox.stop_reason,
+                )
                 return sandbox
 
-            exit_code, _ = await asyncio.to_thread(container.exec_run, "test -f /tmp/.sandbox_ready")
-            if exit_code == 0:
+            exit_code, output = await asyncio.to_thread(
+                container.exec_run, ["/bin/sh", "-c", br.PROBE_SCRIPT]
+            )
+            text = output.decode("utf-8", "replace") if isinstance(output, bytes) else str(output or "")
+            snapshot = br.parse_probe(text if exit_code == 0 else "")
+
+            if br.advanced(previous, snapshot):
+                phase_started = time.monotonic()
+                await publish(snapshot)
+            previous = snapshot
+
+            if snapshot.usable:
                 sandbox.status = SandboxStatus.READY
+                if snapshot.phase == br.PHASE_HOME_SYNC or (
+                    snapshot.files_total and not snapshot.ready_marker
+                ):
+                    # Up and bindable while its home is still filling in. The
+                    # briefing line is the honest half of that: the screen says
+                    # what is still happening rather than pretending or dying.
+                    logger.info(
+                        "Sandbox %s is usable with home sync still running (%s)",
+                        sandbox.sandbox_id, snapshot.progress_text() or "no count",
+                    )
+                else:
+                    sandbox.boot = None
                 return sandbox
 
         except (NotFound, APIError) as e:
             logger.warning("Error polling sandbox %s: %s", sandbox.sandbox_id, e)
             sandbox.status = SandboxStatus.FAILED
+            sandbox.stop_reason = f"boot probe could not reach the container: {e}"
             return sandbox
 
-        await asyncio.sleep(interval)
-        elapsed += interval
+        budget = br.phase_budget(
+            previous.budget_phase if previous else None,
+            ready_budget=ready_budget,
+            home_sync_budget=home_sync_budget,
+        )
+        stalled_for = time.monotonic() - phase_started
+        if stalled_for >= budget:
+            reason = br.timeout_reason(previous, budget, time.monotonic() - started)
+            logger.warning("Sandbox %s gave up: %s", sandbox.sandbox_id, reason)
+            sandbox.status = SandboxStatus.FAILED
+            sandbox.stop_reason = reason
+            return sandbox
 
-    logger.warning("Sandbox %s did not become ready within %ds", sandbox.sandbox_id, timeout)
-    sandbox.status = SandboxStatus.FAILED
-    return sandbox
+        await asyncio.sleep(poll_interval)
 
 
 def _backfill_proxy_url(sb: SandboxResponse | None) -> SandboxResponse | None:

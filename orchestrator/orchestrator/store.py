@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
-from orchestrator.models import SandboxResponse, SandboxStatus
+from orchestrator.models import SandboxBoot, SandboxResponse, SandboxStatus
 
 logger = logging.getLogger(__name__)
 
@@ -28,17 +28,102 @@ def _explicit_organization_id(sandbox: SandboxResponse) -> UUID:
         ) from exc
 
 
+def _occupant(row: Any) -> dict[str, Any]:
+    """One occupying sandbox, reduced to what a refusal may name.
+
+    Accepts either a :class:`SandboxResponse` (in-memory store) or an asyncpg
+    ``Record`` (Postgres store). Nothing sensitive travels: id, name, status
+    and birth date are exactly what the person already sees in their own list.
+    """
+    def field(key: str) -> Any:
+        if isinstance(row, SandboxResponse):
+            return getattr(row, key, None)
+        try:
+            return row[key]
+        except (KeyError, IndexError, TypeError):
+            return None
+
+    created = field("created_at")
+    status = field("status")
+    return {
+        "sandbox_id": field("sandbox_id"),
+        "name": field("name"),
+        "status": getattr(status, "value", status),
+        "created_at": created.isoformat() if hasattr(created, "isoformat") else created,
+    }
+
+
+#: Where the live boot phase rides in the persisted ``config`` jsonb. It is a
+#: server-owned key, stripped back out on read, so a caller's own ``config``
+#: never sees it and no schema change was needed to make boot progress durable.
+BOOT_CONFIG_KEY = "_boot"
+
+
+def _config_with_boot(sandbox: SandboxResponse) -> str:
+    """Serialize ``config`` with the live boot phase folded in."""
+    payload = dict(sandbox.config or {})
+    payload.pop(BOOT_CONFIG_KEY, None)
+    if sandbox.boot is not None:
+        payload[BOOT_CONFIG_KEY] = sandbox.boot.model_dump(mode="json")
+    return json.dumps(payload) if payload else '{}'
+
+
+def _split_boot(config_val: Any) -> tuple[dict, SandboxBoot | None]:
+    """Pull the server-owned boot phase back out of a persisted ``config``."""
+    payload = dict(config_val or {})
+    raw = payload.pop(BOOT_CONFIG_KEY, None)
+    if not isinstance(raw, dict) or not raw.get("phase"):
+        return payload, None
+    try:
+        return payload, SandboxBoot(**raw)
+    except Exception:  # a malformed row must never break a list call
+        return payload, None
+
+
 class KnobSourceUnavailableError(RuntimeError):
     """This store has no database to read ``platform.feature_knob`` from."""
 
 
 class AdmissionCapacityExceeded(RuntimeError):
-    """The durable active-sandbox admission ceiling refused a new row."""
+    """The durable active-sandbox admission ceiling refused a new row.
 
-    def __init__(self, *, ceiling: int, occupied: int) -> None:
+    A refusal that only says "full" is a silent refusal: the person is told no
+    and left with no way to act. Every raise therefore carries ``occupants`` —
+    the exact boxes counting against the ceiling — so the API can name them and
+    say how to free a slot. ``occupants`` may be empty only when the counting
+    query genuinely returned no identities (never as a convenience default).
+    """
+
+    #: Where an operator changes the ceiling. Named in the refusal so nobody
+    #: has to go looking for a constant that does not exist.
+    KNOB = "infrastructure.sandbox.active_sandbox_capacity"
+
+    def __init__(
+        self, *, ceiling: int, occupied: int,
+        occupants: list[dict[str, Any]] | None = None,
+    ) -> None:
         self.ceiling = ceiling
         self.occupied = occupied
-        super().__init__(f"active sandbox capacity exhausted ({occupied}/{ceiling})")
+        self.occupants = list(occupants or [])
+        super().__init__(
+            f"active sandbox capacity exhausted ({occupied}/{ceiling}); "
+            f"occupied by {', '.join(o['sandbox_id'] for o in self.occupants) or 'unlisted rows'}"
+        )
+
+    def remedy(self) -> str:
+        """The one sentence a refused caller needs, in plain English."""
+        named = ", ".join(
+            f"{o['sandbox_id']}"
+            + (f" ({o['name']})" if o.get("name") else " (unnamed)")
+            + (f" — {o['status']}" if o.get("status") else "")
+            for o in self.occupants
+        )
+        return (
+            f"You already have {self.occupied} of {self.ceiling} sandboxes running"
+            + (f": {named}. " if named else ". ")
+            + "Stop or delete one of them to start another, or raise the "
+            f"limit with the {self.KNOB} setting."
+        )
 
 
 class SandboxStore(ABC):
@@ -296,7 +381,10 @@ class InMemorySandboxStore(SandboxStore):
                         or getattr(predecessor.status, "value", predecessor.status) not in active):
                     raise RuntimeError("replacement predecessor is not the caller's active sandbox")
             if len(occupied_rows) >= ceiling:
-                raise AdmissionCapacityExceeded(ceiling=ceiling, occupied=len(occupied_rows))
+                raise AdmissionCapacityExceeded(
+                    ceiling=ceiling, occupied=len(occupied_rows),
+                    occupants=[_occupant(row) for row in occupied_rows],
+                )
             self._sandboxes[sandbox.sandbox_id] = sandbox
 
     async def resume_active(self, sandbox: SandboxResponse) -> None:
@@ -329,13 +417,17 @@ class InMemorySandboxStore(SandboxStore):
             if isinstance(ceiling, bool) or not isinstance(ceiling, int) or not 1 <= ceiling <= 100:
                 raise RuntimeError("active sandbox capacity knob must be an integer from 1 through 100")
             active = {"creating", "starting", "ready", "running"}
-            occupied = sum(
-                1 for sid, row in self._sandboxes.items()
+            occupied_rows = [
+                row for sid, row in self._sandboxes.items()
                 if sid not in self._deleted and row.user_id == sandbox.user_id
                 and getattr(row.status, "value", row.status) in active
-            )
+            ]
+            occupied = len(occupied_rows)
             if occupied >= ceiling:
-                raise AdmissionCapacityExceeded(ceiling=ceiling, occupied=occupied)
+                raise AdmissionCapacityExceeded(
+                    ceiling=ceiling, occupied=occupied,
+                    occupants=[_occupant(row) for row in occupied_rows],
+                )
             current.status = SandboxStatus.STARTING
 
     def seed_feature_knobs(self, feature: str, values: dict[str, Any]) -> None:
@@ -653,14 +745,19 @@ class PostgresSandboxStore(SandboxStore):
                         )
                         if predecessor is None:
                             raise RuntimeError("replacement predecessor is not the caller's active sandbox")
-                    occupied = await conn.fetchval(
-                        """SELECT count(*) FROM sandbox_instances
+                    occupant_rows = await conn.fetch(
+                        """SELECT sandbox_id, name, status, created_at FROM sandbox_instances
                            WHERE user_id = $1 AND deleted_at IS NULL AND status = ANY($2::text[])
-                             AND ($3::text IS NULL OR sandbox_id <> $3)""",
+                             AND ($3::text IS NULL OR sandbox_id <> $3)
+                           ORDER BY created_at""",
                         UUID(sandbox.user_id), list(active), replacement_for,
                     )
+                    occupied = len(occupant_rows)
                     if occupied >= ceiling:
-                        raise AdmissionCapacityExceeded(ceiling=ceiling, occupied=occupied)
+                        raise AdmissionCapacityExceeded(
+                            ceiling=ceiling, occupied=occupied,
+                            occupants=[_occupant(row) for row in occupant_rows],
+                        )
                     row = await conn.fetchrow(
                         """INSERT INTO sandbox_instances
                            (id, user_id, organization_id, sandbox_id, name, status, container_id, created_at,
@@ -670,7 +767,7 @@ class PostgresSandboxStore(SandboxStore):
                            RETURNING id""",
                         sandbox.row_id, UUID(sandbox.user_id), organization_id, sandbox.sandbox_id,
                         sandbox.name, sandbox.created_at, sandbox.hot_path, sandbox.cold_path,
-                        json.dumps(sandbox.config) if sandbox.config else '{}', sandbox.ttl_seconds,
+                        _config_with_boot(sandbox), sandbox.ttl_seconds,
                         sandbox.tier, sandbox.template, sandbox.template_version,
                         json.dumps(sandbox.labels) if sandbox.labels else None,
                     )
@@ -720,13 +817,18 @@ class PostgresSandboxStore(SandboxStore):
                     ceiling = json.loads(value) if isinstance(value, str) else value
                     if isinstance(ceiling, bool) or not isinstance(ceiling, int) or not 1 <= ceiling <= 100:
                         raise RuntimeError("active sandbox capacity knob must be an integer from 1 through 100")
-                    occupied = await conn.fetchval(
-                        """SELECT count(*) FROM sandbox_instances
-                           WHERE user_id = $1 AND deleted_at IS NULL AND status = ANY($2::text[])""",
+                    occupant_rows = await conn.fetch(
+                        """SELECT sandbox_id, name, status, created_at FROM sandbox_instances
+                           WHERE user_id = $1 AND deleted_at IS NULL AND status = ANY($2::text[])
+                           ORDER BY created_at""",
                         UUID(sandbox.user_id), list(active),
                     )
+                    occupied = len(occupant_rows)
                     if occupied >= ceiling:
-                        raise AdmissionCapacityExceeded(ceiling=ceiling, occupied=occupied)
+                        raise AdmissionCapacityExceeded(
+                            ceiling=ceiling, occupied=occupied,
+                            occupants=[_occupant(row) for row in occupant_rows],
+                        )
                     updated = await conn.execute(
                         """UPDATE sandbox_instances SET status = 'starting'
                            WHERE sandbox_id = $1 AND id = $2 AND user_id = $3
@@ -753,8 +855,8 @@ class PostgresSandboxStore(SandboxStore):
                 INSERT INTO sandbox_instances
                     (id, user_id, organization_id, sandbox_id, name, status, container_id, created_at, hot_path, cold_path,
                      config, ttl_seconds, tier, template, template_version, labels,
-                     persistence_volume, created_by)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, $16::jsonb, $17, $2)
+                     persistence_volume, created_by, stop_reason)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, $16::jsonb, $17, $2, $18)
                 ON CONFLICT (sandbox_id) DO UPDATE SET
                     organization_id = EXCLUDED.organization_id,
                     -- Canonical access uses created_by. Repair legacy blanks
@@ -778,9 +880,15 @@ class PostgresSandboxStore(SandboxStore):
                     stopped_at = CASE
                         WHEN EXCLUDED.status IN ('stopped', 'expired', 'failed', 'shutting_down')
                         THEN sandbox_instances.stopped_at ELSE NULL END,
+                    -- A caller that computed a REASON (a boot that gave up
+                    -- naming its phase and file count, say) must be able to
+                    -- store it: until 2026-09-18 this kept only whatever was
+                    -- already there, so a create that failed on readiness left
+                    -- a `failed` row with a blank explanation.
                     stop_reason = CASE
                         WHEN EXCLUDED.status IN ('stopped', 'expired', 'failed', 'shutting_down')
-                        THEN sandbox_instances.stop_reason ELSE NULL END,
+                        THEN COALESCE(EXCLUDED.stop_reason, sandbox_instances.stop_reason)
+                        ELSE NULL END,
                     updated_at = NOW()
                 RETURNING id
                 """,
@@ -794,13 +902,14 @@ class PostgresSandboxStore(SandboxStore):
                 sandbox.created_at,
                 sandbox.hot_path,
                 sandbox.cold_path,
-                json.dumps(sandbox.config) if sandbox.config else '{}',
+                _config_with_boot(sandbox),
                 sandbox.ttl_seconds,
                 sandbox.tier,
                 sandbox.template,
                 sandbox.template_version,
                 json.dumps(sandbox.labels) if sandbox.labels else None,
                 sandbox.persistence_volume,
+                sandbox.stop_reason,
             )
             sandbox.row_id = UUID(str(row["id"]))
 
@@ -1239,6 +1348,7 @@ def _row_to_sandbox(row) -> SandboxResponse:
     config_val = _maybe("config")
     if isinstance(config_val, str):
         config_val = json.loads(config_val)
+    config_val, boot_val = _split_boot(config_val)
 
     labels_val = _maybe("labels")
     if isinstance(labels_val, str):
@@ -1263,6 +1373,7 @@ def _row_to_sandbox(row) -> SandboxResponse:
         hot_path=_maybe("hot_path") or "/home/agent",
         cold_path=_maybe("cold_path") or "/data/cold",
         config=config_val or {},
+        boot=boot_val,
         ttl_seconds=_maybe("ttl_seconds") or 7200,
         expires_at=_maybe("expires_at"),
         tier=_maybe("tier"),
