@@ -39,12 +39,17 @@ if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
 fi
 
 # ─── Step 1: Skip S3 in local mode ──────────────────────────────────────────
+# See sandbox-image/scripts/boot-phase.sh: the box reports its own phase so
+# the orchestrator's readiness wait is a phase signal, not a wall clock.
+boot_phase() { /opt/sandbox/scripts/boot-phase.sh "$@" 2>/dev/null || true; }
+boot_phase container
 echo "[1/5] S3 sync skipped (local mode — using Docker volumes)"
 
 # ─── Step 2: Skip FUSE mount in local mode ──────────────────────────────────
 echo "[2/5] FUSE mount skipped (local mode)"
 
 # ─── Step 3: Set up environment for agent ────────────────────────────────────
+boot_phase environment
 echo "[3/5] Preparing agent environment..."
 
 HOT_PATH="${HOT_PATH:-/home/agent}"
@@ -137,6 +142,7 @@ else
 fi
 
 # ─── Step 4: Start SSH server ────────────────────────────────────────────────
+boot_phase sdk
 echo "[4/5] Starting SSH server..."
 mkdir -p /run/sshd
 /usr/sbin/sshd 2>/dev/null || echo "  SSH start skipped (non-critical in local mode)"
@@ -194,6 +200,7 @@ fi
 
 # ─── Step 5: Signal readiness ────────────────────────────────────────────────
 echo "[5/5] Sandbox is READY."
+boot_phase ready
 touch /tmp/.sandbox_ready
 if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
     touch "$MATRX_MIGRATION_ACTIVATED_MARKER"

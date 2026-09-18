@@ -14,6 +14,7 @@ import os
 import re
 from pathlib import Path
 import shlex
+import time
 import uuid
 from datetime import datetime, timezone
 from typing import Any
@@ -24,9 +25,10 @@ from docker.errors import DockerException, NotFound, APIError
 
 from orchestrator.bridge_headers import identity_headers
 from orchestrator.config import settings
+from orchestrator.boot_readiness import BOOT_FOLLOW_INTERVAL_SECONDS
 from orchestrator.knobs import knob_float, knob_int, knob_str
 from orchestrator.runtime_isolation import container_runtime_isolation
-from orchestrator.models import SandboxResponse, SandboxStatus
+from orchestrator.models import SandboxBoot, SandboxResponse, SandboxStatus
 from orchestrator.storage_layout import (
     StorageLocation,
     ec2_home_volume_name,
@@ -197,6 +199,33 @@ PLATFORM_PASSTHROUGH_TEMPLATES: frozenset[str] = frozenset({"aidream"})
 #: Where the binding-time vault refresh publishes the person's CURRENT vault
 #: values (orchestrator/vault_env_refresh.py owns the writing). Named here so
 #: the exec wrapper does not import that module for one string.
+#: Every env name the ORCHESTRATOR itself puts in a container (see the `env`
+#: dict in ``create_sandbox``). The binding-time refresh must never clear one of
+#: these while trying to clear a leaked platform credential: several of them
+#: MATCH the master-credential patterns on purpose (MATRX_AIDREAM_SERVICE_TOKEN,
+#: AWS_SECRET_ACCESS_KEY), and a hosted box loses its S3 sync without them.
+#: ``create_sandbox`` asserts its own keys are a subset of this set, so the two
+#: cannot drift (tests/test_github_credential_and_vault_env.py).
+ORCHESTRATOR_MANAGED_ENV: frozenset[str] = frozenset({
+    "SANDBOX_ID", "USER_ID", "ORGANIZATION_ID",
+    "S3_BUCKET", "S3_REGION", "HOT_PATH", "COLD_PATH",
+    "SHUTDOWN_TIMEOUT_SECONDS",
+    "MATRX_TIER", "MATRX_HOT_PREFIX", "MATRX_COLD_PREFIX",
+    "SANDBOX_TEMPLATE", "SANDBOX_TEMPLATE_VERSION", "SANDBOX_MIGRATION",
+    "MATRX_AGENT_TOKEN",
+    "MATRX_AIDREAM_URL", "MATRX_AIDREAM_SERVICE_TOKEN",
+    "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
+    "AWS_DEFAULT_REGION", "AWS_REGION",
+})
+
+#: Names the platform has RETIRED as git credentials (2026-09-18). They are not
+#: master-credential shaped, so the pattern filter alone would leave them in a
+#: box forever; the credential helper no longer reads them, and a name nothing
+#: reads should not sit in a user's environment looking like a credential.
+RETIRED_GIT_CREDENTIAL_NAMES: frozenset[str] = frozenset({
+    "GH_TOKEN", "GITHUB_PAT", "MATRX_GITHUB_TOKEN",
+})
+
 VAULT_ENV_FILE = "/etc/matrx/vault-env.sh"
 #: Where the box's identity lives (write-bridge-env.sh at boot on a current
 #: image; republished at binding by vault_env_refresh for boxes older than that
@@ -748,6 +777,21 @@ async def _create_sandbox_unleased(
             env["AWS_DEFAULT_REGION"] = region
             env["AWS_REGION"] = region
 
+        # The refresh's protected set and the dict above are ONE contract: a
+        # name the orchestrator manages but that is missing from
+        # ORCHESTRATOR_MANAGED_ENV would be CLEARED out of every live box by the
+        # binding-time leak sweep (vault_env_refresh.leaked_platform_names).
+        # Checked HERE — after the orchestrator's own block and before the
+        # caller's config.env, the vault and the passthrough merge in, so this
+        # sees exactly the set it is about.
+        _unregistered = sorted(set(env) - ORCHESTRATOR_MANAGED_ENV)
+        if _unregistered:
+            raise RuntimeError(
+                f"orchestrator-managed env names missing from "
+                f"ORCHESTRATOR_MANAGED_ENV: {_unregistered}. Add them there, or the "
+                f"binding-time leak sweep will clear them out of live boxes."
+            )
+
         # ── aidream-in-sandbox env passthrough (aidream template ONLY) ────────
         # Forward env vars named in EITHER (a) the file at
         # settings.aidream_passthrough_env_file (e.g. /srv/projects/aidream/.env)
@@ -1126,35 +1170,200 @@ async def _create_sandbox_unleased(
         raise RuntimeError(f"Failed to create sandbox {sandbox_id}: {e}") from e
 
 
-async def _wait_for_ready(sandbox: SandboxResponse, timeout: int = 120) -> SandboxResponse:
-    """Poll container until it signals readiness or times out."""
-    client = _get_docker_client()
-    elapsed = 0
-    interval = 2
+async def _wait_for_ready(
+    sandbox: SandboxResponse,
+    *,
+    store: "SandboxStore | None" = None,
+    poll_interval: float = 2.0,
+) -> SandboxResponse:
+    """Wait on the box's own boot PHASE — never on a fixed wall clock.
 
-    while elapsed < timeout:
+    See :mod:`orchestrator.boot_readiness` for the incident this replaces: a
+    hardcoded 120s killed every EC2 create whose S3 home sync ran longer than
+    two minutes, including boxes whose entrypoints went on to log
+    ``Sandbox is READY`` minutes later.
+
+    The budgets are operator knobs, and they are *liveness* budgets: the clock
+    resets whenever the box changes phase or copies another file, so a big
+    home is never a reason to die while a wedged one still is. The box is
+    handed over as soon as its SDK answers, even mid home-sync; the sync's
+    progress rides along on the row (``sandbox.boot``) so the caller can say
+    "home sync in progress: N/M files" instead of the box disappearing.
+    """
+    from orchestrator import boot_readiness as br
+    from orchestrator.knobs import knob_int
+
+    client = _get_docker_client()
+    store = store or _get_store()
+
+    ready_budget = float(await knob_int("ready_timeout_seconds"))
+    home_sync_budget = float(await knob_int("home_sync_timeout_seconds"))
+
+    started = time.monotonic()
+    phase_started = started
+    previous: br.BootSnapshot | None = None
+    last_published: str | None = None
+
+    async def publish(snapshot: br.BootSnapshot) -> None:
+        """Surface the live phase on the row so a person can watch it."""
+        nonlocal last_published
+        sandbox.boot = SandboxBoot(
+            phase=snapshot.budget_phase,
+            files_done=snapshot.files_done,
+            files_total=snapshot.files_total,
+            briefing=snapshot.briefing(),
+            updated_at=datetime.now(timezone.utc),
+        )
+        signature = f"{snapshot.budget_phase}:{snapshot.files_done}"
+        if signature != last_published:
+            last_published = signature
+            try:
+                await store.save(sandbox)
+            except Exception as exc:  # never let a status write fail a create
+                logger.warning(
+                    "Could not publish boot phase for %s: %s", sandbox.sandbox_id, exc
+                )
+
+    while True:
         try:
             container = await asyncio.to_thread(client.containers.get, sandbox.sandbox_id)
             if container.status == "exited":
                 sandbox.status = SandboxStatus.FAILED
+                sandbox.stop_reason = br.timeout_reason(
+                    previous, 0.0, time.monotonic() - started
+                ).replace("stalled in", "exited during")
+                logger.error(
+                    "Sandbox %s container exited during boot (%s)",
+                    sandbox.sandbox_id, sandbox.stop_reason,
+                )
                 return sandbox
 
-            exit_code, _ = await asyncio.to_thread(container.exec_run, "test -f /tmp/.sandbox_ready")
-            if exit_code == 0:
+            exit_code, output = await asyncio.to_thread(
+                container.exec_run, ["/bin/sh", "-c", br.PROBE_SCRIPT]
+            )
+            text = output.decode("utf-8", "replace") if isinstance(output, bytes) else str(output or "")
+            snapshot = br.parse_probe(text if exit_code == 0 else "")
+
+            if br.advanced(previous, snapshot):
+                phase_started = time.monotonic()
+                await publish(snapshot)
+            previous = snapshot
+
+            if snapshot.usable:
                 sandbox.status = SandboxStatus.READY
+                if snapshot.phase == br.PHASE_HOME_SYNC or (
+                    snapshot.files_total and not snapshot.ready_marker
+                ):
+                    # Up and bindable while its home is still filling in. The
+                    # briefing line is the honest half of that: the screen says
+                    # what is still happening rather than pretending or dying.
+                    logger.info(
+                        "Sandbox %s is usable with home sync still running (%s)",
+                        sandbox.sandbox_id, snapshot.progress_text() or "no count",
+                    )
+                    # ...and something must keep telling the truth after we
+                    # return, or the row would say "4210/8630" forever. The
+                    # follower runs the same probe until the box reports
+                    # `ready`, then clears the line.
+                    _follow_boot_to_completion(sandbox.sandbox_id, store)
+                else:
+                    sandbox.boot = None
                 return sandbox
 
         except (NotFound, APIError) as e:
             logger.warning("Error polling sandbox %s: %s", sandbox.sandbox_id, e)
             sandbox.status = SandboxStatus.FAILED
+            sandbox.stop_reason = f"boot probe could not reach the container: {e}"
             return sandbox
 
-        await asyncio.sleep(interval)
-        elapsed += interval
+        budget = br.phase_budget(
+            previous.budget_phase if previous else None,
+            ready_budget=ready_budget,
+            home_sync_budget=home_sync_budget,
+        )
+        stalled_for = time.monotonic() - phase_started
+        if stalled_for >= budget:
+            reason = br.timeout_reason(previous, budget, time.monotonic() - started)
+            logger.warning("Sandbox %s gave up: %s", sandbox.sandbox_id, reason)
+            sandbox.status = SandboxStatus.FAILED
+            sandbox.stop_reason = reason
+            return sandbox
 
-    logger.warning("Sandbox %s did not become ready within %ds", sandbox.sandbox_id, timeout)
-    sandbox.status = SandboxStatus.FAILED
-    return sandbox
+        await asyncio.sleep(poll_interval)
+
+
+#: Detached boot followers, keyed by sandbox id, so one box never gets two.
+_boot_followers: dict[str, asyncio.Task] = {}
+
+
+def _follow_boot_to_completion(sandbox_id: str, store: "SandboxStore") -> None:
+    """Keep a handed-over box's boot line true until its boot really ends.
+
+    A box admitted mid home-sync carries a progress line. Without this, that
+    line would be frozen at whatever count it had when we returned — a screen
+    stating something that stopped being true, which is the quiet half of the
+    same defect the phase budgets fixed. The follower re-runs the same probe
+    and clears ``boot`` once the box reports ``ready``.
+
+    Detached and entirely best-effort: it never blocks a create, never fails
+    one, and an orchestrator restart that loses it cannot leave a lying row
+    either — ``SandboxBoot`` expires on age when it is read back.
+    """
+    existing = _boot_followers.get(sandbox_id)
+    if existing is not None and not existing.done():
+        return
+
+    async def follow() -> None:
+        from orchestrator import boot_readiness as br
+
+        client = _get_docker_client()
+        try:
+            budget = float(await knob_int("home_sync_timeout_seconds"))
+        except Exception:
+            return
+        deadline = time.monotonic() + budget
+        previous: br.BootSnapshot | None = None
+        while time.monotonic() < deadline:
+            await asyncio.sleep(BOOT_FOLLOW_INTERVAL_SECONDS)
+            try:
+                container = await asyncio.to_thread(client.containers.get, sandbox_id)
+                code, output = await asyncio.to_thread(
+                    container.exec_run, ["/bin/sh", "-c", br.PROBE_SCRIPT]
+                )
+            except (NotFound, APIError):
+                return
+            text = output.decode("utf-8", "replace") if isinstance(output, bytes) else str(output or "")
+            snapshot = br.parse_probe(text if code == 0 else "")
+            if not br.advanced(previous, snapshot):
+                continue
+            previous = snapshot
+
+            row = await store.get(sandbox_id)
+            if row is None or getattr(row.status, "value", row.status) not in {"ready", "running", "starting"}:
+                return
+            finished = snapshot.ready_marker or snapshot.phase == br.PHASE_READY
+            row.boot = None if finished else SandboxBoot(
+                phase=snapshot.budget_phase,
+                files_done=snapshot.files_done,
+                files_total=snapshot.files_total,
+                briefing=snapshot.briefing(),
+                updated_at=datetime.now(timezone.utc),
+            )
+            try:
+                await store.save(row)
+            except Exception as exc:
+                logger.warning("Boot follower could not update %s: %s", sandbox_id, exc)
+                return
+            if finished:
+                logger.info("Sandbox %s finished its boot; progress line cleared", sandbox_id)
+                return
+
+    try:
+        task = asyncio.get_running_loop().create_task(follow())
+    except RuntimeError:
+        return
+    _boot_followers[sandbox_id] = task
+    task.add_done_callback(lambda _t: _boot_followers.pop(sandbox_id, None))
 
 
 def _backfill_proxy_url(sb: SandboxResponse | None) -> SandboxResponse | None:

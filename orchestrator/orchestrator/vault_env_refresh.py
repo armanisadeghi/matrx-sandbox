@@ -92,6 +92,7 @@ from orchestrator.models import SandboxResponse
 logger = logging.getLogger(__name__)
 
 KNOB = "vault_env_refresh_on_binding"
+LEAK_KNOB = "clear_leaked_platform_env_on_binding"
 
 #: Root-owned, agent-readable, container-layer only. Mirrors bridge-env.sh.
 ENV_DIR = "/etc/matrx"
@@ -195,6 +196,42 @@ def render_env_file(
     lines.append("unset __matrx_vault_skip")
     lines.append("")
     return "\n".join(lines)
+
+
+def leaked_platform_names(
+    container_env_names: list[str],
+    *,
+    template: str | None,
+    vault_names: set[str],
+) -> list[str]:
+    """Platform credential names sitting in a box that was never entitled to them.
+
+    Pure, and deliberately conservative in the one direction that matters: a
+    name the ORCHESTRATOR manages is never returned, whatever it looks like.
+    """
+    from orchestrator.sandbox_manager import (
+        ORCHESTRATOR_MANAGED_ENV,
+        RETIRED_GIT_CREDENTIAL_NAMES,
+        is_master_credential_name,
+        template_receives_platform_env,
+    )
+
+    if template_receives_platform_env(template):
+        # The one template that is SUPPOSED to hold platform env.
+        return []
+    return sorted(
+        {
+            name
+            for name in container_env_names
+            if name
+            and name not in vault_names
+            and name not in ORCHESTRATOR_MANAGED_ENV
+            and (
+                is_master_credential_name(name)
+                or name in RETIRED_GIT_CREDENTIAL_NAMES
+            )
+        }
+    )
 
 
 def box_identity(sandbox: SandboxResponse) -> dict[str, str]:
@@ -303,7 +340,43 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
             "Shells in this box will refuse AI Dream calls and say so.",
             sandbox_id, ", ".join(missing_identity),
         )
-    version = vault_version({**env, **{f"__id__{k}": v for k, v in identity.items()}})
+    leaked: list[str] = []
+    try:
+        if await knob_bool(LEAK_KNOB):
+            container_names = [
+                entry.split("=", 1)[0]
+                for entry in ((getattr(container, "attrs", None) or {}).get("Config") or {}).get(
+                    "Env"
+                )
+                or []
+            ]
+            leaked = leaked_platform_names(
+                container_names, template=sandbox.template, vault_names=set(env)
+            )
+            if leaked:
+                logger.warning(
+                    "PLATFORM ENV LEAK found in %s (template=%s): %s. These are the "
+                    "platform's own credential names in a box that was never entitled "
+                    "to them (incident 2026-09-13, boxes created before the fix). "
+                    "Unsetting them for every shell; the container's own environ keeps "
+                    "them until it is recreated.",
+                    sandbox_id, sandbox.template, ", ".join(leaked),
+                )
+    except (KnobNotRegisteredError, KnobSourceUnavailableError) as exc:
+        logger.warning(
+            "LEAK SWEEP UNAVAILABLE for %s: %s. Seed "
+            "'infrastructure.sandbox.%s'; until then a box created before "
+            "2026-09-13 keeps the platform credentials it leaked.",
+            sandbox_id, exc, LEAK_KNOB,
+        )
+
+    version = vault_version(
+        {
+            **env,
+            **{f"__id__{k}": v for k, v in identity.items()},
+            **{f"__leak__{n}": "1" for n in leaked},
+        }
+    )
     cached = _recent.get(sandbox_id)
     if cached and cached[0] == version and time.monotonic() - cached[1] < _RECENT_TTL:
         return _result(
@@ -328,7 +401,7 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
                 previous = _created_with_names(sandbox)
 
             added = sorted(set(env) - set(previous))
-            removed = sorted(set(previous) - set(env))
+            removed = sorted((set(previous) - set(env)) | set(leaked))
 
             written = await _write_env_files(
                 container=container,
@@ -347,6 +420,7 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
         present=sorted(env),
         identity=sorted(identity),
         identity_missing=missing_identity,
+        leaked_platform_env_cleared=leaked,
         vault_version=version,
         **written,
     )

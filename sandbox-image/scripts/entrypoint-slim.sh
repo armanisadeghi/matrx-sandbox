@@ -31,6 +31,11 @@ for var in SANDBOX_ID USER_ID; do
     fi
 done
 
+# See entrypoint.sh / boot-phase.sh: the box reports its phase so readiness is
+# never a host-side wall clock.
+boot_phase() { /opt/sandbox/scripts/boot-phase.sh "$@" 2>/dev/null || true; }
+boot_phase container
+
 MATRX_MIGRATION_COMMIT_MARKER="${MATRX_MIGRATION_COMMIT_MARKER:-/var/lib/matrx-migration/committed}"
 MATRX_MIGRATION_ACTIVATED_MARKER="/tmp/.matrx-migration-activated"
 AGENT_API_STARTED="${MATRX_AGENT_API_STARTED:-0}"
@@ -60,6 +65,7 @@ fi
 HOT_PATH="${HOT_PATH:-/home/agent}"
 
 # ─── Step 1: Agent environment ───────────────────────────────────────────────
+boot_phase environment
 echo "[1/4] Preparing agent environment..."
 # Publish the container identity (user, organization, AI Dream URL + token)
 # where SHELLS can read it. sshd passes the container env to nothing, so
@@ -112,6 +118,7 @@ else
 fi
 
 # ─── Step 2: Start SSH server (optional human shell-in) ──────────────────────
+boot_phase sdk
 echo "[2/4] Starting SSH server..."
 /usr/sbin/sshd
 echo "[2/4] SSH server running on port 22."
@@ -130,6 +137,7 @@ if [ "${SANDBOX_MIGRATION:-}" = "1" ] || [ "$MATRX_MIGRATION_ACTIVATION" = "1" ]
     # contributor to migration time.
     echo "[3.5/4] Migration boot — skipping cloud_files down-sync (data already on the volume)."
 else
+    boot_phase cloud_files
     echo "[3.5/4] Syncing AI Dream cloud_files (if configured)..."
     sudo -E -u agent /opt/sandbox/scripts/cloud-files-sync.sh down || true
     echo "[3.5/4] cloud_files sync complete."
@@ -137,6 +145,7 @@ fi
 
 # ─── Step 4: Signal readiness ─────────────────────────────────────────────────
 echo "[4/4] Lightweight sandbox is READY."
+boot_phase ready
 touch /tmp/.sandbox_ready
 if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
     touch "$MATRX_MIGRATION_ACTIVATED_MARKER"

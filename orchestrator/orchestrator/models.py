@@ -92,6 +92,26 @@ class CreateSandboxRequest(BaseModel):
         return value
 
 
+class SandboxBoot(BaseModel):
+    """What the box is still doing while it comes up.
+
+    A box whose home is large is usable long before the copy finishes, so it is
+    handed over ``ready`` with this attached rather than being killed by a
+    clock (see ``orchestrator/boot_readiness.py``). ``briefing`` is the exact
+    sentence a screen shows — the "nothing fails silently" half of admitting a
+    box early: the person is told what is still running, not left wondering why
+    half their files are missing. Cleared once boot completes.
+    """
+    phase: str = Field(..., description="Boot phase the box last reported (home_sync, sdk, ready, …)")
+    files_done: int | None = Field(default=None, description="Files restored so far in a counted phase")
+    files_total: int | None = Field(default=None, description="Files the counted phase expects in total")
+    briefing: str | None = Field(
+        default=None,
+        description="Human sentence for the UI, e.g. 'home sync in progress: 4210/8630 files'",
+    )
+    updated_at: datetime | None = Field(default=None, description="When this phase reading was taken")
+
+
 class SandboxResponse(BaseModel):
     # Stable canonical row identity.  ``sandbox_id`` names the runtime route;
     # this UUID names the persisted row and never substitutes for it.
@@ -142,6 +162,15 @@ class SandboxResponse(BaseModel):
             "Hosted-tier per-user Docker volume backing /home/agent. Set on "
             "create; survives container destruction. EC2-tier sandboxes leave "
             "this null and use the S3 prefix model instead."
+        ),
+    )
+    boot: SandboxBoot | None = Field(
+        default=None,
+        description=(
+            "Live boot phase while the box is still finishing work it can be "
+            "used during (today: the S3 home restore). Null once boot is done. "
+            "Persisted inside ``config`` so it survives an orchestrator restart "
+            "without a schema change."
         ),
     )
     proxy_url: str | None = Field(
