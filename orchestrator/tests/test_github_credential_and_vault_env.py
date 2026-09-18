@@ -529,10 +529,20 @@ def test_a_persons_own_vault_value_is_never_treated_as_a_leak() -> None:
     assert _leaked(["OPENAI_API_KEY"], vault=["OPENAI_API_KEY"]) == []
 
 
-def test_the_aidream_template_keeps_the_platform_env_it_is_entitled_to() -> None:
-    """That template exists to run aidream itself inside a box. Sweeping it
-    would break the one lawful consumer."""
-    assert _leaked(["GITHUB_PAT", "SUPABASE_MATRIX_PASSWORD"], template="aidream") == []
+def test_the_aidream_template_is_swept_against_the_allowlist_too() -> None:
+    """XT-10 (feedback 34dcf28a) reversed this test's original claim. The
+    aidream template used to be skipped wholesale — "the one lawful consumer" —
+    which meant every box born before the allowlist kept a live platform
+    credential in its shell until it was destroyed. It is now swept against the
+    fail-closed PLATFORM_ENV_ALLOWLIST like every other box; what it is
+    ENTITLED to (the public JWKS URL, the orchestrator's identity vars, the
+    path overrides) is what survives."""
+    assert _leaked(
+        ["GITHUB_PAT", "SUPABASE_MATRIX_PASSWORD", "ANTHROPIC_KEY"], template="aidream"
+    ) == ["ANTHROPIC_KEY", "GITHUB_PAT", "SUPABASE_MATRIX_PASSWORD"]
+    assert _leaked(
+        ["MATRX_PLATFORM_AUTH_JWKS_URL", "BASE_DIR", "SANDBOX_ID"], template="aidream"
+    ) == []
 
 
 def test_an_ordinary_non_credential_name_is_left_alone() -> None:

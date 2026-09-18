@@ -12,9 +12,12 @@ The class, and the guards:
    template's env is the orchestrator-managed identity/storage vars, the
    caller's ``config.env`` and the user's vault secrets — nothing from the
    orchestrator's own process environment.
-2. Even the ``aidream`` template never receives names that look like master
-   credentials unless the ``aidream_template_forwards_master_credentials``
-   knob (feature ``infrastructure.sandbox``, default OFF) is on.
+2. Even the ``aidream`` template receives ONLY names on the fail-closed
+   ``PLATFORM_ENV_ALLOWLIST`` unless the
+   ``aidream_template_forwards_master_credentials`` knob (feature
+   ``infrastructure.sandbox``, default OFF) is on. The pattern denylist that
+   used to stand here was fail-open and leaked 14 real secrets — XT-10,
+   feedback 34dcf28a, and tests/test_platform_env_allowlist.py.
 3. Migration refreshes obey the same two rules, and strip previously leaked
    platform names from a non-aidream box's env.
 """
@@ -142,11 +145,17 @@ async def test_non_aidream_templates_receive_no_platform_env(created_env, templa
 @pytest.mark.asyncio
 async def test_aidream_template_keeps_config_but_never_master_credentials(created_env):
     env = await created_env("aidream")
-    # Non-credential platform config flows (this is the whole point of the
-    # aidream template).
-    assert env["SUPABASE_MATRIX_HOST"] == "db.matrxserver.com"
+    # Non-secret platform config on the ALLOWLIST flows. XT-10 (feedback
+    # 34dcf28a) narrowed this: SUPABASE_MATRIX_HOST/PORT/USER/DATABASE_NAME used
+    # to flow as "non-credential connection bits", which left a box holding every
+    # part of a platform DB connection except the password — and any forwarded
+    # ..._KEY that turned out to be a service-role key closed even that gap. A
+    # box needs none of them; the allowlist is the forward set now, and
+    # tests/test_platform_env_allowlist.py owns the full contract.
     assert env["MATRX_ENV"] == "production"
     assert env["LOG_LEVEL"] == "INFO"
+    assert "SUPABASE_MATRIX_HOST" not in env
+    assert "SUPABASE_MATRIX_PORT" not in env
     # Master credentials are denied by default.
     denied = {
         "MATRX_DATABASE_URL", "SUPABASE_MATRIX_PASSWORD", "SUPABASE_MATRIX_JWT_SECRET",
@@ -261,5 +270,8 @@ def test_migration_refresh_denies_master_credentials_for_aidream_by_default():
         template="aidream",
         allow_master_credentials=False,
     )
-    assert "SUPABASE_MATRIX_HOST=db.matrxserver.com" in refreshed
-    assert not any(item.startswith("SUPABASE_MATRIX_PASSWORD=") for item in refreshed)
+    # Neither survives: the password never matched the allowlist, and the host
+    # is not on it either (XT-10 — see the comment above).
+    names = {item.split("=", 1)[0] for item in refreshed}
+    assert "SUPABASE_MATRIX_HOST" not in names
+    assert "SUPABASE_MATRIX_PASSWORD" not in names

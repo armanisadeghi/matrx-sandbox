@@ -679,15 +679,25 @@ async def sandbox_agent_env(sandbox_id: str) -> dict:
         inside ``mtx aidream serve``), reflecting what the FastAPI
         process actually sees. Only present if aidream is running.
 
-    Names are returned alphabetically; values are returned verbatim
-    because operator-only and isolated to the diagnostics surface.
-    Use this to debug 'why doesn't the agent see X?' without guessing.
+    Names are returned alphabetically. VALUES ARE NEVER RETURNED — each
+    record is ``{key, present, chars, redacted}`` (XT-10, feedback 34dcf28a:
+    verbatim values here disclosed a live provider key over HTTP). Use this to
+    debug 'why doesn't the agent see X?' by NAME; read a value from inside the
+    box's own shell.
     """
     sandbox = await sandbox_manager.get_sandbox(sandbox_id)
     if not sandbox:
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
 
-    out: dict = {"sandbox_id": sandbox_id}
+    out: dict = {
+        "sandbox_id": sandbox_id,
+        "values_redacted": True,
+        "values_redacted_reason": (
+            "Env VALUES are never returned by the orchestrator (feedback "
+            "34dcf28a). Each record reports the NAME, whether it is set, and "
+            "its length. To read a value, open a shell in the box."
+        ),
+    }
 
     try:
         client = sandbox_manager._get_docker_client()
@@ -2135,11 +2145,19 @@ import asyncio  # noqa: E402  (late import — only needed for log streaming)
 
 
 def _kv_list_from_env_lines(lines: list[str]) -> list[dict[str, str]]:
-    """Turn a list of ``KEY=value`` strings into ``[{key, value}]`` records,
-    sorted by key. Skips lines without ``=``. Used by the agent-env endpoint
-    so the FE renders a stable, alphabetised view across all three sources.
+    """Turn a list of ``KEY=value`` strings into ``[{key, present, chars}]``
+    records, sorted by key. Skips lines without ``=``. Used by the agent-env
+    endpoint so the FE renders a stable, alphabetised view across all sources.
+
+    🚨 VALUES ARE NEVER RETURNED (XT-10, feedback 34dcf28a). This endpoint used
+    to hand back every value verbatim "because operator-only", and that is how a
+    live ``sk-ant-api03-…`` was read out of a box over HTTP. The question this
+    view exists to answer — "does the agent see X?" — is answered by the NAME
+    and its presence; a value is read from inside the box's own shell by the
+    person who owns the box. Same rule the binding report already follows:
+    names only, never values.
     """
-    out: list[dict[str, str]] = []
+    out: list[dict[str, object]] = []
     seen: set[str] = set()
     for raw in lines:
         if not raw or "=" not in raw:
@@ -2149,8 +2167,13 @@ def _kv_list_from_env_lines(lines: list[str]) -> list[dict[str, str]]:
         if not key or key in seen:
             continue
         seen.add(key)
-        out.append({"key": key, "value": value})
-    out.sort(key=lambda r: r["key"])
+        out.append({
+            "key": key,
+            "present": bool(value),
+            "chars": len(value),
+            "redacted": True,
+        })
+    out.sort(key=lambda r: str(r["key"]))
     return out
 
 

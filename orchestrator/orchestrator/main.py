@@ -441,6 +441,7 @@ def _aidream_passthrough_status() -> dict:
     import os
     from orchestrator.sandbox_manager import (
         MASTER_CREDENTIALS_KNOB,
+        PLATFORM_ENV_ALLOWLIST,
         PLATFORM_PASSTHROUGH_TEMPLATES,
         _resolve_passthrough_keys,
         is_master_credential_name,
@@ -450,9 +451,14 @@ def _aidream_passthrough_status() -> dict:
     missing_keys = sorted(k for k in keys if not os.environ.get(k))
     return {
         "source_file": settings.aidream_passthrough_env_file or None,
-        # Isolation (incident 2026-09-13): only these templates receive any
-        # of this, and names the deny-list catches stay behind the knob.
+        # Isolation (incident 2026-09-13 + XT-10 2026-09-18): only these
+        # templates receive any of this, and with the knob OFF the forward set
+        # is the fail-closed allowlist — NOT "everything a pattern missed".
         "forwarded_to_templates": sorted(PLATFORM_PASSTHROUGH_TEMPLATES),
+        "allowlist": sorted(PLATFORM_ENV_ALLOWLIST),
+        "allowlist_configured": sorted(set(set_keys) & PLATFORM_ENV_ALLOWLIST),
+        "withheld_with_knob_off_count": len(set(set_keys) - PLATFORM_ENV_ALLOWLIST),
+        "withheld_with_knob_off": sorted(set(set_keys) - PLATFORM_ENV_ALLOWLIST),
         "master_credential_knob": f"infrastructure.sandbox.{MASTER_CREDENTIALS_KNOB}",
         "master_credential_names_configured": sorted(
             k for k in set_keys if is_master_credential_name(k)

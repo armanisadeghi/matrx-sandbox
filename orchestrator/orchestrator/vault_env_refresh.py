@@ -208,24 +208,45 @@ def leaked_platform_names(
 
     Pure, and deliberately conservative in the one direction that matters: a
     name the ORCHESTRATOR manages is never returned, whatever it looks like.
+
+    A PASSTHROUGH template (``aidream``) is swept too, against the fail-closed
+    :data:`~orchestrator.sandbox_manager.PLATFORM_ENV_ALLOWLIST` — XT-10,
+    feedback 34dcf28a. It used to be skipped wholesale ("the one template that
+    is SUPPOSED to hold platform env"), which is exactly why every aidream box
+    born before the allowlist keeps a live ``ANTHROPIC_KEY`` in its shell until
+    it is destroyed. Its leak set is every REGISTRY name the box carries that a
+    box created today would not receive.
     """
     from orchestrator.sandbox_manager import (
         ORCHESTRATOR_MANAGED_ENV,
+        PLATFORM_ENV_ALLOWLIST,
         RETIRED_GIT_CREDENTIAL_NAMES,
+        _resolve_passthrough_keys,
+        aidream_template_path_overrides,
         is_master_credential_name,
         template_receives_platform_env,
     )
 
+    present = {name for name in container_env_names if name}
+    keep = set(vault_names) | set(ORCHESTRATOR_MANAGED_ENV)
     if template_receives_platform_env(template):
-        # The one template that is SUPPOSED to hold platform env.
-        return []
+        return sorted(
+            (
+                (present & set(_resolve_passthrough_keys()))
+                # Retired git-credential names are swept out of every box,
+                # registry or not: nothing reads them any more.
+                | (present & set(RETIRED_GIT_CREDENTIAL_NAMES))
+            )
+            - keep
+            - set(PLATFORM_ENV_ALLOWLIST)
+            # Registry names the ORCHESTRATOR itself sets for this template.
+            - set(aidream_template_path_overrides())
+        )
     return sorted(
         {
             name
-            for name in container_env_names
-            if name
-            and name not in vault_names
-            and name not in ORCHESTRATOR_MANAGED_ENV
+            for name in present
+            if name not in keep
             and (
                 is_master_credential_name(name)
                 or name in RETIRED_GIT_CREDENTIAL_NAMES

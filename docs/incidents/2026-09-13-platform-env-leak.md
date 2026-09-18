@@ -304,3 +304,49 @@ is the census of what is still dirty.
   `matrx_tools/browser_manager.py`) — the fix is a per-sandbox scoped token minted by aidream
   (sandbox_id + user_id + org bound, revocable), the way `MATRX_AGENT_TOKEN` is already
   per-sandbox. Separate campaign; filed with this note.
+
+## REOPENED and closed differently — 2026-09-18 (XT-10, feedback 34dcf28a)
+
+The fix above was a **pattern denylist**, and a denylist is fail-open by construction.
+Measured on a real hosted box (`sbx-7bc1060b325f`, created as admin@admin.com, row
+`6e4c88ce-b38d-4b6c-ae0a-3700917f2a71`) by reading its own `agent-env`: the orchestrator
+reported `denied_count=72` and the box looked protected, while **14 secret-shaped names were
+forwarded** because no pattern matched their exact spelling —
+
+`ANTHROPIC_KEY` (a live `sk-ant-api03-…`), `MATRX_AGENT_TOKEN`, `MATRX_SCRAPER_TOKEN`,
+`SUPABASE_KEY`, `SUPABASE_MATRIX_KEY`, `SUPABASE_DJANGO_KEY`, `SUPABASE_MATRIX_DJANGO_KEY`,
+`SUPABASE_AI_MATRIX_KEY`, `SUPABASE_SAMPLE_MATRIX_KEY`, `SUPABASE_MATRIX_PUBLISHABLE_KEY`,
+`TENSORDOCK_AUTH_KEY`, `MATRX_ENGINE_TENSOR_DOCK_SERVER_KEY`, `HUGGING_FACE_TOKEN_ID`,
+`MATRX_REDACTION_KMS_KEY_ID`.
+
+`.*_API_KEY.*` does not match `ANTHROPIC_KEY`; `.*_SERVICE_TOKEN.*` does not match
+`MATRX_AGENT_TOKEN`; a Supabase service-role key is spelled `..._KEY`, not `..._SECRET`. The
+box also held `SUPABASE_MATRIX_HOST`/`_PORT`/`_USER`/`_DATABASE_NAME` — every part of a
+platform DB connection except the password.
+
+**The fix, by class not instance:** the forward set is now the FAIL-CLOSED
+`sandbox_manager.PLATFORM_ENV_ALLOWLIST`. A name is forwarded only if it is on it; everything
+else is dropped, counted and NAMED in the boot report (`platform env withheld …` at WARNING,
+and `config.platform_env` on the row). `MASTER_CREDENTIAL_PATTERNS` survives ONLY as a
+secondary guard — `_assert_allowlist_holds_no_secret_shapes()` refuses at import and on every
+decision if an allowlisted name is secret-shaped. **Never fix a missing name by adding a
+pattern.**
+
+Applied at every place env reaches a container, all of which funnel through
+`platform_env_decision`: `create_sandbox` (docker run), `migrate._refresh_platform_environment`
+(→ `migrate.py` and `hosted_runtime.migrate_hosted`), the `/diagnostics` expectation, and
+`/aidream-passthrough`. `vault_env_refresh.leaked_platform_names` now sweeps the **aidream
+template too** (it used to skip it wholesale, which is why a box born before this kept a live
+`ANTHROPIC_KEY` in its shell until it was destroyed) — protecting the person's own vault names,
+`ORCHESTRATOR_MANAGED_ENV`, and the orchestrator's own path overrides
+(`aidream_template_path_overrides`, extracted so the setter and the sweep cannot drift).
+
+**And the disclosure channel:** `GET /sandboxes/{id}/agent-env` returned every VALUE verbatim
+"because operator-only" — that is how the live key was read out over HTTP. It now answers
+`{key, present, chars, redacted}`. Names only, never values — the same rule the binding report
+already followed. The frontend diagnostics panel renders presence and length.
+
+Guards: `orchestrator/tests/test_platform_env_allowlist.py` — 18 tests, 15 proven RED on the
+pre-fix code then green, including the 14 names planted in the host env and asserted absent
+from the rendered container env, and an unknown name (`BRAND_NEW_PROVIDER_CREDENTIAL`) withheld
+by default.
