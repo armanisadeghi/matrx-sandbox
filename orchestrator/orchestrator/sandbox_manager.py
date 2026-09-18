@@ -1236,6 +1236,7 @@ async def _wait_for_ready(
                     "Sandbox %s container exited during boot (%s)",
                     sandbox.sandbox_id, sandbox.stop_reason,
                 )
+                sandbox.boot = None
                 return sandbox
 
             exit_code, output = await asyncio.to_thread(
@@ -1274,6 +1275,7 @@ async def _wait_for_ready(
             logger.warning("Error polling sandbox %s: %s", sandbox.sandbox_id, e)
             sandbox.status = SandboxStatus.FAILED
             sandbox.stop_reason = f"boot probe could not reach the container: {e}"
+            sandbox.boot = None
             return sandbox
 
         budget = br.phase_budget(
@@ -1287,6 +1289,10 @@ async def _wait_for_ready(
             logger.warning("Sandbox %s gave up: %s", sandbox.sandbox_id, reason)
             sandbox.status = SandboxStatus.FAILED
             sandbox.stop_reason = reason
+            # A dead box has no boot in progress. The reason carries the phase
+            # and count; a live-looking progress line on a failed row would be
+            # the screen lying again.
+            sandbox.boot = None
             return sandbox
 
         await asyncio.sleep(poll_interval)
