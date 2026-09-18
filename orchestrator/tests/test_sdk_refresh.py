@@ -62,6 +62,20 @@ def _sdk_tar() -> bytes:
     return buf.getvalue()
 
 
+def _scripts_tar() -> bytes:
+    """What ``/opt/sandbox/scripts`` looks like inside the CURRENT image."""
+    buf = io.BytesIO()
+    with tarfile.open(fileobj=buf, mode="w") as tar:
+        root = tarfile.TarInfo("scripts")
+        root.type = tarfile.DIRTYPE
+        tar.addfile(root)
+        body = b"#!/usr/bin/env bash\n# current helper\n"
+        info = tarfile.TarInfo("scripts/matrx-git-credential-env")
+        info.size = len(body)
+        tar.addfile(info, io.BytesIO(body))
+    return buf.getvalue()
+
+
 @pytest.fixture(autouse=True)
 def _clean_caches():
     sdk_refresh.clear_caches()
@@ -69,11 +83,14 @@ def _clean_caches():
     sdk_refresh.clear_caches()
 
 
-def _wire(monkeypatch, container, *, exec_results, current_available=True):
+def _wire(monkeypatch, container, *, exec_results, current_available=True, scripts_stamped=True):
     client = MagicMock()
     client.containers.get.return_value = container
     holder = MagicMock()
-    holder.get_archive.return_value = ([_sdk_tar()], {})
+    holder.get_archive.side_effect = lambda path: (
+        [_sdk_tar()] if path.endswith("/sdk") else [_scripts_tar()],
+        {},
+    )
     client.containers.create.return_value = holder
     monkeypatch.setattr(sdk_refresh.sandbox_manager, "_get_docker_client", lambda: client)
     monkeypatch.setattr(
@@ -84,7 +101,40 @@ def _wire(monkeypatch, container, *, exec_results, current_available=True):
             "sep14", current_available,
         ),
     )
-    execute = AsyncMock(side_effect=exec_results)
+    # The refresh now delivers /opt/sandbox/scripts as well as the SDK, so the
+    # exec stream is no longer one fixed sequence. ``exec_results`` stays the
+    # SDK script: the stamp read, then the installer. Everything the SCRIPTS
+    # half runs is answered generically here — those calls have their own
+    # guards in tests/test_github_credential_and_vault_env.py, and a positional
+    # list would make every SDK test break whenever that half grows a step.
+    sdk_script = list(exec_results)
+
+    async def _dispatch(*, sandbox_id, command, **_kwargs):
+        if ".matrx-scripts-refresh" in command:
+            if command.startswith("cat >"):
+                return (0, "", "", "/opt/sandbox")
+            stamp = (
+                json.dumps(
+                    {
+                        "to_image_id": CURRENT_IMAGE_ID,
+                        "contract": sdk_refresh.SCRIPTS_CONTRACT,
+                    }
+                )
+                if scripts_stamped
+                else ""
+            )
+            return (0, stamp, "", "/opt/sandbox")
+        if command.startswith("find /opt/sandbox/scripts"):
+            return (0, "matrx-git-credential-env deadbeef\n", "", "/opt/sandbox")
+        if "cp -a /opt/sandbox/scripts.incoming" in command:
+            return (0, "", "", "/opt/sandbox")
+        if "configure-git-credentials.sh" in command or "write-bridge-env.sh" in command:
+            return (0, "", "", "/opt/sandbox")
+        if not sdk_script:
+            raise AssertionError(f"unexpected exec with no scripted result: {command[:120]}")
+        return sdk_script.pop(0)
+
+    execute = AsyncMock(side_effect=_dispatch)
     monkeypatch.setattr(sdk_refresh.sandbox_manager, "exec_in_sandbox", execute)
     return client, execute
 
@@ -106,6 +156,7 @@ async def test_binding_installs_the_current_sdk_into_an_older_box(monkeypatch):
     client, execute = _wire(
         monkeypatch,
         container,
+        scripts_stamped=False,   # this box has never had either tree delivered
         exec_results=[
             (0, "", "", "/opt/sandbox"),          # no stamp yet — never refreshed
             (0, installer_report, "", "/opt/sandbox"),
@@ -123,6 +174,15 @@ async def test_binding_installs_the_current_sdk_into_an_older_box(monkeypatch):
 
     # The staged tree is unpacked beside the live SDK, never on top of it, and
     # the installer that runs is the STAGED one — not whatever the old box has.
+    # Two payloads now land: the scripts tree first, then the SDK. The SDK is
+    # the last one, and both must be confined to their own staging directory.
+    assert container.put_archive.call_count == 2
+    scripts_names = tarfile.open(
+        fileobj=io.BytesIO(container.put_archive.call_args_list[0][0][1])
+    ).getnames()
+    assert all(
+        n == "scripts.incoming" or n.startswith("scripts.incoming/") for n in scripts_names
+    ), scripts_names
     put_path, payload = container.put_archive.call_args[0]
     assert put_path == "/opt/sandbox"
     names = tarfile.open(fileobj=io.BytesIO(payload)).getnames()
@@ -175,7 +235,12 @@ async def test_refresh_runs_once_per_box_per_image_version(monkeypatch):
     assert first["to"] == "sep14"
     assert second["status"] == "already_refreshed"
     assert second.get("cached") is True
-    assert execute.await_count == 1, "the second binding must not exec at all"
+    after_first = execute.await_count
+    assert after_first <= 2, (
+        "a box that is already current must cost at most the two stamp reads "
+        f"(scripts, sdk) — it cost {after_first}"
+    )
+    assert execute.await_count == after_first, "the second binding must not exec at all"
     container.put_archive.assert_not_called()
 
 

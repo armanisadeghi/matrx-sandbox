@@ -1,4 +1,4 @@
-"""Binding-time runtime SDK refresh — every box inherits SDK updates, alive.
+"""Binding-time runtime refresh — every box inherits /opt/sandbox updates, alive.
 
 THE GAP (review row ca931876, 2026-09-14). The ``matrx_agent`` SDK — the ``mtx``
 CLI and the in-container daemon — is baked into the image, and an existing box is
@@ -33,6 +33,20 @@ SAFETY.
   restart is deferred and said out loud; the CLI half is live immediately
   because ``mtx`` is a fresh process on every invocation.
 * **Never during a migration.** A fenced box is left alone.
+
+WHY IT DELIVERS ``scripts`` TOO (2026-09-18). Until now this refreshed ONLY
+``/opt/sandbox/sdk``. ``/opt/sandbox/scripts`` — the git credential helper, the
+bridge-header builder, ``write-bridge-env.sh``, ``configure-git-credentials.sh``
+— stayed frozen at the box's birthday. Admin's box sbx-cd6d53863995, checked
+live on 2026-09-18, had an SDK tree from Sep 18 sitting next to a scripts tree
+from Aug 15: a 925-byte credential helper that read ``$GITHUB_PAT`` out of the
+environment and had never heard of the AI Dream bridge, and no ``/etc/matrx`` at
+all. Every fix shipped to that helper in the last month reached new boxes only.
+The scripts are plain files with no import graph and no daemon to restart, so
+they are staged and swapped the same way — and when the credential helper or the
+bridge-env writer actually CHANGED, the two idempotent scripts that install
+their effects are re-run, so a month-old box ends the refresh with the live
+helper wired into ``~/.gitconfig`` and its identity published to ``/etc/matrx``.
 """
 
 from __future__ import annotations
@@ -60,6 +74,28 @@ SDK_PATH = "/opt/sandbox/sdk"
 STAGE_DIR = "sdk.incoming"
 STAGE_PATH = f"/opt/sandbox/{STAGE_DIR}"
 OPT_SANDBOX = "/opt/sandbox"
+SCRIPTS_PATH = "/opt/sandbox/scripts"
+SCRIPTS_STAGE_DIR = "scripts.incoming"
+SCRIPTS_STAGE_PATH = f"/opt/sandbox/{SCRIPTS_STAGE_DIR}"
+#: Scripts whose CONTENT changing means an install step has to run again. Each
+#: is idempotent and safe to re-run on a live box.
+SCRIPT_REINSTALL: tuple[tuple[str, str, str], ...] = (
+    (
+        "matrx-git-credential-env",
+        f"sudo -H -u agent {SCRIPTS_PATH}/configure-git-credentials.sh",
+        "the git credential helper changed",
+    ),
+    (
+        "configure-git-credentials.sh",
+        f"sudo -H -u agent {SCRIPTS_PATH}/configure-git-credentials.sh",
+        "the credential configuration changed",
+    ),
+    (
+        "write-bridge-env.sh",
+        f"{SCRIPTS_PATH}/write-bridge-env.sh",
+        "the identity publisher changed",
+    ),
+)
 #: The install itself is seconds; the budget is for the worst case — a daemon
 #: restart that waits out a slow start (60s) AND a rollback restart after it.
 INSTALL_TIMEOUT = 240
@@ -150,16 +186,31 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
 
     with _preserved_cwd(sandbox_id):
         async with activity.track(sandbox_id):
+            # The scripts half runs FIRST and on its own stamp. A box whose SDK
+            # was already refreshed by the pre-2026-09-18 code would otherwise
+            # short-circuit below and keep its birthday scripts forever — which
+            # is exactly the state admin's box was found in.
+            scripts = await _refresh_scripts(
+                client=client,
+                container=container,
+                sandbox_id=sandbox_id,
+                image_tag=current.tag,
+                image_id=current.image_id,
+            )
+
             stamp = await _read_stamp(sandbox_id)
             if stamp.get("to_image_id") == current.image_id:
                 _recent[sandbox_id] = (current.image_id, time.monotonic())
                 return _result(
                     "already_refreshed",
+                    scripts=scripts,
                     **{"from": stamp.get("to_version") or box_version, "to": to_version},
                 )
             from_version = stamp.get("to_version") or box_version
 
-            payload = await asyncio.to_thread(_stage_payload, client, current.tag)
+            payload = await asyncio.to_thread(
+                _stage_payload, client, current.tag, SDK_PATH, STAGE_DIR
+            )
             await asyncio.to_thread(_put_payload, container, payload)
 
             allow_restart = activity.open_session_count(sandbox_id) == 0
@@ -187,6 +238,7 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
         )
         return _result(
             "failed",
+            scripts=scripts,
             **{
                 "from": from_version,
                 "to": to_version,
@@ -199,6 +251,7 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
     daemon = installed.get("daemon_restart") or {}
     result = _result(
         installed.get("status") or "failed",
+        scripts=scripts,
         **{
             "from": from_version,
             "to": to_version,
@@ -233,6 +286,133 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
     return result
 
 
+SCRIPTS_STAMP = f"{SCRIPTS_PATH}/.matrx-scripts-refresh"
+#: Bump when the delivery contract changes, so boxes stamped by an older
+#: version of THIS code are refreshed once more rather than trusted forever.
+SCRIPTS_CONTRACT = 1
+
+
+async def _refresh_scripts(
+    *, client, container, sandbox_id: str, image_tag: str, image_id: str
+) -> dict:
+    """Deliver ``/opt/sandbox/scripts`` from the current image into a live box.
+
+    Never raises: a scripts failure is a status, exactly like the SDK half.
+    """
+    try:
+        stamp = _parse_json(
+            (
+                await sandbox_manager.exec_in_sandbox(
+                    sandbox_id=sandbox_id,
+                    command=f"cat {SCRIPTS_STAMP} 2>/dev/null || true",
+                    timeout=20,
+                    user="root",
+                    cwd=OPT_SANDBOX,
+                )
+            )[1]
+        )
+        if (
+            stamp.get("to_image_id") == image_id
+            and stamp.get("contract") == SCRIPTS_CONTRACT
+        ):
+            return {"status": "already_refreshed", "changed": []}
+
+        before = await _script_digests(sandbox_id)
+        payload = await asyncio.to_thread(
+            _stage_payload, client, image_tag, SCRIPTS_PATH, SCRIPTS_STAGE_DIR
+        )
+        await asyncio.to_thread(_put_payload, container, payload)
+
+        # Swap in place: the staged tree becomes the live tree file by file.
+        # `cp -a` rather than a directory rename, so a script a box added
+        # locally is not deleted and nothing holding the directory breaks.
+        swap = (
+            f"cp -a {SCRIPTS_STAGE_PATH}/. {SCRIPTS_PATH}/ && "
+            f"chmod 0755 {SCRIPTS_PATH}/* 2>/dev/null; "
+            f"rc=$?; rm -rf {SCRIPTS_STAGE_PATH}; exit 0"
+        )
+        exit_code, _out, err, _ = await sandbox_manager.exec_in_sandbox(
+            sandbox_id=sandbox_id, command=swap, timeout=60, user="root", cwd=OPT_SANDBOX
+        )
+        if exit_code != 0:
+            return {
+                "status": "failed",
+                "changed": [],
+                "reason": (err or "the scripts swap failed").strip()[-400:],
+            }
+        after = await _script_digests(sandbox_id)
+        changed = sorted(
+            name for name in set(before) | set(after) if before.get(name) != after.get(name)
+        )
+
+        reinstalled: list[str] = []
+        for script, command, why in SCRIPT_REINSTALL:
+            if script not in changed:
+                continue
+            rc, _o, rerr, _ = await sandbox_manager.exec_in_sandbox(
+                sandbox_id=sandbox_id, command=command, timeout=60, user="root", cwd=OPT_SANDBOX
+            )
+            reinstalled.append(script if rc == 0 else f"{script} (FAILED: {why})")
+            if rc != 0:
+                logger.warning(
+                    "SCRIPTS REFRESH on %s: %s, but re-running %r failed (exit=%s): %s",
+                    sandbox_id, why, command, rc, (rerr or "")[-300:],
+                )
+
+        await sandbox_manager.exec_in_sandbox(
+            sandbox_id=sandbox_id,
+            command=(
+                f"cat > {SCRIPTS_STAMP} <<'MATRXSTAMP'\n"
+                + json.dumps(
+                    {
+                        "to_image_id": image_id,
+                        "contract": SCRIPTS_CONTRACT,
+                        "changed": changed,
+                        "at": time.time(),
+                    }
+                )
+                + "\nMATRXSTAMP"
+            ),
+            timeout=20,
+            user="root",
+            cwd=OPT_SANDBOX,
+        )
+        if changed:
+            logger.info(
+                "SCRIPTS REFRESH on %s: %d file(s) updated (%s); re-ran %s",
+                sandbox_id, len(changed), ", ".join(changed[:10]), reinstalled or "nothing",
+            )
+        return {
+            "status": "refreshed",
+            "changed": changed,
+            "reinstalled": reinstalled,
+        }
+    except Exception as exc:  # noqa: BLE001 — never fatal to a binding
+        logger.exception("SCRIPTS REFRESH FAILED for %s", sandbox_id)
+        return {"status": "failed", "changed": [], "reason": f"{type(exc).__name__}: {exc}"}
+
+
+async def _script_digests(sandbox_id: str) -> dict[str, str]:
+    """name -> sha256, for every file in the box's scripts directory."""
+    _rc, out, _err, _ = await sandbox_manager.exec_in_sandbox(
+        sandbox_id=sandbox_id,
+        command=(
+            f"find {SCRIPTS_PATH} -maxdepth 1 -type f -printf '%f\\n' 2>/dev/null "
+            f"| while read -r f; do printf '%s %s\\n' \"$f\" "
+            f"\"$(sha256sum {SCRIPTS_PATH}/\"$f\" | cut -d' ' -f1)\"; done"
+        ),
+        timeout=30,
+        user="root",
+        cwd=OPT_SANDBOX,
+    )
+    digests: dict[str, str] = {}
+    for line in (out or "").splitlines():
+        parts = line.strip().split()
+        if len(parts) == 2:
+            digests[parts[0]] = parts[1]
+    return digests
+
+
 async def _read_stamp(sandbox_id: str) -> dict:
     exit_code, stdout, _stderr, _ = await sandbox_manager.exec_in_sandbox(
         sandbox_id=sandbox_id,
@@ -261,20 +441,25 @@ def _parse_json(text: str | None) -> dict:
     return {}
 
 
-def _stage_payload(client, image_tag: str) -> bytes:
-    """Pull ``/opt/sandbox/sdk`` out of the CURRENT image as a tar whose members
-    are rewritten to ``sdk.incoming/`` — so unpacking it in a live box can never
-    land on top of the SDK the box is currently importing."""
+def _stage_payload(
+    client,
+    image_tag: str,
+    source_path: str = SDK_PATH,
+    stage_dir: str = STAGE_DIR,
+) -> bytes:
+    """Pull ``source_path`` out of the CURRENT image as a tar whose members are
+    rewritten to ``<stage_dir>/`` — so unpacking it in a live box can never land
+    on top of the tree the box is currently using."""
     holder = client.containers.create(image_tag, command="/bin/true")
     try:
-        stream, _stat = holder.get_archive(SDK_PATH)
+        stream, _stat = holder.get_archive(source_path)
         raw = io.BytesIO()
         size = 0
         for chunk in stream:
             size += len(chunk)
             if size > MAX_STAGE_BYTES:
                 raise RuntimeError(
-                    f"refusing to stage {size} bytes from {image_tag}:{SDK_PATH} — "
+                    f"refusing to stage {size} bytes from {image_tag}:{source_path} — "
                     f"over the {MAX_STAGE_BYTES} byte guardrail"
                 )
             raw.write(chunk)
@@ -296,9 +481,9 @@ def _stage_payload(client, image_tag: str) -> bytes:
             if not name:
                 continue
             head, _, rest = name.partition("/")
-            member.name = f"{STAGE_DIR}/{rest}" if rest else STAGE_DIR
+            member.name = f"{stage_dir}/{rest}" if rest else stage_dir
             if member.islnk() and member.linkname.startswith(f"{head}/"):
-                member.linkname = f"{STAGE_DIR}/{member.linkname[len(head) + 1:]}"
+                member.linkname = f"{stage_dir}/{member.linkname[len(head) + 1:]}"
             if member.isfile():
                 dst.addfile(member, src.extractfile(member))
             else:

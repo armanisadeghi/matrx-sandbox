@@ -194,6 +194,11 @@ def _parse_env_file_keys(path: str) -> frozenset[str]:
 
 PLATFORM_PASSTHROUGH_TEMPLATES: frozenset[str] = frozenset({"aidream"})
 
+#: Where the binding-time vault refresh publishes the person's CURRENT vault
+#: values (orchestrator/vault_env_refresh.py owns the writing). Named here so
+#: the exec wrapper does not import that module for one string.
+VAULT_ENV_FILE = "/etc/matrx/vault-env.sh"
+
 MASTER_CREDENTIALS_KNOB = "aidream_template_forwards_master_credentials"
 
 #: Name patterns (matched against the whole upper-cased name) that identify
@@ -915,6 +920,11 @@ async def _create_sandbox_unleased(
                             if isinstance(k, str) and isinstance(v, str):
                                 secrets_env[k] = v
                     diag["fetched_count"] = len(secrets_env)
+                    # NAMES only, never values. This is the baseline the
+                    # binding-time vault refresh diffs against the first time it
+                    # runs on this box: without it, it can say what was ADDED
+                    # but not what the person has since DELETED.
+                    diag["names"] = sorted(secrets_env)
                     logger.info(
                         "user-secrets: injected %d secret(s) for user=%s org=%s",
                         len(secrets_env), user_id, organization_id,
@@ -997,15 +1007,21 @@ async def _create_sandbox_unleased(
             env["SANDBOX_MIGRATION"] = "1"
 
         if template == "development":
-            github_token_keys = (
-                "GITHUB_TOKEN",
-                "GH_TOKEN",
-                "GITHUB_PAT",
-                "MATRX_GITHUB_TOKEN",
-            )
-            if not any(env.get(key) for key in github_token_keys):
+            # The internal development box clones private repos at boot, so it
+            # must be born able to reach GitHub. Until 2026-09-18 this accepted
+            # GH_TOKEN / GITHUB_PAT / MATRX_GITHUB_TOKEN as well — names that
+            # could be satisfied by the ORCHESTRATOR HOST's own master PAT
+            # rather than by the person's credential, which is how a box came
+            # to hold a revoked platform token for a month. The gate now names
+            # the ONE vault key the credential helper actually reads, and says
+            # what to do when it is missing.
+            if not env.get("GITHUB_TOKEN"):
                 raise RuntimeError(
-                    "internal development sandbox requires a vaulted GitHub token"
+                    "internal development sandbox requires a GITHUB_TOKEN vault "
+                    "item marked 'inject into sandbox' for the user this box "
+                    "belongs to. GH_TOKEN, GITHUB_PAT and MATRX_GITHUB_TOKEN are "
+                    "no longer accepted: they named the platform's own token, not "
+                    "this person's."
                 )
 
         # Resource overrides — fall back to the fleet settings
@@ -1253,7 +1269,22 @@ async def exec_in_sandbox(
         # ``eval`` parses the command as its own complete shell program while
         # still running in this shell, so intentional ``cd`` changes remain
         # visible to the CWD trailer.
+        # THE VAULT ENV LINE (2026-09-18). ``docker exec`` always injects the
+        # environment the CONTAINER WAS CREATED WITH — a snapshot that is wrong
+        # the moment the person adds, rotates or deletes a vault value, and
+        # that cannot be changed without destroying the container. The
+        # binding-time refresh writes the current truth to
+        # /etc/matrx/vault-env.sh; sourcing it here is what makes a month-old
+        # box run the agent's command with today's credentials. `bash -c` is
+        # neither a login nor an interactive shell, so it reads no profile and
+        # no bashrc: without this line the file would reach ssh sessions and
+        # miss the tool path entirely. MATRX_VAULT_ENV_SKIP protects names this
+        # caller set on purpose for this one exec.
+        vault_line = f"[ -r {shlex.quote(VAULT_ENV_FILE)} ] && . {shlex.quote(VAULT_ENV_FILE)}; "
         wrapped = (
+            f"MATRX_VAULT_ENV_SKIP={shlex.quote(' '.join(sorted(env or {})))}; "
+            f"export MATRX_VAULT_ENV_SKIP; "
+            f"{vault_line}"
             f"cd {shlex.quote(effective_cwd)} && "
             f"eval -- {shlex.quote(command)}; "
             f"__matrx_ec=$?; "

@@ -1923,18 +1923,26 @@ async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
 
     * ``sdk_refresh`` runs on EVERY binding, every template. A box created from
       an older image is never force-migrated (SBX-006), so without this it could
-      never run a command the SDK grew after its birth. See
-      ``orchestrator/sdk_refresh.py``.
+      never run a command the SDK grew after its birth. It also delivers
+      ``/opt/sandbox/scripts`` — the git credential helper and its installers.
+      See ``orchestrator/sdk_refresh.py``.
+    * ``vault_env_refresh`` runs on EVERY binding, every template. A container's
+      environment is the snapshot taken when it was created; this republishes
+      the person's CURRENT vault values into the box and names what was added
+      and removed, so the sandbox briefing's vault section is true rather than
+      aspirational. See ``orchestrator/vault_env_refresh.py``.
     * the repository sync runs only for the internal ``development`` worker.
 
     Failures stay visible in the report and logs, but never overwrite work or
     prevent token issuance.
     """
     from orchestrator.sdk_refresh import refresh_sdk_if_stale
+    from orchestrator.vault_env_refresh import refresh_vault_env
 
     sdk_refresh = await refresh_sdk_if_stale(sandbox)
+    vault_env = await refresh_vault_env(sandbox)
     if sandbox.template != "development":
-        return {"sdk_refresh": sdk_refresh}
+        return {"sdk_refresh": sdk_refresh, "vault_env_refresh": vault_env}
     from orchestrator.connection_hooks import prepare_development_connection
 
     try:
@@ -1964,6 +1972,7 @@ async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
             }
         return {
             "sdk_refresh": sdk_refresh,
+            "vault_env_refresh": vault_env,
             "hook": str(report.get("hook", "session_start.repo_sync")),
             "status": str(report.get("status", "unknown")),
             "exit_code": (
@@ -1987,6 +1996,7 @@ async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
         )
         return {
             "sdk_refresh": sdk_refresh,
+            "vault_env_refresh": vault_env,
             "status": "failed",
             "summary": "Development connection preparation failed; it will retry on the next binding.",
         }

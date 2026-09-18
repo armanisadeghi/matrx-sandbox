@@ -7,22 +7,38 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from orchestrator import connection_hooks, sdk_refresh
+from orchestrator import connection_hooks, sdk_refresh, vault_env_refresh
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.routes import sandboxes
 
 
 @pytest.fixture(autouse=True)
 def _stub_sdk_refresh(monkeypatch):
-    """The SDK refresh is its own hook with its own guards
-    (tests/test_sdk_refresh.py); here it is stubbed so these tests stay about
-    the repository sync. It runs for EVERY template, so it cannot be skipped."""
+    """The SDK refresh and the vault env refresh are their own hooks with their
+    own guards (tests/test_sdk_refresh.py,
+    tests/test_github_credential_and_vault_env.py); here they are stubbed so
+    these tests stay about the repository sync. Both run for EVERY template, so
+    neither can be skipped."""
     monkeypatch.setattr(
         sdk_refresh,
         "refresh_sdk_if_stale",
         AsyncMock(return_value={"hook": "session_start.sdk_refresh", "status": "current",
                                 "from": "v1", "to": "v1"}),
     )
+    monkeypatch.setattr(
+        vault_env_refresh,
+        "refresh_vault_env",
+        AsyncMock(return_value=VAULT_STUB),
+    )
+
+
+VAULT_STUB = {
+    "hook": "session_start.vault_env_refresh",
+    "status": "current",
+    "added": [],
+    "removed": [],
+    "present": ["SERPAPI_API_KEY"],
+}
 
 
 def _sandbox() -> SandboxResponse:
@@ -109,6 +125,7 @@ async def test_prepare_connection_isolates_hook_failure_from_token_mint(
     result = await sandboxes._prepare_connection(_sandbox())
 
     assert result == {
+        "vault_env_refresh": VAULT_STUB,
         "sdk_refresh": {"hook": "session_start.sdk_refresh", "status": "current",
                         "from": "v1", "to": "v1"},
         "status": "failed",
@@ -129,6 +146,7 @@ async def test_prepare_connection_skips_the_repo_sync_for_an_ordinary_sandbox(mo
     result = await sandboxes._prepare_connection(ordinary)
 
     assert result == {
+        "vault_env_refresh": VAULT_STUB,
         "sdk_refresh": {"hook": "session_start.sdk_refresh", "status": "current",
                         "from": "v1", "to": "v1"},
     }
@@ -158,6 +176,7 @@ async def test_prepare_connection_returns_only_json_safe_bounded_diagnostics(mon
     result = await sandboxes._prepare_connection(_sandbox())
 
     assert result == {
+        "vault_env_refresh": VAULT_STUB,
         "sdk_refresh": {"hook": "session_start.sdk_refresh", "status": "current",
                         "from": "v1", "to": "v1"},
         "hook": "session_start.repo_sync",

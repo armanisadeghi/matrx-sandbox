@@ -323,7 +323,9 @@ async def test_development_sandbox_mounts_workspace_and_restarts(
         organization_id=ORG_ID,
         template="development",
         tier="ec2",
-        config={"workspace_key": "primary", "env": {"GH_TOKEN": "test-token"}},
+        # GITHUB_TOKEN, not GH_TOKEN: since 2026-09-18 the gate names the ONE
+        # vault key the box's git credential helper actually reads.
+        config={"workspace_key": "primary", "env": {"GITHUB_TOKEN": "test-token"}},
     )
 
     kwargs = mock_docker.containers.run.call_args.kwargs
@@ -335,6 +337,40 @@ async def test_development_sandbox_mounts_workspace_and_restarts(
         "MaximumRetryCount": 0,
     }
     assert sandbox.persistence_volume == "host:primary"
+
+
+@pytest.mark.asyncio
+async def test_development_sandbox_refuses_a_platform_pat_as_its_credential(
+    mock_docker,
+    monkeypatch,
+    tmp_path,
+):
+    """GH_TOKEN / GITHUB_PAT / MATRX_GITHUB_TOKEN used to satisfy this gate.
+
+    They could be satisfied by the ORCHESTRATOR HOST's own GitHub account, which
+    is how a box came to push with the platform's revoked PAT (2026-09-18).
+    """
+    from orchestrator import sandbox_manager
+    from orchestrator.config import settings
+
+    monkeypatch.setattr(settings, "internal_development_workspace_root", str(tmp_path))
+    monkeypatch.setattr(settings, "aidream_url", "")
+    monkeypatch.setattr(settings, "aidream_service_token", "")
+    monkeypatch.setattr("os.chown", MagicMock())
+
+    with pytest.raises(RuntimeError, match="no longer accepted"):
+        await sandbox_manager.create_sandbox(
+            user_id="00000000-0000-4000-8000-000000000001",
+            organization_id=ORG_ID,
+            template="development",
+            tier="ec2",
+            config={
+                "workspace_key": "primary",
+                "env": {"GITHUB_PAT": "the-platform-host-token"},
+            },
+        )
+
+    mock_docker.containers.run.assert_not_called()
 
 
 @pytest.mark.asyncio
@@ -353,7 +389,7 @@ async def test_development_sandbox_refuses_to_boot_without_github_auth(
 
     with pytest.raises(
         RuntimeError,
-        match="requires a vaulted GitHub token",
+        match="requires a GITHUB_TOKEN vault item",
     ):
         await sandbox_manager.create_sandbox(
             user_id="00000000-0000-4000-8000-000000000001",

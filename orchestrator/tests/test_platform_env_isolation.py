@@ -122,13 +122,13 @@ def created_env(monkeypatch, tmp_path):
 @pytest.mark.asyncio
 @pytest.mark.parametrize("template", ["slim", "development"])
 async def test_non_aidream_templates_receive_no_platform_env(created_env, template):
-    env = await created_env(template, GH_TOKEN="user-vault-or-config-token")
+    env = await created_env(template, GITHUB_TOKEN="user-vault-or-config-token")
     leaked = sorted(set(env) & set(PLATFORM_ENV))
     assert leaked == [], f"{template} box received platform env: {leaked}"
     # What the box IS allowed to carry: identity/storage + the caller's env.
     assert env["SANDBOX_TEMPLATE"] == template
     assert env["USER_ID"] == "00000000-0000-4000-8000-000000000001"
-    assert env["GH_TOKEN"] == "user-vault-or-config-token"
+    assert env["GITHUB_TOKEN"] == "user-vault-or-config-token"
 
 
 @pytest.mark.asyncio

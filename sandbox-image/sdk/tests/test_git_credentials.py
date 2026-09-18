@@ -4,6 +4,8 @@ import os
 import subprocess
 from pathlib import Path
 
+import pytest
+
 
 HELPER = Path(__file__).resolve().parents[2] / "scripts" / "matrx-git-credential-env"
 
@@ -62,10 +64,10 @@ def _matching_curl(tmp_path: Path, pattern_body: str) -> Path:
     return fake_curl
 
 
-def test_env_helper_returns_github_token():
+def test_env_helper_returns_the_vault_github_token():
     proc = _run_helper(
         "protocol=https\nhost=github.com\n\n",
-        {"GITHUB_PAT": "ghp_secret", "GITHUB_USERNAME": "octo"},
+        {"GITHUB_TOKEN": "ghp_secret", "GITHUB_USERNAME": "octo"},
     )
 
     assert proc.returncode == 0
@@ -74,10 +76,25 @@ def test_env_helper_returns_github_token():
 
 
 def test_env_helper_uses_standard_default_username():
-    proc = _run_helper("protocol=https\nhost=github.com\n\n", {"GH_TOKEN": "ghs_secret"})
+    proc = _run_helper("protocol=https\nhost=github.com\n\n", {"GITHUB_TOKEN": "ghs_secret"})
 
     assert proc.returncode == 0
     assert proc.stdout == "username=x-access-token\npassword=ghs_secret\n"
+
+
+@pytest.mark.parametrize("name", ["GH_TOKEN", "GITHUB_PAT", "MATRX_GITHUB_TOKEN"])
+def test_a_container_born_token_is_never_used_and_is_announced(name: str):
+    """2026-09-18. These three names were satisfied by whatever the CONTAINER
+    was created carrying — including, via the orchestrator's passthrough
+    registry, the PLATFORM HOST's own PAT. A box pushed with a revoked platform
+    token for two months and nothing said so. They are no longer credentials;
+    a box that still has one is TOLD, so the person can delete it."""
+    proc = _run_helper("protocol=https\nhost=github.com\n\n", {name: "ghp_stale"})
+
+    assert "ghp_stale" not in proc.stdout
+    assert proc.stdout == ""
+    assert name in proc.stderr
+    assert "NOT used for git any more" in proc.stderr
 
 
 def test_env_helper_ignores_non_github_hosts():
@@ -90,13 +107,20 @@ def test_env_helper_ignores_non_github_hosts():
     assert proc.stdout == ""
 
 
-def test_env_helper_noops_without_token():
-    """No identity and no token: git gets nothing — but it SAYS so, because
-    git itself only reports "authentication failed" and the user is left
-    guessing whether their connected GitHub account is missing or broken."""
+def test_env_helper_fails_loudly_without_a_token():
+    """No identity and no token: git gets nothing — and the helper EXITS
+    NON-ZERO so git surfaces the reason.
+
+    It used to ``exit 0``. Git then printed its own "authentication failed" and
+    the five explanatory sentences above it read as unrelated noise, which is
+    how a person ends up reconnecting a GitHub account that was never the
+    problem."""
     proc = _run_helper("protocol=https\nhost=github.com\n\n")
 
-    assert proc.returncode == 0
+    assert proc.returncode != 0, (
+        "a helper that knows why the credential is missing must make git's "
+        "failure carry that reason"
+    )
     assert proc.stdout == ""
     assert "no AI Dream identity" in proc.stderr
 
@@ -181,7 +205,7 @@ def test_partial_identity_is_loud_even_when_the_file_is_absent(tmp_path: Path):
         {"USER_ID": "user-123"},
     )
 
-    assert proc.returncode == 0
+    assert proc.returncode != 0
     assert "MATRX_AIDREAM_URL" in proc.stderr
     assert "ORGANIZATION_ID" in proc.stderr
 
@@ -205,7 +229,7 @@ def test_helper_prefers_refreshable_aimatrx_connection(tmp_path: Path):
             "MATRX_AIDREAM_SERVICE_TOKEN": "bridge-secret",
             "USER_ID": "user-123",
             "ORGANIZATION_ID": "org-9",
-            "GITHUB_PAT": "ghp_stale-fallback",
+            "GITHUB_TOKEN": "ghp_stale-fallback",
         },
     )
 
@@ -226,7 +250,7 @@ def test_helper_falls_back_to_injected_token_when_bridge_is_unavailable(tmp_path
             "MATRX_AIDREAM_SERVICE_TOKEN": "bridge-secret",
             "USER_ID": "user-123",
             "ORGANIZATION_ID": "org-9",
-            "GH_TOKEN": "ghp_fallback",
+            "GITHUB_TOKEN": "ghp_fallback",
         },
     )
 
@@ -251,7 +275,7 @@ def test_helper_refuses_the_bridge_call_without_an_organization(tmp_path: Path):
             "MATRX_AIDREAM_URL": "https://server.example.test",
             "MATRX_AIDREAM_SERVICE_TOKEN": "bridge-secret",
             "USER_ID": "user-123",
-            "GH_TOKEN": "ghp_fallback",
+            "GITHUB_TOKEN": "ghp_fallback",
         },
     )
 
@@ -296,7 +320,7 @@ def test_a_membership_refusal_prints_the_servers_message_and_remedy(tmp_path: Pa
 
     proc = _run_helper("protocol=https\nhost=github.com\n\n", _identity_env(tmp_path))
 
-    assert proc.returncode == 0
+    assert proc.returncode != 0, "git must fail loudly, not quietly decline"
     assert proc.stdout == ""
     assert "403" in proc.stderr
     assert "organization_membership_required" in proc.stderr
@@ -322,14 +346,32 @@ def test_an_unverifiable_membership_is_reported_as_the_server_stated_it(tmp_path
     assert "Connect a GitHub account" not in proc.stderr
 
 
-def test_a_404_still_means_connect_a_github_account(tmp_path: Path):
-    """The pre-existing case is kept: the endpoint answering 'no connection'
-    is the one thing 'Connect a GitHub account' is the right remedy for."""
-    _stub_curl(tmp_path, "404", '{"detail":"no github integration"}')
+def test_a_404_prints_the_servers_own_diagnosis_not_this_scripts_guess(tmp_path: Path):
+    """2026-09-18: a CONNECTED user got "Connect GitHub in AI Matrx" from a box.
+
+    404 used to be excluded from the "the server knows why" branch, because the
+    server's 404 body WAS that same guess. The bridge now answers with the user
+    id it looked up and what exists for it — the only datum that separates "you
+    never connected GitHub" from "this box named somebody else's id" — and this
+    helper must carry those words through untouched."""
+    _stub_curl(
+        tmp_path,
+        "404",
+        '{"detail":{"code":"github_connection_not_found",'
+        '"message":"No usable GitHub connection: no GitHub connection row of any '
+        'kind exists for user id 00000000-0000-4000-8000-000000000000.",'
+        '"remedy":"Check that X-Matrx-User-Id names the person who connected GitHub."}}',
+    )
 
     proc = _run_helper("protocol=https\nhost=github.com\n\n", _identity_env(tmp_path))
 
-    assert "Connect a GitHub account" in proc.stderr
+    assert proc.returncode != 0
+    assert "00000000-0000-4000-8000-000000000000" in proc.stderr, (
+        "the user id the server actually looked up must reach the person "
+        "standing at the failed git command"
+    )
+    assert "github_connection_not_found" in proc.stderr
+    assert "X-Matrx-User-Id" in proc.stderr
 
 
 def test_a_2xx_body_is_still_the_token(tmp_path: Path):
@@ -345,8 +387,12 @@ def test_a_2xx_body_is_still_the_token(tmp_path: Path):
 def test_a_refusal_still_prefers_an_explicit_token_when_one_exists(tmp_path: Path):
     _stub_curl(tmp_path, "403", '{"detail":{"code":"organization_membership_required"}}')
     env = _identity_env(tmp_path)
-    env["GITHUB_PAT"] = "ghp_local"
+    env["GITHUB_TOKEN"] = "ghp_local"
 
     proc = _run_helper("protocol=https\nhost=github.com\n\n", env)
 
     assert proc.stdout == "username=x-access-token\npassword=ghp_local\n"
+    assert "HTTP 403" in proc.stderr, (
+        "using the vault fallback must never hide that the bridge refused — "
+        "silently pushing with a second credential is the whole 2026-09-18 bug"
+    )

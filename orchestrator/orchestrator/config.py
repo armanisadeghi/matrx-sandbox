@@ -245,7 +245,14 @@ class Settings(BaseSettings):
         "TWILIO_ACCOUNT_SID,TWILIO_AUTH_TOKEN,TWILIO_PHONE_NUMBER,"
         "TWILIO_MESSAGING_SERVICE_SID,TWILIO_VERIFY_SID,TWILIO_SKIP_VALIDATION,"
         "SLACK_CLIENT_ID,SLACK_CLIENT_SECRET,SLACK_REDIRECT_URL,"
-        "GITHUB_CLIENT_ID,GITHUB_CLIENT_SECRET,GITHUB_PAT,"
+        # GITHUB_PAT is deliberately ABSENT (2026-09-18). A box's git
+        # credential comes from the person's own AI Matrx GitHub connection
+        # through the AI Dream bridge, or from their own GITHUB_TOKEN vault
+        # item — never from the ORCHESTRATOR HOST's account. The name here
+        # put the platform's master PAT on the passthrough list, where the
+        # only thing standing between it and a container was the
+        # master-credential deny-list.
+        "GITHUB_CLIENT_ID,GITHUB_CLIENT_SECRET,"
         "GITHUB_BOT_ACCOUNT_USERNAME,GITHUB_BOT_EMAIL,GITHUB_ORG_NAME,"
         "SHOPIFY_API_SECRET_KEY,SHOPIFY_API_ACCESS_TOKEN,SHOPIFY_APP_NAME,"
         "SHOPIFY_APP_CLIENT_ID,SHOPIFY_APP_CLIENT_SECRET,"
