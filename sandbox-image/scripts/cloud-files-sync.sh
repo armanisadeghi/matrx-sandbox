@@ -73,7 +73,7 @@ case "$DIRECTION" in
     down)
         echo "[cloud-files-sync] Pulling user's cld_files → $CLOUD_DIR"
         # Tight 60s budget so a flaky AI Dream doesn't block sandbox startup.
-        timeout 60 /usr/bin/python3.11 -m matrx_agent.cli files sync down \
+        timeout 60 /usr/bin/python3 -m matrx_agent.cli files sync down \
             --dest "$CLOUD_DIR" || {
             echo "[cloud-files-sync] WARNING: down-sync failed or timed out"
             exit 0  # don't block startup
@@ -87,7 +87,7 @@ case "$DIRECTION" in
         ;;
     up)
         echo "[cloud-files-sync] Pushing ~/cloud-files/ → cld_files"
-        timeout 60 /usr/bin/python3.11 -m matrx_agent.cli files sync up \
+        timeout 60 /usr/bin/python3 -m matrx_agent.cli files sync up \
             --src "$CLOUD_DIR" || {
             echo "[cloud-files-sync] WARNING: up-sync failed or timed out"
             exit 0

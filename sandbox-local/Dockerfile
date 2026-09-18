@@ -43,6 +43,18 @@ RUN UARCH=$(uname -m) \
     -o /usr/local/bin/ttyd \
     && chmod +x /usr/local/bin/ttyd
 
+# ─── Toolchain contract verification (inherited from :core) ──────────────────
+# Node 22, an agent-writable npm global prefix with install scripts allowed, a
+# RELEASE python3 >= 3.12 and the `browse` CLI are the same floor every variant
+# owes an agent (sandbox-image/ADDING_UTILITIES.md § The toolchain contract). A
+# :core regression must fail THIS build rather than reach a box.
+RUN node --version \
+    && node -e "process.exit(parseInt(process.versions.node) >= 22 ? 0 : 1)" \
+    && /usr/bin/python3 -c "import sys; v=sys.version_info; assert v[:2] >= (3, 12) and v.releaselevel == 'final', sys.version" \
+    && /usr/bin/python3 -c "import matrx_agent, matrx_tools" \
+    && npm --version \
+    && test -x /usr/local/bin/browse
+
 # ─── Copy local-mode scripts ─────────────────────────────────────────────────
 COPY scripts/entrypoint-local.sh /opt/sandbox/scripts/entrypoint-local.sh
 COPY scripts/healthcheck-local.sh /opt/sandbox/scripts/healthcheck-local.sh

@@ -42,6 +42,8 @@ from __future__ import annotations
 
 import os
 import platform
+import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -59,9 +61,50 @@ class NoWritableToolTarget(RuntimeError):
 UV_VERSION = "0.10.8"
 PNPM_VERSION = "10.15.0"
 GH_VERSION = "2.100.0"
+NODE_MAJOR = "22"
+#: Exact Node used by the self-service path. The image installs the nodesource
+#: ``setup_22.x`` stream, so the minor can differ; the FLOOR is what matters and
+#: both sides are held to ``NODE_MAJOR``.
+NODE_VERSION = "22.23.2"
+
+#: THE TOOLCHAIN CONTRACT (2026-09-18 field report). Every image variant and
+#: every self-service upgrade owes an agent the same floor:
+#:
+#:   * Node >= 22 — Stagehand v4 and friends need it (P1-1: Node 20 gave
+#:     ``ReferenceError: WebSocket is not defined``).
+#:   * ``npm i -g`` works AS THE AGENT — an image-owned, agent-writable global
+#:     prefix (P1-2: EACCES on root-owned /usr/lib/node_modules).
+#:   * install scripts run for the agent's own installs, with the policy stated
+#:     (P1-3: npm 11's ``allow-scripts`` allowlist silently skips postinstall).
+#:   * ``python3`` is a FINAL release >= 3.12 (P2-1: jammy's python3.11 package
+#:     is 3.11.0rc1, a 2022 release candidate).
+#:   * ``browse`` is on PATH (P2-2).
+#:
+#: The guard that proves it on a real box is
+#: ``sandbox-image/scripts/test-toolchain.sh``.
+PYTHON_MIN = (3, 12)
+NPM_GLOBAL_PREFIX = "/opt/npm-global"
+NPM_POLICY_LINES = (
+    "# Matrx sandbox npm policy — see sandbox-image/ADDING_UTILITIES.md.",
+    "dangerously-allow-all-scripts=true",
+    "ignore-scripts=false",
+    "fund=false",
+)
 
 #: Every binary the agent-facing setup recipe assumes exists.
-REQUIRED_TOOLS = ("uv", "pnpm", "gh")
+REQUIRED_TOOLS = ("uv", "pnpm", "gh", "node")
+
+#: Minimum major version for tools where "present" is not good enough. A tool
+#: below its floor is treated exactly like a missing one by ``ensure``.
+MIN_MAJOR = {"node": int(NODE_MAJOR)}
+
+#: ``/usr/local/bin`` shims the image installs. ``ensure`` re-creates them on a
+#: box that predates them, so a boxload of agents does not have to learn which
+#: vintage it is sitting in.
+SHIMS = {
+    "mtx": '#!/bin/sh\nexec /usr/bin/python3 -m matrx_agent.cli "$@"\n',
+    "browse": '#!/bin/sh\nexec /usr/bin/python3 -m matrx_agent.cli browse "$@"\n',
+}
 
 _LOCAL_BIN = "/usr/local/bin"
 
@@ -265,7 +308,210 @@ def _install_gh(target: _Target) -> tuple[bool, str]:
     return True, f"gh {GH_VERSION} -> {target.directory}/gh"
 
 
-_INSTALLERS = {"uv": _install_uv, "pnpm": _install_pnpm, "gh": _install_gh}
+def _install_node(target: _Target) -> tuple[bool, str]:
+    """Put Node >= 22 on an OLD box, without root and without a migration.
+
+    Existing boxes are never force-migrated (SBX-006), so an image that ships
+    Node 22 does nothing for a box created last month — and that box is where
+    the agent that hit ``ReferenceError: WebSocket is not defined`` actually
+    lives. The official linux tarball is one download, works as a non-root
+    user, and brings its own npm/npx, which is why it beats nodesource+apt
+    here for the same reason ``gh`` comes from a tarball.
+
+    The tree lands in ``<target>/../lib/matrx-node-<major>`` (or ``~/.local``
+    when we do not own the prefix) and only the three entry points are linked
+    onto PATH, ahead of whatever old Node the box still carries.
+    """
+    arch = _arch()
+    if arch is None:
+        return False, f"unsupported architecture {platform.machine()}"
+    stem = f"node-v{NODE_VERSION}-linux-{'x64' if arch == 'amd64' else 'arm64'}"
+    url = f"https://nodejs.org/dist/v{NODE_VERSION}/{stem}.tar.xz"
+    dest_root = target.directory.parent / "lib" / f"matrx-node-{NODE_MAJOR}"
+    with tempfile.TemporaryDirectory() as tmp:
+        tarball = Path(tmp) / "node.tar.xz"
+        dl = subprocess.run(
+            ["curl", "-fsSL", url, "-o", str(tarball)], capture_output=True, text=True
+        )
+        if dl.returncode != 0:
+            return False, f"could not download {url}: {dl.stderr.strip()[:200]}"
+        ex = subprocess.run(
+            ["tar", "-xJf", str(tarball), "-C", tmp], capture_output=True, text=True
+        )
+        if ex.returncode != 0:
+            return False, f"could not unpack the node tarball: {ex.stderr.strip()[:200]}"
+        extracted = Path(tmp) / stem
+        if not (extracted / "bin" / "node").exists():
+            return False, f"node binary missing from tarball (expected {extracted}/bin/node)"
+        mk = target.run(["mkdir", "-p", str(dest_root.parent)], capture_output=True, text=True)
+        if mk.returncode != 0:
+            return False, (mk.stderr or mk.stdout).strip()[:300]
+        target.run(["rm", "-rf", str(dest_root)], capture_output=True, text=True)
+        mv = target.run(
+            ["cp", "-a", str(extracted), str(dest_root)], capture_output=True, text=True
+        )
+        if mv.returncode != 0:
+            return False, (mv.stderr or mv.stdout).strip()[:300]
+    for name in ("node", "npm", "npx"):
+        link = target.run(
+            ["ln", "-sf", str(dest_root / "bin" / name), str(target.directory / name)],
+            capture_output=True,
+            text=True,
+        )
+        if link.returncode != 0:
+            return False, f"installed at {dest_root} but could not link {name} into {target.directory}"
+    return True, f"node {NODE_VERSION} -> {target.directory}/node (tree at {dest_root})"
+
+
+def _npm_prefix_target(target: _Target) -> tuple[bool, str]:
+    """Make ``npm i -g`` work as the agent, and make install scripts run.
+
+    On a current image this is already true (the Dockerfile owns it). On an old
+    box the global prefix is ``/usr`` — root-owned — and npm 11's
+    ``allow-scripts`` allowlist is unset, so the agent gets EACCES on one
+    command and a silently script-less install on the next. Both are fixed the
+    same way the image fixes them: an image-level, agent-owned prefix at
+    ``/opt/npm-global``, with the policy written into its own ``etc/npmrc``.
+
+    NOT ``~/.npm-global``: the home is restored wholesale from a volume or S3 at
+    boot, so a prefix inside it is wiped or resurrected stale across an image
+    swap.
+    """
+    prefix = Path(NPM_GLOBAL_PREFIX)
+    uid, gid = os.getuid(), os.getgid()
+    mk = target.run(
+        ["mkdir", "-p", str(prefix / "bin"), str(prefix / "lib"), str(prefix / "etc")],
+        capture_output=True,
+        text=True,
+    )
+    if mk.returncode != 0:
+        return False, (mk.stderr or mk.stdout).strip()[:300]
+    ch = target.run(
+        ["chown", "-R", f"{uid}:{gid}", str(prefix)], capture_output=True, text=True
+    )
+    if ch.returncode != 0 and not os.access(prefix / "lib", os.W_OK):
+        return False, f"{prefix} is not writable by uid {uid}: {(ch.stderr or ch.stdout).strip()[:200]}"
+    try:
+        (prefix / "etc" / "npmrc").write_text("\n".join(NPM_POLICY_LINES) + "\n")
+    except OSError as exc:
+        return False, f"could not write {prefix}/etc/npmrc: {exc}"
+    return True, f"npm global prefix {prefix} (agent-owned, install scripts allowed)"
+
+
+def ensure_npm_policy(quiet: bool = False) -> bool:
+    """Apply the npm half of the contract to THIS box. Idempotent."""
+    prefix = Path(NPM_GLOBAL_PREFIX)
+    npmrc = prefix / "etc" / "npmrc"
+    already = (
+        os.access(prefix / "lib", os.W_OK)
+        and npmrc.exists()
+        and "dangerously-allow-all-scripts=true" in npmrc.read_text()
+    )
+    if not already:
+        try:
+            target = _pick_target()
+        except NoWritableToolTarget as exc:
+            _warn(str(exc))
+            return False
+        ok, detail = _npm_prefix_target(target)
+        if not ok:
+            _warn(
+                f"could not make `npm i -g` work as this user: {detail}\n"
+                f"  do it by hand with: sudo install -d -o $(id -u) -g $(id -g) "
+                f"{prefix}/bin {prefix}/lib {prefix}/etc && "
+                f"printf 'dangerously-allow-all-scripts=true\\n' > {prefix}/etc/npmrc"
+            )
+            return False
+        if not quiet:
+            _say(f"configured {detail}")
+    # The env half: this process's children, plus every future shell. sshd
+    # starts shells with none of the container env, same reason the image also
+    # writes /etc/profile.d.
+    bin_dir = prefix / "bin"
+    if os.environ.get("NPM_CONFIG_PREFIX") == str(prefix) and str(bin_dir) in _path_entries():
+        # A current image already publishes both (ENV + /etc/profile.d). Leave
+        # the user's shell profiles alone.
+        return True
+    os.environ["NPM_CONFIG_PREFIX"] = str(prefix)
+    if str(bin_dir) not in _path_entries():
+        os.environ["PATH"] = f"{bin_dir}{os.pathsep}{os.environ.get('PATH', '')}"
+        _persist_path(bin_dir)
+    _persist_npm_prefix(prefix)
+    return True
+
+
+def _persist_npm_prefix(prefix: Path) -> None:
+    """Write NPM_CONFIG_PREFIX into the shell profiles, once."""
+    marker = "# npm prefix added by `mtx toolchain ensure`"
+    line = f'export NPM_CONFIG_PREFIX="{prefix}"'
+    for name in (".bashrc", ".profile"):
+        profile = Path.home() / name
+        try:
+            existing = profile.read_text() if profile.exists() else ""
+            if marker in existing:
+                continue
+            with profile.open("a") as fh:
+                fh.write(f"\n{marker}\n{line}\n")
+        except OSError as exc:  # pragma: no cover - unwritable home
+            _warn(f"could not update {profile}: {exc}")
+
+
+def ensure_shims(quiet: bool = False) -> None:
+    """Create ``mtx`` / ``browse`` in /usr/local/bin on a box that predates them.
+
+    Only ever CREATE — a shim that already exists is a command that works on
+    this box today, and rewriting it is how you break the thing you came to fix.
+    """
+    for name, body in SHIMS.items():
+        path = Path(_LOCAL_BIN) / name
+        if path.exists():
+            continue
+        try:
+            target = _pick_target()
+        except NoWritableToolTarget as exc:
+            _warn(str(exc))
+            return
+        proc = target.run(
+            ["sh", "-c", f"printf '%s' {shlex.quote(body)} > {shlex.quote(str(path))} "
+                         f"&& chmod 0755 {shlex.quote(str(path))}"],
+            capture_output=True,
+            text=True,
+        )
+        if proc.returncode == 0:
+            if not quiet:
+                _say(f"installed the `{name}` shim at {path}")
+        else:
+            _warn(
+                f"could not install the `{name}` shim at {path}: "
+                f"{(proc.stderr or proc.stdout).strip()[:200]}\n"
+                f"  run it directly instead: python3 -m matrx_agent.cli "
+                f"{'browse ' if name == 'browse' else ''}--help"
+            )
+
+
+def _major(output: str) -> int | None:
+    match = re.search(r"(\d+)", output.strip().lstrip("v"))
+    return int(match.group(1)) if match else None
+
+
+def tool_version(name: str) -> str:
+    try:
+        proc = subprocess.run([name, "--version"], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.SubprocessError) as exc:
+        return f"unavailable ({exc})"
+    return (proc.stdout or proc.stderr).strip().splitlines()[0] if proc.returncode == 0 else "unavailable"
+
+
+def _below_floor(name: str) -> bool:
+    """True when ``name`` is present but older than the contract allows."""
+    floor = MIN_MAJOR.get(name)
+    if floor is None or shutil.which(name) is None:
+        return False
+    major = _major(tool_version(name))
+    return major is not None and major < floor
+
+
+_INSTALLERS = {"uv": _install_uv, "pnpm": _install_pnpm, "gh": _install_gh, "node": _install_node}
 
 _MANUAL = {
     "uv": f"curl -LsSf https://astral.sh/uv/{UV_VERSION}/install.sh | sh",
@@ -273,6 +519,10 @@ _MANUAL = {
     "gh": (
         f"curl -fsSL https://github.com/cli/cli/releases/download/v{GH_VERSION}/"
         f"gh_{GH_VERSION}_linux_amd64.tar.gz | tar -xz"
+    ),
+    "node": (
+        f"curl -fsSL https://nodejs.org/dist/v{NODE_VERSION}/"
+        f"node-v{NODE_VERSION}-linux-x64.tar.xz | tar -xJ"
     ),
 }
 
@@ -288,7 +538,17 @@ def ensure(tools: tuple[str, ...] | list[str] = REQUIRED_TOOLS, quiet: bool = Fa
     for name in unknown:
         _warn(f"unknown tool '{name}' (known: {', '.join(sorted(_INSTALLERS))})")
 
-    missing = [name for name in wanted if shutil.which(name) is None]
+    # The npm prefix + install-script policy and the /usr/local/bin shims are
+    # part of the same contract as the binaries, and they are what an OLD box
+    # is missing even when every binary is present. Always reconcile them.
+    npm_ok = ensure_npm_policy(quiet=quiet)
+    ensure_shims(quiet=quiet)
+
+    # "Present" is not the bar for every tool: an old box has node 20, which is
+    # exactly the defect (P1-1). A tool below its floor is installed over.
+    missing = [
+        name for name in wanted if shutil.which(name) is None or _below_floor(name)
+    ]
     if not missing:
         if not quiet:
             _say(
@@ -296,7 +556,7 @@ def ensure(tools: tuple[str, ...] | list[str] = REQUIRED_TOOLS, quiet: bool = Fa
                 + ", ".join(f"{n} ({shutil.which(n)})" for n in wanted)
                 + " — nothing to do."
             )
-        return 1 if unknown else 0
+        return 1 if (unknown or not npm_ok) else 0
 
     try:
         target = _pick_target()
@@ -337,7 +597,7 @@ def ensure(tools: tuple[str, ...] | list[str] = REQUIRED_TOOLS, quiet: bool = Fa
     if not quiet:
         present = [n for n in wanted if n not in failures]
         _say(f"ready: {', '.join(present) if present else '(none)'}")
-    return 0 if not failures and not unknown else 1
+    return 0 if not failures and not unknown and npm_ok else 1
 
 
 def run(args) -> int:
@@ -345,13 +605,61 @@ def run(args) -> int:
     action = getattr(args, "toolchain_cmd", "ensure")
     tools = getattr(args, "tools", None) or list(REQUIRED_TOOLS)
     if action == "check":
-        missing = [n for n in tools if shutil.which(n) is None]
+        broken: list[str] = []
         for name in tools:
             where = shutil.which(name)
-            print(f"{name}: {where or 'MISSING'}")
-        if missing:
+            if where is None:
+                print(f"{name}: MISSING")
+                broken.append(name)
+                continue
+            version = tool_version(name)
+            floor = MIN_MAJOR.get(name)
+            if _below_floor(name):
+                print(f"{name}: {where} ({version}) — BELOW THE FLOOR (needs >= {floor})")
+                broken.append(name)
+            else:
+                print(f"{name}: {where} ({version})")
+
+        # The rest of the toolchain contract — the parts that are not binaries.
+        for shim in SHIMS:
+            path = Path(_LOCAL_BIN) / shim
+            print(f"{shim} shim: {path if path.exists() else 'MISSING'}")
+            if not path.exists():
+                broken.append(shim)
+
+        prefix = Path(NPM_GLOBAL_PREFIX)
+        npmrc = prefix / "etc" / "npmrc"
+        writable = os.access(prefix / "lib", os.W_OK)
+        policy = npmrc.exists() and "dangerously-allow-all-scripts=true" in npmrc.read_text()
+        print(
+            f"npm global prefix: {prefix} "
+            f"({'writable' if writable else 'NOT WRITABLE BY THIS USER'}, "
+            f"{'install scripts allowed' if policy else 'NO SCRIPT POLICY'})"
+        )
+        if not (writable and policy):
+            broken.append("npm-global-prefix")
+
+        version = sys.version_info
+        release = version[:2] >= PYTHON_MIN and version.releaselevel == "final"
+        print(
+            f"python3: {sys.executable} ({sys.version.split()[0]})"
+            + ("" if release else f" — NOT A RELEASE >= {'.'.join(map(str, PYTHON_MIN))}")
+        )
+        if not release:
+            # Never silently pass: an old box's python3 is 3.11.0rc1 and only a
+            # new image fixes it (this command cannot repoint an interpreter the
+            # SDK is installed into). Say so with the remedy.
             _warn(
-                f"missing: {', '.join(missing)} — fix every one of them with: "
+                "this box's python3 is not a release >= "
+                f"{'.'.join(map(str, PYTHON_MIN))}. `mtx toolchain ensure` cannot "
+                "change it — the SDK is installed into that interpreter. Recreate "
+                "the box on the current image to get it."
+            )
+            broken.append("python3")
+
+        if broken:
+            _warn(
+                f"not to contract: {', '.join(broken)} — fix what is fixable here with: "
                 "mtx toolchain ensure"
             )
             return 1

@@ -24,6 +24,19 @@ from matrx_agent.cli.__main__ import main
 DOCKERFILE = Path(__file__).resolve().parents[2] / "Dockerfile"
 
 
+@pytest.fixture(autouse=True)
+def _no_real_box_repairs(monkeypatch):
+    """Keep the binary-installation unit tests off the real filesystem.
+
+    ``ensure`` also reconciles the npm global prefix, the install-script policy
+    and the /usr/local/bin shims — real repairs on a real box, and each has its
+    own test below. They must not run (or sudo) inside a unit-test process.
+    """
+    monkeypatch.setattr(toolchain, "ensure_npm_policy", lambda quiet=False: True)
+    monkeypatch.setattr(toolchain, "ensure_shims", lambda quiet=False: None)
+    monkeypatch.setattr(toolchain, "_below_floor", lambda name: False)
+
+
 # ─── The pins the image and the self-service path share ─────────────────────
 
 
@@ -86,7 +99,7 @@ def _never_called(_target):  # pragma: no cover - reaching this IS the failure
 
 
 def test_ensure_installs_only_what_is_missing(monkeypatch, capsys):
-    present = {"pnpm", "gh"}
+    present = {"pnpm", "gh", "node"}
     installed: list[str] = []
 
     def which(name, path=None, **kw):
@@ -242,3 +255,118 @@ def test_unwritable_local_dir_is_named_not_a_traceback(tmp_path, monkeypatch, ca
     assert "Traceback" not in err
     assert "permission denied" in err
     assert "install by hand" in err
+
+
+# ─── THE TOOLCHAIN CONTRACT across EVERY image variant ──────────────────────
+# The 2026-09-18 field report's five defects were one defect: nothing held the
+# variants to a single floor, so `Dockerfile.development` could install Node 22
+# on top of a Node 20 base and nobody noticed which layer won. These tests are
+# the paper half of that floor; `scripts/test-toolchain.sh` is the real half.
+
+IMAGE_DIR = DOCKERFILE.parent
+BASE_DOCKERFILES = (DOCKERFILE, IMAGE_DIR / "Dockerfile.slim")
+DERIVED_DOCKERFILES = (
+    IMAGE_DIR / "Dockerfile.development",
+    IMAGE_DIR / "Dockerfile.aidream",
+    IMAGE_DIR.parent / "sandbox-local" / "Dockerfile",
+)
+
+
+@pytest.mark.parametrize("path", BASE_DOCKERFILES, ids=lambda p: p.name)
+def test_base_images_pin_the_contract_versions(path):
+    text = path.read_text()
+    node = re.search(r"^ARG NODE_MAJOR=(\S+)", text, re.M)
+    assert node, f"{path.name} does not declare NODE_MAJOR"
+    assert node.group(1) == toolchain.NODE_MAJOR, (
+        f"{path.name} builds Node {node.group(1)} but the contract is "
+        f"{toolchain.NODE_MAJOR}. Node below 22 is the Stagehand/WebSocket defect."
+    )
+    python = re.search(r"^ARG PYTHON_VERSION=(\S+)", text, re.M)
+    assert python, f"{path.name} does not declare PYTHON_VERSION"
+    major_minor = tuple(int(part) for part in python.group(1).split("."))
+    assert major_minor >= toolchain.PYTHON_MIN, (
+        f"{path.name} builds Python {python.group(1)}; the contract floor is "
+        f"{'.'.join(map(str, toolchain.PYTHON_MIN))}."
+    )
+
+
+@pytest.mark.parametrize("path", BASE_DOCKERFILES, ids=lambda p: p.name)
+def test_base_images_refuse_a_release_candidate_interpreter(path):
+    """Ubuntu 22.04's python3.11 package IS 3.11.0rc1. The build must catch it."""
+    text = path.read_text()
+    assert "releaselevel" in text, (
+        f"{path.name} never asserts sys.version_info.releaselevel == 'final'; a "
+        f"distro release candidate could ship as `python3` again (P2-1)."
+    )
+
+
+@pytest.mark.parametrize("path", BASE_DOCKERFILES, ids=lambda p: p.name)
+def test_base_images_own_an_agent_writable_npm_prefix(path):
+    text = path.read_text()
+    assert f"ENV NPM_CONFIG_PREFIX={toolchain.NPM_GLOBAL_PREFIX}" in text, (
+        f"{path.name} does not set the image-owned npm global prefix "
+        f"{toolchain.NPM_GLOBAL_PREFIX}; `npm i -g` as the agent goes back to EACCES."
+    )
+    assert "/home/agent" not in toolchain.NPM_GLOBAL_PREFIX, (
+        "the npm global prefix must not live in the home — a home restore or "
+        "image swap wipes it or freezes it stale."
+    )
+    assert f"chown -R 1000:1000 {toolchain.NPM_GLOBAL_PREFIX}" in text, (
+        f"{path.name} never hands {toolchain.NPM_GLOBAL_PREFIX} back to the agent "
+        f"after npm's own root-owned global installs."
+    )
+
+
+@pytest.mark.parametrize("path", BASE_DOCKERFILES, ids=lambda p: p.name)
+def test_base_images_state_the_install_script_policy(path):
+    """npm 11 silently skips a dependency's postinstall without a policy."""
+    text = path.read_text()
+    for line in toolchain.NPM_POLICY_LINES:
+        if line.startswith("#"):
+            continue
+        assert line in text, f"{path.name} is missing the npm policy line {line!r}"
+
+
+@pytest.mark.parametrize("path", BASE_DOCKERFILES, ids=lambda p: p.name)
+def test_base_images_install_every_shim(path):
+    text = path.read_text()
+    for shim in toolchain.SHIMS:
+        assert f"/usr/local/bin/{shim}" in text, (
+            f"{path.name} never installs the `{shim}` shim; an agent typing it "
+            f"gets `command not found` (P2-2)."
+        )
+    assert "python3.11 -m matrx_agent" not in text, (
+        f"{path.name} still hardcodes python3.11 in a shim. Use /usr/bin/python3 "
+        f"so one shim body is right on every image vintage."
+    )
+
+
+@pytest.mark.parametrize("path", DERIVED_DOCKERFILES, ids=lambda p: p.name)
+def test_derived_images_verify_the_contract_they_inherit(path):
+    """A derived variant must fail its own build when the base regresses."""
+    text = path.read_text()
+    assert "process.versions.node) >= 22" in text, (
+        f"{path.name} never checks it inherited Node >= 22."
+    )
+    assert "releaselevel" in text, (
+        f"{path.name} never checks it inherited a release python3."
+    )
+    assert "/usr/local/bin/browse" in text, (
+        f"{path.name} never checks it inherited the `browse` CLI."
+    )
+
+
+def test_the_guard_script_checks_every_contract_item():
+    guard = (IMAGE_DIR / "scripts" / "test-toolchain.sh").read_text()
+    for needle in (
+        "node >= 22",
+        "npm install -g as",
+        "npm global prefix",
+        "dependency postinstall",
+        "python3 release >= 3.12",
+        "browse --help",
+    ):
+        assert needle in guard, (
+            f"scripts/test-toolchain.sh no longer checks {needle!r}; the contract "
+            f"would regress with a green guard."
+        )

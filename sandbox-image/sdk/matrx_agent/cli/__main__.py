@@ -120,6 +120,13 @@ def main(argv: list[str] | None = None) -> int:
     )
     su_p.add_argument("--status", action="store_true", help="print what SDK this box carries and exit")
 
+    # `mtx browse <subcommand>` / the `browse` shim — the sandbox browser from a
+    # shell. Registered by the browse module itself so the standalone `browse`
+    # entry point and this one can never drift apart.
+    from matrx_agent.cli.browse import _subparser as _browse_subparser
+
+    _browse_subparser(sub)
+
     # `mtx aidream <subcommand> [args...]` — dispatches to a shell helper.
     # Only available on matrx-sandbox:aidream image variants. We use
     # parser.parse_known_args so the subcommand args pass through untouched.
@@ -163,6 +170,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.status:
             sub_argv.append("--status")
         return selfupdate.main(sub_argv)
+
+    if args.cmd == "browse":
+        from matrx_agent.cli.browse import run as browse_run
+        return browse_run(args)
 
     if args.cmd == "files":
         from matrx_agent.cli.files import run as files_run

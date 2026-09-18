@@ -54,7 +54,12 @@ DEFAULT_SOURCE = "/opt/sandbox/sdk.incoming"
 STAMP_NAME = ".matrx-sdk-refresh"
 VERSION_NAME = "VERSION"
 MTX_SHIM = "/usr/local/bin/mtx"
-MTX_SHIM_BODY = '#!/bin/sh\nexec /usr/bin/python3.11 -m matrx_agent.cli "$@"\n'
+# /usr/bin/python3 — the update-alternatives symlink, NOT a hardcoded minor.
+# It points at 3.12 in current images and at whatever an older box carries,
+# so one shim body is correct everywhere and no image bump can strand it.
+MTX_SHIM_BODY = '#!/bin/sh\nexec /usr/bin/python3 -m matrx_agent.cli "$@"\n'
+BROWSE_SHIM = "/usr/local/bin/browse"
+BROWSE_SHIM_BODY = '#!/bin/sh\nexec /usr/bin/python3 -m matrx_agent.cli browse "$@"\n'
 DAEMON_MARKER = "matrx_agent.api.main"
 DAEMON_HEALTH = "http://127.0.0.1:8000/health"
 
@@ -446,22 +451,36 @@ def _purge_pycache(root: str) -> None:
                 dirnames.remove(name)
 
 
-def _ensure_shim(result: dict) -> None:
-    """A box born before the ``mtx`` shim existed gets it here, or it could
-    never type the command the refresh just installed."""
-    # Only ever CREATE it. A box whose shim points at a different interpreter
-    # is a box where mtx works today; "correcting" it would break the command
-    # this refresh exists to deliver.
-    if os.path.exists(MTX_SHIM):
-        result["mtx_shim"] = "present"
+def _write_shim(path: str, body: str, key: str, result: dict) -> None:
+    """Create one ``/usr/local/bin`` shim, once, and say which way it went.
+
+    Only ever CREATE. A box whose shim points at a different interpreter is a
+    box where that command works today; "correcting" it would break the command
+    this refresh exists to deliver.
+    """
+    if os.path.exists(path):
+        result[key] = "present"
         return
     try:
-        with open(MTX_SHIM, "w", encoding="utf-8") as fh:
-            fh.write(MTX_SHIM_BODY)
-        os.chmod(MTX_SHIM, 0o755)
-        result["mtx_shim"] = "installed"
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(body)
+        os.chmod(path, 0o755)
+        result[key] = "installed"
     except OSError as exc:
-        result["mtx_shim"] = f"failed: {exc}"
+        result[key] = f"failed: {exc}"
+
+
+def _ensure_shim(result: dict) -> None:
+    """A box born before a shim existed gets it here, or it could never type
+    the command the refresh just installed.
+
+    ``browse`` joined ``mtx`` on 2026-09-18: the browser CLI ships in the image
+    from that build on, and this is how every EXISTING box gets it without a
+    migration (boxes are never force-migrated — see the toolchain note in
+    ``matrx_agent/cli/toolchain.py``).
+    """
+    _write_shim(MTX_SHIM, MTX_SHIM_BODY, "mtx_shim", result)
+    _write_shim(BROWSE_SHIM, BROWSE_SHIM_BODY, "browse_shim", result)
 
 
 def main(argv: list[str] | None = None) -> int:

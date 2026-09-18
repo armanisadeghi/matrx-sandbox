@@ -177,6 +177,22 @@ RUN printf '%s\n' '#!/bin/sh' \
     && chown agent:agent /home/agent/.bashrc \
     && ln -sf /home/agent/aidream/.venv/bin/python /usr/local/bin/aidream-python
 
+# ─── Toolchain contract verification (inherited from :core) ────────────────
+# :aidream adds its own uv-managed Python 3.13 for the aidream venv, but the
+# BOX toolchain — Node 22, npm 11 with an agent-writable global prefix and the
+# install-script policy, a release Python >= 3.12 at /usr/bin/python3, and the
+# `browse` CLI — is the same contract every variant owes an agent. A :core
+# regression must fail this build, not reach a user's box.
+# See sandbox-image/ADDING_UTILITIES.md § The toolchain contract.
+RUN node --version \
+    && node -e "process.exit(parseInt(process.versions.node) >= 22 ? 0 : 1)" \
+    && /usr/bin/python3 -c "import sys; v=sys.version_info; assert v[:2] >= (3, 12) and v.releaselevel == 'final', sys.version" \
+    && /usr/bin/python3 -c "import matrx_agent, matrx_tools" \
+    && npm --version \
+    && test -w /opt/npm-global/lib \
+    && test -x /usr/local/bin/browse \
+    && test -x /usr/local/bin/mtx
+
 # ─── Replace entrypoint with the aidream-aware variant ─────────────────────
 # Wraps the existing entrypoint with a "first-spawn copy template → home" step.
 # Daemon + ttyd + cloud-files-sync + persistence module all still run.

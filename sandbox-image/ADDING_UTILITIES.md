@@ -38,13 +38,85 @@ serve uses the template venv's Python in isolated mode. Exact verification
 rejects untracked tampering. Only the user home and explicit runtime tmpfs/log
 paths remain writable.
 
+## The toolchain contract (every variant owes an agent the same floor)
+
+Five defects found by an agent working in a real EC2 `development` box
+(2026-09-18) were one defect: nothing held the image variants to a single
+floor. They are now **one contract**, identical in `Dockerfile`,
+`Dockerfile.slim` and — by inheritance plus their own build-time verification —
+`Dockerfile.development`, `Dockerfile.aidream` and `sandbox-local/Dockerfile`.
+
+| The contract | Why | Defect it closes |
+|---|---|---|
+| **Node ≥ 22 LTS**, corepack enabled, pinned `pnpm` first on PATH | Stagehand v4 and its generation need Node 22 (`ReferenceError: WebSocket is not defined` on 20) | P1-1 |
+| **`npm i -g` works as the agent**, prefix `/opt/npm-global` (agent-owned, on PATH) | the prefix was `/usr`, whose `lib/node_modules` is root-owned → `EACCES` | P1-2 |
+| **Install scripts run** — `dangerously-allow-all-scripts=true` in `/opt/npm-global/etc/npmrc` | npm 11 ships an `allow-scripts` allowlist; without a policy a dependency's postinstall is SKIPPED with only a warning | P1-3 |
+| **`python3` is a FINAL release ≥ 3.12** (deadsnakes 3.12 on jammy; `python3.11` is GONE) | Ubuntu 22.04's `python3.11` package is **3.11.0rc1**, a 2022 release candidate | P2-1 |
+| **`browse` is preinstalled** | agents typed `browse` and got `command not found` | P2-2 |
+
+**Why `/opt/npm-global` and not `~/.npm-global`.** The home is restored
+wholesale at boot — from a per-user Docker volume (hosted) or S3 (ec2 templates
+that enable it). A global prefix inside the home is therefore either wiped by a
+restore or resurrected *stale* across an image swap, and it would also put
+agent-installed binaries under the home-ownership chokepoint. `/opt/npm-global`
+is built with the image, replaced with the image, and untouched by every home
+restore. It is published twice — as `ENV` for the container, and in
+`/etc/profile.d/matrx-npm-global.sh` for shells `sshd` starts, which inherit
+none of the container env.
+
+**THE INSTALL-SCRIPT POLICY, stated.** Inside a Matrx sandbox the agent's own
+installs run their lifecycle scripts. The isolation boundary here is the
+**container**, not npm's allowlist: the box is single-tenant, disposable,
+already grants passwordless sudo, and carries no platform credentials (see the
+platform-env isolation rule in `CLAUDE.md`). An allowlist that a
+non-interactive agent cannot answer converts a loud install failure into a
+silently half-installed package — half the native JS ecosystem (esbuild, sharp,
+puppeteer, playwright) depends on postinstall. If a future template ever does
+hold credentials, it flips this file's npmrc, not the agent's workflow.
+
+**`browse`** is the platform browser CLI: a thin front end on the **same**
+canonical Browser Manager path `matrx_tools.tools.browser` uses
+(`sdk/matrx_agent/cli/browse.py`, also reachable as `mtx browse`). It is never a
+second browser — the sandbox still launches no Chromium and holds no profile.
+
+```bash
+browse open https://example.com --text
+browse click "More information"
+browse shot page.png
+```
+
+**The guard.** `scripts/test-toolchain.sh` proves the whole contract on a real
+box — it runs the real binaries, really installs a global package as the agent,
+really runs a dependency postinstall, and asserts `sys.version_info.releaselevel`
+rather than matching a string (that is the field that catches `3.11.0rc1`):
+
+```bash
+docker run --rm -u agent matrx-sandbox:core bash /opt/sandbox/scripts/test-toolchain.sh
+```
+
+It is **red on any image built before 2026-09-18** (7 failures) and green on the
+current one. The paper half — the variants may not drift from each other or
+from `sdk/matrx_agent/cli/toolchain.py`'s constants — is
+`sdk/tests/test_cli_toolchain.py`.
+
+**Existing boxes are never force-migrated** (SBX-006), so a box created before
+this build keeps its old toolchain until it is recreated. `mtx toolchain ensure`
+closes four of the five on a box as it stands — it installs Node 22 from the
+official tarball (no root needed), fixes the npm prefix and policy, and creates
+the `mtx`/`browse` shims. It **cannot** change `python3`: the SDK is installed
+into that interpreter. `mtx toolchain check` says so in plain words with the
+remedy (recreate the box) rather than passing quietly.
+
+---
+
 ## The agent project toolchain (already there — don't re-add it)
 
 Every image — `:core` (which backs the `bare`, `node-22` and `python-3.13`
 templates), `:slim`, and `:aidream`/`:development` by inheritance — ships
-**`uv`**, **`pnpm`** and **`gh`**, pinned by the `UV_VERSION` / `PNPM_VERSION`
-build ARGs in `Dockerfile` and `Dockerfile.slim`. The build fails loudly if any
-of the three is missing.
+**`uv`**, **`pnpm`**, **`gh`** and **`node`**, pinned by the `UV_VERSION` /
+`PNPM_VERSION` / `NODE_MAJOR` build ARGs in `Dockerfile` and `Dockerfile.slim`.
+The build fails loudly if any of them is missing. The version floors they must
+clear are **The toolchain contract** above.
 
 Agents start projects with the SDK CLI, not by improvising flags:
 
