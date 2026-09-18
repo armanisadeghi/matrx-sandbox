@@ -36,6 +36,13 @@ if [ "${MATRX_MIGRATION_HOLD:-}" = "1" ]; then
     echo "[entrypoint-aidream] Migration commit marker observed; activating services without modifying the mounted home."
 fi
 
+# See boot-phase.sh: this wrapper seeds the aidream checkout BEFORE handing off
+# to the tier entrypoint, and that seeding is itself minutes of work on a cold
+# volume. Publish it as its own phase so the orchestrator waits on the signal
+# rather than on a clock.
+boot_phase() { /opt/sandbox/scripts/boot-phase.sh "$@" 2>/dev/null || true; }
+boot_phase environment
+
 TEMPLATE_DIR="/opt/aidream-template"
 WORK_DIR="/home/agent/aidream"
 
@@ -149,16 +156,12 @@ else
   log "managed aidream API disabled: Claude managed runtime is hosted-only (tier=${MATRX_TIER:-unset})"
 fi
 
-# Hand off to the right downstream entrypoint based on tier. Production
-# entrypoint.sh requires S3_BUCKET (it runs hot-sync), which the hosted tier
-# doesn't set; entrypoint-local.sh skips S3 and is what :local uses.
-if [ -n "${S3_BUCKET:-}" ]; then
-    log "handing off to /opt/sandbox/scripts/entrypoint.sh (production / S3 hot-sync)"
-    exec /opt/sandbox/scripts/entrypoint.sh "$@"
-elif [ -x /opt/sandbox/scripts/entrypoint-local.sh ]; then
-    log "handing off to /opt/sandbox/scripts/entrypoint-local.sh (no S3 → hosted tier)"
-    exec /opt/sandbox/scripts/entrypoint-local.sh "$@"
-else
-    log "ERROR: no S3_BUCKET set AND entrypoint-local.sh not present in image"
+# Hand off to the right downstream entrypoint. The DECISION lives in its own
+# script so it can be tested (see aidream-downstream-entrypoint.sh for why, and
+# for the hosted-tier failure that made it necessary).
+downstream=$(/opt/sandbox/scripts/aidream-downstream-entrypoint.sh) || {
+    log "ERROR: cannot choose a downstream entrypoint (tier=${MATRX_TIER:-unset}, s3=${S3_BUCKET:+set})"
     exit 1
-fi
+}
+log "handing off to ${downstream} (tier=${MATRX_TIER:-unset})"
+exec "$downstream" "$@"

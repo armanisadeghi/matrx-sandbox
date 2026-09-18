@@ -187,7 +187,12 @@ RUN chmod 0555 /opt/sandbox/scripts/aidream-helpers.sh /opt/sandbox/scripts/aidr
 # Wrap `mtx aidream <subcommand>` → /opt/sandbox/scripts/aidream-helpers.sh.
 # The base mtx CLI dispatches `mtx aidream` to this script.
 COPY --chown=root:root ./scripts/entrypoint-aidream.sh /opt/sandbox/scripts/entrypoint-aidream.sh
-RUN chmod +x /opt/sandbox/scripts/entrypoint-aidream.sh
+# The hand-off DECISION, in its own file so it is testable — the boot script
+# execs it, so a box whose image lacks it dies at hand-off. Guard:
+# orchestrator/tests/test_aidream_entrypoint_tier_dispatch.py.
+COPY --chown=root:root ./scripts/aidream-downstream-entrypoint.sh /opt/sandbox/scripts/aidream-downstream-entrypoint.sh
+RUN chmod +x /opt/sandbox/scripts/entrypoint-aidream.sh \
+    && chmod 0555 /opt/sandbox/scripts/aidream-downstream-entrypoint.sh
 
 # Bake the hosted-tier entrypoint variant (skips S3 hot-sync) so an aidream
 # sandbox can run on the hosted tier without S3 creds. The :core image only
