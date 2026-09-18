@@ -191,8 +191,10 @@ COPY --chown=root:root ./scripts/entrypoint-aidream.sh /opt/sandbox/scripts/entr
 # execs it, so a box whose image lacks it dies at hand-off. Guard:
 # orchestrator/tests/test_aidream_entrypoint_tier_dispatch.py.
 COPY --chown=root:root ./scripts/aidream-downstream-entrypoint.sh /opt/sandbox/scripts/aidream-downstream-entrypoint.sh
+COPY --chown=root:root ./scripts/aidream-retarget-editables.sh /opt/sandbox/scripts/aidream-retarget-editables.sh
 RUN chmod +x /opt/sandbox/scripts/entrypoint-aidream.sh \
-    && chmod 0555 /opt/sandbox/scripts/aidream-downstream-entrypoint.sh
+    && chmod 0555 /opt/sandbox/scripts/aidream-downstream-entrypoint.sh \
+    && chmod 0555 /opt/sandbox/scripts/aidream-retarget-editables.sh
 
 # Bake the hosted-tier entrypoint variant (skips S3 hot-sync) so an aidream
 # sandbox can run on the hosted tier without S3 creds. The :core image only
