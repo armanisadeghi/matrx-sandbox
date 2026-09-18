@@ -197,6 +197,14 @@ class Settings(BaseSettings):
     #      identities — comprehensive even if the env_file is unset.
     aidream_passthrough_env_file: str = "/srv/projects/aidream/.env"
     aidream_passthrough_env: str = (
+        # The in-box aidream's PUBLIC identity material. Not a credential and
+        # deliberately not a SUPABASE_* name: a hosted box verifies the person's
+        # ES256 JWT against the project's public JWKS document, which is the
+        # same document every browser bundle fetches. It is the ONE thing a
+        # credential-free box needs in order to know who is calling it, and
+        # naming it MATRX_* keeps the blanket denial of SUPABASE_* to this
+        # template exactly as it is (chair ruling R14, 2026-09-18).
+        "MATRX_PLATFORM_AUTH_JWKS_URL,"
         # AWS — region (boto3) + bucket
         "AWS_REGION,AWS_BUCKET_MODELS,"
         # Supabase — auth + JWT validation
