@@ -53,6 +53,7 @@ floor. They are now **one contract**, identical in `Dockerfile`,
 | **Install scripts run** — `dangerously-allow-all-scripts=true` in `/opt/npm-global/etc/npmrc` | npm 11 ships an `allow-scripts` allowlist; without a policy a dependency's postinstall is SKIPPED with only a warning | P1-3 |
 | **`python3` is a FINAL release ≥ 3.12** (deadsnakes 3.12 on jammy; `python3.11` is GONE) | Ubuntu 22.04's `python3.11` package is **3.11.0rc1**, a 2022 release candidate | P2-1 |
 | **`browse` is preinstalled** | agents typed `browse` and got `command not found` | P2-2 |
+| **Platform-launched binaries live OUTSIDE `/opt/npm-global`** — root-owned prefix, resolved on `/usr/local/bin:/usr/bin:/bin` | the agent-writable prefix means agent-replaceable; a privileged launch carrying a brokered credential must not exec a binary the model can swap | XT-09 |
 
 **Why `/opt/npm-global` and not `~/.npm-global`.** The home is restored
 wholesale at boot — from a per-user Docker volume (hosted) or S3 (ec2 templates
@@ -63,6 +64,20 @@ is built with the image, replaced with the image, and untouched by every home
 restore. It is published twice — as `ENV` for the container, and in
 `/etc/profile.d/matrx-npm-global.sh` for shells `sshd` starts, which inherit
 none of the container env.
+
+**🚨 A BINARY THE PLATFORM LAUNCHES NEVER GOES IN `/opt/npm-global`.** The
+prefix is agent-writable BY DESIGN, so everything in it is agent-replaceable by
+design too. That is correct for the agent's own tools and wrong for anything
+the platform execs on the agent's behalf with a credential attached: the hosted
+Codex runtime launches `codex` carrying a brokered OpenAI capability, so a
+`codex` the model could overwrite would be a credential-exfiltration path
+rather than an inconvenience. Such a tool gets its OWN root-owned prefix
+(`Dockerfile.aidream` installs the pinned Codex CLI into `/opt/matrx-codex`,
+symlinked at `/usr/local/bin/codex`), the launching code resolves it against
+`/usr/local/bin:/usr/bin:/bin` and nothing else, and the build proves BOTH
+halves on the finished image — the agent can run it, the agent cannot replace
+it. Add a platform-launched binary the same way, with the same two build
+assertions.
 
 **THE INSTALL-SCRIPT POLICY, stated.** Inside a Matrx sandbox the agent's own
 installs run their lifecycle scripts. The isolation boundary here is the

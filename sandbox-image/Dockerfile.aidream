@@ -69,6 +69,50 @@ RUN command -v bwrap >/dev/null \
     && bwrap --version \
     && socat -V 2>&1 | head -1
 
+# ─── The Codex CLI, pinned — for the hosted Codex runtime ──────────────────
+# aidream's `coding_session_bridge/codex_runtime.py` launches `codex exec
+# --json` inside this box. Its capability verdict is computed from whether this
+# binary exists, so a box built from an image WITHOUT it reports Codex as
+# unavailable with a reason rather than offering a launch that cannot work.
+#
+# 🚨 NOT installed into /opt/npm-global. That prefix is deliberately
+# AGENT-WRITABLE (uid 1000) so an agent can `npm i -g` its own tools — which
+# means anything the agent puts there can be overwritten by the agent. The
+# hosted runtime execs `codex` as a privileged launch carrying a brokered
+# OpenAI capability, so a `codex` the model could replace is a
+# credential-exfiltration path, not an inconvenience. This prefix is
+# root-owned, non-agent-writable, and exposed at /usr/local/bin — which is why
+# the runtime resolves the binary against /usr/local/bin:/usr/bin:/bin and
+# nothing else.
+#
+# Pinned, never `latest`: the runtime's launch flags and the JSONL event names
+# it ledgers are a contract with a specific CLI. A floating tag turns a
+# provider rename into a silently truncated transcript.
+#
+# The four checks below fail the BUILD rather than a user's turn: the pin
+# actually landed, the stamp the capability verdict reads agrees with the
+# binary, the agent can RUN it, and the agent can NOT replace it.
+ARG CODEX_CLI_VERSION=0.155.0
+ENV MATRX_CODEX_PREFIX=/opt/matrx-codex
+RUN npm install --global --prefix "${MATRX_CODEX_PREFIX}" \
+        "@openai/codex@${CODEX_CLI_VERSION}" \
+    && ln -sf "${MATRX_CODEX_PREFIX}/bin/codex" /usr/local/bin/codex \
+    && chown -R root:root "${MATRX_CODEX_PREFIX}" \
+    && chmod -R go-w "${MATRX_CODEX_PREFIX}" \
+    && installed="$(PATH=/usr/local/bin:/usr/bin:/bin codex --version)" \
+    && echo "[image] codex reports: ${installed}" \
+    && case "${installed}" in \
+        *"${CODEX_CLI_VERSION}"*) : ;; \
+        *) echo "[image] codex --version lacks the pin ${CODEX_CLI_VERSION}" >&2; exit 1 ;; \
+       esac \
+    && printf '%s\n' "${installed}" > /etc/matrx-codex-version \
+    && chmod 0444 /etc/matrx-codex-version \
+    && su -s /bin/sh -c 'PATH=/usr/local/bin:/usr/bin:/bin codex --version >/dev/null' agent \
+    && if su -s /bin/sh -c 'touch /opt/matrx-codex/bin/.agent-write-probe' agent 2>/dev/null; then \
+           echo "[image] the agent can overwrite the codex binary — refusing to ship" >&2; \
+           exit 1; \
+       fi
+
 # ─── uv installer + uv-managed Python 3.13 ─────────────────────────────────
 # uv installs its own Python — avoids the deadsnakes-PPA + python3-apt
 # breakage on Ubuntu 22.04. The :core image's system Python 3.11 stays

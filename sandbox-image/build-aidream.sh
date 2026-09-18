@@ -184,6 +184,23 @@ IMAGE_AIDREAM_SHA=$(docker image inspect "$TAG" --format '{{ index .Config.Label
     exit 1
 }
 
+echo "[build-aidream] verifying the pinned Codex CLI in $TAG"
+# Asserted on the FINISHED image, not only inside its RUN layer: a cached or
+# swapped layer can satisfy the build and still ship a box whose hosted Codex
+# runtime reports "this image does not ship the Codex CLI". The stamp is what
+# the capability verdict reads, so the stamp and the binary are checked to
+# agree, and the agent is proven able to run it and unable to replace it.
+docker run --rm --entrypoint /bin/sh "$TAG" -c \
+    'set -eu \
+    && stamped=$(cat /etc/matrx-codex-version) \
+    && reported=$(PATH=/usr/local/bin:/usr/bin:/bin codex --version) \
+    && test "$stamped" = "$reported" \
+    && case "$stamped" in codex-cli\ *) : ;; *) echo "bad codex stamp: $stamped" >&2; exit 1 ;; esac \
+    && test ! -w /opt/matrx-codex/bin/codex \
+    && su -s /bin/sh -c "PATH=/usr/local/bin:/usr/bin:/bin codex --version >/dev/null" agent \
+    && ! su -s /bin/sh -c "touch /opt/matrx-codex/bin/.probe" agent 2>/dev/null \
+    && echo "[build-aidream] codex ok: $stamped"'
+
 echo "[build-aidream] verifying Claude Linux sandbox prerequisites in $TAG"
 docker run --rm --entrypoint /bin/sh "$TAG" -c \
     'test "$(cat /etc/aidream-image-sha)" = "$(git -C /opt/aidream-template rev-parse HEAD)" \
