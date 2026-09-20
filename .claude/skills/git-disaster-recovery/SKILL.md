@@ -4,7 +4,7 @@ type: Skill
 title: "git-disaster-recovery — stacked leftover recovery (living, unproven)"
 description: "Stacked-git recovery when a checkout looks like a second product line. Use when ahead/behind is huge, worktrees/PRs/stashes stacked, the shared checkout is dirty, or you are tempted to reset, force-push, or commit the dirty tree. NOT for a 30-minute integration sweep (use integration-maintainer)."
 tags: [operations, git, worktrees, branches, pull-requests, recovery]
-timestamp: 2026-09-19T00:00:00Z
+timestamp: 2026-09-20T00:00:00Z
 ---
 
 <!-- SYNCED COPY — do not edit here.
@@ -100,10 +100,16 @@ Fetch. Do not move `HEAD` or the working tree.
 
 Count with ordinary git: extra worktrees, local branches, remote branches besides
 `main`, open PRs, stashes, dirty and untracked files, `HEAD` vs `origin/main`
-left-right. If an official audit script goes silent, drop it.
+left-right. If an official audit script goes silent, drop it. If
+`git cherry HEAD origin/main` (the GitHub-only side) hangs on a large behind
+count, kill it. The direction that decides unique local work is
+`git cherry origin/main HEAD`.
 
-- A handful of leftovers already on `origin/main` → this is not a disaster. Junior
-  leftover pass. This skill stands down.
+- A handful of leftovers whose unique patches are already on `origin/main` → this
+  is not a disaster. **Finish Stage 1 first.** `HEAD` matching `origin/main` can
+  still hide leftover branches, a rejected prototype, skill companions that
+  sync wrote and nobody committed, or unique untracked files that `log.md`
+  already names. Then stand Size 2 down. Junior leftover pass.
 - A pile like the 2026-09-19 aidream example (dozens of worktrees, diverged local
   `main`, dirty shared checkout, stacked PRs or stashes) → stop other writers on
   this checkout, then only safe repair. Continue.
@@ -115,12 +121,22 @@ The status line is usually a liar. The hygiene pile is usually not.
 **1a. The two mains as patches.** Record GitHub `main` SHA, local `HEAD`,
 merge-base, last push age. Then `git cherry origin/main HEAD`. Same-message
 commits on GitHub usually mean "already landed under a new hash." Report unique
-local commits, not the ahead count.
+local commits, not the ahead count. Then cherry **every leftover branch** the
+same way. `HEAD == origin/main` does not mean the leftover branches are empty.
+Cherry `+` plus a same-message commit already on GitHub, with later GitHub
+commits on those files, is J: keep GitHub. The leftover is not newer just
+because the patches differ.
 
 **1b. Dirty checkout vs GitHub, not vs stale local `main`.** For each modified or
 untracked path: already matches `origin/main`, already exists on `origin/main`,
 generated/lockfile/`.wt` noise, or truly unique. Untracked often only looks new
-because local `main` froze.
+because local `main` froze. If `SKILL.md` is on GitHub and its companions
+(`evals.md`, `field-log.md`, `owner-park.md`, or any other file in that skill
+directory) are only untracked here, that is a sync-commit miss — land the
+canonical copies. It is not unique product. Dirty can also be a rewind: a
+working-tree file older than GitHub (a version number, a config). That is
+junk, not unique product. A `log.md` Creation line is not proof the file is
+on GitHub — check `origin/main:path`.
 
 **1c. Bucket every leftover** — every worktree, local branch, remote branch, PR,
 and stash gets one letter:
@@ -148,6 +164,16 @@ fifteenth fate.
 **1d. Census sibling repos** with the same four numbers: extra worktrees, unique
 local commits (`cherry`, not ahead), dirty vs `origin/main`, open PRs.
 
+Resolve `git rev-parse --git-common-dir` for every folder. A differently named
+folder that shares another repo's `.git` is that repo's leftover, not a new
+disaster. Do not assign a second recovery to it.
+
+A stash can be mixed: some files already on GitHub, some unique lines. Do not
+drop it in Stage 2. Land the unique lines, then drop.
+
+Two recoveries writing this skill at once is bucket J on the overlapping
+paragraphs: keep GitHub, land only the new capability.
+
 Stop and report two sentences: what the status implied, what the patches say.
 Ask before any delete.
 
@@ -160,7 +186,8 @@ Delete A, B, and H. Leave C through G and I through L.
 - Delete local and remote branches whose unique patches are on `origin/main`.
   Cherry / patch-id, not `--merged`.
 - Drop a stash only when it is empty or older than what is already on GitHub. If
-  you cannot prove it, it stays.
+  you cannot prove every file is already on GitHub, it stays. A mixed stash
+  (some files B, some unique lines) is not a Stage 2 drop.
 
 Do not touch the dirty shared checkout, open PRs, unique patches, or local `main`.
 
@@ -300,7 +327,8 @@ ordered Stage 6.
 Same stages. Do not invent a second method. Suggested order from the first
 census: smallest pile first (that night: common-docs, then matrx-local, then
 matrx-frontend). Confirm sandbox / extend / ship are still one worktree on
-`main`, then ignore them.
+`main`, then ignore them. A folder that is only another name for an already
+counted checkout (same common git dir) is not a sibling — skip it.
 
 ## Stage 6 — Shared checkout last
 
@@ -473,6 +501,12 @@ Rows from the 2026-09-19 transcript, not imagined.
 | Excuse | Reality |
 |---|---|
 | "149 ahead means 149 unique commits" | Cherry / patch-id. Most were already on GitHub under new hashes. |
+| "Cherry said plus, so this leftover is newer" | Same-message on GitHub plus later GitHub commits on those files is J. Keep GitHub. |
+| "This dirty file is uncommitted new work" | Compare to GitHub. A rewind (older version number, older config) is junk. |
+| "I need the GitHub-only cherry to finish before I know unique work" | Kill it if it hangs. `git cherry origin/main HEAD` is the unique-local direction. |
+| "log.md says the file was created, so it is on GitHub" | Check the path on `origin/main`. A Creation line can land without the file. |
+| "This stash is B because one of its files already landed" | A mixed stash stays until the unique lines land. |
+| "I'll overwrite the skill with this repo's findings" | Keep GitHub. Land only the new capability. Two recoveries must not rewind each other. |
 | "I'll wait for the official audit script" | It ran ~16 minutes with no output. Count with ordinary git. |
 | "I'll reset the dirty checkout to make room" | Open an intake worktree from current `origin/main`. |
 | "Failing CI means do not merge" | Stop only when this change broke boot, auth, data, or a shared contract. |
@@ -496,6 +530,8 @@ Rows from the 2026-09-19 transcript, not imagined.
 | "The first release is out, so we are done" | Stage 8 is the point. Pull main, fix fast, fan out, commit, release again. |
 | "Wait for the subagent plan before touching anything" | Do what you can now. Fan the rest. Do not sit. |
 | "pnpm db-types will clear three missing RPCs" | Only at `origin/main`. On a behind checkout it imports the whole live schema and explodes tsc. Splice the missing functions, or pull first. |
+| "HEAD equals origin/main, so stand down now" | Finish Stage 1. Leftover branches can still hold a unique rejected commit. |
+| "The skill file is on GitHub, so the skill landed" | Companions are part of the skill. Untracked companions after a `SKILL.md` commit are a sync-commit miss. Land the canonical copies. |
 
 ## Red flags
 
@@ -514,6 +550,11 @@ Rows from the 2026-09-19 transcript, not imagined.
 - "The first release shipped, so we can slow down."
 - "I'll wait for the subagent roster before I pull."
 - "I'll just run `pnpm db-types` on this behind checkout."
+- "HEAD matches GitHub, so there is nothing left."
+- "SKILL.md synced, so I can ignore the untracked companions."
+- "log.md already recorded the creation, so the file is on GitHub."
+- "One file in the stash landed, so drop the stash."
+- "I'll replace the skill text with this repo's version."
 
 ## Trigger relocation
 
