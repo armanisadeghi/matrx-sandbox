@@ -47,3 +47,49 @@ Postgres never receives an org-less sandbox write. Read the emergency contract:
 - 2026-08-25 — Made Postgres pool recovery generation-safe and non-blocking: one lock now serializes pool publication, failed pools are detached before graceful close, and retirement has a five-second hard bound with forced termination. This prevents a leaked/closing asyncpg connection from wedging `/health`, removing the only Traefik backend, and turning every sandbox token mint into a misleading plain 404.
 - 2026-08-23 — Required explicit organization identity through create, lifecycle, reconcile, and persistence.
 - 2026-08-21 — Removed implicit EC2 selection from storage and token routing.
+
+## The sandbox↔browser join (2026-09-20)
+
+A box drives the person's OWN persistent cloud browser, not a throwaway
+Chromium. `browser_profile.py` asks AI Dream
+`GET /api/sandboxes/internal/default-browser-profile` over the sandbox bridge
+(service token + `X-Matrx-User-Id` + a membership-PROVED `X-Organization-Id`)
+for the default `browser.profile` in this box's organization, and the create
+path injects `MATRX_BROWSER_PROFILE_ID` + `MATRX_BROWSER_EXECUTION_TARGET`.
+Never a DB read from this host: a second reader of `browser.profile` would be a
+second opinion on who owns which browser.
+
+Both names are on `ORCHESTRATOR_MANAGED_ENV`, and `vault_env_refresh`
+re-resolves the pair at EVERY binding and UNSETS both when the browser is gone —
+a person can create, rename or delete their browser long after the box was born.
+No browser yet means NEITHER name is injected (never a guessed id, never half a
+pair); the reason is stamped on `config.browser_profile` and the in-box client
+refuses with a sentence telling the person how to get one. Guards:
+`tests/test_browser_profile_join.py`.
+
+## Boot measurement (2026-09-20)
+
+Nothing here measured time-to-ready before this date. `_wait_for_ready` now
+records, on the row, `ready_at`, `boot_seconds` (from the CALLER's clock — the
+moment the create/resume began), `boot_kind` (`create` | `resume`, never
+averaged together) and `boot_phase_seconds`. All nullable: **NULL means NOT
+MEASURED, never "instant"**. Migration `007`; the same migration honestly
+creates `organization_id` and `created_by`, which `store.py` had been writing
+with no migration file behind them. The upsert COALESCEs the four columns so a
+later save (a heartbeat, a status change) cannot erase the number. Guards:
+`tests/test_boot_measurement.py`.
+
+First real figures, live orchestrators, admin test user, template `slim`:
+EC2 create→ready 3.7 s, resume→ready 3.3 s / 4.9 s; hosted create→ready
+4.8–10.0 s, resume→ready 5.7 s. The "~0.5 s from the warm pool" figure in the
+canonical vision doc describes a mechanism retired on 2026-09-17.
+
+## The TTL is an idle ceiling (2026-09-20)
+
+`models.py` and `reaper.py` both described a heartbeat-refreshed ceiling while
+`store.update_heartbeat` stamped `last_heartbeat_at` and nothing else, so a box
+somebody was working in died on a wall clock. A heartbeat from a LIVE row now
+rolls `expires_at` forward by its full `ttl_seconds`, under
+`infrastructure.sandbox.heartbeat_extends_ttl` (default on). A terminal row, or
+one whose TTL clock never started, is never touched. Guards:
+`tests/test_heartbeat_extends_ttl.py`.
