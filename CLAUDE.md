@@ -30,6 +30,7 @@
 
 ## Platform laws (one-liner each — the body lives in the canonical doc)
 
+- **The Platform List is Arman's alone.** At session start read `common-docs/operations/platform-list/LIST.md` if it is on this machine; if any row's Start date is today or past, tell Arman in your first reply (he snoozes by naming a new date). Only Arman adds, kills, or removes a row. Agents suggest in plain English and never write copies, histories, or "deleted" notes anywhere. Skill: `platform-list`.
 - **Shared checkout, many concurrent writers — NORMAL, never a finding.** `origin/main` is the only sync point: commit+push as you go in small batches; never tree-wide destructive git (blanket `stash`/`checkout -- .`/`reset --hard`/`clean`/dirty `pull --rebase` — pathspec-scope to your own files); never complain about concurrent editors or request your own PR/branch/worktree. Canonical: [shared-checkout.md](/Users/armanisadeghi/code/common-docs/policies/shared-checkout.md).
 - **Mandates — no hardcoded agents.** Anywhere software invokes intelligence, the agent/workflow is chosen live from a UI, never welded into code. Canonical: [mandates/FEATURE.md](/Users/armanisadeghi/code/common-docs/systems/mandates/FEATURE.md).
 - **No unapproved schedules.** No automated schedule or interval exists unless Arman approved its exact name and interval in the register; code or an enabled DB row does not grant approval. Register: [operations/scheduled-tasks.md](/Users/armanisadeghi/code/common-docs/operations/scheduled-tasks.md).
