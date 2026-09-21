@@ -1465,7 +1465,17 @@ async def _wait_for_ready(
         sandbox.ready_at = datetime.now(timezone.utc)
         sandbox.boot_seconds = round(now - started, 3)
         sandbox.boot_kind = kind
-        sandbox.boot_phase_seconds = dict(phase_seconds) or None
+        # NAME THE GAP. The phases only start being reported once the box
+        # answers its first probe; everything before that — admission, the
+        # image, `docker run`, the seconds until the container can exec — is
+        # real time a caller waited and belongs to no phase. Leaving it out
+        # silently would make the phases look like they add up to the total
+        # when they do not, which is the quiet way a measurement starts lying.
+        measured = dict(phase_seconds)
+        gap = round((sandbox.boot_seconds or 0.0) - sum(measured.values()), 3)
+        if gap > 0.05:
+            measured["before_first_phase_report"] = gap
+        sandbox.boot_phase_seconds = measured or None
         logger.info(
             "Sandbox %s %s→ready in %.1fs (phases: %s)",
             sandbox.sandbox_id, kind, sandbox.boot_seconds,
