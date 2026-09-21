@@ -16,10 +16,27 @@ over the same approved-server authentication described below:
 matrx_tools -> /browser-manager/internal/sandbox/* -> Browser Manager -> canonical worker
 ```
 
-The orchestrator must explicitly inject `MATRX_BROWSER_PROFILE_ID` and
+The orchestrator injects `MATRX_BROWSER_PROFILE_ID` and
 `MATRX_BROWSER_EXECUTION_TARGET` in addition to the existing AI Dream URL,
-service token, `USER_ID`, and `SANDBOX_ID`. Missing browser identity fails closed;
-there is no local-browser fallback. `browser_fleet` is usable once the central
+service token, `USER_ID`, and `SANDBOX_ID` — **wired 2026-09-20**; between
+2026-08-20 and that date the client shipped and nothing set the pair, so every
+in-box browser call failed closed for a month.
+
+Where they come from: `orchestrator/browser_profile.py` asks AI Dream
+`GET /api/sandboxes/internal/default-browser-profile` (the sandbox bridge:
+shared service token + `X-Matrx-User-Id` + a membership-PROVED
+`X-Organization-Id`) for the person's default `browser.profile` in this
+sandbox's organization. It is resolved at create AND re-resolved at every
+binding (`vault_env_refresh.py`), because a person can create, rename or delete
+their browser long after the box was born; both names are on
+`sandbox_manager.ORCHESTRATOR_MANAGED_ENV` so the binding-time leak sweep never
+strips them. Never a DB read from the orchestrator: a second reader of
+`browser.profile` would be a second opinion on who owns which browser.
+
+A person with no cloud browser gets **neither** name — never a guessed id, never
+half a pair — the lookup's reason is stamped on `config.browser_profile`, and
+the in-box client refuses with a sentence telling them how to get one. Missing
+browser identity fails closed; there is no local-browser fallback. `browser_fleet` is usable once the central
 worker is healthy. The `sandbox` value is deliberately refused by AI Dream until
 G2 provides durable per-sandbox placement, isolation proof, and measured capacity;
 it cannot silently fall through to the singleton central worker.

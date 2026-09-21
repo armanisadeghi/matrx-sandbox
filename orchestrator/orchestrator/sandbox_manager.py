@@ -25,6 +25,7 @@ import docker
 from docker.errors import DockerException, NotFound, APIError
 
 from orchestrator.bridge_headers import identity_headers
+from orchestrator.browser_profile import resolve_browser_profile
 from orchestrator.config import settings
 from orchestrator.boot_readiness import BOOT_FOLLOW_INTERVAL_SECONDS
 from orchestrator.knobs import knob_float, knob_int, knob_str
@@ -234,6 +235,12 @@ ORCHESTRATOR_MANAGED_ENV: frozenset[str] = frozenset({
     "MATRX_AIDREAM_URL", "MATRX_AIDREAM_SERVICE_TOKEN",
     "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY",
     "AWS_DEFAULT_REGION", "AWS_REGION",
+    # The sandbox↔browser join (2026-09-20). Orchestrator-managed on purpose:
+    # the pair is REFRESHED at every binding like the identity, because a
+    # person can create, rename or delete their cloud browser long after this
+    # box was born. Missing from this set, the binding-time leak sweep would
+    # clear them out of every live box the first time it ran.
+    "MATRX_BROWSER_PROFILE_ID", "MATRX_BROWSER_EXECUTION_TARGET",
 })
 
 #: Names the platform has RETIRED as git credentials (2026-09-18). They are not
@@ -968,6 +975,32 @@ async def _create_sandbox_unleased(
             env["AWS_DEFAULT_REGION"] = region
             env["AWS_REGION"] = region
 
+        # ── The sandbox↔browser join ─────────────────────────────────────────
+        # The box drives the person's OWN persistent cloud browser — the one
+        # that already survives teardown — rather than launching a second,
+        # amnesiac Chromium of its own. Two names carry that: which browser,
+        # and where it runs. Resolved through AI Dream's door, never by reading
+        # browser.profile from here (orchestrator/browser_profile.py says why).
+        #
+        # NOTHING FAILS SILENTLY, AND NOTHING IS INVENTED: a person with no
+        # cloud browser gets NEITHER name, the in-box client refuses with a
+        # sentence telling them how to get one, and the reason is stamped on
+        # the row so the screen can say why instead of showing a dead control.
+        browser_lookup = await resolve_browser_profile(
+            user_id=user_id, organization_id=organization_id
+        )
+        env.update(browser_lookup.env())
+        if browser_lookup.present:
+            logger.info(
+                "Sandbox %s is joined to cloud browser %s (%s)",
+                sandbox_id, browser_lookup.profile_id, browser_lookup.label or "unnamed",
+            )
+        else:
+            logger.info(
+                "Sandbox %s gets no browser names: %s",
+                sandbox_id, browser_lookup.reason,
+            )
+
         # The refresh's protected set and the dict above are ONE contract: a
         # name the orchestrator manages but that is missing from
         # ORCHESTRATOR_MANAGED_ENV would be CLEARED out of every live box by the
@@ -1186,12 +1219,18 @@ async def _create_sandbox_unleased(
         # merge) AND `sandbox.config` (the field that gets serialized into
         # the DB row). Pydantic v2 keeps the ref for dict fields, but being
         # explicit means future pydantic changes can't silently drop this.
+        browser_diag = browser_lookup.diagnostic()
         if isinstance(config, dict):
             config["secrets_injection"] = diag
+            config["browser_profile"] = browser_diag
         if isinstance(sandbox.config, dict):
             sandbox.config["secrets_injection"] = diag
+            sandbox.config["browser_profile"] = browser_diag
         else:
-            sandbox.config = {"secrets_injection": diag}
+            sandbox.config = {
+                "secrets_injection": diag,
+                "browser_profile": browser_diag,
+            }
 
         # Merge per-sandbox env from THREE sources, last-wins:
         #   1. orchestrator-wide passthrough (already in `env` above)

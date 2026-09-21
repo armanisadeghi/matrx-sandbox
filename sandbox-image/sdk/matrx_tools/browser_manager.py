@@ -63,6 +63,27 @@ class BrowserManagerConfig:
                 "execution_target": "MATRX_BROWSER_EXECUTION_TARGET",
                 "sandbox_id": "SANDBOX_ID",
             }
+            # THE COMMON CASE HAS ITS OWN SENTENCE. Until 2026-09-20 every
+            # failure here printed the same variable-name list, so the one
+            # reason a person can actually DO something about — "you have no
+            # cloud browser yet" — arrived as ``missing
+            # MATRX_BROWSER_PROFILE_ID``, which tells a human nothing. The
+            # orchestrator now injects that pair from the person's own default
+            # browser (matrx-sandbox orchestrator/browser_profile.py), so its
+            # absence means one of exactly two things, and each says what to do.
+            if missing == ["profile_id"] or set(missing) == {
+                "profile_id",
+                "execution_target",
+            }:
+                raise BrowserManagerNotConfiguredError(
+                    "There is no cloud browser attached to this sandbox. Either "
+                    "you do not have one yet — open AI Matrx and create a cloud "
+                    "browser, and this box picks it up automatically the next "
+                    "time an agent uses it — or this box was created before the "
+                    "browser was, in which case ask for it to be reconnected. "
+                    "This sandbox will not start a throwaway browser of its own: "
+                    "a browser that forgets every login is worse than none."
+                )
             needed = ", ".join(env_names[name] for name in missing)
             raise BrowserManagerNotConfiguredError(
                 f"Canonical Browser Manager is not configured; missing {needed}. "

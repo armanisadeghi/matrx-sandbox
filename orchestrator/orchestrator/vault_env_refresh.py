@@ -81,6 +81,7 @@ import time
 
 from orchestrator import activity, sandbox_manager
 from orchestrator.bridge_headers import BridgeIdentityMissing, identity_headers
+from orchestrator.browser_profile import BROWSER_ENV_NAMES, resolve_browser_profile
 from orchestrator.config import settings
 from orchestrator.knobs import (
     KnobNotRegisteredError,
@@ -112,6 +113,13 @@ IDENTITY_NAMES = (
     "MATRX_AIDREAM_URL",
     "MATRX_AIDREAM_SERVICE_TOKEN",
 )
+#: The sandbox↔browser join, republished here for the same reason the identity
+#: is: a person can create, rename or DELETE their cloud browser long after this
+#: box was born, and the container's own environ cannot be rewritten in place.
+#: Present → exported beside the identity. Absent → actively UNSET, so a box
+#: whose browser was deleted stops naming a profile that no longer exists.
+BROWSER_NAMES = BROWSER_ENV_NAMES
+
 SANDBOX_ENV_FILE = "/home/agent/.sandbox_env"
 
 FETCH_TIMEOUT_SECONDS = 10.0
@@ -278,7 +286,7 @@ def render_identity_file(identity: dict[str, str]) -> str:
         "# Written by the orchestrator's binding-time identity publish.",
         "# The identity this sandbox carries into every AI Dream call.",
     ]
-    for name in IDENTITY_NAMES:
+    for name in (*IDENTITY_NAMES, *BROWSER_NAMES):
         if identity.get(name):
             lines.append(f"export {name}={shlex.quote(identity[name])}")
     lines.append("")
@@ -361,6 +369,16 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
             "Shells in this box will refuse AI Dream calls and say so.",
             sandbox_id, ", ".join(missing_identity),
         )
+    # The browser join, re-resolved every binding. Fail-open and never fatal:
+    # ``resolve_browser_profile`` answers with a reason rather than raising, and
+    # a box whose owner has no cloud browser simply carries neither name.
+    browser = await resolve_browser_profile(
+        user_id=str(sandbox.user_id or ""),
+        organization_id=str(sandbox.organization_id or ""),
+    )
+    identity.update(browser.env())
+    browser_cleared = [] if browser.present else list(BROWSER_NAMES)
+
     leaked: list[str] = []
     try:
         if await knob_bool(LEAK_KNOB):
@@ -396,6 +414,7 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
             **env,
             **{f"__id__{k}": v for k, v in identity.items()},
             **{f"__leak__{n}": "1" for n in leaked},
+            **{f"__browser__{n}": "1" for n in browser_cleared},
         }
     )
     cached = _recent.get(sandbox_id)
@@ -422,7 +441,9 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
                 previous = _created_with_names(sandbox)
 
             added = sorted(set(env) - set(previous))
-            removed = sorted((set(previous) - set(env)) | set(leaked))
+            removed = sorted(
+                (set(previous) - set(env)) | set(leaked) | set(browser_cleared)
+            )
 
             written = await _write_env_files(
                 container=container,
@@ -442,6 +463,7 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
         identity=sorted(identity),
         identity_missing=missing_identity,
         leaked_platform_env_cleared=leaked,
+        browser_profile=browser.diagnostic(),
         vault_version=version,
         **written,
     )
