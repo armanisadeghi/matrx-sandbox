@@ -61,6 +61,9 @@ SANDBOX_KNOB_TEST_VALUES = {
     # WEDGED phase, never a big one.
     "ready_timeout_seconds": 900,
     "home_sync_timeout_seconds": 3600,
+    # A heartbeat from a live box rolls its expiry forward: the TTL is an idle
+    # ceiling, which is what models.py and reaper.py always claimed.
+    "heartbeat_extends_ttl": True,
 }
 
 

@@ -644,6 +644,10 @@ async def resume_sandbox(sandbox_id: str):
             labels=labels,
             ttl_seconds=ttl_seconds,
             persistence_from=(sandbox_id if is_ec2 and old.persistence_volume and not old.persistence_volume.startswith("host:") else None),
+            # The MEASUREMENT is labelled, not the behaviour: a resume lands on
+            # a retained home and its time-to-ready is a different number from a
+            # cold create's. Averaging the two would make both meaningless.
+            boot_kind="resume",
         )
     except AdmissionCapacityExceeded as exc:
         raise HTTPException(status_code=429, detail={

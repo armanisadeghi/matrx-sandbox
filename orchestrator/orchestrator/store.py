@@ -329,6 +329,14 @@ class SandboxStore(ABC):
         pass
 
 
+#: Statuses whose TTL clock is still running. A terminal row is never extended
+#: by a late ping from a container on its way out.
+_LIVE_STATUSES = {
+    SandboxStatus.CREATING, SandboxStatus.STARTING,
+    SandboxStatus.READY, SandboxStatus.RUNNING,
+}
+
+
 class InMemorySandboxStore(SandboxStore):
     """In-memory sandbox store using a dict. Default for local dev.
 
@@ -512,7 +520,7 @@ class InMemorySandboxStore(SandboxStore):
         self._sandboxes[sandbox_id] = sandbox
         return True
 
-    async def update_heartbeat(self, sandbox_id: str) -> bool:
+    async def update_heartbeat(self, sandbox_id: str, *, extend_ttl: bool = False) -> bool:
         # Match the Postgres store: a heartbeat only stamps last_heartbeat_at,
         # it does NOT force the status to RUNNING. The inherited base impl did
         # the latter, so dev (in-memory) and prod (Postgres) disagreed — a box
@@ -521,6 +529,10 @@ class InMemorySandboxStore(SandboxStore):
         if not sandbox:
             return False
         sandbox.last_heartbeat_at = datetime.now(timezone.utc)
+        if extend_ttl and sandbox.expires_at is not None and sandbox.status in _LIVE_STATUSES:
+            sandbox.expires_at = sandbox.last_heartbeat_at + timedelta(
+                seconds=sandbox.ttl_seconds
+            )
         self._sandboxes[sandbox_id] = sandbox
         return True
 
@@ -862,8 +874,10 @@ class PostgresSandboxStore(SandboxStore):
                 INSERT INTO sandbox_instances
                     (id, user_id, organization_id, sandbox_id, name, status, container_id, created_at, hot_path, cold_path,
                      config, ttl_seconds, tier, template, template_version, labels,
-                     persistence_volume, created_by, stop_reason)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, $16::jsonb, $17, $2, $18)
+                     persistence_volume, created_by, stop_reason,
+                     ready_at, boot_seconds, boot_kind, boot_phase_seconds)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11::jsonb, $12, $13, $14, $15, $16::jsonb, $17, $2, $18,
+                        $19, $20, $21, $22::jsonb)
                 ON CONFLICT (sandbox_id) DO UPDATE SET
                     organization_id = EXCLUDED.organization_id,
                     -- Canonical access uses created_by. Repair legacy blanks
@@ -878,6 +892,15 @@ class PostgresSandboxStore(SandboxStore):
                     template_version = COALESCE(EXCLUDED.template_version, sandbox_instances.template_version),
                     labels = COALESCE(EXCLUDED.labels, sandbox_instances.labels),
                     persistence_volume = COALESCE(EXCLUDED.persistence_volume, sandbox_instances.persistence_volume),
+                    -- A measurement is written ONCE and never overwritten by a
+                    -- later save that carries none: every subsequent save of a
+                    -- live row (a heartbeat, a status change) passes NULL here,
+                    -- and COALESCE the other way round would erase the number
+                    -- the boot actually produced.
+                    ready_at = COALESCE(EXCLUDED.ready_at, sandbox_instances.ready_at),
+                    boot_seconds = COALESCE(EXCLUDED.boot_seconds, sandbox_instances.boot_seconds),
+                    boot_kind = COALESCE(EXCLUDED.boot_kind, sandbox_instances.boot_kind),
+                    boot_phase_seconds = COALESCE(EXCLUDED.boot_phase_seconds, sandbox_instances.boot_phase_seconds),
                     -- A row must never be both live AND carry a stop marker.
                     -- Whenever an upsert moves a row back to a non-terminal
                     -- status (e.g. resume, or a boot reconcile that finds the
@@ -917,6 +940,10 @@ class PostgresSandboxStore(SandboxStore):
                 json.dumps(sandbox.labels) if sandbox.labels else None,
                 sandbox.persistence_volume,
                 sandbox.stop_reason,
+                sandbox.ready_at,
+                sandbox.boot_seconds,
+                sandbox.boot_kind,
+                json.dumps(sandbox.boot_phase_seconds) if sandbox.boot_phase_seconds else None,
             )
             sandbox.row_id = UUID(str(row["id"]))
 
@@ -1030,13 +1057,46 @@ class PostgresSandboxStore(SandboxStore):
                 )
             return result == "UPDATE 1"
 
-    async def update_heartbeat(self, sandbox_id: str) -> bool:
+    async def update_heartbeat(self, sandbox_id: str, *, extend_ttl: bool = False) -> bool:
+        """Stamp the ping, and — when asked — roll the TTL forward from it.
+
+        🚨 THE DOC AND THE CODE DISAGREED FOR MONTHS. ``models.py`` told every
+        caller "heartbeats roll expires_at forward on every ping; the TTL is
+        the idle ceiling, not a hard wall-clock limit", the reaper's header
+        said the same, and this statement stamped ``last_heartbeat_at`` and
+        NOTHING else. A person working in a box for three hours on a two-hour
+        TTL had it torn down under them, exactly as if they had been idle,
+        while the documentation promised the opposite. Fixed 2026-09-20 by
+        making the CODE true rather than by deleting the promise: for a
+        personal box, activity IS the reason to keep it, and a wall clock that
+        ignores a person at the keyboard is the wrong primitive.
+
+        Gated by ``infrastructure.sandbox.heartbeat_extends_ttl`` (default on)
+        so an operator can choose the hard-ceiling behaviour instead.
+
+        Only a LIVE row with a TTL clock already running is extended: a
+        stopped, expired or failed box is never quietly resurrected by a
+        late ping from a container that is going away.
+        """
         pool = await self._get_pool()
         async with pool.acquire() as conn:
-            result = await conn.execute(
-                "UPDATE sandbox_instances SET last_heartbeat_at = NOW() WHERE sandbox_id = $1",
-                sandbox_id,
-            )
+            if extend_ttl:
+                result = await conn.execute(
+                    """UPDATE sandbox_instances
+                          SET last_heartbeat_at = NOW(),
+                              expires_at = CASE
+                                  WHEN expires_at IS NOT NULL
+                                   AND status IN ('creating', 'starting', 'ready', 'running')
+                                  THEN NOW() + make_interval(secs => ttl_seconds)
+                                  ELSE expires_at END
+                        WHERE sandbox_id = $1""",
+                    sandbox_id,
+                )
+            else:
+                result = await conn.execute(
+                    "UPDATE sandbox_instances SET last_heartbeat_at = NOW() WHERE sandbox_id = $1",
+                    sandbox_id,
+                )
             return result == "UPDATE 1"
 
     async def mark_stopped(self, sandbox_id: str, reason: str) -> bool:
@@ -1388,7 +1448,23 @@ def _row_to_sandbox(row) -> SandboxResponse:
         template_version=_maybe("template_version"),
         labels=labels_val,
         persistence_volume=_maybe("persistence_volume"),
+        ready_at=_maybe("ready_at"),
+        boot_seconds=_maybe("boot_seconds"),
+        boot_kind=_maybe("boot_kind"),
+        boot_phase_seconds=_boot_phases(_maybe("boot_phase_seconds")),
     )
+
+
+def _boot_phases(value) -> dict | None:
+    """``boot_phase_seconds`` as a dict, or None. Never a half-parsed string."""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except ValueError:
+            return None
+    return value if isinstance(value, dict) else None
 
 
 def create_store() -> SandboxStore:

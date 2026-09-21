@@ -13,6 +13,24 @@
 > `orchestrator/orchestrator/storage_layout.py` and
 > [OPERATIONS.md](OPERATIONS.md) § Pre-organization per-user volumes.
 
+> 🔴 **"EC2 homes are S3-backed" is NOT true as written (corrected 2026-09-20).**
+> This document says the EC2 tier persists `/home/agent` through a per-USER S3
+> prefix. The live code keeps an EC2 home in a per-SANDBOX Docker volume,
+> `matrx-ec2-home-<sandbox_id>` (`orchestrator/storage_layout.py`), and S3 hot/cold
+> sync runs only for templates that enable it. **The shipped default template,
+> `slim`, has no S3 home at all** — matching `common-docs` sandbox STATE.md
+> (*"Tier=ec2 does not prove S3 persistence"*) and this repo's own CLAUDE.md
+> (*"template-specific retained homes; not universally S3-backed"*), and
+> contradicting the table and §2.1 below.
+>
+> **Measured 2026-09-20** (live EC2 orchestrator, admin test user, `slim`): a file
+> written to `/home/agent` survived two full stop→resume cycles — resume mints a
+> NEW `sandbox_id` and re-attaches the SAME `matrx-ec2-home-sbx-…` volume. So the
+> persistence is real and proven; its MECHANISM is a retained Docker volume on that
+> EC2 host, which means it does not survive losing the host, and it is not the
+> per-user S3 prefix this document describes. Read every "S3-backed home" claim
+> below as "for templates that enable S3", never as a property of the tier.
+
 ## What landed today (2026-04-26)
 
 - ✅ **Phase 1: hosted-tier per-user Docker volumes.** Volume `matrx-user-<uid>` (today: `matrx-user-<uid>-org-<oid>`) mounted at `/home/agent` for hosted-tier sandboxes; survives container destroy. Verified: write file in sandbox A → destroy → create sandbox B for same user → file is there.

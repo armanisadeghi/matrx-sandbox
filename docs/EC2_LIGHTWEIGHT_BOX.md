@@ -1,5 +1,15 @@
 # EC2 Lightweight Coding Box — Spec
 
+> ⚠️ **SUPERSEDED IN ONE RESPECT (2026-09-20): stop reading the warm-pool sections as a recommendation.**
+> The warm pool was RETIRED on 2026-09-17 — a container pre-booted before it has an
+> owner can never be given a user and an organization afterwards
+> (`orchestrator/pool.py`). This document's "build a small warm pool of 1–2 slim
+> instances" recommendation, and the open question "is ~60–90s click-and-wait
+> acceptable", both predate two facts: the retirement, and the first real
+> measurement. **Measured 2026-09-20 against the live EC2 orchestrator, admin
+> test user, template `slim`: create→ready 3.7 s, resume→ready 3.3 s and 4.9 s.**
+> There is no 60–90 s wait to design around and no warm pool to build.
+
 Status: **proposal** · Author: lifecycle work follow-up · Date: 2026-05-22
 
 > The "big big missing thing": a minimal sandbox you can launch from a chat

@@ -167,7 +167,12 @@ async def test_expiry_that_loses_to_real_legacy_resume_never_stops_the_resumed_c
     client = SimpleNamespace(containers=SimpleNamespace(get=lambda identity: container if identity == container.id else None))
     monkeypatch.setattr(sandbox_manager, "_get_docker_client", lambda: client)
 
-    async def ready(sandbox):
+    async def ready(sandbox, **kwargs):
+        # **kwargs, not a fixed arity: the real _wait_for_ready also takes the
+        # measurement's kind and start clock, and a double that pins today's
+        # signature turns tomorrow's extra keyword into a TypeError swallowed
+        # by a task nobody awaits — which is exactly how this test HUNG rather
+        # than failed when create/resume timings landed (2026-09-20).
         sandbox.status = SandboxStatus.READY
         return sandbox
 

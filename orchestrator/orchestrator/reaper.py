@@ -24,6 +24,14 @@ The user's mental model, now actually implemented:
     (latest image) on the same volume.
   - Permanent = ``ttl_seconds`` huge / never reaped; same machinery.
 
+The TTL is an IDLE ceiling, not a wall clock: each heartbeat from a live box
+rolls ``expires_at`` forward by its full ``ttl_seconds``
+(``store.update_heartbeat(extend_ttl=True)``, knob
+``infrastructure.sandbox.heartbeat_extends_ttl``, default on). Until
+2026-09-20 this header SAID that and the store did not, so a box somebody was
+working in was torn down on schedule as though it had been abandoned. With the
+knob off the old hard-wall-clock behaviour returns, deliberately.
+
 Idempotent and self-healing: a teardown failure for one sandbox is logged
 and the loop moves on; the next tick retries.
 """

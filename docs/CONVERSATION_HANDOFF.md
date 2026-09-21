@@ -50,7 +50,10 @@ Three calls, all to the orchestrator (tier-routed as today):
 
 ```
 1. POST /sandboxes/claim           { user_id, template:"slim", ttl_seconds }
-   -> { sandbox_id, ... }          # ~0.5s from the warm pool; memory hydrated in
+   -> { sandbox_id, ... }          # MEASURED 3.7s cold, EC2/slim (2026-09-20)
+                                   # (the warm pool this line once claimed
+                                   #  ~0.5s for was retired 2026-09-17; /claim
+                                   #  cold-creates. memory hydrated in)
 
 2. POST /sandboxes/{id}/agent-binding   {}        (master key / admin)
    -> { sandbox_id, base_url, access_token, root_path, expires_at }

@@ -28,7 +28,7 @@ from orchestrator.bridge_headers import identity_headers
 from orchestrator.browser_profile import resolve_browser_profile
 from orchestrator.config import settings
 from orchestrator.boot_readiness import BOOT_FOLLOW_INTERVAL_SECONDS
-from orchestrator.knobs import knob_float, knob_int, knob_str
+from orchestrator.knobs import knob_bool, knob_float, knob_int, knob_str
 from orchestrator.runtime_isolation import container_runtime_isolation
 from orchestrator.models import SandboxBoot, SandboxResponse, SandboxStatus
 from orchestrator.storage_layout import (
@@ -735,9 +735,16 @@ async def create_sandbox(
     persistence_from: str | None = None,
     replacement_for: str | None = None,
     reserved: SandboxResponse | None = None,
+    boot_kind: str = "create",
     _lifecycle_lease_held: bool = False,
 ) -> SandboxResponse:
-    """Create under the hosted home lease before the first durable write."""
+    """Create under the hosted home lease before the first durable write.
+
+    ``boot_kind`` labels the MEASUREMENT this journey produces, never its
+    behaviour: a resume re-creates a container onto a retained home and its
+    time-to-ready is a different number from a cold create's, so the two must
+    not be averaged together on the row.
+    """
     config = config or {}
     config_organization_id = config.get("organization_id")
     if config_organization_id is not None and config_organization_id != organization_id:
@@ -796,7 +803,7 @@ async def create_sandbox(
         return await _create_sandbox_unleased(
             sandbox_id, user_id, organization_id, name, config, template,
             template_version, tier, resources, labels, ttl_seconds, persistence_reference,
-            replacement_for, reserved,
+            replacement_for, reserved, boot_kind,
         )
     if _lifecycle_lease_held:
         return await create_under_lease()
@@ -819,6 +826,7 @@ async def _create_sandbox_unleased(
     persistence_reference: str | None = None,
     replacement_for: str | None = None,
     reserved: SandboxResponse | None = None,
+    boot_kind: str = "create",
 ) -> SandboxResponse:
     """Create and start a new sandbox container for a user.
 
@@ -827,6 +835,13 @@ async def _create_sandbox_unleased(
     container CPU/memory limits when supplied (hosted tier only — EC2 tier ignores
     overrides for now). ``ttl_seconds`` overrides the default TTL for this sandbox.
     """
+    # THE CLOCK STARTS HERE, not at the first poll. "Creation and teardown need
+    # to be easy and fast… The data and all of that should already be very fast
+    # but check" (Arman, 2026-09-20) is a claim about the journey a caller
+    # experiences — admission, image pull, container start, home restore, SDK —
+    # so the number has to cover all of it. Nothing in this repository measured
+    # any of it before 2026-09-20.
+    boot_started = time.monotonic()
     store = _get_store()
     from orchestrator.hosted_migration import hosted_volume_fenced
     if (tier or settings.host_tier) == "hosted" and hosted_volume_fenced(
@@ -1370,7 +1385,9 @@ async def _create_sandbox_unleased(
 
         await store.save(sandbox)
 
-        sandbox = await _wait_for_ready(sandbox)
+        sandbox = await _wait_for_ready(
+            sandbox, kind=boot_kind, started_monotonic=boot_started
+        )
         await store.save(sandbox)
 
         # Hydrate the user's central memory into .matrx/memory/ so a fresh box
@@ -1398,6 +1415,8 @@ async def _wait_for_ready(
     *,
     store: "SandboxStore | None" = None,
     poll_interval: float = 2.0,
+    kind: str = "create",
+    started_monotonic: float | None = None,
 ) -> SandboxResponse:
     """Wait on the box's own boot PHASE — never on a fixed wall clock.
 
@@ -1422,10 +1441,36 @@ async def _wait_for_ready(
     ready_budget = float(await knob_int("ready_timeout_seconds"))
     home_sync_budget = float(await knob_int("home_sync_timeout_seconds"))
 
-    started = time.monotonic()
-    phase_started = started
+    # ``started_monotonic`` is the caller's clock — the moment the create or
+    # resume began, not the moment this poll loop was entered — so the number
+    # on the row is the one a caller waited through. Falling back to now() keeps
+    # every existing caller working and UNDER-reports rather than inventing.
+    started = started_monotonic if started_monotonic is not None else time.monotonic()
+    phase_started = time.monotonic()
+    #: phase name -> seconds spent in it. A phase the box never reported is
+    #: simply absent: partial truth, never a zero that reads as "instant".
+    phase_seconds: dict[str, float] = {}
     previous: br.BootSnapshot | None = None
     last_published: str | None = None
+
+    def close_phase(name: str | None, at: float) -> None:
+        if not name:
+            return
+        phase_seconds[name] = round(phase_seconds.get(name, 0.0) + (at - phase_started), 3)
+
+    def record_ready() -> None:
+        """Stamp the measurement on the row. Never raises, never blocks a create."""
+        now = time.monotonic()
+        close_phase(previous.budget_phase if previous else None, now)
+        sandbox.ready_at = datetime.now(timezone.utc)
+        sandbox.boot_seconds = round(now - started, 3)
+        sandbox.boot_kind = kind
+        sandbox.boot_phase_seconds = dict(phase_seconds) or None
+        logger.info(
+            "Sandbox %s %s→ready in %.1fs (phases: %s)",
+            sandbox.sandbox_id, kind, sandbox.boot_seconds,
+            phase_seconds or "none reported",
+        )
 
     async def publish(snapshot: br.BootSnapshot) -> None:
         """Surface the live phase on the row so a person can watch it."""
@@ -1469,11 +1514,17 @@ async def _wait_for_ready(
             snapshot = br.parse_probe(text if exit_code == 0 else "")
 
             if br.advanced(previous, snapshot):
-                phase_started = time.monotonic()
+                _now = time.monotonic()
+                # Only a PHASE CHANGE closes a phase; file-count movement inside
+                # one phase resets the liveness clock without splitting it.
+                if previous is not None and previous.budget_phase != snapshot.budget_phase:
+                    close_phase(previous.budget_phase, _now)
+                phase_started = _now
                 await publish(snapshot)
             previous = snapshot
 
             if snapshot.usable:
+                record_ready()
                 sandbox.status = SandboxStatus.READY
                 if snapshot.phase == br.PHASE_HOME_SYNC or (
                     snapshot.files_total and not snapshot.ready_marker
@@ -2079,6 +2130,7 @@ async def resume_retained_ec2_layer(sandbox: SandboxResponse) -> SandboxResponse
         raise RuntimeError("sandbox is not a retained EC2 writable-layer sandbox")
     if not sandbox.container_id:
         raise RuntimeError("retained EC2 writable-layer sandbox has no recorded container identity")
+    resume_started = time.monotonic()
     client = _get_docker_client()
     try:
         container = await asyncio.to_thread(client.containers.get, sandbox.container_id)
@@ -2099,7 +2151,9 @@ async def resume_retained_ec2_layer(sandbox: SandboxResponse) -> SandboxResponse
         await _get_store().resume_active(sandbox)
         sandbox.status = SandboxStatus.STARTING
         await asyncio.to_thread(container.start)
-        sandbox = await _wait_for_ready(sandbox)
+        sandbox = await _wait_for_ready(
+            sandbox, kind="resume", started_monotonic=resume_started
+        )
         await _get_store().save(sandbox)
         return sandbox
 
@@ -2303,13 +2357,40 @@ async def get_user_volume_size(user_id: str, organization_id: str) -> int | None
     return None
 
 
+HEARTBEAT_EXTENDS_TTL_KNOB = "heartbeat_extends_ttl"
+
+
 async def heartbeat(sandbox_id: str) -> bool:
-    """Record a heartbeat from a sandbox. Returns True if sandbox exists."""
+    """Record a heartbeat from a sandbox. Returns True if sandbox exists.
+
+    🚨 A HEARTBEAT ROLLS THE TTL FORWARD (2026-09-20, knob-gated, default on).
+    ``models.py`` and ``reaper.py`` both described ``ttl_seconds`` as an IDLE
+    ceiling that "heartbeats refresh", and the store stamped only
+    ``last_heartbeat_at`` — so a person working in a box for three hours on a
+    two-hour TTL lost it mid-sentence, exactly as if they had walked away,
+    while every document promised otherwise. The doc was the better design, so
+    the CODE moved: for a personal box, activity is the reason to keep it.
+
+    An operator who wants the hard wall clock instead turns
+    ``infrastructure.sandbox.heartbeat_extends_ttl`` off; a knob that cannot be
+    read leaves the OLD behaviour (stamp only) and says so, because the safe
+    failure here is a box that expires on time, never one that never expires.
+    """
     store = _get_store()
     sandbox = await store.get(sandbox_id)
     if not sandbox:
         return False
-    await store.update_heartbeat(sandbox_id)
+    extend = False
+    try:
+        extend = await knob_bool(HEARTBEAT_EXTENDS_TTL_KNOB)
+    except Exception as exc:  # noqa: BLE001 — a knob read never drops a heartbeat
+        logger.warning(
+            "HEARTBEAT TTL EXTENSION UNAVAILABLE for %s: %s. Seed "
+            "'infrastructure.sandbox.%s'; until then a box expires on its "
+            "wall clock even while someone is working in it.",
+            sandbox_id, exc, HEARTBEAT_EXTENDS_TTL_KNOB,
+        )
+    await store.update_heartbeat(sandbox_id, extend_ttl=extend)
     return True
 
 

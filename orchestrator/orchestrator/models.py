@@ -55,12 +55,22 @@ class CreateSandboxRequest(BaseModel):
     labels: dict[str, str] | None = Field(default=None, description="Free-form tags persisted with the sandbox")
     # TTL ceiling raised to 1 year so the "permanent default sandbox" path
     # (aidream's ensure_default_sandbox) can request a TTL the user
-    # intuitively reads as "never expire while in use". Heartbeats roll
-    # expires_at forward on every ping; the TTL is the idle ceiling, not a
-    # hard wall-clock limit.
+    # intuitively reads as "never expire while in use".
+    #
+    # This comment described a heartbeat-refreshed IDLE ceiling from the day it
+    # was written; the store stamped ``last_heartbeat_at`` and nothing else
+    # until 2026-09-20, so the sentence was a promise nobody kept and a box in
+    # active use died on a wall clock. The behaviour now matches the words,
+    # under the knob ``infrastructure.sandbox.heartbeat_extends_ttl`` (default
+    # on) — turn it off and this becomes the hard wall clock it accidentally
+    # was.
     ttl_seconds: int | None = Field(
         default=None, ge=60, le=31_536_000,
-        description="Override default TTL (idle ceiling; heartbeats refresh it)",
+        description=(
+            "Override default TTL. With heartbeat_extends_ttl on (the default) "
+            "this is an IDLE ceiling that each heartbeat rolls forward; with it "
+            "off it is a hard wall clock from the moment the box went live."
+        ),
     )
 
     @field_validator("user_id")
@@ -171,6 +181,39 @@ class SandboxResponse(BaseModel):
             "used during (today: the S3 home restore). Null once boot is done. "
             "Persisted inside ``config`` so it survives an orchestrator restart "
             "without a schema change."
+        ),
+    )
+    ready_at: datetime | None = Field(
+        default=None,
+        description=(
+            "When this box first reported itself usable. NULL means NOT "
+            "MEASURED — never 'instant'. Boxes created before 2026-09-20 have "
+            "none, because nothing in this repository measured boot until then."
+        ),
+    )
+    boot_seconds: float | None = Field(
+        default=None,
+        description=(
+            "Wall clock from the start of the create/resume to ready_at. The "
+            "number a caller actually waited through: admission, image, "
+            "container start, home restore, SDK."
+        ),
+    )
+    boot_kind: str | None = Field(
+        default=None,
+        description=(
+            "Which journey boot_seconds measures: 'create' (cold) or 'resume' "
+            "(a fresh container onto a retained home). The two are different "
+            "numbers and are never averaged together."
+        ),
+    )
+    boot_phase_seconds: dict[str, float] | None = Field(
+        default=None,
+        description=(
+            "Seconds spent in each boot phase the box reported (container, "
+            "home_sync, cold_mount, environment, sdk, cloud_files). Partial by "
+            "nature: an image without phase markers reports none, and an absent "
+            "phase is absent rather than zero."
         ),
     )
     proxy_url: str | None = Field(
