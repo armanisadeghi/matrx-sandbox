@@ -32,6 +32,12 @@ rolls ``expires_at`` forward by its full ``ttl_seconds``
 working in was torn down on schedule as though it had been abandoned. With the
 knob off the old hard-wall-clock behaviour returns, deliberately.
 
+An enrolled person's workspace box is ALWAYS ON, and this same tick is what
+makes that true: after the liveness reconcile, ``always_on.revive_always_on``
+brings back every marked box that is down, rate-limited by two knobs. There is
+deliberately no second scheduler — a second timer is a second thing that can be
+down while the first looks healthy.
+
 Idempotent and self-healing: a teardown failure for one sandbox is logged
 and the loop moves on; the next tick retries.
 """
@@ -264,6 +270,20 @@ async def _reap_once() -> dict:
     except Exception as exc:
         logger.warning("Reaper: liveness reconcile failed this tick: %s", exc)
 
+    # Always-on revive: an enrolled person's workspace box must be UP, or
+    # something must be actively bringing it back. No new scheduler and no new
+    # loop — a second timer is a second thing that can be down while the first
+    # looks healthy. Rate-limited by two knobs and never raises out of the
+    # tick; see orchestrator/always_on.py for every rule and its reason.
+    try:
+        from orchestrator import always_on
+        revived = await always_on.revive_always_on(store)
+        summary["always_on_revived"] = len(revived["revived"])
+        summary["always_on_failed"] = revived["failed"]
+        summary["always_on_left_for_next_tick"] = revived["left_for_next_tick"]
+    except Exception as exc:
+        logger.warning("Reaper: always-on revive failed this tick: %s", exc)
+
     # Version-drift alarm (zero-drift system, Phase 1). Its configurable,
     # process-coalesced cadence is independent of the 60-second lifecycle
     # sweep above. Each eligible pass resolves the newest image then; it never
@@ -318,13 +338,16 @@ async def _reap_once() -> dict:
                 logger.warning("Reaper: auto-migrate raised: %s (backing off %ds)", exc, delay)
 
     if (summary["expired_found"] or summary["liveness_stopped"]
-            or summary.get("drifted") or summary.get("zombies_reaped")):
+            or summary.get("drifted") or summary.get("zombies_reaped")
+            or summary.get("always_on_revived") or summary.get("always_on_failed")):
         logger.info(
             "Reaper sweep: expired_found=%d torn_down=%d failed=%d "
-            "liveness_stopped=%d liveness_refreshed=%d drifted=%d zombies_reaped=%d",
+            "liveness_stopped=%d liveness_refreshed=%d drifted=%d zombies_reaped=%d "
+            "always_on_revived=%d always_on_failed=%d",
             summary["expired_found"], summary["torn_down"], summary["failed"],
             summary["liveness_stopped"], summary["liveness_refreshed"],
             summary.get("drifted", 0), summary.get("zombies_reaped", 0),
+            summary.get("always_on_revived", 0), summary.get("always_on_failed", 0),
         )
     return summary
 

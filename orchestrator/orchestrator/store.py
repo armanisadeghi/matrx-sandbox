@@ -13,6 +13,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Any
 from uuid import UUID
 
+from orchestrator.always_on import is_always_on
 from orchestrator.models import SandboxBoot, SandboxResponse, SandboxStatus
 from orchestrator.secret_redaction import redact_secret_values
 
@@ -211,7 +212,10 @@ class SandboxStore(ABC):
         """Soft-delete every non-deleted row that has been in a terminal
         status (stopped/expired/failed) for more than ``days`` days — the
         retention sweep behind "finished sandboxes disappear after a while".
-        Returns the affected sandbox_ids."""
+        Returns the affected sandbox_ids.
+
+        Never an always-on workspace: a soft-deleted row cannot be resumed, so
+        purging one is permanent data loss (orchestrator/always_on.py)."""
         return []
 
     @abstractmethod
@@ -280,12 +284,12 @@ class SandboxStore(ABC):
     ) -> dict:
         """Liveness reconcile against the host's actually-alive containers.
 
-        Default: no-op. The in-memory store is rebuilt from ``docker ps`` on
-        every boot, so it never holds rows whose container has vanished. The
-        Postgres store overrides this to (a) mark active rows whose container
-        is gone as STOPPED and (b) refresh ``updated_at`` for rows whose
-        container is alive (so long-lived sandboxes don't look stale to the
-        persistence watchdog). Returns ``{"stopped": [...], "refreshed": int}``.
+        Default: no-op. BOTH shipped stores override it, and they must stay in
+        step: (a) mark active rows whose container is gone as STOPPED, and
+        (b) for rows whose container IS alive, refresh ``updated_at`` AND
+        stamp ``last_heartbeat_at`` — the observation is the platform's
+        heartbeat — applying ``heartbeat_extends_ttl``. Returns
+        ``{"stopped": [...], "refreshed": int}``.
         """
         return {"stopped": [], "refreshed": 0}
 
@@ -301,6 +305,9 @@ class SandboxStore(ABC):
 
         Default implementation scans ``list()``; the Postgres store overrides
         with a single atomic UPDATE so concurrent reapers can't double-claim.
+
+        Neither touches an always-on workspace: an enrolled person's box has
+        no idle ceiling (orchestrator/always_on.py).
         """
         now = datetime.now(timezone.utc)
         expired: list[str] = []
@@ -308,6 +315,12 @@ class SandboxStore(ABC):
             if tier and getattr(sb.tier, "value", sb.tier) != tier:
                 continue
             if include_sandbox_ids is not None and sb.sandbox_id not in include_sandbox_ids:
+                continue
+            # An always-on workspace has no idle ceiling: its owner is
+            # enrolled in a box that must stay up, so "you stopped typing" is
+            # never a reason to take it away. Same predicate as the Postgres
+            # sweep (orchestrator/always_on.py) — do not respell it.
+            if is_always_on(sb.labels):
                 continue
             status = getattr(sb.status, "value", sb.status)
             if status in ("ready", "running") and sb.expires_at and sb.expires_at < now:
@@ -345,6 +358,37 @@ _LIVE_STATUSES = {
     SandboxStatus.CREATING, SandboxStatus.STARTING,
     SandboxStatus.READY, SandboxStatus.RUNNING,
 }
+
+
+#: The liveness reconcile's observation is a heartbeat, and it honours the same
+#: shipped knob the (never-sent) container ping was supposed to honour.
+OBSERVATION_EXTENDS_TTL_KNOB = "heartbeat_extends_ttl"
+
+
+async def _observation_extends_ttl() -> bool:
+    """Read ``infrastructure.sandbox.heartbeat_extends_ttl`` for a liveness pass.
+
+    Read through ``orchestrator.knobs`` — the one way this orchestrator reads a
+    setting — so the liveness pass and ``sandbox_manager.heartbeat`` cannot end
+    up honouring two different values of the same knob, and so the 60-second
+    sweep rides the knob cache instead of adding a query per tick.
+
+    An unreadable knob leaves the OLD behaviour (stamp only, no extension) and
+    says so: the safe failure here is a box that expires on its wall clock,
+    never one that never expires.
+    """
+    from orchestrator.knobs import knob_bool
+
+    try:
+        return await knob_bool(OBSERVATION_EXTENDS_TTL_KNOB)
+    except Exception as exc:  # noqa: BLE001 — never fail a liveness sweep on a knob
+        logger.warning(
+            "LIVENESS TTL EXTENSION UNAVAILABLE: %s. Seed "
+            "'infrastructure.sandbox.%s'; until then a box expires on its wall "
+            "clock even while the orchestrator can see it running.",
+            exc, OBSERVATION_EXTENDS_TTL_KNOB,
+        )
+        return False
 
 
 class InMemorySandboxStore(SandboxStore):
@@ -503,6 +547,12 @@ class InMemorySandboxStore(SandboxStore):
         for sid, sb in self._sandboxes.items():
             if sid in self._deleted:
                 continue
+            # Retention must never reach an always-on workspace: a
+            # soft-deleted row cannot be resumed (`/sandboxes/{id}/resume`
+            # 409s on deleted_at), so purging an enrolled person's parked box
+            # converts a recoverable outage into permanent data loss.
+            if is_always_on(sb.labels):
+                continue
             status = getattr(sb.status, "value", sb.status)
             if status not in ("stopped", "expired", "failed"):
                 continue
@@ -529,6 +579,61 @@ class InMemorySandboxStore(SandboxStore):
         sandbox.status = status
         self._sandboxes[sandbox_id] = sandbox
         return True
+
+    async def reconcile(
+        self, alive_container_ids: set[str], tier: str | None = None,
+        exclude_sandbox_ids: frozenset[str] = frozenset(),
+        include_sandbox_ids: frozenset[str] | None = None,
+        authoritative_sandbox_ids: set[str] | None = None,
+    ) -> dict:
+        """Mirror of :meth:`PostgresSandboxStore.reconcile`.
+
+        Until 2026-09-22 this inherited the base no-op on the theory that the
+        in-memory store is rebuilt from ``docker ps`` on every boot. That left
+        the repo with no way to exercise the liveness pass without a database,
+        which is exactly how the two implementations drift — and the liveness
+        pass is now where ``last_heartbeat_at`` comes from.
+        """
+        extend_ttl = await _observation_extends_ttl()
+        stopped: list[str] = []
+        refreshed = 0
+        now = datetime.now(timezone.utc)
+        for sandbox_id, sb in list(self._sandboxes.items()):
+            if sandbox_id in self._deleted:
+                continue
+            if tier and getattr(sb.tier, "value", sb.tier) != tier:
+                continue
+            if sandbox_id in exclude_sandbox_ids:
+                continue
+            if include_sandbox_ids is not None and sandbox_id not in include_sandbox_ids:
+                continue
+            status = getattr(sb.status, "value", sb.status)
+            if status not in ("creating", "ready", "running", "starting"):
+                continue
+            if not sb.container_id:
+                continue
+            if sb.container_id not in alive_container_ids:
+                # An empty inventory proves nothing; the caller decides.
+                if not alive_container_ids:
+                    continue
+                if status not in ("ready", "running", "starting"):
+                    continue
+                sb.status = SandboxStatus.STOPPED
+                sb.stopped_at = now
+                # The closest admissible stop_reason for "the container is
+                # simply no longer here" (see the CHECK on stop_reason).
+                sb.stop_reason = "graceful_shutdown"
+                stopped.append(sandbox_id)
+                continue
+            if status not in ("ready", "running", "starting"):
+                continue
+            # The observation IS the heartbeat — see the Postgres statement.
+            sb.updated_at = now
+            sb.last_heartbeat_at = now
+            if extend_ttl and sb.expires_at is not None and sb.status in _LIVE_STATUSES:
+                sb.expires_at = now + timedelta(seconds=sb.ttl_seconds)
+            refreshed += 1
+        return {"stopped": stopped, "refreshed": refreshed}
 
     async def update_heartbeat(self, sandbox_id: str, *, extend_ttl: bool = False) -> bool:
         # Match the Postgres store: a heartbeat only stamps last_heartbeat_at,
@@ -1041,6 +1146,12 @@ class PostgresSandboxStore(SandboxStore):
                    SET deleted_at = NOW(), updated_at = NOW()
                    WHERE deleted_at IS NULL
                      AND status IN ('stopped', 'expired', 'failed')
+                     -- Never an always-on workspace. A soft-deleted row
+                     -- cannot be resumed (`/sandboxes/{id}/resume` 409s on
+                     -- deleted_at), so purging an enrolled person's parked
+                     -- box turns a recoverable outage into permanent data
+                     -- loss. See orchestrator/always_on.py.
+                     AND COALESCE(labels->>'always_on','') <> 'true'
                      AND COALESCE(stopped_at, updated_at, created_at)
                          < NOW() - make_interval(days => $1)
                    RETURNING sandbox_id""",
@@ -1204,6 +1315,8 @@ class PostgresSandboxStore(SandboxStore):
         tier's perfectly healthy rows as stopped. Returns
         ``{"stopped": [...], "refreshed": int}``.
         """
+        extend_ttl = await _observation_extends_ttl()
+
         async def _do() -> dict:
             pool = await self._get_pool()
             stopped: list[str] = []
@@ -1303,8 +1416,28 @@ class PostgresSandboxStore(SandboxStore):
 
                 refreshed = 0
                 if alive_sandbox_ids:
+                    # 🚨 THIS STATEMENT IS THE PLATFORM'S HEARTBEAT. The
+                    # in-container one never existed: matrx_agent's
+                    # ``heartbeat()`` is written and nothing calls it, so of
+                    # 273 production rows only 9 had EVER carried a
+                    # last_heartbeat_at (measured 2026-09-22) and every
+                    # consumer judging liveness by it concluded "corpse" and
+                    # cold-created a replacement box. We already asked Docker
+                    # which containers are alive three lines up, and an
+                    # observation BY the platform is a stronger signal than a
+                    # container asserting its own health — so the same UPDATE
+                    # stamps it, and applies heartbeat_extends_ttl exactly as
+                    # ``update_heartbeat`` does so the shipped knob is real.
                     result = await conn.execute(
-                        """UPDATE sandbox_instances SET updated_at = NOW()
+                        """UPDATE sandbox_instances
+                              SET updated_at = NOW(),
+                                  last_heartbeat_at = NOW(),
+                                  expires_at = CASE
+                                      WHEN $5::boolean
+                                       AND expires_at IS NOT NULL
+                                       AND status IN ('creating', 'starting', 'ready', 'running')
+                                      THEN NOW() + make_interval(secs => ttl_seconds)
+                                      ELSE expires_at END
                            WHERE sandbox_id = ANY($1::text[])
                              AND status IN ('ready', 'running', 'starting')
                              AND deleted_at IS NULL
@@ -1314,6 +1447,7 @@ class PostgresSandboxStore(SandboxStore):
                         alive_sandbox_ids,
                         tier, list(exclude_sandbox_ids),
                         list(include_sandbox_ids) if include_sandbox_ids is not None else None,
+                        extend_ttl,
                     )
                     try:
                         refreshed = int(result.split()[-1])
@@ -1347,6 +1481,11 @@ class PostgresSandboxStore(SandboxStore):
                          AND expires_at IS NOT NULL
                          AND expires_at < NOW()
                          AND deleted_at IS NULL
+                         -- An always-on workspace has no idle ceiling. Its
+                         -- owner is enrolled in a box that must stay up, so
+                         -- the TTL sweep is not allowed to be the thing that
+                         -- takes it away. See orchestrator/always_on.py.
+                         AND COALESCE(labels->>'always_on','') <> 'true'
                          AND ($1::text IS NULL OR tier = $1)
                          AND ($2::text[] IS NULL OR sandbox_id = ANY($2::text[]))
                        RETURNING sandbox_id""",

@@ -64,6 +64,11 @@ SANDBOX_KNOB_TEST_VALUES = {
     # A heartbeat from a live box rolls its expiry forward: the TTL is an idle
     # ceiling, which is what models.py and reaper.py always claimed.
     "heartbeat_extends_ttl": True,
+    # An enrolled person's workspace box is always on; these bound how fast the
+    # reaper may bring a down one back. Seeded in production by aidream
+    # migration 1028 — change these only when that migration changes.
+    "always_on_revive_max_per_pass": 5,
+    "always_on_revive_min_interval_seconds": 180,
 }
 
 

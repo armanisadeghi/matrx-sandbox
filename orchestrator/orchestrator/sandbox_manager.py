@@ -107,13 +107,18 @@ async def get_live_sandbox_for_issuance(sandbox_id: str) -> SandboxResponse | No
         ) from exc
 
     store = _get_store()
-    changed = await store.mark_stopped_if_active(
-        sandbox_id, "container_missing_at_token_issuance"
-    )
+    # 🚨 'error', not a descriptive phrase. `sandbox_instances_stop_reason_check`
+    # admits exactly user_requested | expired | error | graceful_shutdown |
+    # admin, so the old "container_missing_at_token_issuance" made this UPDATE
+    # RAISE — and the dead row stayed 'ready' forever, holding the person's
+    # admission slot against a container that no longer exists. The real
+    # detail belongs in the log line, which is where it is.
+    changed = await store.mark_stopped_if_active(sandbox_id, STOP_REASON_ERROR)
     if changed:
         logger.warning(
-            "Sandbox %s container vanished during token issuance; marked STOPPED",
-            sandbox_id,
+            "Sandbox %s container vanished during token issuance; marked "
+            "STOPPED (stop_reason=%s, detail=container_missing_at_token_issuance)",
+            sandbox_id, STOP_REASON_ERROR,
         )
     return _backfill_proxy_url(await store.get(sandbox_id)) or sandbox
 
@@ -839,6 +844,26 @@ async def reset_successor_admission(
         yield successor
 
 
+def container_restart_policy(template: str | None, labels: dict | None) -> dict:
+    """Docker's restart policy for a new box.
+
+    ``development`` binds a live workspace and has always come back with the
+    daemon. Everything else — including ``slim``, the Personal Staff default —
+    was ``no``, so a Docker daemon restart or a host reboot left the container
+    exited and the next liveness pass wrote the row ``stopped``. For an
+    enrolled person that is the box simply gone after a reboot, which is the
+    state the always-on mark exists to make impossible, so a marked box comes
+    back with the daemon too (orchestrator/always_on.py).
+    """
+    from orchestrator.always_on import is_always_on
+
+    persistent = template == "development" or is_always_on(labels)
+    return {
+        "Name": "unless-stopped" if persistent else "no",
+        "MaximumRetryCount": 0,
+    }
+
+
 async def create_sandbox(
     user_id: str,
     organization_id: str,
@@ -1489,10 +1514,7 @@ async def _create_sandbox_unleased(
                 **({"matrx.template_version": template_version} if template_version else {}),
                 **{f"matrx.label.{k}": v for k, v in (labels or {}).items()},
             },
-            restart_policy={
-                "Name": "unless-stopped" if template == "development" else "no",
-                "MaximumRetryCount": 0,
-            },
+            restart_policy=container_restart_policy(template, labels),
         ))  # type: ignore[call-overload]
 
         sandbox.container_id = container.id
@@ -1529,6 +1551,45 @@ async def _create_sandbox_unleased(
         await store.save(sandbox)
         logger.error("Failed to create sandbox %s: %s", sandbox_id, e)
         raise RuntimeError(f"Failed to create sandbox {sandbox_id}: {e}") from e
+
+
+#: The ONLY values ``sandbox_instances.stop_reason`` accepts
+#: (``sandbox_instances_stop_reason_check``, verified against the live schema
+#: 2026-09-22). A write outside this set does not degrade — it RAISES, the
+#: UPDATE is lost, and the row keeps whatever status it had.
+ALLOWED_STOP_REASONS = frozenset(
+    {"user_requested", "expired", "error", "graceful_shutdown", "admin"}
+)
+
+#: The canonical reason for "this went wrong". The sentence goes in the log and
+#: in ``config['stop_detail']``, never in the column.
+STOP_REASON_ERROR = "error"
+
+#: Where a failure's honest sentence lives on the row, since the column cannot
+#: hold it. It rides in ``config``, so every client that already reads config
+#: gets it for free.
+STOP_DETAIL_CONFIG_KEY = "stop_detail"
+
+
+def record_boot_failure(sandbox: SandboxResponse, detail: str) -> None:
+    """Fail a box LOUDLY and ADMISSIBLY — the one place a boot gives up.
+
+    Until 2026-09-22 ``_wait_for_ready`` wrote its diagnosis ("stalled in
+    home_sync after 3600s, 4210/8630 files") straight into ``stop_reason``.
+    ``save()`` passes that column through verbatim, so the CHECK rejected it
+    and the ENTIRE save of the FAILED row raised: the box was dead, the row
+    still said ``creating``, and the reason was lost. Both halves matter, so
+    both are kept — a canonical reason in the column, the sentence in
+    ``config`` and in the log. A screen is absent or honest, never lying.
+    """
+    sandbox.status = SandboxStatus.FAILED
+    sandbox.stop_reason = STOP_REASON_ERROR
+    config = dict(sandbox.config or {})
+    config[STOP_DETAIL_CONFIG_KEY] = detail
+    sandbox.config = config
+    # A dead box has no boot in progress; a live-looking progress line on a
+    # failed row would be the screen lying again.
+    sandbox.boot = None
 
 
 async def _wait_for_ready(
@@ -1627,15 +1688,14 @@ async def _wait_for_ready(
         try:
             container = await asyncio.to_thread(client.containers.get, sandbox.sandbox_id)
             if container.status == "exited":
-                sandbox.status = SandboxStatus.FAILED
-                sandbox.stop_reason = br.timeout_reason(
+                detail = br.timeout_reason(
                     previous, 0.0, time.monotonic() - started
                 ).replace("stalled in", "exited during")
                 logger.error(
                     "Sandbox %s container exited during boot (%s)",
-                    sandbox.sandbox_id, sandbox.stop_reason,
+                    sandbox.sandbox_id, detail,
                 )
-                sandbox.boot = None
+                record_boot_failure(sandbox, detail)
                 return sandbox
 
             exit_code, output = await asyncio.to_thread(
@@ -1678,9 +1738,9 @@ async def _wait_for_ready(
 
         except (NotFound, APIError) as e:
             logger.warning("Error polling sandbox %s: %s", sandbox.sandbox_id, e)
-            sandbox.status = SandboxStatus.FAILED
-            sandbox.stop_reason = f"boot probe could not reach the container: {e}"
-            sandbox.boot = None
+            record_boot_failure(
+                sandbox, f"boot probe could not reach the container: {e}"
+            )
             return sandbox
 
         budget = br.phase_budget(
@@ -1690,14 +1750,9 @@ async def _wait_for_ready(
         )
         stalled_for = time.monotonic() - phase_started
         if stalled_for >= budget:
-            reason = br.timeout_reason(previous, budget, time.monotonic() - started)
-            logger.warning("Sandbox %s gave up: %s", sandbox.sandbox_id, reason)
-            sandbox.status = SandboxStatus.FAILED
-            sandbox.stop_reason = reason
-            # A dead box has no boot in progress. The reason carries the phase
-            # and count; a live-looking progress line on a failed row would be
-            # the screen lying again.
-            sandbox.boot = None
+            detail = br.timeout_reason(previous, budget, time.monotonic() - started)
+            logger.warning("Sandbox %s gave up: %s", sandbox.sandbox_id, detail)
+            record_boot_failure(sandbox, detail)
             return sandbox
 
         await asyncio.sleep(poll_interval)
