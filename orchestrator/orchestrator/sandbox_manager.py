@@ -243,6 +243,26 @@ ORCHESTRATOR_MANAGED_ENV: frozenset[str] = frozenset({
     "MATRX_BROWSER_PROFILE_ID", "MATRX_BROWSER_EXECUTION_TARGET",
 })
 
+# 🚨 BE HONEST ABOUT WHAT THIS SET STILL CARRIES (XT-10 round 2, V-XT-10).
+# The allowlist above governs the PASSTHROUGH REGISTRY. It does NOT govern this
+# set, which ``create_sandbox`` writes directly, so three platform credentials
+# still enter every hosted box BY DESIGN:
+#
+#   * ``MATRX_AIDREAM_SERVICE_TOKEN`` — the ONE shared
+#     ``AIDREAM_SANDBOX_SERVICE_TOKEN``, not a per-box token. aidream trusts
+#     ``X-Matrx-User-Id`` beside it, so a box holding it can act as ANY user
+#     against cloud-files, the secrets vault and the GitHub token endpoint.
+#   * ``AWS_ACCESS_KEY_ID`` / ``AWS_SECRET_ACCESS_KEY`` — explicit creds on the
+#     hosted tier, because those containers have no instance role.
+#
+# The in-container daemon and hot-sync genuinely need them today, so they are
+# entitled and the census below does not flag them. **That is an OPEN item, not
+# a closed one:** the fix is per-box scoped tokens minted by aidream (bound to
+# sandbox_id + user_id + org, revocable) the way ``MATRX_AGENT_TOKEN`` already
+# is, and instance-profile-style credentials for hosted S3. Tracked in
+# docs/incidents/2026-09-13-platform-env-leak.md § What is still open. Never
+# describe the sandbox as "no platform secrets in the box" while these are here.
+
 #: Names the platform has RETIRED as git credentials (2026-09-18). They are not
 #: master-credential shaped, so the pattern filter alone would leave them in a
 #: box forever; the credential helper no longer reads them, and a name nothing
@@ -321,25 +341,118 @@ PLATFORM_ENV_ALLOWLIST: frozenset[str] = frozenset({
 })
 
 
-def _assert_allowlist_holds_no_secret_shapes(
-    names: "frozenset[str] | set[str]" = PLATFORM_ENV_ALLOWLIST,
+#: The ONLY env-var names that may be on the allowlist without matching a
+#: shape rule: locale, path, region and log-level basics. Small, literal and
+#: documented on purpose — this is the "safe set" the guard checks against, and
+#: adding to it is the security decision, not editing the allowlist.
+PLATFORM_ENV_PUBLIC_BASICS: frozenset[str] = frozenset({
+    "PATH", "LANG", "LANGUAGE", "LC_ALL", "TZ",
+    "AWS_REGION", "AWS_DEFAULT_REGION",
+    "MATRX_ENV", "LOG_LEVEL", "DEBUG",
+    "TOOL_WORKSPACE_BASE",
+})
+
+#: Value shapes that are a secret whatever the variable is called. A name can
+#: be spelled innocently — the 2026-09-18 leak was ``ANTHROPIC_KEY`` carrying
+#: ``sk-ant-api03-…`` — so the guard reads the HOST's actual value too.
+_SECRET_VALUE_PREFIXES: tuple[str, ...] = (
+    "sk-", "sk_", "pk_", "rk_", "xoxb-", "xoxp-", "ghp_", "gho_", "ghu_",
+    "ghs_", "github_pat_", "AKIA", "ASIA", "AIza", "-----BEGIN",
+    "eyJ",  # a JWT / base64 JSON header — a service-role key starts here
+)
+
+
+def _looks_like_a_secret_value(value: str | None) -> str | None:
+    """Why this VALUE reads as a credential, or None. Names lie; values don't."""
+    v = (value or "").strip()
+    if not v:
+        return None
+    for prefix in _SECRET_VALUE_PREFIXES:
+        if v.startswith(prefix):
+            return f"value begins with {prefix!r}, a credential prefix"
+    # A long opaque token: no whitespace, no path or URL punctuation, and
+    # long enough that it cannot be a flag, a region or a locale. PATH, a URL
+    # and /home/agent all carry "/" or ":" and are excluded by construction.
+    if len(v) >= 32 and not any(c in v for c in " \t/:@\\"):
+        alnum = sum(1 for c in v if c.isalnum())
+        if alnum >= len(v) - 4:
+            return (
+                f"value is a {len(v)}-character opaque token (no whitespace, "
+                "no path or URL punctuation)"
+            )
+    return None
+
+
+def _assert_allowlist_is_public_by_design(
+    names: "frozenset[str] | set[str] | None" = None,
+    environ: "os._Environ[str] | dict[str, str] | None" = None,
 ) -> None:
-    """The SECONDARY guard: the patterns no longer gate the registry, they
-    police the allowlist. A secret-shaped name on the allowlist is a mistake
-    that would hand a real credential to every box of a passthrough template,
-    so it refuses LOUDLY — at import, and again on every forward decision."""
-    offenders = sorted(n for n in names if is_master_credential_name(n))
-    if offenders:
+    """The SECONDARY guard, and it is a POSITIVE check — not a denylist.
+
+    The patterns can never be this guard: a denylist is what the 2026-09-18
+    leak defeated, and it does not fire for ``ANTHROPIC_KEY``,
+    ``SUPABASE_SERVICE_ROLE_KEY``, ``OPENAI_KEY`` or ``MATRX_AGENT_TOKEN``
+    either. So an allowlist entry must EARN its place by one of two rules:
+
+    1. it is one of :data:`PLATFORM_ENV_PUBLIC_BASICS` — the small, literal,
+       documented set of locale/path/region/log basics; or
+    2. it ends in ``_URL`` and the host's value is an ``http(s)://`` URL with
+       no embedded userinfo — a public document address, like the JWKS URL a
+       credential-free box needs.
+
+    Anything else refuses, by name, with the remedy. And on top of the name
+    rules the HOST's actual value is read: a value that looks like a credential
+    refuses even for an allowed name, because a secret can be spelled
+    innocently.
+
+    ``names`` defaults to the LIVE module global at call time (never a def-time
+    default — that bound the old guard to the value the module was imported
+    with, so widening the global at runtime slipped straight past it).
+    """
+    live = PLATFORM_ENV_ALLOWLIST if names is None else names
+    source = os.environ if environ is None else environ
+
+    unvetted: list[str] = []
+    for name in sorted(live):
+        if name in PLATFORM_ENV_PUBLIC_BASICS:
+            continue
+        if name.endswith("_URL"):
+            val = (source.get(name) or "").strip()
+            if not val:
+                continue  # not set on this host — nothing forwards
+            if val.startswith(("http://", "https://")) and "@" not in val.split("://", 1)[1].split("/", 1)[0]:
+                continue
+            unvetted.append(f"{name} (ends in _URL but its value is not a bare http(s) URL)")
+            continue
+        unvetted.append(f"{name} (matches no public-by-design rule)")
+    if unvetted:
         raise RuntimeError(
-            "PLATFORM_ENV_ALLOWLIST holds secret-shaped name(s): "
-            f"{offenders}. The allowlist may only carry names that are PUBLIC "
-            "by design. REMEDY: remove them, or (if the name is genuinely "
-            "public despite its spelling) rename the platform variable — never "
-            "loosen MASTER_CREDENTIAL_PATTERNS to make room for it."
+            "PLATFORM_ENV_ALLOWLIST holds name(s) that are not public by "
+            f"design: {unvetted}. An entry must either be in "
+            "PLATFORM_ENV_PUBLIC_BASICS or end in _URL with a bare http(s) "
+            "value. REMEDY: remove it. A platform secret reaches a user's "
+            "container the moment it is on this list — never widen the list to "
+            "make a box boot, and never add a pattern to MASTER_CREDENTIAL_"
+            "PATTERNS instead (that denylist is what the 2026-09-18 leak "
+            "defeated)."
+        )
+
+    secret_valued: list[str] = []
+    for name in sorted(live):
+        why = _looks_like_a_secret_value(source.get(name))
+        if why:
+            secret_valued.append(f"{name} ({why})")
+    if secret_valued:
+        raise RuntimeError(
+            "PLATFORM_ENV_ALLOWLIST holds name(s) whose value on THIS host is "
+            f"a credential: {secret_valued}. The name passed the public-by-"
+            "design rules but the value did not. REMEDY: take the name off the "
+            "allowlist; if the platform variable really is public, its value "
+            "has been set to something that is not."
         )
 
 
-_assert_allowlist_holds_no_secret_shapes()
+_assert_allowlist_is_public_by_design()
 
 
 def aidream_template_path_overrides(sandbox_home: str = "/home/agent") -> dict[str, str]:
@@ -450,11 +563,11 @@ def platform_env_decision(
     if not template_receives_platform_env(template):
         return PlatformEnvDecision("", {}, (), (), False)
 
-    # The patterns' ONLY remaining job: police the allowlist. Re-checked here
-    # (not just at import) so a test or a runtime patch cannot slip past it.
-    _assert_allowlist_holds_no_secret_shapes()
-
     source = os.environ if environ is None else environ
+    # The secondary guard, re-run on EVERY decision against the LIVE allowlist
+    # and THIS host's values — so a runtime patch of the module global, or a
+    # platform variable whose value became a credential, cannot slip past it.
+    _assert_allowlist_is_public_by_design(PLATFORM_ENV_ALLOWLIST, source)
     forwarded: dict[str, str] = {}
     not_allowlisted: list[str] = []
     master_credential: list[str] = []
@@ -1019,7 +1132,7 @@ async def _create_sandbox_unleased(
         # The refresh's protected set and the dict above are ONE contract: a
         # name the orchestrator manages but that is missing from
         # ORCHESTRATOR_MANAGED_ENV would be CLEARED out of every live box by the
-        # binding-time leak sweep (vault_env_refresh.leaked_platform_names).
+        # binding-time leak sweep (vault_env_refresh.unentitled_platform_env_names).
         # Checked HERE — after the orchestrator's own block and before the
         # caller's config.env, the vault and the passthrough merge in, so this
         # sees exactly the set it is about.
