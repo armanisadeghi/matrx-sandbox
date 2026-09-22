@@ -256,22 +256,91 @@ async def test_the_boot_report_names_the_withheld_secrets(created_env, caplog):
 # ── The patterns survive only as a guard over the allowlist ──────────────────
 
 
-def test_a_secret_shaped_name_on_the_allowlist_refuses():
-    """The secondary guard. The patterns no longer gate the registry; they
-    police the allowlist, and a secret-shaped entry refuses LOUDLY instead of
-    handing a real credential to every box of the template."""
-    from orchestrator.sandbox_manager import _assert_allowlist_holds_no_secret_shapes
+#: The names V-XT-10 proved the OLD guard let onto the allowlist, because that
+#: guard was itself the pattern denylist: none of these matches a pattern, and
+#: they are the exact names from the incident.
+NAMES_A_DENYLIST_GUARD_MISSES = [
+    "ANTHROPIC_KEY",
+    "SUPABASE_SERVICE_ROLE_KEY",
+    "OPENAI_KEY",
+    "MATRX_AGENT_TOKEN",
+    "SUPABASE_MATRIX_KEY",
+    "TENSORDOCK_AUTH_KEY",
+    "HUGGING_FACE_TOKEN_ID",
+]
+
+
+@pytest.mark.parametrize("name", NAMES_A_DENYLIST_GUARD_MISSES)
+def test_the_secondary_guard_is_positive_not_a_denylist(name):
+    """RED on the first fix: its guard was `is_master_credential_name`, so it
+    did not fire for ANY of these — the very names that leaked. The guard is now
+    a POSITIVE rule (PLATFORM_ENV_PUBLIC_BASICS, or *_URL with a bare http(s)
+    value), so a name earns its place instead of merely dodging a pattern."""
+    from orchestrator.sandbox_manager import (
+        PLATFORM_ENV_ALLOWLIST,
+        _assert_allowlist_is_public_by_design,
+    )
+
+    widened = set(PLATFORM_ENV_ALLOWLIST) | {name}
+    with pytest.raises(RuntimeError) as exc:
+        _assert_allowlist_is_public_by_design(widened, {name: "x"})
+    assert name in str(exc.value)
+    assert "public by design" in str(exc.value)
+
+
+def test_the_guard_reads_the_hosts_value_not_just_the_name():
+    """A secret can be spelled innocently — ANTHROPIC_KEY carried sk-ant-api03.
+    So an allowed NAME whose host VALUE is a credential refuses too."""
+    from orchestrator.sandbox_manager import _assert_allowlist_is_public_by_design
 
     with pytest.raises(RuntimeError) as exc:
-        _assert_allowlist_holds_no_secret_shapes({"OPENAI_API_KEY", "MATRX_ENV"})
-    assert "OPENAI_API_KEY" in str(exc.value)
-    assert "PUBLIC by design" in str(exc.value)
+        _assert_allowlist_is_public_by_design(
+            {"MATRX_ENV"}, {"MATRX_ENV": "sk-ant-api03-not-a-real-key"}
+        )
+    assert "credential" in str(exc.value)
+    # ...and a name that only LOOKS like a public document address.
+    with pytest.raises(RuntimeError):
+        _assert_allowlist_is_public_by_design(
+            {"SNEAKY_URL"}, {"SNEAKY_URL": "postgresql://u:pw@host/db"}
+        )
 
 
-def test_the_shipped_allowlist_holds_no_secret_shapes():
-    from orchestrator.sandbox_manager import _assert_allowlist_holds_no_secret_shapes
+def test_the_guard_reads_the_LIVE_allowlist_not_a_def_time_default(monkeypatch):
+    """RED on the first fix: the runtime re-check called the guard with NO
+    argument, which bound the def-time default, so widening the module global
+    forwarded ADMIN_API_TOKEN's value without raising (V-XT-10). The decision
+    must refuse against the allowlist as it is AT CALL TIME."""
+    from orchestrator import sandbox_manager
 
-    _assert_allowlist_holds_no_secret_shapes()  # must not raise
+    monkeypatch.setattr(
+        sandbox_manager,
+        "PLATFORM_ENV_ALLOWLIST",
+        frozenset(set(sandbox_manager.PLATFORM_ENV_ALLOWLIST) | {"ADMIN_API_TOKEN"}),
+    )
+    with pytest.raises(RuntimeError) as exc:
+        sandbox_manager.platform_env_decision(
+            "aidream",
+            allow_master_credentials=False,
+            environ={"ADMIN_API_TOKEN": "the-platform-admin-token"},
+        )
+    assert "ADMIN_API_TOKEN" in str(exc.value)
+
+
+def test_the_shipped_allowlist_is_public_by_design():
+    from orchestrator.sandbox_manager import _assert_allowlist_is_public_by_design
+
+    _assert_allowlist_is_public_by_design()  # must not raise
+
+    # And every entry is either a documented basic or a *_URL — no third way.
+    from orchestrator.sandbox_manager import (
+        PLATFORM_ENV_ALLOWLIST,
+        PLATFORM_ENV_PUBLIC_BASICS,
+    )
+    unexplained = sorted(
+        n for n in PLATFORM_ENV_ALLOWLIST
+        if n not in PLATFORM_ENV_PUBLIC_BASICS and not n.endswith("_URL")
+    )
+    assert unexplained == []
 
 
 # ── Every other env-to-container path obeys the same allowlist ──────────────
@@ -297,9 +366,9 @@ def test_binding_sweep_clears_the_fourteen_from_a_live_aidream_box():
     """The third path: a RUNNING box's shell. The sweep used to skip the aidream
     template wholesale, so every box born before this fix would keep a live
     ANTHROPIC_KEY until it was destroyed."""
-    from orchestrator.vault_env_refresh import leaked_platform_names
+    from orchestrator.vault_env_refresh import unentitled_platform_env_names
 
-    leaked = leaked_platform_names(
+    leaked = unentitled_platform_env_names(
         sorted(HOST_ENV) + ["BASE_DIR", "SANDBOX_ID", "MY_OWN_VAULT_SECRET"],
         template="aidream",
         vault_names={"MY_OWN_VAULT_SECRET"},
@@ -318,6 +387,96 @@ def test_binding_sweep_clears_the_fourteen_from_a_live_aidream_box():
     assert "MATRX_AGENT_TOKEN" not in leaked
     assert "BASE_DIR" not in leaked
     assert "MATRX_PLATFORM_AUTH_JWKS_URL" not in leaked
+
+
+def test_the_sweep_uses_the_allowlist_on_a_NON_passthrough_box_too():
+    """THE V-XT-10 FINDING, as a test.
+
+    The first fix converted only the PASSTHROUGH branch to the allowlist and
+    left the non-passthrough branch as the pattern denylist — and
+    non-passthrough boxes (``bare``, ``slim``) are exactly what the 2026-09-13
+    incident contaminated. Run against admin's real running ``bare`` box
+    sbx-7520dde5030e, that branch cleared 67 names and LEFT these ten behind.
+    RED on the first fix; green on one rule for both branches.
+    """
+    from orchestrator.vault_env_refresh import unentitled_platform_env_names
+
+    left_behind_by_the_denylist = [
+        "ANTHROPIC_KEY", "MATRX_SCRAPER_TOKEN", "SUPABASE_KEY",
+        "SUPABASE_MATRIX_KEY", "SUPABASE_DJANGO_KEY", "SUPABASE_AI_MATRIX_KEY",
+        "SUPABASE_MATRIX_DJANGO_KEY", "SUPABASE_SAMPLE_MATRIX_KEY",
+        "TENSORDOCK_AUTH_KEY", "HUGGING_FACE_TOKEN_ID",
+    ]
+    for template in ("bare", "slim", "development", None):
+        cleared = set(unentitled_platform_env_names(
+            sorted(HOST_ENV) + ["PATH", "HOME", "UV_PYTHON", "MY_OWN_VAULT_SECRET"],
+            template=template,
+            vault_names={"MY_OWN_VAULT_SECRET"},
+        ))
+        missed = [n for n in left_behind_by_the_denylist if n not in cleared]
+        assert missed == [], f"template={template} still leaves {missed}"
+        # Never the person's own item, the shell's basics, or the image's vars.
+        assert "MY_OWN_VAULT_SECRET" not in cleared
+        assert "PATH" not in cleared
+        assert "HOME" not in cleared
+        assert "UV_PYTHON" not in cleared
+
+
+def test_one_census_serves_both_doors_and_they_cannot_disagree():
+    """/diagnostics reported seven "leaks" on clean boxes because its local
+    expression subtracted neither the person's vault nor ORCHESTRATOR_MANAGED_ENV,
+    while the sweep subtracted both (V-XT-10). There is one function now, and
+    the route calls it — asserted by reading the route's source, because a
+    second local expression is exactly the regression to catch."""
+    import inspect
+
+    from orchestrator.routes import sandboxes as routes
+    from orchestrator.vault_env_refresh import unentitled_platform_env_names
+
+    source = inspect.getsource(routes.sandbox_diagnostics)
+    assert "unentitled_platform_env_names" in source
+    assert "recorded_vault_names" in source
+
+    # A clean post-fix box: the orchestrator's own vars + the person's vault +
+    # the allowlist. Zero findings — no crying wolf.
+    clean = [
+        "SANDBOX_ID", "USER_ID", "ORGANIZATION_ID", "MATRX_AGENT_TOKEN",
+        "MATRX_AIDREAM_URL", "MATRX_AIDREAM_SERVICE_TOKEN",
+        "AWS_ACCESS_KEY_ID", "AWS_SECRET_ACCESS_KEY", "AWS_REGION",
+        "MATRX_BROWSER_PROFILE_ID", "MATRX_BROWSER_EXECUTION_TARGET",
+        "PATH", "LANG", "DEBUG", "LOG_LEVEL", "MATRX_PLATFORM_AUTH_JWKS_URL",
+        "BRAVE_SEARCH_API_KEY", "DATA_FOR_SEO_PASSWORD", "SERPAPI_API_KEY",
+    ]
+    assert unentitled_platform_env_names(
+        clean,
+        template="aidream",
+        vault_names={"BRAVE_SEARCH_API_KEY", "DATA_FOR_SEO_PASSWORD", "SERPAPI_API_KEY"},
+    ) == []
+
+
+def test_recorded_vault_names_reads_the_row_the_create_path_stamps():
+    from orchestrator.vault_env_refresh import recorded_vault_names
+
+    class Row:
+        config = {"secrets_injection": {"names": ["BRAVE_SEARCH_API_KEY"]},
+                  "vault_env_refresh": {"present": ["SERPAPI_API_KEY"]}}
+    assert recorded_vault_names(Row()) == {"BRAVE_SEARCH_API_KEY", "SERPAPI_API_KEY"}
+
+    class Old:
+        config = None
+    assert recorded_vault_names(Old()) == set()
+
+
+def test_a_failed_env_command_never_returns_its_output():
+    """routes/sandboxes.py handed the raw `env` text back as runtime_env_error on
+    a non-zero exit — the same disclosure, through the error field (V-XT-10)."""
+    import inspect
+
+    from orchestrator.routes import sandboxes as routes
+
+    source = inspect.getsource(routes.sandbox_agent_env)
+    assert 'out["runtime_env_error"] = text' not in source
+    assert "is withheld" in source
 
 
 def test_agent_env_endpoint_never_returns_a_value():

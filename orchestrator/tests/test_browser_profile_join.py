@@ -26,7 +26,7 @@ from orchestrator.browser_profile import (
     BrowserProfileLookup,
 )
 from orchestrator.sandbox_manager import ORCHESTRATOR_MANAGED_ENV
-from orchestrator.vault_env_refresh import leaked_platform_names
+from orchestrator.vault_env_refresh import unentitled_platform_env_names
 
 
 def test_the_browser_names_are_orchestrator_managed() -> None:
@@ -42,7 +42,7 @@ def test_the_browser_names_are_orchestrator_managed() -> None:
 def test_the_leak_sweep_never_clears_the_browser_join() -> None:
     present = [PROFILE_ID_ENV, EXECUTION_TARGET_ENV, "ANTHROPIC_KEY"]
     for template in (None, "slim", "aidream"):
-        cleared = leaked_platform_names(present, template=template, vault_names=set())
+        cleared = unentitled_platform_env_names(present, template=template, vault_names=set())
         assert PROFILE_ID_ENV not in cleared, template
         assert EXECUTION_TARGET_ENV not in cleared, template
 

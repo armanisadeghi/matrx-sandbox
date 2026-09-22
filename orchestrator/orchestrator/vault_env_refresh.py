@@ -206,24 +206,80 @@ def render_env_file(
     return "\n".join(lines)
 
 
-def leaked_platform_names(
+def recorded_vault_names(sandbox) -> set[str]:
+    """The person's own vault NAMES as this box last recorded them.
+
+    ``create_sandbox`` stamps them on ``config.secrets_injection.names`` and the
+    binding refresh restamps them. A caller that judges a box's env without this
+    would call the person's OWN ``BRAVE_SEARCH_API_KEY`` a platform leak — which
+    is precisely what ``/diagnostics`` did before XT-10 round 2.
+
+    Returns an empty set when the box predates the stamp; the census then errs
+    toward naming a name, which is the safe direction for a REPORT (it is never
+    the direction used to decide a forward).
+    """
+    config = getattr(sandbox, "config", None)
+    if not isinstance(config, dict):
+        return set()
+    names: set[str] = set()
+    for block in ("secrets_injection", "vault_env_refresh"):
+        blob = config.get(block)
+        if isinstance(blob, dict):
+            for field in ("names", "present", "added"):
+                value = blob.get(field)
+                if isinstance(value, list):
+                    names.update(n for n in value if isinstance(n, str))
+    return names
+
+
+def unentitled_platform_env_names(
     container_env_names: list[str],
     *,
     template: str | None,
     vault_names: set[str],
 ) -> list[str]:
-    """Platform credential names sitting in a box that was never entitled to them.
+    """THE ONE CENSUS: platform env names a box holds that it is not entitled to.
 
-    Pure, and deliberately conservative in the one direction that matters: a
-    name the ORCHESTRATOR manages is never returned, whatever it looks like.
+    Pure. Two doors read it and must never disagree — the binding-time sweep
+    below, and ``/sandboxes/{id}/diagnostics``'s ``platform_env_unentitled_*``.
+    They drifted once (the diagnostic subtracted neither the person's vault nor
+    ``ORCHESTRATOR_MANAGED_ENV`` and reported seven "leaks" on clean boxes), and
+    a census that cries wolf is how a real leak gets ignored.
 
-    A PASSTHROUGH template (``aidream``) is swept too, against the fail-closed
-    :data:`~orchestrator.sandbox_manager.PLATFORM_ENV_ALLOWLIST` — XT-10,
-    feedback 34dcf28a. It used to be skipped wholesale ("the one template that
-    is SUPPOSED to hold platform env"), which is exactly why every aidream box
-    born before the allowlist keeps a live ``ANTHROPIC_KEY`` in its shell until
-    it is destroyed. Its leak set is every REGISTRY name the box carries that a
-    box created today would not receive.
+    THE RULE, and it is the same for EVERY template (XT-10 round 2). A box is
+    entitled to:
+
+    * the person's OWN vault items — theirs, never filtered;
+    * ``ORCHESTRATOR_MANAGED_ENV`` — identity, storage, the per-box daemon
+      token, the browser join. **Read the honest note in that constant: the
+      shared AI Dream service token and the hosted-tier AWS pair are in it, so
+      they DO enter every box by design. That is an open item, not a closed
+      one;**
+    * :data:`~orchestrator.sandbox_manager.PLATFORM_ENV_ALLOWLIST` — public by
+      design for any template (it holds ``PATH`` and the locale, so it must be
+      entitled even on a box that receives no passthrough at all);
+    * for the ``aidream`` template, the orchestrator's own path overrides.
+
+    Anything else it carries FROM the platform's own environment — the whole
+    passthrough registry, the retired git-credential names, or any name of a
+    master-credential shape — is unentitled and gets cleared.
+
+    🚨 Why the registry and the patterns are UNIONED here, when the forward
+    decision uses the allowlist alone: this function looks at a box that
+    already exists, and a pre-fix box may carry a platform name that has since
+    been removed from the registry. The registry is the comprehensive list of
+    what the platform's env HAS; the patterns catch what it has since dropped.
+    Both only ever ADD names to clear, so neither can reopen the door.
+
+    It is NOT a general env cleaner: a name that is neither in the registry nor
+    credential-shaped (the image's ``UV_*``, ``NPM_CONFIG_PREFIX``, the
+    person's own exported variables) is none of its business.
+
+    The non-passthrough branch used to be the pattern denylist — the very
+    construct that leaked — and it left ``ANTHROPIC_KEY``,
+    ``MATRX_SCRAPER_TOKEN`` and six ``SUPABASE_*_KEY`` names in admin's real
+    ``bare`` boxes, which are exactly the boxes the 2026-09-13 incident
+    contaminated. V-XT-10 measured that. Both branches are now one rule.
     """
     from orchestrator.sandbox_manager import (
         ORCHESTRATOR_MANAGED_ENV,
@@ -232,35 +288,24 @@ def leaked_platform_names(
         _resolve_passthrough_keys,
         aidream_template_path_overrides,
         is_master_credential_name,
-        template_receives_platform_env,
     )
 
     present = {name for name in container_env_names if name}
-    keep = set(vault_names) | set(ORCHESTRATOR_MANAGED_ENV)
-    if template_receives_platform_env(template):
-        return sorted(
-            (
-                (present & set(_resolve_passthrough_keys()))
-                # Retired git-credential names are swept out of every box,
-                # registry or not: nothing reads them any more.
-                | (present & set(RETIRED_GIT_CREDENTIAL_NAMES))
-            )
-            - keep
-            - set(PLATFORM_ENV_ALLOWLIST)
-            # Registry names the ORCHESTRATOR itself sets for this template.
-            - set(aidream_template_path_overrides())
-        )
-    return sorted(
-        {
-            name
-            for name in present
-            if name not in keep
-            and (
-                is_master_credential_name(name)
-                or name in RETIRED_GIT_CREDENTIAL_NAMES
-            )
-        }
+
+    entitled = (
+        set(vault_names)
+        | set(ORCHESTRATOR_MANAGED_ENV)
+        | set(PLATFORM_ENV_ALLOWLIST)
     )
+    if (template or "") == "aidream":
+        entitled |= set(aidream_template_path_overrides())
+
+    platform_shaped = (
+        (present & set(_resolve_passthrough_keys()))
+        | (present & set(RETIRED_GIT_CREDENTIAL_NAMES))
+        | {name for name in present if is_master_credential_name(name)}
+    )
+    return sorted(platform_shaped - entitled)
 
 
 def box_identity(sandbox: SandboxResponse) -> dict[str, str]:
@@ -389,17 +434,28 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
                 )
                 or []
             ]
-            leaked = leaked_platform_names(
+            leaked = unentitled_platform_env_names(
                 container_names, template=sandbox.template, vault_names=set(env)
             )
             if leaked:
+                # 🚨 THE HALF THIS SWEEP CANNOT DO (V-XT-10). Unsetting a name in
+                # /etc/matrx/vault-env.sh fixes SHELLS. It does NOT touch
+                # Config.Env or /proc/1/environ — a container's own environment
+                # cannot be rewritten in place — so the daemon, every process
+                # already running, and `docker inspect` keep the credential
+                # until the container is REPLACED. Say so with the remedy
+                # instead of letting "swept" read as "clean".
                 logger.warning(
                     "PLATFORM ENV LEAK found in %s (template=%s): %s. These are the "
-                    "platform's own credential names in a box that was never entitled "
-                    "to them (incident 2026-09-13, boxes created before the fix). "
-                    "Unsetting them for every shell; the container's own environ keeps "
-                    "them until it is recreated.",
-                    sandbox_id, sandbox.template, ", ".join(leaked),
+                    "platform's own names in a box that is not entitled to them "
+                    "(incident 2026-09-13 + the fail-open denylist closed by XT-10). "
+                    "Unsetting them for every SHELL now — but the container's own "
+                    "environ and /proc/1/environ KEEP them, so this box is not clean "
+                    "until it is recreated: POST /sandboxes/%s/migrate rebuilds the "
+                    "container from the same home, keeps the sandbox_id and the "
+                    "volume, and rebuilds the env through the one chokepoint. Fleet "
+                    "census: GET /platform-env-census.",
+                    sandbox_id, sandbox.template, ", ".join(leaked), sandbox_id,
                 )
     except (KnobNotRegisteredError, KnobSourceUnavailableError) as exc:
         logger.warning(
@@ -463,6 +519,16 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
         identity=sorted(identity),
         identity_missing=missing_identity,
         leaked_platform_env_cleared=leaked,
+        # The sweep cleared them for SHELLS only; the container's own environ
+        # still holds them. A caller reading only `leaked_platform_env_cleared`
+        # would believe the box is clean, so the remedy travels WITH the claim.
+        leaked_platform_env_still_in_container_environ=leaked,
+        leaked_platform_env_remedy=(
+            None if not leaked else
+            f"This box is NOT clean: Config.Env and /proc/1/environ still hold "
+            f"{len(leaked)} platform name(s). Recreate it from the same home with "
+            f"POST /sandboxes/{sandbox_id}/migrate."
+        ),
         browser_profile=browser.diagnostic(),
         vault_version=version,
         **written,

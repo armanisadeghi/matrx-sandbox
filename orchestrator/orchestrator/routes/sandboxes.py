@@ -717,7 +717,15 @@ async def sandbox_agent_env(sandbox_id: str) -> dict:
             exit_code, output = await asyncio.to_thread(lambda: container.exec_run(["env"], stdout=True, stderr=True))
             text = output.decode(errors="replace") if output else ""
             if exit_code != 0:
-                out["runtime_env_error"] = text
+                # A FAILED `env` still prints env on some shells, and this
+                # branch handed that raw text straight back — the same
+                # disclosure the redaction above closed, through the error
+                # field (V-XT-10). Report the failure, never the output.
+                out["runtime_env_error"] = (
+                    f"`env` exited {exit_code} inside the container. Its output is "
+                    "withheld: this endpoint never returns env values. Run the "
+                    "command in the box's own shell to see it."
+                )
             else:
                 out["runtime_env"] = _kv_list_from_env_lines(text.splitlines())
         except Exception as exc:
@@ -751,8 +759,11 @@ async def sandbox_agent_env(sandbox_id: str) -> dict:
                         env_out.decode(errors="replace").splitlines()
                     )
                 else:
+                    # Same rule as runtime_env_error: /proc/<pid>/environ output
+                    # is the values themselves, so a failure reports the code.
                     out["aidream_proc_env_error"] = (
-                        env_out.decode(errors="replace") if env_out else ""
+                        f"reading /proc/{pid_text}/environ exited {env_code}; its "
+                        "output is withheld (this endpoint never returns env values)"
                     )
             else:
                 # Not an error — slim/bare templates simply don't run aidream.
@@ -2241,13 +2252,10 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
         net_first = next(iter(net.values()), {}) if net else {}
         # Which platform vars made it (names only, never values), judged
         # against what the orchestrator would forward to a NEW box of this
-        # template TODAY: nothing for non-aidream templates, and no master
-        # credential unless the operator knob is on. Any registry name
-        # present beyond that set is a LEAK (a box born before the
-        # 2026-09-13 isolation fix) — recreate or migrate it.
+        # template TODAY: nothing for non-aidream templates, and only the
+        # fail-closed allowlist unless the operator knob is on.
         env_list = attrs.get("Config", {}).get("Env", []) or []
         env_keys_in_container = sorted({e.split("=", 1)[0] for e in env_list if "=" in e})
-        passthrough_keys = set(sandbox_manager._resolve_passthrough_keys())
         expected_env, _denied = sandbox_manager.platform_passthrough_env(
             template,
             allow_master_credentials=await sandbox_manager.master_credentials_allowed(),
@@ -2255,8 +2263,20 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
         expected_keys = set(expected_env)
         env_passthrough_landed = sorted(set(env_keys_in_container) & expected_keys)
         env_passthrough_missing = sorted(expected_keys - set(env_keys_in_container))
-        env_platform_leaked = sorted(
-            (set(env_keys_in_container) & passthrough_keys) - expected_keys
+        # THE ONE CENSUS, shared with the binding-time sweep
+        # (vault_env_refresh.unentitled_platform_env_names). This used to be a
+        # local expression that subtracted neither the person's own vault items
+        # nor ORCHESTRATOR_MANAGED_ENV, so it cried "7 leaks" on clean boxes
+        # while the sweep said none (V-XT-10). A census that cries wolf is how a
+        # real leak gets ignored, so there is exactly one of them now.
+        from orchestrator.vault_env_refresh import (
+            recorded_vault_names,
+            unentitled_platform_env_names,
+        )
+        env_platform_unentitled = unentitled_platform_env_names(
+            env_keys_in_container,
+            template=template,
+            vault_names=set(recorded_vault_names(sandbox)),
         )
         container_info = {
             "present": True,
@@ -2270,12 +2290,25 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
             "passthrough_landed": env_passthrough_landed,
             "passthrough_missing_count": len(env_passthrough_missing),
             "passthrough_missing_sample": env_passthrough_missing[:10],
-            # Platform names this box carries that a box of its template
-            # would NOT receive today. Non-zero = born before the
-            # 2026-09-13 fix (or the knob was since turned off): recreate
-            # or migrate it, and rotate what it saw.
-            "platform_env_leaked_count": len(env_platform_leaked),
-            "platform_env_leaked_names": env_platform_leaked,
+            # Platform env names this box is NOT entitled to — the person's
+            # own vault items and ORCHESTRATOR_MANAGED_ENV are subtracted, so a
+            # non-zero count is a real finding: a box born before the allowlist
+            # (XT-10) or before the 2026-09-13 isolation fix.
+            #
+            # 🚨 The binding sweep can only unset these for SHELLS. A container's
+            # own Config.Env and /proc/1/environ cannot be rewritten in place, so
+            # the ONLY cure is recreating the container from the same home:
+            # POST /sandboxes/{id}/migrate (refresh_platform_env, which is the
+            # default) does exactly that and keeps the sandbox_id and the volume.
+            # The fleet-wide census is GET /platform-env-census.
+            "platform_env_unentitled_count": len(env_platform_unentitled),
+            "platform_env_unentitled_names": env_platform_unentitled,
+            "platform_env_remedy": (
+                None if not env_platform_unentitled else
+                f"POST /sandboxes/{sandbox_id}/migrate to recreate this container "
+                "from the same home; the binding sweep alone cannot clear "
+                "Config.Env or /proc/1/environ."
+            ),
         }
     except Exception as exc:
         container_info["error"] = str(exc)

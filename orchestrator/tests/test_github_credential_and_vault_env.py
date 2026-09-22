@@ -450,9 +450,9 @@ def test_the_refresh_writes_the_same_paths_write_bridge_env_owns() -> None:
 
 
 def _leaked(names, *, template="bare", vault=()):
-    from orchestrator.vault_env_refresh import leaked_platform_names
+    from orchestrator.vault_env_refresh import unentitled_platform_env_names
 
-    return leaked_platform_names(list(names), template=template, vault_names=set(vault))
+    return unentitled_platform_env_names(list(names), template=template, vault_names=set(vault))
 
 
 def test_the_platform_credentials_a_pre_fix_box_still_holds_are_cleared() -> None:
@@ -547,8 +547,17 @@ def test_the_aidream_template_is_swept_against_the_allowlist_too() -> None:
 
 def test_an_ordinary_non_credential_name_is_left_alone() -> None:
     """The sweep is not a general env cleaner. A box's own PATH, HOME, or a
-    tool's plain setting is none of its business."""
-    assert _leaked(["PATH", "HOME", "LANG", "NODE_ENV", "GITHUB_ORG_NAME"]) == []
+    tool's plain setting is none of its business.
+
+    XT-10 round 2 narrowed the example, deliberately: ``GITHUB_ORG_NAME`` used
+    to be listed here as "ordinary", but it is a name in the PLATFORM's own
+    passthrough registry, and the rule is now fail-closed for every template —
+    a registry name a box is not entitled to is cleared whether or not it is
+    credential-shaped. A denylist asking "does this look secret?" is exactly
+    what leaked. Names that are genuinely none of the sweep's business are the
+    ones the platform's env never held."""
+    assert _leaked(["PATH", "HOME", "LANG", "NODE_ENV", "UV_PYTHON"]) == []
+    assert _leaked(["GITHUB_ORG_NAME"]) == ["GITHUB_ORG_NAME"]
 
 
 def test_the_cleared_names_are_reported_and_actually_unset() -> None:

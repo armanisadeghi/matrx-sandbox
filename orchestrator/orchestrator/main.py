@@ -409,6 +409,86 @@ async def root():
     }
 
 
+@app.get("/platform-env-census", tags=["meta"])
+async def platform_env_census():
+    """THE CENSUS of boxes carrying platform env they are not entitled to.
+
+    A box's ``Config.Env`` and ``/proc/1/environ`` are a SNAPSHOT taken at
+    ``docker run`` and cannot be rewritten in place. The binding-time sweep can
+    only unset a name for SHELLS — and it defers entirely on a busy box — so a
+    box born before the fail-closed allowlist (XT-10) or before the 2026-09-13
+    isolation fix keeps the platform's credentials in its process environment
+    until the container is REPLACED. V-XT-10 measured two of admin's running
+    boxes still holding a live ``ANTHROPIC_KEY`` that way.
+
+    This lists them, with the exact remedy per box, so "we fixed the class" can
+    be checked against the fleet instead of asserted. The cure is
+    ``POST /sandboxes/{id}/migrate``: it recreates the container from the SAME
+    home volume, keeps the sandbox_id (so existing bindings stay valid), and
+    rebuilds the env through the one chokepoint. Master-key only.
+    """
+    from orchestrator.sandbox_manager import _get_docker_client, _get_store
+    from orchestrator.vault_env_refresh import (
+        recorded_vault_names,
+        unentitled_platform_env_names,
+    )
+
+    client = _get_docker_client()
+    store = _get_store()
+    rows = await store.list()
+    out: list[dict] = []
+    checked = 0
+    unreadable: list[dict] = []
+    for row in rows:
+        if (row.status or "").lower() in {"destroyed", "expired", "stopped", "failed"}:
+            continue
+        try:
+            container = await asyncio.to_thread(client.containers.get, row.sandbox_id)
+            env_list = (container.attrs.get("Config") or {}).get("Env") or []
+        except Exception as exc:
+            unreadable.append({"sandbox_id": row.sandbox_id, "reason": str(exc)[:160]})
+            continue
+        checked += 1
+        names = sorted({e.split("=", 1)[0] for e in env_list if "=" in e})
+        unentitled = unentitled_platform_env_names(
+            names, template=row.template, vault_names=set(recorded_vault_names(row))
+        )
+        if unentitled:
+            out.append({
+                "sandbox_id": row.sandbox_id,
+                "user_id": str(row.user_id or ""),
+                "organization_id": str(row.organization_id or ""),
+                "template": row.template,
+                "status": row.status,
+                "created_at": str(row.created_at or ""),
+                "unentitled_count": len(unentitled),
+                "unentitled_names": unentitled,
+                "remedy": f"POST /sandboxes/{row.sandbox_id}/migrate",
+            })
+    out.sort(key=lambda r: (-r["unentitled_count"], r["sandbox_id"]))
+    return {
+        "checked_containers": checked,
+        "contaminated_count": len(out),
+        "contaminated": out,
+        "unreadable_count": len(unreadable),
+        "unreadable": unreadable[:20],
+        "why_a_sweep_is_not_enough": (
+            "A container's own environ cannot be rewritten in place. The "
+            "binding sweep unsets these names for SHELLS only, and it defers on "
+            "a busy box. Recreating the container from the same home is the "
+            "only cure: POST /sandboxes/{id}/migrate keeps the sandbox_id and "
+            "the volume."
+        ),
+        "still_open_by_design": (
+            "Every hosted box also receives MATRX_AIDREAM_SERVICE_TOKEN (the "
+            "ONE shared AI Dream service token, not per-box) and the hosted-tier "
+            "AWS pair, written directly by create_sandbox via "
+            "ORCHESTRATOR_MANAGED_ENV. They are entitled today and therefore "
+            "NOT counted above. Per-box scoped tokens are the open fix."
+        ),
+    }
+
+
 @app.get("/drift", tags=["meta"])
 async def version_drift():
     """Image-version drift report for THIS orchestrator's tier (master-key only,

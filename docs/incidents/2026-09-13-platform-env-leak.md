@@ -350,3 +350,49 @@ Guards: `orchestrator/tests/test_platform_env_allowlist.py` — 18 tests, 15 pro
 pre-fix code then green, including the 14 names planted in the host env and asserted absent
 from the rendered container env, and an unknown name (`BRAND_NEW_PROVIDER_CREDENTIAL`) withheld
 by default.
+
+### Round 2 — what the independent verify (V-XT-10) refuted, and the real close
+
+The allowlist above was right and measured, but the first pass shipped four holes. A verifier that
+did not inherit the builder's file list found them by running the real code against admin's REAL
+pre-fix boxes:
+
+1. **Only the passthrough branch had been converted.** `leaked_platform_names`' NON-passthrough
+   branch was still the pattern denylist — and `bare` / `slim` boxes are exactly what this incident
+   contaminated. Run against admin's live `bare` box `sbx-7520dde5030e` (born 2026-08-04, 174 names)
+   it cleared 67 and LEFT `ANTHROPIC_KEY`, `MATRX_SCRAPER_TOKEN`, `SUPABASE_KEY`,
+   `SUPABASE_MATRIX_KEY`, `SUPABASE_DJANGO_KEY`, `SUPABASE_AI_MATRIX_KEY`,
+   `SUPABASE_MATRIX_DJANGO_KEY`, `SUPABASE_SAMPLE_MATRIX_KEY`, `TENSORDOCK_AUTH_KEY`,
+   `HUGGING_FACE_TOKEN_ID`. **The fix had improved the branch that was least affected.**
+   → There is now ONE census, `vault_env_refresh.unentitled_platform_env_names`, and it judges
+   every template by the same rule: entitled = the person's vault ∪ `ORCHESTRATOR_MANAGED_ENV` ∪
+   the allowlist ∪ (aidream's path overrides); everything else the box holds from the platform's own
+   environment — the registry, the retired git names, any master-credential shape — is cleared.
+2. **The secondary guard was itself a denylist.** It used `is_master_credential_name`, so it did not
+   fire for `ANTHROPIC_KEY`, `SUPABASE_SERVICE_ROLE_KEY`, `OPENAI_KEY` or `MATRX_AGENT_TOKEN` on the
+   allowlist — the exact names that leaked — and its own test passed only because it used
+   `OPENAI_API_KEY`, which a pattern happens to catch. Worse, the runtime re-check was called with
+   no argument, binding the def-time default, so widening the module global forwarded
+   `ADMIN_API_TOKEN`'s real value while the comment claimed "a runtime patch cannot slip past it".
+   → The guard is now POSITIVE: an entry must be in `PLATFORM_ENV_PUBLIC_BASICS` or end in `_URL`
+   with a bare `http(s)` value, the HOST's actual value is read as well (a secret can be spelled
+   innocently), and the live global is passed on every decision.
+3. **A sweep can never clean a box, and the docs implied it could.** `Config.Env` and
+   `/proc/1/environ` cannot be rewritten in place, and the sweep defers entirely on a busy box. The
+   binding report now carries `leaked_platform_env_still_in_container_environ` and the remedy beside
+   the claim, `GET /platform-env-census` lists every contaminated box fleet-wide, and the cure is
+   `POST /sandboxes/{id}/migrate` — it recreates the container from the same home volume and keeps
+   the `sandbox_id`, so existing bindings stay valid.
+4. **The diagnostic cried wolf.** `platform_env_leaked_*` subtracted neither the person's vault nor
+   `ORCHESTRATOR_MANAGED_ENV` and reported seven "leaks" on two clean post-fix boxes, disagreeing
+   with the sweep. It is now `platform_env_unentitled_*`, computed by the one census function.
+5. **`runtime_env_error` returned the raw `env` output** on a non-zero exit — the redaction with a
+   hole in it. Both error paths now report the exit code and withhold the output.
+
+**And the honest part.** "Secrets never reach the container" was false as worded, and is still false:
+`create_sandbox` writes `MATRX_AIDREAM_SERVICE_TOKEN` — the ONE shared
+`AIDREAM_SANDBOX_SERVICE_TOKEN`, with aidream trusting `X-Matrx-User-Id` beside it — plus the
+hosted-tier `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` into every box through
+`ORCHESTRATOR_MANAGED_ENV`, which the allowlist does not govern. They are entitled today because the
+daemon and hot-sync need them. **That is an open item** (per-box scoped tokens; see § What is still
+open) and the census says so in its own response rather than leaving a reader to infer a clean box.
