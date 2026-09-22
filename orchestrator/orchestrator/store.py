@@ -14,6 +14,7 @@ from typing import Any
 from uuid import UUID
 
 from orchestrator.models import SandboxBoot, SandboxResponse, SandboxStatus
+from orchestrator.secret_redaction import redact_secret_values
 
 logger = logging.getLogger(__name__)
 
@@ -60,8 +61,17 @@ BOOT_CONFIG_KEY = "_boot"
 
 
 def _config_with_boot(sandbox: SandboxResponse) -> str:
-    """Serialize ``config`` with the live boot phase folded in."""
-    payload = dict(sandbox.config or {})
+    """Serialize ``config`` with the live boot phase folded in.
+
+    🚨 This is the ONE place a ``config`` dict becomes a database value
+    (``reserve_active``'s INSERT and ``save``'s upsert both call it), which
+    is why the secret-value redaction lives here and not at one of the
+    callers: a future write path inherits the rule instead of having to
+    remember it. See ``orchestrator/secret_redaction.py`` for the incident
+    and the contract — a secret VALUE is injected into the container's
+    process environment, never written back to a row.
+    """
+    payload = redact_secret_values(sandbox.config)
     payload.pop(BOOT_CONFIG_KEY, None)
     if sandbox.boot is not None:
         payload[BOOT_CONFIG_KEY] = sandbox.boot.model_dump(mode="json")

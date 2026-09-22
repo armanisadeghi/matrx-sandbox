@@ -27,6 +27,7 @@ from docker.errors import DockerException, NotFound, APIError
 from orchestrator.bridge_headers import identity_headers
 from orchestrator.browser_profile import resolve_browser_profile
 from orchestrator.config import settings
+from orchestrator.secret_redaction import redact_secret_values
 from orchestrator.boot_readiness import BOOT_FOLLOW_INTERVAL_SECONDS
 from orchestrator.knobs import knob_bool, knob_float, knob_int, knob_str
 from orchestrator.runtime_isolation import container_runtime_isolation
@@ -783,7 +784,8 @@ async def reserve_sandbox_admission(
     sandbox = SandboxResponse(
         sandbox_id=sandbox_id, user_id=user_id, organization_id=organization_id,
         name=name, status=SandboxStatus.CREATING, created_at=datetime.now(timezone.utc),
-        config={**(config or {}), "organization_id": organization_id},
+        # Secret VALUES never reach a persisted row (secret_redaction.py).
+        config=redact_secret_values({**(config or {}), "organization_id": organization_id}),
         ttl_seconds=ttl_seconds or 7200, tier=tier, template=template,
         template_version=template_version, labels=labels,
         proxy_url=_proxy_url_for(sandbox_id),
@@ -817,7 +819,10 @@ async def reset_successor_admission(
         name=name,
         status=SandboxStatus.CREATING,
         created_at=datetime.now(timezone.utc),
-        config={**(config or {}), "organization_id": predecessor.organization_id},
+        # Secret VALUES never reach a persisted row (secret_redaction.py).
+        config=redact_secret_values(
+            {**(config or {}), "organization_id": predecessor.organization_id}
+        ),
         ttl_seconds=ttl_seconds or 7200,
         tier=tier,
         template=template,
@@ -967,7 +972,10 @@ async def _create_sandbox_unleased(
     sandbox = reserved or SandboxResponse(
         sandbox_id=sandbox_id, user_id=user_id, organization_id=organization_id,
         name=name, status=SandboxStatus.CREATING, created_at=datetime.now(timezone.utc),
-        config=config, ttl_seconds=ttl_seconds or 7200, tier=tier, template=template,
+        # The local `config` keeps its values for the docker env merge below;
+        # the SANDBOX (and therefore every row and API response) gets the
+        # redacted copy. See orchestrator/secret_redaction.py.
+        config=redact_secret_values(config), ttl_seconds=ttl_seconds or 7200, tier=tier, template=template,
         template_version=template_version, labels=labels, proxy_url=_proxy_url_for(sandbox_id),
     )
     # Capacity is a durable admission, not a best-effort count in a route.
