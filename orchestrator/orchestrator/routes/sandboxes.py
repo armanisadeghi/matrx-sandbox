@@ -2269,13 +2269,19 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
         # while the sweep said none (V-XT-10). A census that cries wolf is how a
         # real leak gets ignored, so there is exactly one of them now.
         from orchestrator.vault_env_refresh import (
-            recorded_vault_names,
+            live_vault_names,
             unentitled_platform_env_names,
         )
+        # ASK aidream for the person's current vault names rather than trusting
+        # the row's stamp: a box born before the stamp existed would otherwise
+        # have its OWNER's own vault item reported as a platform leak. When the
+        # call fails the reason travels with the answer and the door says its
+        # list is unverified instead of asserting a leak it cannot prove.
+        vault_names, vault_names_error = await live_vault_names(sandbox)
         env_platform_unentitled = unentitled_platform_env_names(
             env_keys_in_container,
             template=template,
-            vault_names=set(recorded_vault_names(sandbox)),
+            vault_names=set(vault_names),
         )
         container_info = {
             "present": True,
@@ -2303,6 +2309,11 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
             # The fleet-wide census is GET /platform-env-census.
             "platform_env_unentitled_count": len(env_platform_unentitled),
             "platform_env_unentitled_names": env_platform_unentitled,
+            # Whether the person's vault list was verified against aidream. When
+            # false, a name below may be the OWNER's own item, not a leak — and
+            # the census says so rather than letting a reader assume.
+            "platform_env_vault_names_verified": vault_names_error is None,
+            "platform_env_vault_names_unverified_reason": vault_names_error,
             "platform_env_remedy": (
                 None if not env_platform_unentitled else
                 f"POST /sandboxes/{sandbox_id}/migrate to recreate this container "

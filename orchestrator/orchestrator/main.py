@@ -429,7 +429,7 @@ async def platform_env_census():
     """
     from orchestrator.sandbox_manager import _get_docker_client, _get_store
     from orchestrator.vault_env_refresh import (
-        recorded_vault_names,
+        live_vault_names,
         unentitled_platform_env_names,
     )
 
@@ -439,6 +439,8 @@ async def platform_env_census():
     out: list[dict] = []
     checked = 0
     unreadable: list[dict] = []
+    vault_cache: dict[tuple[str, str], tuple[set[str], str | None]] = {}
+    unverified_owners: dict[str, str] = {}
     for row in rows:
         if (row.status or "").lower() in {"destroyed", "expired", "stopped", "failed"}:
             continue
@@ -450,8 +452,17 @@ async def platform_env_census():
             continue
         checked += 1
         names = sorted({e.split("=", 1)[0] for e in env_list if "=" in e})
+        # Same exactness as the per-box door: ask aidream for the owner's
+        # current vault names, cached per (user, organization) so a 200-box
+        # fleet costs one call per owner, not one per box.
+        owner = (str(row.user_id or ""), str(row.organization_id or ""))
+        if owner not in vault_cache:
+            vault_cache[owner] = await live_vault_names(row)
+        vault_names, vault_error = vault_cache[owner]
+        if vault_error:
+            unverified_owners[owner[0]] = vault_error
         unentitled = unentitled_platform_env_names(
-            names, template=row.template, vault_names=set(recorded_vault_names(row))
+            names, template=row.template, vault_names=set(vault_names)
         )
         if unentitled:
             out.append({
@@ -464,6 +475,7 @@ async def platform_env_census():
                 "unentitled_count": len(unentitled),
                 "unentitled_names": unentitled,
                 "remedy": f"POST /sandboxes/{row.sandbox_id}/migrate",
+                "vault_names_verified": not vault_error,
             })
     out.sort(key=lambda r: (-r["unentitled_count"], r["sandbox_id"]))
     return {
@@ -472,6 +484,11 @@ async def platform_env_census():
         "contaminated": out,
         "unreadable_count": len(unreadable),
         "unreadable": unreadable[:20],
+        # Owners whose vault list could not be verified against aidream. For
+        # their boxes a listed name MAY be the person's own item rather than a
+        # platform leak — said here instead of inflating the finding.
+        "owners_with_unverified_vault_count": len(unverified_owners),
+        "owners_with_unverified_vault": unverified_owners,
         "why_a_sweep_is_not_enough": (
             "A container's own environ cannot be rewritten in place. The "
             "binding sweep unsets these names for SHELLS only, and it defers on "
