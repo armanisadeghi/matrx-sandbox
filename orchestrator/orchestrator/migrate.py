@@ -196,7 +196,6 @@ def _has_recent_heartbeat(sbx, window_seconds: int) -> bool:
 
 async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = None,
                           verify_timeout: int = 90, require_idle: bool = False,
-                          refresh_platform_env: bool = False,
                           interrupt_attached_sessions: bool = False,
                           quiet_interval: int | None = None,
                           operation_id: str | None = None) -> dict:
@@ -228,7 +227,6 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
             target_image=target_image,
             verify_timeout=verify_timeout,
             require_idle=require_idle,
-            refresh_platform_env=refresh_platform_env,
             interrupt_attached_sessions=interrupt_attached_sessions,
             quiet_interval=quiet_interval,
             operation_id=canonical_operation,
@@ -239,7 +237,6 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
 async def _migrate_sandbox_once(
     sandbox_id: str, *, store, target_image: str | None = None,
     verify_timeout: int = 90, require_idle: bool = False,
-    refresh_platform_env: bool = False,
     interrupt_attached_sessions: bool = False,
     quiet_interval: int | None = None,
     operation_id: str,
@@ -288,12 +285,19 @@ async def _migrate_sandbox_once(
         e for e in (cfg.get("Env") or [])
         if not e.startswith("MATRX_IMAGE_VERSION=") and not e.startswith("SANDBOX_MIGRATION=")
     ]
-    platform_env_changes = 0
-    if refresh_platform_env:
-        from orchestrator.sandbox_manager import master_credentials_allowed
-        env, platform_env_changes = _refresh_platform_environment(
-            env, template, allow_master_credentials=await master_credentials_allowed(),
-        )
+    # 🚨 ALWAYS, never a flag (XT-10 round 2). This used to be
+    # ``if refresh_platform_env:`` with a default of False, and the ``/migrate``
+    # route did not pass it — so the ONE documented cure for a box born before
+    # the isolation fix copied the contaminated env verbatim into the new
+    # container. Measured: admin's sbx-7520dde5030e migrated onto the current
+    # image, reported ``platform_env_changed: 0``, and still had a live
+    # ANTHROPIC_KEY in /proc/1/environ afterwards. A new container has no reason
+    # to inherit a stale platform env — that is what this function is for — so
+    # the choice is gone and no call site can recreate a container carrying one.
+    from orchestrator.sandbox_manager import master_credentials_allowed
+    env, platform_env_changes = _refresh_platform_environment(
+        env, template, allow_master_credentials=await master_credentials_allowed(),
+    )
 
     if (
         not target_image

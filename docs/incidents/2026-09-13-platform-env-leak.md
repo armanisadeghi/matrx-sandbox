@@ -396,3 +396,15 @@ hosted-tier `AWS_ACCESS_KEY_ID` / `AWS_SECRET_ACCESS_KEY` into every box through
 `ORCHESTRATOR_MANAGED_ENV`, which the allowlist does not govern. They are entitled today because the
 daemon and hot-sync need them. **That is an open item** (per-box scoped tokens; see § What is still
 open) and the census says so in its own response rather than leaving a reader to infer a clean box.
+
+### Round 2, the second measured hole: the documented CURE did not cure
+
+`/diagnostics`, the binding sweep and this doc all name `POST /sandboxes/{id}/migrate` as the one
+way to clean a pre-fix box. It was not. `_migrate_sandbox_once` took
+`refresh_platform_env: bool = False` and the `/migrate` route never passed it, so the recreate
+copied `Config.Env` verbatim into the new container. Measured on admin's real box: after a
+successful migrate onto the current image (`sbx-7520dde5030e`, 134 s, same `sandbox_id`), the
+response said `platform_env_changed: 0` and `/proc/1/environ` still held all 13 names, including
+`ANTHROPIC_KEY`. The flag is DELETED — a new container always rebuilds the platform env through
+`_refresh_platform_environment`, and no call site can ask otherwise. Guard:
+`test_a_recreate_always_rebuilds_the_platform_env_never_optionally`, red on `27c4c9e`.
