@@ -49,7 +49,12 @@ async def test_missing_container_is_atomically_stopped_before_token_mint(monkeyp
 
     assert stale is not None
     assert stale.status == SandboxStatus.STOPPED
-    assert stale.stop_reason == "container_missing_at_token_issuance"
+    # 'error', not the old descriptive phrase: `sandbox_instances_stop_reason_check`
+    # admits only user_requested|expired|error|graceful_shutdown|admin, so the
+    # descriptive write RAISED and this row stayed 'ready' forever, holding the
+    # person's admission slot against a container that no longer exists. The
+    # detail is on the WARNING log line (2026-09-22).
+    assert stale.stop_reason == "error"
 
 
 @pytest.mark.asyncio

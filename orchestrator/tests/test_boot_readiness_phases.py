@@ -170,9 +170,15 @@ async def test_a_wedged_phase_still_fails_and_names_phase_and_count(monkeypatch)
     result = await sandbox_manager._wait_for_ready(row(), store=store, poll_interval=2.0)
 
     assert result.status is SandboxStatus.FAILED
-    assert br.PHASE_HOME_SYNC in result.stop_reason
-    assert "4210/8630 files" in result.stop_reason
-    assert "home_sync_timeout_seconds" in result.stop_reason
+    # The sentence lives in config['stop_detail'], not in stop_reason: the
+    # column has a five-value CHECK and a free-text write there made the whole
+    # save RAISE, so the row stayed 'creating' and the reason was lost
+    # entirely (see sandbox_manager.record_boot_failure, 2026-09-22).
+    detail = result.config["stop_detail"]
+    assert result.stop_reason == "error"
+    assert br.PHASE_HOME_SYNC in detail
+    assert "4210/8630 files" in detail
+    assert "home_sync_timeout_seconds" in detail
 
 
 @pytest.mark.asyncio
@@ -408,4 +414,4 @@ async def test_a_failed_box_carries_no_progress_line(monkeypatch):
     assert result.status is SandboxStatus.FAILED
     assert result.boot is None
     # The count is not lost — it moved to where a dead box belongs.
-    assert "4210/8630 files" in result.stop_reason
+    assert "4210/8630 files" in result.config["stop_detail"]

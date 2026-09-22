@@ -84,6 +84,44 @@ EC2 create→ready 3.7 s, resume→ready 3.3 s / 4.9 s; hosted create→ready
 4.8–10.0 s, resume→ready 5.7 s. The "~0.5 s from the warm pool" figure in the
 canonical vision doc describes a mechanism retired on 2026-09-17.
 
+## The heartbeat is an OBSERVATION, and an always-on box never goes down (2026-09-22)
+
+**The heartbeat never existed.** `sandbox-image/sdk/matrx_agent/client.py::heartbeat()`
+is written and nothing calls it; the "matrx_agent daemon pings every ~60s" that
+aidream's `ensure_default_sandbox` documents as THE liveness signal has never
+run. Measured on production: of 273 `sandbox_instances` rows only 9 had EVER
+carried a `last_heartbeat_at`, the newest was two days old, and 223 of the 226
+live rows had none. So aidream called every box a corpse and cold-created a new
+one on each contact (a 364 s create instead of a ~4 s reuse), and the shipped
+`heartbeat_extends_ttl` knob governed nothing. Fixed where the truth already
+lives: the 60-second liveness reconcile already asks Docker which containers are
+alive, so that same UPDATE stamps `last_heartbeat_at` and applies the knob. The
+column now means **"the last time the platform OBSERVED this box alive"** — a
+stronger signal than a container asserting its own health. Guards:
+`tests/test_observed_liveness_is_the_heartbeat.py`.
+
+**Always-on workspaces.** A box carrying `labels->>'always_on' = 'true'` must
+stay up; the only honest states are up, or an outage something is repairing.
+One predicate, one module (`orchestrator/always_on.py`), four call sites: the
+TTL sweep and the retention purge exclude it, `docker run` gives it
+`restart_policy=unless-stopped` so it survives a daemon restart, and the
+existing 60s reaper tick revives a down one through the orchestrator's OWN
+resume path — tier-scoped, newest row per (user, organization), never beside a
+live box, capped by `always_on_revive_max_per_pass`, and braked unconditionally
+by `always_on_revive_min_interval_seconds` so a box that cannot boot is not
+resurrected every minute forever. Every revive logs at WARNING. Guards:
+`tests/test_always_on_workspace.py`.
+
+**`stop_reason` has five legal values.** `sandbox_instances_stop_reason_check`
+admits only `user_requested | expired | error | graceful_shutdown | admin`;
+anything else RAISES and the row keeps its stale status. Two live instances
+fixed: the token-issuance liveness stop, and `_wait_for_ready`'s free-text boot
+failures (which made the whole save of a FAILED row raise, so it stayed
+`creating` with no reason at all). `sandbox_manager.record_boot_failure` is the
+chokepoint — canonical reason in the column, the honest sentence in
+`config['stop_detail']` and the log. Guard:
+`tests/test_stop_reason_is_always_admissible.py`.
+
 ## The TTL is an idle ceiling (2026-09-20)
 
 `models.py` and `reaper.py` both described a heartbeat-refreshed ceiling while
