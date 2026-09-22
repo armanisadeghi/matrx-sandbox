@@ -876,7 +876,6 @@ async def refresh_sandbox_platform_env(sandbox_id: str):
         sandbox_id,
         store=store,
         require_idle=True,
-        refresh_platform_env=True,
     )
     if result["status"] in ("migrated", "already_current", "busy_deferred"):
         return result
@@ -2298,8 +2297,9 @@ async def sandbox_diagnostics(sandbox_id: str) -> dict:
             # 🚨 The binding sweep can only unset these for SHELLS. A container's
             # own Config.Env and /proc/1/environ cannot be rewritten in place, so
             # the ONLY cure is recreating the container from the same home:
-            # POST /sandboxes/{id}/migrate (refresh_platform_env, which is the
-            # default) does exactly that and keeps the sandbox_id and the volume.
+            # POST /sandboxes/{id}/migrate — which ALWAYS rebuilds the platform
+            # env through the one chokepoint, never optionally — does exactly
+            # that, and keeps the sandbox_id and the home volume.
             # The fleet-wide census is GET /platform-env-census.
             "platform_env_unentitled_count": len(env_platform_unentitled),
             "platform_env_unentitled_names": env_platform_unentitled,

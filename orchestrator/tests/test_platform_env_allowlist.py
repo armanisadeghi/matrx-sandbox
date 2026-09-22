@@ -362,6 +362,47 @@ def test_migration_refresh_strips_the_fourteen_from_an_aidream_box():
     assert "MATRX_PLATFORM_AUTH_JWKS_URL" in names
 
 
+def test_a_recreate_always_rebuilds_the_platform_env_never_optionally():
+    """THE SECOND MEASURED HOLE (XT-10 round 2).
+
+    ``/diagnostics`` and the binding sweep both name ``POST /migrate`` as THE
+    cure for a box born before the isolation fix — and ``_migrate_sandbox_once``
+    took ``refresh_platform_env: bool = False`` while the ``/migrate`` route did
+    not pass it. So the documented cure copied the contaminated env verbatim into
+    the new container: admin's ``sbx-7520dde5030e`` migrated onto the current
+    image, answered ``platform_env_changed: 0``, and still carried a live
+    ``ANTHROPIC_KEY`` in ``/proc/1/environ``. The choice is deleted — a new
+    container can never inherit a stale platform env.
+    """
+    import inspect
+
+    from orchestrator import migrate
+
+    for fn in (migrate.migrate_sandbox, migrate._migrate_sandbox_once):
+        assert "refresh_platform_env" not in inspect.signature(fn).parameters, (
+            f"{fn.__name__} can still be asked NOT to rebuild the platform env"
+        )
+    # Code lines only — the function's own comment quotes the old `if` on
+    # purpose, so the history stays readable at the call site.
+    code = [
+        line for line in inspect.getsource(migrate._migrate_sandbox_once).splitlines()
+        if not line.strip().startswith("#")
+    ]
+    assert not any("if refresh_platform_env" in line for line in code)
+    assert any("_refresh_platform_environment(" in line for line in code)
+
+    # And the refresh itself strips a contaminated box clean, whatever template.
+    existing = [f"{k}={v}" for k, v in HOST_ENV.items()] + ["USER_CHOSEN=keep-me"]
+    for template in ("bare", "slim", "aidream"):
+        refreshed, changed = migrate._refresh_platform_environment(
+            existing, template=template, allow_master_credentials=False,
+        )
+        names = {item.split("=", 1)[0] for item in refreshed}
+        assert sorted(set(THE_FOURTEEN) & names - {"MATRX_AGENT_TOKEN"}) == []
+        assert changed > 0, f"template={template} reported no change on a dirty box"
+        assert "USER_CHOSEN=keep-me" in refreshed
+
+
 def test_binding_sweep_clears_the_fourteen_from_a_live_aidream_box():
     """The third path: a RUNNING box's shell. The sweep used to skip the aidream
     template wholesale, so every box born before this fix would keep a live
