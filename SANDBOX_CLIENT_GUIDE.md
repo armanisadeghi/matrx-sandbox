@@ -131,7 +131,13 @@ GET /sandboxes/{sandbox_id}          → one
 
 Two separate concepts:
 
-- **Heartbeat** = "I'm still here, mark me alive" (no TTL change):
+- **Heartbeat** = "I'm still here, mark me alive". Optional, and NOT where
+  `last_heartbeat_at` comes from: since 2026-09-22 the orchestrator's own
+  60-second liveness reconcile stamps that column for every container it
+  observes running, and applies `infrastructure.sandbox.heartbeat_extends_ttl`
+  there. `last_heartbeat_at` means "the last time the platform OBSERVED this
+  box alive", never "the box claimed to be well". Do not build liveness on a
+  client sending this:
   ```
   POST /sandboxes/{id}/heartbeat
   ```

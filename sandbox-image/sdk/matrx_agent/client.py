@@ -140,7 +140,22 @@ class SandboxClient:
         raise RuntimeError(f"Failed to reach orchestrator at {url}") from last_error
 
     async def heartbeat(self) -> bool:
-        """Send a heartbeat to the orchestrator. Returns True if acknowledged."""
+        """Send a heartbeat to the orchestrator. Returns True if acknowledged.
+
+        🚨 NOTHING IN THE IMAGE CALLS THIS, AND NOTHING EVER HAS. There is no
+        matrx_agent daemon loop pinging every ~60s — any doc that says so is
+        describing an intention, not this code. Measured on production
+        2026-09-22: of 273 ``sandbox_instances`` rows, 9 had EVER carried a
+        ``last_heartbeat_at``, and 223 of the 226 live rows had none.
+
+        Since 2026-09-22 the platform does not depend on it: the orchestrator's
+        60-second liveness reconcile asks Docker which containers are alive and
+        stamps ``last_heartbeat_at`` on exactly those rows
+        (``orchestrator/store.py``). An observation BY the platform is a
+        stronger signal than a container asserting its own health, so this
+        method is an optional extra, never the liveness source. If you wire a
+        caller for it, it must not become the thing liveness depends on.
+        """
         try:
             resp = await self._request_with_retry(
                 "POST",

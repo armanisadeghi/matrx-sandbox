@@ -148,8 +148,23 @@ class SandboxResponse(BaseModel):
             "Surfaced so operators can spot stuck rows without querying Postgres."
         ),
     )
+    # 🚨 THE MEANING CHANGED BECAUSE THE OLD ONE WAS NEVER TRUE (2026-09-22).
+    # This never was "a ping from the in-container agent": matrx_agent's
+    # ``heartbeat()`` is written and nothing calls it, so of 273 production
+    # rows only 9 had EVER carried a value here. It is now stamped by the
+    # 60-second liveness reconcile, which asks Docker which containers are
+    # alive — an observation BY the platform, which is a stronger signal than
+    # a container asserting its own health. A browser hook may also stamp it
+    # while somebody has the workspace open; both mean the same thing.
     last_heartbeat_at: datetime | None = Field(
-        default=None, description="Last heartbeat received from the in-container agent (null if it never sent one)."
+        default=None,
+        description=(
+            "The last time the platform OBSERVED this box alive — normally the "
+            "orchestrator's 60s liveness reconcile seeing its container "
+            "running, sometimes a client ping. Null means never observed, "
+            "which for a live-status row means the orchestrator has lost "
+            "track of it."
+        ),
     )
     stopped_at: datetime | None = Field(default=None, description="When the sandbox reached a terminal status.")
     stop_reason: str | None = Field(
