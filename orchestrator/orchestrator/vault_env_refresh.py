@@ -222,6 +222,10 @@ def recorded_vault_names(sandbox) -> set[str]:
     if not isinstance(config, dict):
         return set()
     names: set[str] = set()
+    # (see also live_vault_names below, which ASKS aidream when the stamp is
+    # missing — a box born before the stamp existed would otherwise have its
+    # owner's own YOUTUBE_DATA_API_KEY reported as a platform leak, which is
+    # exactly the crying-wolf that V-XT-10 flagged)
     for block in ("secrets_injection", "vault_env_refresh"):
         blob = config.get(block)
         if isinstance(blob, dict):
@@ -230,6 +234,22 @@ def recorded_vault_names(sandbox) -> set[str]:
                 if isinstance(value, list):
                     names.update(n for n in value if isinstance(n, str))
     return names
+
+
+async def live_vault_names(sandbox: SandboxResponse) -> tuple[set[str], str | None]:
+    """The person's CURRENT vault names, asked of aidream, with the stamp as a
+    fallback. Returns ``(names, why_it_is_only_the_stamp)``.
+
+    A per-box door (``/diagnostics``) can afford one HTTP call and must be
+    exact: a legacy box has no ``secrets_injection`` stamp, so judging it by the
+    stamp alone reports the OWNER's own vault item as a platform leak. When the
+    call cannot be made the reason travels with the answer, so the door can say
+    its list is unverified instead of asserting a leak it cannot prove.
+    """
+    env, error = await _fetch_vault_env(sandbox)
+    if error is None:
+        return set(env) | recorded_vault_names(sandbox), None
+    return recorded_vault_names(sandbox), error
 
 
 def unentitled_platform_env_names(

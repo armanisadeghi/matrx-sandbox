@@ -476,7 +476,12 @@ def test_one_census_serves_both_doors_and_they_cannot_disagree():
 
     source = inspect.getsource(routes.sandbox_diagnostics)
     assert "unentitled_platform_env_names" in source
-    assert "recorded_vault_names" in source
+    # ...and it judges against the person's REAL vault list, not a bare guess:
+    # a legacy box has no stamp, so the door asks aidream and says plainly when
+    # it could not (the residual false positive V-XT-10's finding left behind —
+    # admin's own YOUTUBE_DATA_API_KEY was named as a leak on a 2026-08 box).
+    assert "live_vault_names" in source
+    assert "platform_env_vault_names_verified" in source
 
     # A clean post-fix box: the orchestrator's own vars + the person's vault +
     # the allowlist. Zero findings — no crying wolf.
