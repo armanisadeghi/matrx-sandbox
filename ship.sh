@@ -55,7 +55,7 @@ if [[ -n "$RELEASE" ]]; then
     RELEASE_RC=$?
 else
     echo "ship.sh: THIS REPO HAS NO RELEASE SCRIPT (looked for scripts/release.sh and ./release.sh)."
-    echo "ship.sh: the sync ran; nothing was released."
+    $DRY_RUN || echo "ship.sh: the sync ran; nothing was released."
     RELEASE_RC=0
 fi
 
