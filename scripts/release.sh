@@ -1,328 +1,257 @@
 #!/usr/bin/env bash
-# release.sh — Bump version, commit, tag, and push.
+# release.sh — bump the version, push it to main, tag it. Never refuses. (Arman, 2026-09-24)
 #
-# Source of truth: package.json (root)
-# Also syncs: orchestrator/pyproject.toml, sandbox-image/sdk/pyproject.toml
+# Usage (./ship.sh runs it after scripts/sync-main.py):
+#   scripts/release.sh                     # patch bump
+#   scripts/release.sh --minor | --major
+#   scripts/release.sh --message "note"    # commit "release: vX.Y.Z - note"
+#   scripts/release.sh --dry-run           # what would ship; nothing changes
 #
-# Usage:
-#   ./scripts/release.sh              # patch bump  (default)
-#   ./scripts/release.sh --patch      # patch bump
-#   ./scripts/release.sh --minor      # minor bump
-#   ./scripts/release.sh --major      # major bump
-#   ./scripts/release.sh --message "feat: something"   # custom commit message
-#   ./scripts/release.sh --dry-run    # preview without changes
-set -euo pipefail
+# THE RULES (every release script in every repo):
+#   1. It never denies a release. A dirty folder, a checkout on another branch, local commits
+#      that conflict, an existing tag, a bad flag: each is a WARNING or ERROR line, and the
+#      release goes out. The only stops: GitHub unreachable, the version unreadable, or five
+#      lost push races in a row.
+#   2. Before the push it only makes the release commit: the version bump (and the changelog
+#      heading when this repo keeps one). Anything that checks the code runs AFTER the push
+#      (AFTER_PUSH below) and can only produce findings.
+#   3. It prints one line — "vX.Y.Z  pushed  (Ns)" — then, only if something is wrong, one
+#      section per category of WARNING / ERROR rows. Never INFO. Full detail: the log file.
+#
+# The release commit is built with git plumbing on top of origin/main (a temporary index,
+# commit-tree, push <sha>:main): the working folder is never read for it, never stashed,
+# rebased or reset, so other sessions' uncommitted files can neither ride along nor block it.
+#
+# Canonical copy: matrx-ship/scripts/release-template.sh. Each repo keeps a copy with only the
+# settings block changed; guard: matrx-ship/scripts/test-release-template.sh.
 
-# ── Failure trap ─────────────────────────────────────────────────────────────
-_on_error() {
-    local exit_code=$?
-    local line_no=${1:-}
-    echo "" >&2
-    echo -e "\033[0;31m╔══════════════════════════════════════════════════════════════╗\033[0m" >&2
-    echo -e "\033[0;31m║                    RELEASE SCRIPT FAILED                    ║\033[0m" >&2
-    echo -e "\033[0;31m╠══════════════════════════════════════════════════════════════╣\033[0m" >&2
-    echo -e "\033[0;31m║  Exit code : ${exit_code}$(printf '%*s' $((61 - ${#exit_code})) '')║\033[0m" >&2
-    [[ -n "$line_no" ]] && \
-    echo -e "\033[0;31m║  Line      : ${line_no}$(printf '%*s' $((61 - ${#line_no})) '')║\033[0m" >&2
-    echo -e "\033[0;31m║  No version was committed, tagged, or pushed.               ║\033[0m" >&2
-    echo -e "\033[0;31m╚══════════════════════════════════════════════════════════════╝\033[0m" >&2
-    echo "" >&2
-}
-trap '_on_error $LINENO' ERR
+# ── the only per-repo settings ─────────────────────────────────────────────────
+VERSION_FILE="package.json"   # JSON with "version": "x.y.z", a pyproject.toml, or a plain VERSION file
+TAG_PREFIX="v"                # the tag is TAG_PREFIX + version
+EXTRA_VERSION_FILES=("orchestrator/pyproject.toml" "sandbox-image/sdk/pyproject.toml")        # other files that carry the same version (JSON or pyproject.toml)
+CHANGELOG=""                  # when set: a "## x.y.z - date" heading goes under "## Unreleased"
+AFTER_PUSH=""                 # a command run after the push; a failure is an ERROR finding
+# ─────────────────────────────────────────────────────────────────────────────
 
-# ── Resolve repo root ────────────────────────────────────────────────────────
-SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
-cd "$REPO_ROOT"
-
-PROJECT_NAME="matrx-sandbox"
-GITHUB_REPO="armanisadeghi/matrx-sandbox"
-VERSION_FILE="package.json"
+set -uo pipefail
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+cd "$ROOT" || exit 1
 REMOTE="origin"
 BRANCH="main"
+START=$SECONDS
 
-# Sub-packages to keep in sync
-PYPROJECT_FILES=(
-    "orchestrator/pyproject.toml"
-    "sandbox-image/sdk/pyproject.toml"
-)
+LOG_DIR="${HOME}/.matrx/release-logs/$(basename "$ROOT")"
+mkdir -p "$LOG_DIR" 2>/dev/null || LOG_DIR="${TMPDIR:-/tmp}"
+LOG="$LOG_DIR/release-$(date +%Y-%m-%d_%H-%M-%S).log"
+: > "$LOG"
+ln -sfn "$(basename "$LOG")" "$LOG_DIR/latest.log" 2>/dev/null || true
+q() { "$@" >>"$LOG" 2>&1; }
 
-# ── Colors ───────────────────────────────────────────────────────────────────
-RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[1;33m'
-CYAN='\033[0;36m'; BOLD='\033[1m'; NC='\033[0m'
-
-info()    { echo -e "${CYAN}[INFO]${NC}  $*"; }
-ok()      { echo -e "${GREEN}[OK]${NC}    $*"; }
-warn()    { echo -e "${YELLOW}[WARN]${NC}  $*"; }
-fail()    { echo -e "${RED}[FAIL]${NC}  $*" >&2; exit 1; }
-preview() { echo -e "${YELLOW}[DRY]${NC}   $*"; }
-
-# Like fail(), but for failures AFTER the release commit + tag were created.
-# Clears the ERR trap so the generic "nothing was committed" box does not print
-# (it would be a lie — the release exists locally, it just was not pushed).
-die_after_commit() {
-    trap - ERR
-    echo "" >&2
-    echo -e "${RED}╔══════════════════════════════════════════════════════════════╗${NC}" >&2
-    echo -e "${RED}║   PUSH INCOMPLETE — release built locally but not pushed   ║${NC}" >&2
-    echo -e "${RED}╚══════════════════════════════════════════════════════════════╝${NC}" >&2
-    echo "" >&2
-    echo -e "$*" >&2
-    echo "" >&2
+FINDINGS=()
+finding() { FINDINGS+=("$1|$2|$3|${4:-}"); }   # LEVEL CATEGORY "text" ["remedy"]
+print_findings() {
+    [[ ${#FINDINGS[@]} -gt 0 ]] || return 0
+    local row r cat seen="|" bar="====================" lvl c text remedy
+    for row in "${FINDINGS[@]}"; do
+        IFS='|' read -r _ cat _ _ <<< "$row"
+        [[ "$seen" == *"|$cat|"* ]] && continue
+        seen+="$cat|"
+        echo ""
+        echo "$bar $cat $bar"
+        printf '%-8s %-12s %s\n' "LEVEL" "CATEGORY" "FINDING"
+        for r in "${FINDINGS[@]}"; do
+            IFS='|' read -r lvl c text remedy <<< "$r"
+            [[ "$c" == "$cat" ]] || continue
+            printf '%-8s %-12s %s%s\n' "$lvl" "$c" "$text" "${remedy:+  → $remedy}"
+        done
+        echo ""
+        echo "$bar End of $cat $bar"
+    done
+}
+stop() {   # the only way out before the push: nothing was released
+    echo "release.sh: NOT RELEASED — $1 (log: $LOG)" >&2
+    print_findings
     exit 1
 }
 
-# Print a side-by-side summary of how local and remote have diverged.
-diverge_summary() {
-    echo "  Your commits not on $REMOTE/$BRANCH:" >&2
-    git log --oneline "$REMOTE/$BRANCH..$BRANCH" | sed 's/^/    /' >&2
-    echo "  $REMOTE/$BRANCH commits not in your branch:" >&2
-    git log --oneline "$BRANCH..$REMOTE/$BRANCH" | sed 's/^/    /' >&2
-}
-
-# ── Portable in-place sed ────────────────────────────────────────────────────
-sedi() {
-    if sed --version 2>/dev/null | grep -q GNU; then
-        sed -i "$@"
-    else
-        sed -i '' "$@"
-    fi
-}
-
-# ── Parse flags ──────────────────────────────────────────────────────────────
-BUMP_TYPE="patch"
-CUSTOM_MESSAGE=""
-DRY_RUN=false
-
+# ── flags: a bad one is a WARNING, never a stop ──────────────────────────────
+BUMP="patch"; NOTE=""; DRY=false
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        --patch)   BUMP_TYPE="patch"; shift ;;
-        --minor)   BUMP_TYPE="minor"; shift ;;
-        --major)   BUMP_TYPE="major"; shift ;;
+        --patch) BUMP="patch"; shift ;;
+        --minor) BUMP="minor"; shift ;;
+        --major) BUMP="major"; shift ;;
         --message|-m)
-            [[ -n "${2:-}" ]] || fail "--message requires an argument."
-            CUSTOM_MESSAGE="$2"; shift 2 ;;
-        --dry-run) DRY_RUN=true; shift ;;
-        -h|--help)
-            grep '^#' "$0" | head -20 | sed 's/^# \?//'
-            exit 0 ;;
-        *) fail "Unknown flag: $1. Use --patch, --minor, --major, --message, or --dry-run." ;;
+            if [[ -n "${2:-}" && "${2:-}" != --* ]]; then NOTE="$2"; shift 2
+            else finding "WARNING" "Invocation" "--message had no text — released without a note"; shift; fi ;;
+        --dry-run) DRY=true; shift ;;
+        *) finding "WARNING" "Invocation" "Unknown flag '$1' was ignored" "--patch --minor --major --message --dry-run"; shift ;;
     esac
 done
 
-# ── Pre-flight checks ────────────────────────────────────────────────────────
-[[ -f "$VERSION_FILE" ]] || fail "$VERSION_FILE not found."
+# ── fetch: the ONE thing that can stop a release before it starts ────────────
+fetched=false
+for _ in 1 2 3; do q git fetch "$REMOTE" "$BRANCH" && { fetched=true; break; }; sleep 2; done
+$fetched || stop "cannot reach GitHub ($REMOTE/$BRANCH)"
 
-CURRENT_BRANCH=$(git rev-parse --abbrev-ref HEAD)
-[[ "$CURRENT_BRANCH" == "$BRANCH" ]] \
-    || fail "Not on '$BRANCH' branch (currently on '$CURRENT_BRANCH'). Switch first."
+# ── the version, bumped on a blob: python does the text work ────────────────
+# bump_text KIND OLD NEW < text > text     KIND: json | pyproject | plain | changelog
+bump_text() {
+    python3 -c '
+import re, sys, datetime
+kind, old, new = sys.argv[1:4]
+text = sys.stdin.read()
+if kind == "json":
+    text, n = re.subn(r"(\"version\"\s*:\s*\")[^\"]*\"", lambda m: m[1] + new + "\"", text, count=1)
+elif kind == "pyproject":
+    text, n = re.subn(r"(?m)^(version\s*=\s*\")[^\"]*\"", lambda m: m[1] + new + "\"", text, count=1)
+elif kind == "plain":
+    text, n = new + "\n", 1
+else:  # changelog
+    head = "## Unreleased\n"
+    n = text.count(head)
+    if n:
+        text = text.replace(head, head + "\n## %s - %s\n" % (new, datetime.date.today().isoformat()), 1)
+sys.stdout.write(text)
+sys.exit(0 if n else 3)
+' "$@"
+}
+kind_of() {
+    case "$1" in *.json) echo json ;; *pyproject.toml) echo pyproject ;; *) echo plain ;; esac
+}
+read_version() {   # tree → current version
+    local text
+    text="$(git cat-file -p "$1:$VERSION_FILE" 2>/dev/null)" || { echo "0.0.0"; return 0; }
+    python3 -c '
+import json, re, sys
+kind, text = sys.argv[1], sys.stdin.read()
+if kind == "json":
+    print(json.loads(text)["version"])
+elif kind == "pyproject":
+    print(re.search(r"(?m)^version\s*=\s*\"([^\"]+)\"", text)[1])
+else:
+    print(text.strip())
+' "$(kind_of "$VERSION_FILE")" <<< "$text"
+}
+next_version() {   # current bump → new (pre-release counters bump on patch)
+    python3 -c '
+import re, sys
+cur, bump = sys.argv[1:3]
+m = re.match(r"^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?$", cur)
+if not m:
+    sys.exit(1)
+a, b, c, pre = int(m[1]), int(m[2]), int(m[3]), m[4]
+if bump == "major":   print("%d.0.0" % (a + 1))
+elif bump == "minor": print("%d.%d.0" % (a, b + 1))
+elif pre and re.search(r"\d+$", pre):
+    print("%d.%d.%d-%s" % (a, b, c, re.sub(r"\d+$", lambda n: str(int(n[0]) + 1), pre)))
+else:                 print("%d.%d.%d" % (a, b, c + 1))
+' "$1" "$2"
+}
 
-if [[ -n "$(git diff --cached --name-only)" ]]; then
-    fail "Staged but uncommitted changes detected. Commit or unstage them first."
-fi
-
-if ! git diff --quiet; then
-    fail "Uncommitted changes detected. Commit them first."
-fi
-
-# ── Sync with remote (do-no-harm: runs BEFORE any commit/tag is created) ──────
-# Nothing has been bumped, committed, or tagged yet, so any abort here leaves
-# the working tree exactly as the user left it. We only proceed past this block
-# if the local branch is in a state that will push cleanly.
-info "Fetching $REMOTE/$BRANCH to check sync state..."
-git fetch "$REMOTE" "$BRANCH" 2>/dev/null \
-    || fail "Could not reach $REMOTE. Check your connection, then re-run. Nothing has been changed."
-
-LOCAL_SHA=$(git rev-parse "$BRANCH")
-REMOTE_SHA=$(git rev-parse "$REMOTE/$BRANCH")
-BASE_SHA=$(git merge-base "$BRANCH" "$REMOTE/$BRANCH")
-
-if [[ "$LOCAL_SHA" == "$REMOTE_SHA" ]]; then
-    ok "Already in sync with $REMOTE/$BRANCH."
-elif [[ "$LOCAL_SHA" == "$BASE_SHA" ]]; then
-    # Local is strictly behind remote — fast-forward is safe and lossless.
-    if $DRY_RUN; then
-        preview "$REMOTE/$BRANCH is ahead — would fast-forward local $BRANCH."
-    else
-        info "$REMOTE/$BRANCH is ahead. Fast-forwarding local $BRANCH..."
-        git merge --ff-only "$REMOTE/$BRANCH" >/dev/null 2>&1 \
-            || fail "Fast-forward unexpectedly failed. Resolve manually. Nothing has been changed."
-        ok "Fast-forwarded to $(git rev-parse --short HEAD)."
-    fi
-elif [[ "$REMOTE_SHA" == "$BASE_SHA" ]]; then
-    # Remote is strictly behind — local is purely ahead, a normal push will work.
-    ok "Local is ahead of $REMOTE/$BRANCH by $(git rev-list --count "$REMOTE/$BRANCH..$BRANCH") commit(s) — ready to release."
+# ── the release tree: origin/main + this checkout's unpushed main commits ────
+LOCAL_HEAD=""
+if [[ "$(git symbolic-ref -q --short HEAD)" == "$BRANCH" ]]; then
+    LOCAL_HEAD="$(git rev-parse HEAD)"
 else
-    # Diverged. Try a clean rebase of local commits onto remote. If it would
-    # conflict, abort and tell the user — never force, never half-finish.
-    if $DRY_RUN; then
-        # Probe whether a clean rebase is possible without mutating anything.
-        if git merge-tree --write-tree "$REMOTE/$BRANCH" "$BRANCH" >/dev/null 2>&1; then
-            preview "Diverged from $REMOTE/$BRANCH — a clean rebase looks possible; would rebase."
-        else
-            warn "Diverged from $REMOTE/$BRANCH — a rebase would likely conflict; would abort and ask you to resolve."
-        fi
+    finding "WARNING" "Git" "This checkout is not on $BRANCH — its commits were not included" "git checkout $BRANCH"
+fi
+base_tree() {   # sets BASE, BASE_TREE, PARENTS
+    BASE="$(git rev-parse "$REMOTE/$BRANCH")"
+    PARENTS=(-p "$BASE")
+    BASE_TREE="$(git rev-parse "$BASE^{tree}")"
+    [[ -z "$LOCAL_HEAD" ]] && return 0
+    git merge-base --is-ancestor "$LOCAL_HEAD" "$BASE" && return 0
+    local merged
+    if merged="$(git merge-tree --write-tree "$BASE" "$LOCAL_HEAD" 2>/dev/null)"; then
+        BASE_TREE="$merged"
+        PARENTS=(-p "$BASE" -p "$LOCAL_HEAD")
     else
-        warn "Local and $REMOTE/$BRANCH have diverged. Attempting a clean rebase..."
-        if git rebase "$REMOTE/$BRANCH" >/dev/null 2>&1; then
-            ok "Clean rebase succeeded — linear history restored on top of $REMOTE/$BRANCH."
-        else
-            git rebase --abort >/dev/null 2>&1 || true
-            echo "" >&2
-            diverge_summary
-            echo "" >&2
-            fail "$(cat <<EOF
-Diverged from $REMOTE/$BRANCH and an automatic rebase would hit conflicts.
-Nothing has been changed — your tree is exactly as you left it.
-
-Resolve by hand, then re-run this script:
-    git rebase $REMOTE/$BRANCH      # fix the conflicts
-    ./scripts/release.sh            # re-run the release
-EOF
-)"
-        fi
+        finding "ERROR" "Git" "Local commits conflict with $REMOTE/$BRANCH — released $BRANCH without ${LOCAL_HEAD:0:9}" "./ship.sh (the sync sorts the conflict)"
+        LOCAL_HEAD=""
     fi
-fi
-
-# ── Read current version ─────────────────────────────────────────────────────
-CURRENT_VERSION=$(node -p "require('./package.json').version" 2>/dev/null) \
-    || fail "Could not read version from $VERSION_FILE."
-
-IFS='.' read -r MAJOR MINOR PATCH <<< "$CURRENT_VERSION"
-
-# ── Calculate new version ────────────────────────────────────────────────────
-case "$BUMP_TYPE" in
-    patch) NEW_VERSION="${MAJOR}.${MINOR}.$((PATCH + 1))" ;;
-    minor) NEW_VERSION="${MAJOR}.$((MINOR + 1)).0" ;;
-    major) NEW_VERSION="$((MAJOR + 1)).0.0" ;;
-esac
-
-NEW_TAG="v${NEW_VERSION}"
-
-# ── Check tag doesn't already exist ──────────────────────────────────────────
-if git rev-parse "$NEW_TAG" &>/dev/null; then
-    fail "Tag $NEW_TAG already exists. Resolve manually or choose a different bump type."
-fi
-
-# ── Build commit message ─────────────────────────────────────────────────────
-if [[ -n "$CUSTOM_MESSAGE" ]]; then
-    COMMIT_MSG="$CUSTOM_MESSAGE"
-else
-    COMMIT_MSG="release: ${NEW_TAG}"
-fi
-
-# ── Preview ──────────────────────────────────────────────────────────────────
-echo ""
-echo -e "${BOLD}  ${PROJECT_NAME} release${NC}"
-echo -e "  ─────────────────────────────────────────────"
-echo -e "  Bump type  : ${CYAN}${BUMP_TYPE}${NC}"
-echo -e "  Old version: ${YELLOW}${CURRENT_VERSION}${NC}"
-echo -e "  New version: ${GREEN}${NEW_VERSION}${NC}"
-echo -e "  Tag        : ${GREEN}${NEW_TAG}${NC}"
-echo -e "  Commit msg : ${CYAN}${COMMIT_MSG}${NC}"
-$DRY_RUN && echo -e "  Mode       : ${YELLOW}DRY RUN — nothing will be changed${NC}"
-echo -e "  ─────────────────────────────────────────────"
-echo ""
-
-if $DRY_RUN; then
-    preview "Would update version in $VERSION_FILE: $CURRENT_VERSION → $NEW_VERSION"
-    for f in "${PYPROJECT_FILES[@]}"; do
-        [[ -f "$f" ]] && preview "Would sync version in $f"
+}
+tag_taken() {
+    git rev-parse -q --verify "refs/tags/$1" >/dev/null && return 0
+    grep -q "refs/tags/$1\$" <<< "$REMOTE_TAGS"
+}
+build_commit() {   # sets RELEASE_SHA from BASE_TREE, CURRENT, NEW, MSG
+    local idx f blob kind
+    idx="$(mktemp)"; rm -f "$idx"
+    GIT_INDEX_FILE="$idx" git read-tree "$BASE_TREE" || return 1
+    for f in "$VERSION_FILE" ${EXTRA_VERSION_FILES[@]+"${EXTRA_VERSION_FILES[@]}"}; do
+        kind="$(kind_of "$f")"
+        if ! git cat-file -e "$BASE_TREE:$f" 2>/dev/null; then
+            if [[ "$f" == "$VERSION_FILE" && "$kind" == plain ]]; then
+                blob="$(printf '%s\n' "$NEW" | git hash-object -w --stdin)"
+            else
+                finding "WARNING" "Version" "$f is not in the repository — its version was not bumped"
+                continue
+            fi
+        elif ! blob="$(git cat-file -p "$BASE_TREE:$f" | bump_text "$kind" "$CURRENT" "$NEW" | git hash-object -w --stdin)"; then
+            finding "WARNING" "Version" "$f has no version field to bump — left unchanged"
+            continue
+        fi
+        GIT_INDEX_FILE="$idx" git update-index --add --cacheinfo "100644,$blob,$f" || return 1
     done
-    preview "Would commit: '$COMMIT_MSG'"
-    preview "Would create tag: $NEW_TAG"
-    preview "Would push to $REMOTE/$BRANCH"
-    echo ""
-    preview "Dry run complete. No changes made."
+    if [[ -n "$CHANGELOG" ]] && git cat-file -e "$BASE_TREE:$CHANGELOG" 2>/dev/null; then
+        if blob="$(git cat-file -p "$BASE_TREE:$CHANGELOG" | bump_text changelog "$CURRENT" "$NEW" | git hash-object -w --stdin)"; then
+            GIT_INDEX_FILE="$idx" git update-index --cacheinfo "100644,$blob,$CHANGELOG" || return 1
+        else
+            finding "WARNING" "Version" "$CHANGELOG has no '## Unreleased' heading — no release heading was added"
+        fi
+    fi
+    local tree
+    tree="$(GIT_INDEX_FILE="$idx" git write-tree)" || return 1
+    rm -f "$idx"
+    RELEASE_SHA="$(git commit-tree "$tree" "${PARENTS[@]}" -m "$MSG")"
+}
+
+base_tree
+REMOTE_TAGS="$(git ls-remote --tags "$REMOTE" 2>/dev/null)"
+if $DRY; then
+    CURRENT="$(read_version "$BASE_TREE")" || stop "cannot read the version in $VERSION_FILE"
+    NEW="$(next_version "$CURRENT" "$BUMP")" || stop "cannot bump the version '$CURRENT'"
+    echo "release.sh: DRY RUN — $REMOTE/$BRANCH is at $CURRENT; would release ${TAG_PREFIX}${NEW}. Nothing changed."
+    print_findings
     exit 0
 fi
 
-# ── Update package.json (+ package-lock.json if present) ─────────────────────
-info "Bumping version in $VERSION_FILE..."
-npm version "$NEW_VERSION" --no-git-tag-version --allow-same-version 2>/dev/null
-ok "$VERSION_FILE → $NEW_VERSION"
-
-FILES_TO_ADD=(package.json)
-[[ -f package-lock.json ]] && FILES_TO_ADD+=(package-lock.json)
-
-# ── Sync sub-package pyproject.toml files ────────────────────────────────────
-for f in "${PYPROJECT_FILES[@]}"; do
-    if [[ -f "$f" ]]; then
-        info "Syncing version in $f..."
-        sedi "s/^version = \"[^\"]*\"/version = \"${NEW_VERSION}\"/" "$f"
-        ok "$f → $NEW_VERSION"
-        FILES_TO_ADD+=("$f")
-    fi
-done
-
-# ── Commit ───────────────────────────────────────────────────────────────────
-info "Committing..."
-git add "${FILES_TO_ADD[@]}"
-git commit -m "$COMMIT_MSG"
-ok "Committed: '$COMMIT_MSG'"
-
-# ── Tag ──────────────────────────────────────────────────────────────────────
-info "Creating tag $NEW_TAG..."
-git tag "$NEW_TAG"
-ok "Tag $NEW_TAG created"
-
-# ── Push (branch + tag atomically; reconcile once if the remote raced us) ─────
-# --atomic guarantees the branch and tag push together or not at all, so a
-# rejection never leaves a half-pushed state. The pre-flight block above makes
-# rejection rare; this only triggers if the remote moved during the few seconds
-# we spent bumping/committing/tagging.
-info "Pushing to $REMOTE/$BRANCH..."
-if git push --atomic "$REMOTE" "$BRANCH" "$NEW_TAG" 2>/dev/null; then
-    ok "Pushed to $REMOTE/$BRANCH with tag $NEW_TAG"
-else
-    warn "Push rejected — $REMOTE/$BRANCH moved while we were releasing. Reconciling once..."
-    git fetch "$REMOTE" "$BRANCH" 2>/dev/null || die_after_commit "$(cat <<EOF
-Push was rejected and we could not re-fetch $REMOTE.
-Your release commit and tag $NEW_TAG exist locally; nothing was force-pushed.
-Once you are back online:
-    git pull --rebase $REMOTE $BRANCH
-    git tag -f $NEW_TAG HEAD
-    git push --atomic $REMOTE $BRANCH $NEW_TAG
-EOF
-)"
-
-    if git rebase "$REMOTE/$BRANCH" >/dev/null 2>&1; then
-        # The rebase rewrote our release commit, so the tag now points at the
-        # old (orphaned) SHA — move it onto the new HEAD before retrying.
-        git tag -f "$NEW_TAG" HEAD >/dev/null
-        info "Rebased onto updated $REMOTE/$BRANCH and re-pointed $NEW_TAG. Retrying push..."
-        if git push --atomic "$REMOTE" "$BRANCH" "$NEW_TAG" 2>/dev/null; then
-            ok "Pushed to $REMOTE/$BRANCH with tag $NEW_TAG"
-        else
-            die_after_commit "$(cat <<EOF
-Rejected again right after a clean rebase — $REMOTE/$BRANCH is moving rapidly
-(someone else is pushing at the same moment). Your history is clean and linear
-locally; just push by hand when the dust settles:
-    git push --atomic $REMOTE $BRANCH $NEW_TAG
-EOF
-)"
-        fi
+RACES=0; BLIPS=0; PUSHED=false
+while (( RACES < 5 && BLIPS < 10 )); do
+    CURRENT="$(read_version "$BASE_TREE")" || stop "cannot read the version in $VERSION_FILE"
+    NEW="$(next_version "$CURRENT" "$BUMP")" || stop "cannot bump the version '$CURRENT' in $VERSION_FILE"
+    while tag_taken "${TAG_PREFIX}${NEW}"; do NEW="$(next_version "$NEW" patch)"; done
+    TAG="${TAG_PREFIX}${NEW}"
+    MSG="release: ${TAG}${NOTE:+ - $NOTE}"
+    build_commit || stop "could not assemble the release commit"
+    [[ -n "${RELEASE_TEST_BEFORE_PUSH:-}" ]] && { bash -c "$RELEASE_TEST_BEFORE_PUSH" >/dev/null 2>&1 || true; }
+    if q git push "$REMOTE" "$RELEASE_SHA:refs/heads/$BRANCH"; then PUSHED=true; break; fi
+    seen="$(git rev-parse "$REMOTE/$BRANCH")"
+    if q git fetch "$REMOTE" "$BRANCH" && [[ "$(git rev-parse "$REMOTE/$BRANCH")" != "$seen" ]]; then
+        RACES=$((RACES + 1))
     else
-        git rebase --abort >/dev/null 2>&1 || true
-        echo "" >&2
-        diverge_summary
-        die_after_commit "$(cat <<EOF
-Push was rejected and an automatic rebase onto the new $REMOTE/$BRANCH conflicts.
-Your release commit and tag $NEW_TAG exist locally; nothing was force-pushed.
-Resolve by hand:
-    git rebase $REMOTE/$BRANCH        # fix the conflicts
-    git tag -f $NEW_TAG HEAD          # re-point the tag onto the rebased commit
-    git push --atomic $REMOTE $BRANCH $NEW_TAG
-EOF
-)"
+        BLIPS=$((BLIPS + 1)); sleep $((BLIPS * 3))
+    fi
+    REMOTE_TAGS="$(git ls-remote --tags "$REMOTE" 2>/dev/null || echo "$REMOTE_TAGS")"
+    base_tree
+done
+$PUSHED || stop "the push to GitHub failed ($RACES lost races, $BLIPS network failures)"
+
+# ── from here the release is out; nothing below can fail it ──────────────────
+if ! q git tag "$TAG" "$RELEASE_SHA" || ! q git push "$REMOTE" "refs/tags/$TAG"; then
+    finding "ERROR" "Git" "Tag $TAG did not reach GitHub" "git push $REMOTE $TAG"
+fi
+if [[ "$(git symbolic-ref -q --short HEAD)" == "$BRANCH" ]]; then
+    q git merge --ff-only "$REMOTE/$BRANCH" \
+        || finding "WARNING" "Git" "This checkout could not fast-forward to $TAG — pull when convenient" "git pull --no-rebase $REMOTE $BRANCH"
+fi
+echo "$TAG  pushed  ($((SECONDS - START))s)"
+
+if [[ -n "$AFTER_PUSH" ]]; then
+    if ! (cd "$ROOT" && bash -c "$AFTER_PUSH") >>"$LOG" 2>&1; then
+        finding "ERROR" "Checks" "After-push checks failed — the release is out; see $LOG" "$AFTER_PUSH"
     fi
 fi
-
-# ── Done ─────────────────────────────────────────────────────────────────────
-echo ""
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo -e "${GREEN}  Released ${PROJECT_NAME} ${NEW_VERSION}${NC}"
-echo -e "${GREEN}━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━${NC}"
-echo ""
-echo -e "  Monitor: ${CYAN}https://github.com/${GITHUB_REPO}/actions${NC}"
-echo ""
+print_findings
+exit 0
