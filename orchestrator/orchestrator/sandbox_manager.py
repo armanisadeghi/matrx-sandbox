@@ -2252,7 +2252,9 @@ async def _destroy_sandbox_unleased(
                 # stream retains lifecycle/deployment locks indefinitely and
                 # prevents the next orchestrator release from promoting.
                 await asyncio.wait_for(
-                    capture_memory_from_container(container, sandbox.user_id, store),
+                    capture_memory_from_container(
+                        container, sandbox.user_id, sandbox.organization_id, store
+                    ),
                     timeout=await knob_int("shutdown_timeout_seconds"),
                 )
             except TimeoutError:

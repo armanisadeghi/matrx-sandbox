@@ -339,8 +339,15 @@ class SandboxStore(ABC):
         ``[{"path", "content", "updated_at"}]``. Override in subclasses."""
         raise NotImplementedError
 
-    async def memory_put(self, user_id: str, path: str, content: str) -> None:
-        """Upsert one memory entry. Override in subclasses."""
+    async def memory_put(
+        self, user_id: str, organization_id: str, path: str, content: str
+    ) -> None:
+        """Upsert one memory entry, filed in the caller's explicit organization.
+
+        Override in subclasses. ``organization_id`` is carried by the caller
+        (the request, or the sandbox the memory was captured from); a missing
+        one is refused, never resolved.
+        """
         raise NotImplementedError
 
     async def memory_delete(self, user_id: str, path: str) -> bool:
@@ -692,7 +699,10 @@ class InMemorySandboxStore(SandboxStore):
             for path, (content, updated_at) in sorted(entries.items())
         ]
 
-    async def memory_put(self, user_id: str, path: str, content: str) -> None:
+    async def memory_put(
+        self, user_id: str, organization_id: str, path: str, content: str
+    ) -> None:
+        _require_memory_organization(organization_id)
         self._memory.setdefault(user_id, {})[path] = (content, datetime.now(timezone.utc))
 
     async def memory_delete(self, user_id: str, path: str) -> bool:
@@ -1513,18 +1523,15 @@ class PostgresSandboxStore(SandboxStore):
                 ]
         return await self._execute_with_retry(_do)
 
-    async def memory_put(self, user_id: str, path: str, content: str) -> None:
+    async def memory_put(
+        self, user_id: str, organization_id: str, path: str, content: str
+    ) -> None:
+        organization = _require_memory_organization(organization_id)
+
         async def _do() -> None:
             pool = await self._get_pool()
             async with pool.acquire() as conn:
                 owner = UUID(user_id)
-                organization_id = await conn.fetchval(
-                    "SELECT public.ensure_personal_organization($1)", owner,
-                )
-                if organization_id is None:
-                    raise RuntimeError(
-                        "personal organization resolution returned no organization for memory owner"
-                    )
                 await conn.execute(
                     """INSERT INTO users.user_memory
                            (created_by, updated_by, organization_id, path, content)
@@ -1534,7 +1541,7 @@ class PostgresSandboxStore(SandboxStore):
                            updated_by = EXCLUDED.updated_by,
                            updated_at = NOW(),
                            deleted_at = NULL""",
-                    owner, UUID(str(organization_id)), path, content,
+                    owner, organization, path, content,
                 )
         await self._execute_with_retry(_do)
 
@@ -1550,6 +1557,27 @@ class PostgresSandboxStore(SandboxStore):
                 )
                 return result == "UPDATE 1"
         return await self._execute_with_retry(_do)
+
+
+class MemoryOrganizationRequiredError(ValueError):
+    """A memory write reached the store with no organization to file it in."""
+
+
+def _require_memory_organization(organization_id: str | None) -> UUID:
+    """The memory row's organization — carried by the caller, never resolved."""
+    value = str(organization_id or "").strip()
+    if not value:
+        raise MemoryOrganizationRequiredError(
+            "organization_required: a user memory write must name the organization "
+            "it belongs to (the request's, or the sandbox's it was captured from). "
+            "Nothing here picks one."
+        )
+    try:
+        return UUID(value)
+    except ValueError as exc:
+        raise MemoryOrganizationRequiredError(
+            "organization_required: the memory write's organization_id is not a UUID."
+        ) from exc
 
 
 def _row_to_sandbox(row) -> SandboxResponse:

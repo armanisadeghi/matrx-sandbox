@@ -52,8 +52,6 @@ async def test_postgres_memory_crud_uses_canonical_owner_org_and_retention_contr
 
         async def fetchval(self, sql, *args):
             calls.append((sql, args))
-            if "ensure_personal_organization" in sql:
-                return UUID(ORG_ID)
             return True
 
         async def execute(self, sql, *args):
@@ -70,20 +68,19 @@ async def test_postgres_memory_crud_uses_canonical_owner_org_and_retention_contr
     assert await store.memory_list(USER_ID) == [
         {"path": "notes/one.md", "content": "one", "updated_at": "now"},
     ]
-    await store.memory_put(USER_ID, "notes/one.md", "updated")
+    await store.memory_put(USER_ID, ORG_ID, "notes/one.md", "updated")
     assert await store.memory_delete(USER_ID, "notes/one.md") is True
 
+    # The organization is carried by the caller: no lookup query runs.
+    assert len(calls) == 3
     list_sql, list_args = calls[0]
-    org_sql, org_args = calls[1]
-    put_sql, put_args = calls[2]
-    delete_sql, delete_args = calls[3]
+    put_sql, put_args = calls[1]
+    delete_sql, delete_args = calls[2]
     owner = UUID(USER_ID)
 
     assert "FROM users.user_memory" in list_sql
     assert "created_by = $1" in list_sql and "deleted_at IS NULL" in list_sql
     assert list_args == (owner,)
-    assert "public.ensure_personal_organization($1)" in org_sql
-    assert org_args == (owner,)
     assert "INSERT INTO users.user_memory" in put_sql
     assert "(created_by, updated_by, organization_id, path, content)" in put_sql
     assert "ON CONFLICT (created_by, path)" in put_sql
@@ -96,6 +93,27 @@ async def test_postgres_memory_crud_uses_canonical_owner_org_and_retention_contr
     assert "DELETE FROM" not in delete_sql
     assert "created_by = $1" in delete_sql and "deleted_at IS NULL" in delete_sql
     assert delete_args == (owner, "notes/one.md")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("organization_id", ["", None, "not-a-uuid"])
+async def test_memory_put_without_an_organization_is_refused_never_resolved(
+    monkeypatch, organization_id
+):
+    """A memory write that names no organization is an organization-required
+    refusal; the store never looks one up for the owner."""
+    from orchestrator.store import MemoryOrganizationRequiredError
+
+    store = PostgresSandboxStore("postgresql://unused")
+
+    async def get_pool():
+        raise AssertionError("no database work may run for an org-less memory write")
+
+    monkeypatch.setattr(store, "_get_pool", get_pool)
+    monkeypatch.setattr(store, "_execute_with_retry", _no_retry)
+
+    with pytest.raises(MemoryOrganizationRequiredError, match="organization_required"):
+        await store.memory_put(USER_ID, organization_id, "notes/one.md", "x")
 
 
 @pytest.mark.asyncio

@@ -28,7 +28,7 @@ async def test_lazy_docker_archive_is_consumed_off_the_event_loop():
             return BlockingArchive(), {}
 
     task = asyncio.create_task(
-        capture_memory_from_container(Container(), "user", object())
+        capture_memory_from_container(Container(), "user", "22222222-2222-4222-8222-222222222222", object())
     )
     assert await asyncio.to_thread(entered.wait, 1)
 

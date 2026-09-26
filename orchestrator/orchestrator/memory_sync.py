@@ -118,8 +118,13 @@ async def hydrate_memory_into_container(container, user_id: str, store) -> int:
         return 0
 
 
-async def capture_memory_from_container(container, user_id: str, store) -> int:
+async def capture_memory_from_container(
+    container, user_id: str, organization_id: str, store
+) -> int:
     """Read the box's ``.matrx/memory/`` and upsert it into central memory.
+
+    Every captured row is filed in ``organization_id`` — the organization the
+    sandbox was created for, carried from its record.
 
     Returns the number of files captured. Best-effort; never raises. Runs
     BEFORE the container is stopped (the dir must still be readable).
@@ -181,7 +186,7 @@ async def capture_memory_from_container(container, user_id: str, store) -> int:
                     logger.debug("memory capture: skipping non-text %s", rel)
                     continue
                 try:
-                    await store.memory_put(user_id, rel, content)
+                    await store.memory_put(user_id, organization_id, rel, content)
                     captured += 1
                     total += member.size
                 except Exception as exc:

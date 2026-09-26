@@ -15,6 +15,7 @@ from pydantic import BaseModel
 from orchestrator import sandbox_manager
 from orchestrator.config import settings
 from orchestrator.storage_layout import resolve_user_storage
+from orchestrator.store import MemoryOrganizationRequiredError
 
 logger = logging.getLogger(__name__)
 
@@ -155,14 +156,27 @@ async def list_user_memory(user_id: str) -> MemoryListResponse:
 
 
 @router.put("/{user_id}/memory/{path:path}", response_model=MemoryEntry)
-async def put_user_memory(user_id: str, path: str, body: MemoryPutRequest) -> MemoryEntry:
+async def put_user_memory(
+    user_id: str,
+    path: str,
+    body: MemoryPutRequest,
+    organization_id: str = Query(
+        ...,
+        description=(
+            "The organization this memory entry is filed in. Required: the "
+            "caller names it; the orchestrator never picks one."
+        ),
+    ),
+) -> MemoryEntry:
     """Upsert one memory entry at ``path`` (relative under .matrx/memory/)."""
     path = path.strip().lstrip("/")
     if not path or ".." in path.split("/"):
         raise HTTPException(status_code=400, detail="Invalid memory path")
     store = sandbox_manager._get_store()
     try:
-        await store.memory_put(user_id, path, body.content)
+        await store.memory_put(user_id, organization_id, path, body.content)
+    except MemoryOrganizationRequiredError as e:
+        raise HTTPException(status_code=422, detail=str(e))
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"Failed to save memory: {e}")
     return MemoryEntry(path=path, content=body.content, updated_at=None)
