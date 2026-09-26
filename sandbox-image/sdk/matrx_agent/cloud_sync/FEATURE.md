@@ -24,9 +24,8 @@ the orchestrator as `ORGANIZATION_ID`). The headers are built in ONE place —
 `matrx_agent/bridge_headers.py` — and a container missing either variable
 REFUSES the call naming the missing variable; `BridgeConfig.from_env()` returns
 None and `report_missing()` lists exactly what is absent. AI Dream refuses a
-call without the organization (`400 organization_required`) because the write
-below it would otherwise land in the person's PERSONAL organization — which is
-what happened to every sandbox write before 2026-09-17. Law:
+call without the organization (`400 organization_required`) because a write
+is never filed in an organization nobody chose. Law:
 `common-docs/policies/context-is-carried-never-rebuilt.md` rule 1.
 
 **Permanent rejections are attempted once — and then HELD, never dropped.** The
