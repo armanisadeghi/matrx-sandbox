@@ -1,6 +1,6 @@
 {
   "name": "matrx-sandbox",
-  "version": "0.1.9",
+  "version": "0.1.10",
   "private": true,
   "description": "Ephemeral sandbox for AI agent execution",
   "scripts": {
