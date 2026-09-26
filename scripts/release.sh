@@ -30,6 +30,7 @@
 VERSION_FILE="package.json"   # JSON with a top-level "version", a pyproject.toml, or a plain VERSION file
 TAG_PREFIX="v"                # the tag is TAG_PREFIX + version
 EXTRA_VERSION_FILES=("orchestrator/pyproject.toml" "sandbox-image/sdk/pyproject.toml")        # other JSON / pyproject.toml files that carry the same version
+EXTRA_UV_LOCK_FILES=("orchestrator/uv.lock" "sandbox-image/sdk/uv.lock")                       # editable self-package versions paired with EXTRA_VERSION_FILES
 CHANGELOG=""                  # when set: a "## x.y.z - date" heading goes under "## Unreleased"
 AFTER_PUSH=""                 # a command run after the push; a failure is an ERROR finding
 # ─────────────────────────────────────────────────────────────────────────────
@@ -118,6 +119,7 @@ def pyproject_span(text):
     return None
 
 VER = re.compile(r"(?m)^(version\s*=\s*\")([^\"]*)(\")")
+NAME = re.compile(r"(?m)^name\s*=\s*\"([^\"]+)\"\s*$")
 
 if cmd == "read":
     text = sys.stdin.read()
@@ -128,6 +130,13 @@ if cmd == "read":
         print(VER.search(text, a, b)[2])
     else:
         print(text.strip())
+elif cmd == "project-name":
+    text = sys.stdin.read()
+    span = pyproject_span(text)
+    name = NAME.search(text, *span) if span else None
+    if not name:
+        sys.exit(3)
+    print(name.group(1))
 elif cmd == "next":
     cur, bump = sys.argv[2], sys.argv[3]
     m = re.match(r"^(v?)(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$", cur)
@@ -166,6 +175,31 @@ elif cmd == "write":
             m = VER.search(text, *span)
             if m:
                 text, ok = text[:m.start(2)] + new + text[m.end(2):], True
+    elif kind == "uvlock":
+        # A lock can contain transitive packages with their own version fields.
+        # Touch exactly the editable package whose name comes from its paired
+        # pyproject, and refuse to guess if that entry is absent or duplicated.
+        package = sys.argv[4]
+        starts = list(re.finditer(r"(?m)^\[\[package\]\][ \t]*\r?$", text))
+        matches = []
+        for index, marker in enumerate(starts):
+            end = starts[index + 1].start() if index + 1 < len(starts) else len(text)
+            block = text[marker.start():end]
+            named = NAME.search(block)
+            version = VER.search(block)
+            editable = re.search(
+                r"(?m)^source\s*=\s*\{\s*editable\s*=\s*\"\.\"\s*\}\s*$", block
+            )
+            if named and named.group(1) == package and version and editable:
+                matches.append((marker.start(), version.start(2), version.end(2)))
+        if len(matches) == 1:
+            block_start, version_start, version_end = matches[0]
+            text = (
+                text[: block_start + version_start]
+                + new
+                + text[block_start + version_end :]
+            )
+            ok = True
     elif kind == "plain":
         text, ok = new + nl, True
     elif kind == "changelog":
@@ -255,6 +289,24 @@ put_blob() {   # idx path kind label → bumped blob into the index, keeping its
     fi
     GIT_INDEX_FILE="$idx" git update-index --add --cacheinfo "$mode,$blob,$f"
 }
+put_uv_lock_blob() {   # idx uv.lock → bump only its paired editable package entry
+    local idx="$1" lock="$2" project package mode blob
+    project="${lock%/uv.lock}/pyproject.toml"
+    if ! git cat-file -e "$BASE_TREE:$lock" 2>/dev/null; then
+        finding "WARNING" "Version" "$lock is not in the repository — its editable self-version was not bumped"
+        return 0
+    fi
+    if ! package="$(git cat-file -p "$BASE_TREE:$project" | vtool project-name pyproject 2>>"$LOG")"; then
+        finding "WARNING" "Version" "$project has no readable [project].name — $lock was not changed"
+        return 0
+    fi
+    mode="$(git ls-tree "$BASE_TREE" -- "$lock" | awk '{print $1}')"
+    if ! blob="$(git cat-file -p "$BASE_TREE:$lock" | vtool write uvlock "$NEW" "$package" 2>>"$LOG" | git hash-object -w --stdin)"; then
+        finding "WARNING" "Version" "$lock has no unique editable $package package entry — its self-version was not bumped"
+        return 0
+    fi
+    GIT_INDEX_FILE="$idx" git update-index --add --cacheinfo "$mode,$blob,$lock"
+}
 build_commit() {   # sets RELEASE_SHA from BASE_TREE, NEW, MSG
     local idx f kind tree
     idx="$(mktemp)"; rm -f "$idx"
@@ -267,6 +319,9 @@ build_commit() {   # sets RELEASE_SHA from BASE_TREE, NEW, MSG
             continue
         fi
         put_blob "$idx" "$f" "$kind" || return 1
+    done
+    for f in ${EXTRA_UV_LOCK_FILES[@]+"${EXTRA_UV_LOCK_FILES[@]}"}; do
+        put_uv_lock_blob "$idx" "$f" || return 1
     done
     if [[ -n "$CHANGELOG" ]]; then
         if git cat-file -e "$BASE_TREE:$CHANGELOG" 2>/dev/null; then
