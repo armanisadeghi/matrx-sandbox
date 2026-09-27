@@ -8,7 +8,7 @@ import os
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.routing import APIRoute, APIWebSocketRoute
 from starlette.responses import JSONResponse
@@ -524,14 +524,23 @@ async def version_drift():
 
 @app.post("/migrate-all", tags=["meta"])
 async def migrate_all():
-    """Roll every drifted box on this tier onto the current image (master-key).
-    Busy boxes are deferred (retry later). Safe to call repeatedly — it's the
-    manual trigger for the same rolling migration the reaper runs when
-    MATRX_AUTO_MIGRATE=1."""
-    from orchestrator.migrate import migrate_all_drifted
-    from orchestrator.sandbox_manager import _get_store
+    """Refuse fleet-wide replacement during the data-preservation hold.
 
-    return await migrate_all_drifted(store=_get_store())
+    Individual owner-confirmed migration remains available at
+    ``POST /sandboxes/{id}/migrate``. A master key authenticates the caller;
+    it does not authorize replacement of every drifted user container.
+    """
+    raise HTTPException(
+        status_code=409,
+        detail={
+            "status": "fleet_migration_disabled",
+            "reason": (
+                "Fleet-wide sandbox migration is disabled during the data-"
+                "preservation hold. Use the owner-confirmed single-sandbox "
+                "migration only after its independent preservation gates pass."
+            ),
+        },
+    )
 
 
 def _aidream_passthrough_status() -> dict:

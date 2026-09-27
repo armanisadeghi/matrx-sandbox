@@ -49,8 +49,8 @@ validate**, not to reimplement:
 |---|---|---|
 | Hosted deploy: rebuild orchestrator + `core`/`slim`/`aidream`, health-gated, rollback, self-heal | `scripts/deploy-hosted.sh`, `.github/workflows/deploy.yml` (`deploy-hosted` job) | **Working** |
 | EC2 deploy: build/push `core`+`slim`+orchestrator to ECR, SSM deploy, health loop | `deploy.yml` (`deploy` job) | **Working** |
-| Rolling auto-migrate (drift → migrate idle boxes, defer busy) | `orchestrator/reaper.py` + `orchestrator/migrate.py`, gated by `MATRX_AUTO_MIGRATE` | **Working, OFF by default** |
-| Per-box / bulk migrate endpoints, drift report | `POST /sandboxes/{id}/migrate`, `POST /migrate-all`, `GET /drift` | **Working** |
+| Rolling auto-migrate (drift → migrate idle boxes, defer busy) | `orchestrator/reaper.py` + `orchestrator/migrate.py`, gated by `infrastructure.sandbox.auto_migrate` | **Disabled during preservation hold** |
+| Per-box migration and drift report | `POST /sandboxes/{id}/migrate`, `GET /drift` | **Per-box explicit route only; bulk route fails closed** |
 | Idle gate: defer migrate on in-flight calls **or** recent heartbeat | `migrate.py` (`MATRX_MIGRATE_RECENT_HEARTBEAT_SECONDS`, default 120s) | **New, on** |
 | EC2/S3-ordered in-place migrate (flush→stop→boot-fresh→cutover) | `migrate._migrate_s3_ordered`, gated by `MATRX_ENABLE_S3_MIGRATE` | **New, OFF — must validate before enabling** |
 | Per-sandbox daemon shared-secret (cross-sandbox isolation) | daemon `matrx_agent/api/_auth.py` + orchestrator `agent_token_for()`; active when `MATRX_ACCESS_TOKEN_SECRET` is set **and** the image is rebuilt | **New, fail-open — must rebuild image + validate** |
@@ -326,9 +326,9 @@ Do not declare done until every box passes. Re-run after any change.
   automatically. If a caller (aidream) can park a turn, it should before driving
   a manual `/sandboxes/{id}/migrate`; the rolling auto-migrate already only
   touches idle boxes.
-- If a deploy floods drift and you want to throttle, lower
-  `MATRX_MIGRATE_MAX_PER_PASS`; to pause rolling entirely, set
-  `MATRX_AUTO_MIGRATE=0` (manual `/migrate-all` still works).
+- The historical environment controls are superseded by platform feature
+  knobs. Do not use `/migrate-all`: it fails closed during the preservation
+  hold, and deployment must never replace user sandboxes.
 
 ## 5. Reference
 

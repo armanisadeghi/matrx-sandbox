@@ -232,8 +232,9 @@ Sandbox metadata is persisted in Supabase Postgres (`sandbox_instances` table):
    d. Deploys to EC2 via **AWS SSM** (Systems Manager) — no SSH needed
    e. SSM command: pulls images from ECR, tags them, restarts systemd service
    f. Health check loop (30 attempts, 2s interval) confirms orchestrator is healthy
-   g. Calls `POST /migrate-all`; idle permanent development workers atomically
-      swap to the approved image while retaining the mounted workspace
+   g. Does not migrate existing user sandboxes. Fleet-wide migration is
+      disabled during the preservation hold; version drift remains visible for
+      later, independently accepted reconciliation.
 
 ### Why SSM Instead of SSH
 - EC2 security group restricts SSH to a single home IP

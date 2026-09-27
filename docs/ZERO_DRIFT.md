@@ -69,7 +69,7 @@ Detection is **tier-scoped by construction**: each orchestrator only sees its ow
 
 Endpoints:
 - **`POST /sandboxes/{id}/migrate`** — migrate one box (master-key). The default remains idle-only. An owner-facing caller that has shown an interruption warning may send `?interrupt_attached_sessions=true`; this permits idle PTY/watch attachments, but executing tool calls are fenced and must drain. `?target_image=` accepts only an immutable image identity. The caller supplies or receives a canonical `operation_id`; success retains the prior `status`/version fields and adds an exact terminal projection, busy refusal is a structured `409`, and failure is `502` with the old box intact. A disconnected caller reconnects with `GET /sandboxes/{id}/migration?operation_id=...`; this read never starts or retries a migration, exposes no journal payload, and reports an unowned nonterminal operation as `recovery_required` rather than guessing success. Exact no-op results have a durable terminal receipt; the S3-ordered path remains refused until it has the same crash-safe operation journal.
-- **`POST /migrate-all`** — roll every drifted box on this tier (the manual trigger for the rolling migration).
+- **`POST /migrate-all`** — deliberately returns `409 fleet_migration_disabled` during the preservation hold. It is not an alternate manual trigger while the automatic migration gates remain disabled.
 
 ---
 
@@ -106,10 +106,10 @@ migration path. Future work must resolve those hazards and verify the real
 Docker tar round-trip plus user file bytes/modes after readiness; mocked archive
 tests cannot authorize a user-fleet rollout.
 
-`migrate_all_drifted()` rolls drifted boxes one at a time (busy ones return `busy_deferred` and retry on the next pass — the "keep checking until it's idle, then migrate" loop). It's wired into the reaper, gated behind the `infrastructure.sandbox.auto_migrate` setting (a `platform.feature_knob` row since 2026-09-11 — it was the env var `MATRX_AUTO_MIGRATE`; USD-5, never an env var):
+`migrate_all_drifted()` is the internal rolling primitive, wired into the reaper and gated behind the `infrastructure.sandbox.auto_migrate` setting (a `platform.feature_knob` row since 2026-09-11 — it was the env var `MATRX_AUTO_MIGRATE`; USD-5, never an env var). The public bulk route is additionally fail-closed during this hold:
 
 - `auto_migrate` on — each reaper sweep (every 60s) migrates up to the `migrate_max_per_pass` setting (2 today) drifted, **idle** boxes; busy ones defer to the next sweep.
-- With it OFF, nothing migrates automatically; `POST /migrate-all` and per-box `/migrate` still work for manual/triggered rollout.
+- With it OFF, nothing migrates automatically. Per-box `/migrate` remains an explicit owner-confirmed lifecycle operation; fleet-wide `/migrate-all` is refused until the canonical register's independent preservation gates are accepted.
 
 **Current hold (2026-09-08, re-verified 2026-09-11 as the seeded setting values):** `auto_migrate` is false on
 both tiers; `enable_s3_migrate` must remain off. The earlier May
@@ -125,7 +125,7 @@ register's independent preservation gates pass.
 
 ### From the Server Manager UI
 
-The Manager's **orchestrator-sandboxes** admin page (`manager.dev.codematrx.com`) shows a **"Version drift" card** whenever any box is stale: it lists each drifted box (`running → current` version) and a **"Migrate all"** button. Backed by Manager proxy routes (`/api/orchestrator-sandboxes-drift`, `-migrate-all`, `/:id/migrate`) that call the orchestrator with the master key. So operators get drift visibility + one-click migration without the CLI or the API key.
+The Manager's **orchestrator-sandboxes** admin page (`manager.dev.codematrx.com`) may show a **"Version drift" card** and a historical **"Migrate all"** control. The orchestrator returns structured `409 fleet_migration_disabled` to that control during the preservation hold; drift visibility does not authorize fleet replacement. The individual migration route remains separate and explicit.
 
 ---
 
