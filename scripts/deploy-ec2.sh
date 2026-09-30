@@ -117,7 +117,11 @@ for leaked in $LEAKED; do
   log "removing leaked release candidate $leaked"
   docker image rm "$leaked" >/dev/null 2>&1 || true
 done
-docker image prune -f >/dev/null 2>&1 || true
+# Dangling-only pruning leaves fully tagged images from old immutable releases
+# behind. Docker has already excluded images used by running containers, so
+# prune every unused image before the free-space admission check. Do not prune
+# volumes: retained sandbox homes are durable user data, not deployment cache.
+docker image prune -a -f >/dev/null 2>&1 || true
 docker builder prune -f >/dev/null 2>&1 || true
 
 REQUIRED_FREE_KB=$((10 * 1024 * 1024))   # 10 GiB — the three pulls land ~5 GiB

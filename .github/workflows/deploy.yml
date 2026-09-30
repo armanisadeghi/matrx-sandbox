@@ -211,7 +211,10 @@ jobs:
               "set -euo pipefail",
               "set -x",
               "df -h /",
-              "sudo docker image prune -f || true",
+              # `-a` removes only images unused by containers. It is required
+              # here because immutable release tags are not dangling, while
+              # retained Docker volumes must never be pruned as deployment GC.
+              "sudo docker image prune -a -f || true",
               ("aws ecr get-login-password --region us-east-1 | sudo docker login --username AWS --password-stdin " + $ecr),
               ("sudo rm -rf /tmp/matrx-sandbox-deploy-" + $sha),
               ("sudo git init -q /tmp/matrx-sandbox-deploy-" + $sha),
