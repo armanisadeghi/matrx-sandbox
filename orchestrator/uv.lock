@@ -559,7 +559,7 @@ wheels = [
 
 [[package]]
 name = "matrx-orchestrator"
-version = "0.1.12"
+version = "0.1.13"
 source = { editable = "." }
 dependencies = [
     { name = "asyncpg" },
