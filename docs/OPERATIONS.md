@@ -2,7 +2,7 @@
 
 Operational runbook for the two sandbox tiers. For architecture (storage tiers, lifecycle, deploy pipeline) see [ARCHITECTURE.md](ARCHITECTURE.md). For the HTTP API see [SANDBOX_CLIENT_GUIDE.md](../SANDBOX_CLIENT_GUIDE.md).
 
-Current cross-repository routing and preservation contract: [sandbox STATE](../../common-docs/systems/infrastructure/sandboxes/STATE.md). September 13, 2026 — restoration root corrected public transport, storage and unsafe cleanup guidance. Use the approved deployment path; never restart a control process around an active image-update operation or bypass its deployment lock.
+Current cross-repository routing and preservation contract: [sandbox STATE](../../common-docs/systems/architecture/sandboxes/STATE.md). September 13, 2026 — restoration root corrected public transport, storage and unsafe cleanup guidance. Use the approved deployment path; never restart a control process around an active image-update operation or bypass its deployment lock.
 
 ---
 

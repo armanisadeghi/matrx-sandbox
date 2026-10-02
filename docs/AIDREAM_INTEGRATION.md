@@ -1,6 +1,6 @@
 # AI Dream ↔ Sandbox Integration
 
-Cross-repo system-of-record: /Users/armanisadeghi/code/common-docs/systems/infrastructure/sandboxes/STATE.md — read it before touching sandbox routing in ANY repo.
+Cross-repo system-of-record: /Users/armanisadeghi/code/common-docs/systems/architecture/sandboxes/STATE.md — read it before touching sandbox routing in ANY repo.
 
 File traffic authority: /Users/armanisadeghi/code/common-docs/systems/media/file-service/STATE.md. The sandbox bridge has not been cut over to the independent file service.
 

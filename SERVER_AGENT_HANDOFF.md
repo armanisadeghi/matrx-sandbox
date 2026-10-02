@@ -16,7 +16,7 @@
 > migration and its completion checklist are withdrawn, not current authority.
 > Keep both migration gates disabled. All current work and independent
 > acceptance live in the canonical
-> [sandbox register](../common-docs/systems/infrastructure/sandboxes/REGISTER.md).
+> [sandbox register](../common-docs/systems/architecture/sandboxes/REGISTER.md).
 > The remainder is retained only as historical design evidence.
 
 **Audience:** the agent operating **directly on the servers** (the `/srv` hosted

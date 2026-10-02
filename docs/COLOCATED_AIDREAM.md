@@ -1,6 +1,6 @@
 # Sandbox topology
 
-Cross-repo system-of-record: /Users/armanisadeghi/code/common-docs/systems/infrastructure/production-infrastructure/FEATURE.md — read it before touching this feature in ANY repo.
+Cross-repo system-of-record: /Users/armanisadeghi/code/common-docs/systems/architecture/production-infra/FEATURE.md — read it before touching this feature in ANY repo.
 
 Sandbox contracts and acceptance: /Users/armanisadeghi/code/common-docs/systems/infrastructure/sandboxes/STATE.md.
 

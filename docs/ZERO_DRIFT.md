@@ -5,11 +5,11 @@
 > failure-safety claims below. EC2 does not imply S3-backed home storage; retained
 > volumes alone do not prove unchanged files. The current safety contract and
 > independent acceptance gates are in the canonical
-> [sandbox register](../../common-docs/systems/infrastructure/sandboxes/REGISTER.md).
+> [sandbox register](../../common-docs/systems/architecture/sandboxes/REGISTER.md).
 > Keep both migration gates disabled. Do not use this document to authorize a
 > user-container replacement or to re-enable automatic migration.
 
-Cross-repo system-of-record: /Users/armanisadeghi/code/common-docs/systems/infrastructure/sandboxes/STATE.md — read it before touching this feature in ANY repo.
+Cross-repo system-of-record: /Users/armanisadeghi/code/common-docs/systems/architecture/sandboxes/STATE.md — read it before touching this feature in ANY repo.
 
 ---
 

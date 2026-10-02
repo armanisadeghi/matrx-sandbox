@@ -2,7 +2,7 @@
 
 This is the authoritative reference for the orchestrator HTTP API as of orchestrator v0.2.0. It documents every route the orchestrator serves, including the proxy routes that **do not appear in `/openapi.json`** (FastAPI omits broad path catchalls from the auto-generated schema). Use [`GET /api-surface`](#0-discovering-the-surface) for machine-readable discovery — it is the source of truth.
 
-Current cross-repository routing, storage-preservation rules and acceptance status live in [sandbox STATE](../common-docs/systems/infrastructure/sandboxes/STATE.md). September 13, 2026 — restoration root corrected the tier URLs and persistence description below; older version-specific examples are not proof of current deployment or implemented capability.
+Current cross-repository routing, storage-preservation rules and acceptance status live in [sandbox STATE](../common-docs/systems/architecture/sandboxes/STATE.md). September 13, 2026 — restoration root corrected the tier URLs and persistence description below; older version-specific examples are not proof of current deployment or implemented capability.
 
 ### Image-update client contract (September 2026 source)
 
