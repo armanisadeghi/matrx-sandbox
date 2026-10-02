@@ -14,7 +14,7 @@
 9. **Raise the bar.** Name the world champion, match it, beat it. `common-docs/policies/champions.md`
 10. **Talk to Arman like a person.** Plain English, in the chat, no paths or codenames. Tell him your decision and reason; ask only what is truly his. `common-docs/policies/talk-to-arman-like-a-person.md`
 
-Also binding: the Data Doctrine (`systems/architecture/database/DECISIONS.md`), the access ladder (`policies/access-ladder.md`), canonical-first triage (`policies/canonical-first-triage.md`), agents never author agents (`policies/agents-never-author-agents.md`), and the domain tree (`policies/domain-tree.md`).
+Also binding: the Data Doctrine (`common-docs/systems/architecture/database/DECISIONS.md`), the access ladder (`common-docs/policies/access-ladder.md`), canonical-first triage (`common-docs/policies/canonical-first-triage.md`), agents never author agents (`common-docs/policies/agents-never-author-agents.md`), and the domain tree (`common-docs/policies/domain-tree.md`).
 <!-- nine-laws:end -->
 
 **Cloud task autonomy:** A task request authorizes routine in-scope edits, verification, exact-path commits, and pushes. Continue without a conversational confirmation pause; honor explicit hold points and human-only gates. [Completion policy](../common-docs/policies/defect-ownership.md).
