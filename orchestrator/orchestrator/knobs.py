@@ -1,6 +1,6 @@
 """The sandbox fleet's settings — ``platform.feature_knob`` rows, read-only.
 
-Authority: common-docs/projects/unified-settings-platform/DECISIONS.md USD-5
+Authority: common-docs/systems/account/settings/VISION.md USD-5
 (Arman, 2026-09-10): *"Settings system. 1 system. Never an env var. Env values
 are only for secrets, not for controlling behavior."*
 

@@ -19,7 +19,7 @@ equivalent fallback for an unknown hosted-tier identity.
 `SandboxResponse`, container labels, and `SandboxStore.save` require the
 initiating `organization_id`; reset, resume, and reconcile preserve that field.
 Postgres never receives an org-less sandbox write. Read the emergency contract:
-[`no-db-assigned-org/PLAN.md`](../../common-docs/projects/no-db-assigned-org/PLAN.md).
+[`no-db-assigned-org/PLAN.md`](../../common-docs/systems/architecture/database/projects/no-db-assigned-org/PLAN.md).
 
 ## Change log
 
