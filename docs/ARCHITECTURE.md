@@ -1,6 +1,6 @@
 # AI Matrx Ephemeral Sandbox Architecture
 
-Cross-repo work order: `/Users/armanisadeghi/code/common-docs/projects/production-reliability-closeout/SANDBOX_FLEET_WORK_ORDER.md` — read it before changing fleet reconciliation, heartbeat/activity, TTL, reaping, drift reporting, or container cleanup.
+Cross-repo work order: `/Users/armanisadeghi/code/common-docs/systems/architecture/sandboxes/STATE.md` — read it before changing fleet reconciliation, heartbeat/activity, TTL, reaping, drift reporting, or container cleanup.
 
 ## Overview
 

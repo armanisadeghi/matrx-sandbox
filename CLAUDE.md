@@ -37,7 +37,7 @@ Also binding: the Data Doctrine (`common-docs/systems/architecture/database/DECI
 - **We don't do legacy.** A replaced system is migrated, repointed, and DELETED — never frozen, never run beside its replacement, never a keep-or-kill question. Canonical: [no-legacy.md](/Users/armanisadeghi/code/common-docs/policies/no-legacy.md).
 - **The access ladder decides who can open a record.** Every table starts at Organization; only Arman approves Confidential or Private; sharing sits outside the ladder; children inherit their parent; organizations are unlimited and equal, with no personal type. → `/Users/armanisadeghi/code/common-docs/policies/access-ladder.md`
 - **One database, addressed only by URL** (`https://db.matrxserver.com`, never by project ref) — this repo's known exception to the connection-variable rule is below in Working Here.
-- **Every sandbox write carries an explicit `organization_id`.** The create request, persisted model, and Postgres payload must refuse absence; the database never assigns it. Emergency work order: [no-db-assigned-org PLAN](/Users/armanisadeghi/code/common-docs/projects/no-db-assigned-org/PLAN.md).
+- **Every sandbox write carries an explicit `organization_id`.** The create request, persisted model, and Postgres payload must refuse absence; the database never assigns it. Emergency work order: [no-db-assigned-org PLAN](/Users/armanisadeghi/code/common-docs/systems/architecture/database/projects/no-db-assigned-org/PLAN.md).
 
 ## Where the detail lives
 
@@ -55,8 +55,8 @@ Also binding: the Data Doctrine (`common-docs/systems/architecture/database/DECI
 | Adding tools/SDKs to the sandbox image | [sandbox-image/ADDING_UTILITIES.md](sandbox-image/ADDING_UTILITIES.md) |
 | Repository layout in detail | [docs/DIRECTORY_STRUCTURE.md](docs/DIRECTORY_STRUCTURE.md) |
 | Local-only sandbox dev on the `/srv` host | [sandbox-local/ROADMAP.md](sandbox-local/ROADMAP.md), [sandbox-local/TESTING.md](sandbox-local/TESTING.md) |
-| AI Work Hub provider runtime (product plan this repo hosts the runtime for) | [ai-work-hub PLAN](/Users/armanisadeghi/code/common-docs/projects/ai-work-hub/PLAN.md) |
-| Persistent Cloud Browser (sandbox-sidecar browser plan) | [persistent-cloud-browser PLAN](/Users/armanisadeghi/code/common-docs/projects/persistent-cloud-browser/PLAN.md) |
+| AI Work Hub provider runtime (product plan this repo hosts the runtime for) | [ai-work-hub PLAN](/Users/armanisadeghi/code/common-docs/systems/chat/ai-work/projects/ai-work-hub/PLAN.md) |
+| Persistent Cloud Browser (sandbox-sidecar browser plan) | [persistent-cloud-browser PLAN](/Users/armanisadeghi/code/common-docs/systems/architecture/persistent-cloud-browser/FEATURE.md) |
 | Live infra dashboard (recommended first stop) | `/administration/sandbox-infra` in matrx-frontend |
 
 **Terminology:** canonical platform vocabulary (Server / Project / Deployment / Sandbox / Template / Image; Manager vs Orchestrator vs Deploy) is [matrx-ship NAMING.md](../matrx-ship/NAMING.md) — where this file differs, NAMING.md wins. "Tier" = where a Sandbox runs (`ec2`/`hosted`); the `matrx-sandbox` *container* on the dev server is a Ship Deployment (version tracking), not a Sandbox.
