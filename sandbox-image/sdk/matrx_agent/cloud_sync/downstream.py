@@ -200,6 +200,16 @@ class PollingSubscriber:
                 return
             except (httpx.HTTPError, Exception) as e:  # noqa: BLE001
                 self._note_failure(e)
+                if self._is_terminal_refusal():
+                    _logger.error(
+                        "cloud-files: change-feed polling STOPPED — a refusal that "
+                        "retrying cannot fix (%s). The box keeps its local files; "
+                        "fix the sandbox's organization/membership and restart it. "
+                        "Reported as downstream.last_refusal on "
+                        "/internal/cloud-sync-status.",
+                        refusal_sentence(self._last_refusal or {}),
+                    )
+                    return
                 retry_after = _retry_after_seconds(e)
                 # Jittered in BOTH branches: the server randomises Retry-After per
                 # response today, but this loop must not depend on that staying true.
@@ -225,6 +235,16 @@ class PollingSubscriber:
                 return  # stop signal
             except asyncio.TimeoutError:
                 pass
+
+    def _is_terminal_refusal(self) -> bool:
+        """400/403 from the bridge (organization required / membership refused).
+
+        The organization comes from the container's baked-in ORGANIZATION_ID, so
+        the same request is refused identically on every retry: looping forever
+        only spams the server. 429/503 pacing and 5xx remain retryable.
+        """
+        status = (self._last_refusal or {}).get("status")
+        return status in (400, 403)
 
     def _note_success(self) -> None:
         if self._last_refusal is not None:

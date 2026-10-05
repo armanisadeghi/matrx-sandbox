@@ -182,3 +182,23 @@ async def test_the_instruction_survives_the_next_cycle() -> None:
     assert subscriber._interval_seconds == 45.0
     subscriber._adopt_server_interval(30)
     assert subscriber._interval_seconds == 30.0
+
+
+class _RefusedClient:
+    def __init__(self, status: int) -> None:
+        self.status = status
+        self.calls = 0
+
+    async def list_changes(self, since_iso: str) -> dict:
+        self.calls += 1
+        raise _status_error(self.status)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status", [400, 403])
+async def test_org_refusal_stops_the_loop_instead_of_retrying_forever(status) -> None:
+    client = _RefusedClient(status)
+    subscriber = downstream.PollingSubscriber(client)
+    await asyncio.wait_for(subscriber._loop(lambda change: asyncio.sleep(0)), timeout=5)
+    assert client.calls == 1
+    assert subscriber.status()["last_refusal"]["status"] == status
