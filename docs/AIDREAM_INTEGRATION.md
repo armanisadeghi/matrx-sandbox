@@ -2,7 +2,7 @@
 
 Cross-repo system-of-record: /Users/armanisadeghi/code/common-docs/systems/architecture/sandboxes/STATE.md — read it before touching sandbox routing in ANY repo.
 
-File traffic authority: /Users/armanisadeghi/code/common-docs/systems/media/file-service/STATE.md. The sandbox bridge has not been cut over to the independent file service.
+File traffic authority: /Users/armanisadeghi/code/common-docs/systems/files/file-service/STATE.md. The sandbox bridge has not been cut over to the independent file service.
 
 **Routing reviewed 2026-09-08.** Current machine ownership and public/private AI Dream URLs live in the production inventory linked by sandbox STATE. The April bridge design and API sketch below are implementation history, not proof of current readiness or a request to regenerate live credentials. Organization-vault and browser sections describe later integration boundaries; verify the deployed API before changing their callers.
 

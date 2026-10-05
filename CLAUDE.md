@@ -49,14 +49,14 @@ Also binding: the Data Doctrine (`common-docs/systems/architecture/database/DECI
 | HTTP API surface for clients (orchestrator endpoints + in-container fs/pty/git/processes/ports daemon) | [SANDBOX_CLIENT_GUIDE.md](SANDBOX_CLIENT_GUIDE.md) — cross-check before relying on an endpoint; not all of it may be implemented |
 | User data persistence (what's saved, where, session-report, auto-stash) | [docs/PERSISTENCE_PLAN.md](docs/PERSISTENCE_PLAN.md) |
 | AI Dream ↔ Sandbox integration (cloud-files bridge, `mtx` CLI, service-token auth) | [docs/AIDREAM_INTEGRATION.md](docs/AIDREAM_INTEGRATION.md) |
-| Files: the sandbox still rides aidream's `/cloud-files/*` bridge and is NOT cut over to the file service | `/Users/armanisadeghi/code/common-docs/systems/media/file-service/STATE.md` — read it before touching file traffic in ANY repo |
+| Files: the sandbox still rides aidream's `/cloud-files/*` bridge and is NOT cut over to the file service | `/Users/armanisadeghi/code/common-docs/systems/files/file-service/STATE.md` — read it before touching file traffic in ANY repo |
 | Cloud-files replica implementation (watcher, replay, system-path boundary, retries) | [sandbox-image/sdk/matrx_agent/cloud_sync/FEATURE.md](sandbox-image/sdk/matrx_agent/cloud_sync/FEATURE.md) |
 | Zero-drift migration (version stamping, drift detection, safe image swap, auto-migrate) | [docs/ZERO_DRIFT.md](docs/ZERO_DRIFT.md) |
 | Adding tools/SDKs to the sandbox image | [sandbox-image/ADDING_UTILITIES.md](sandbox-image/ADDING_UTILITIES.md) |
 | Repository layout in detail | [docs/DIRECTORY_STRUCTURE.md](docs/DIRECTORY_STRUCTURE.md) |
 | Local-only sandbox dev on the `/srv` host | [sandbox-local/ROADMAP.md](sandbox-local/ROADMAP.md), [sandbox-local/TESTING.md](sandbox-local/TESTING.md) |
 | AI Work Hub provider runtime (product plan this repo hosts the runtime for) | [ai-work-hub PLAN](/Users/armanisadeghi/code/common-docs/systems/chat/ai-work/projects/ai-work-hub/PLAN.md) |
-| Persistent Cloud Browser (sandbox-sidecar browser plan) | [persistent-cloud-browser PLAN](/Users/armanisadeghi/code/common-docs/systems/architecture/persistent-cloud-browser/FEATURE.md) |
+| Persistent Cloud Browser (sandbox-sidecar browser plan) | [persistent-cloud-browser PLAN](/Users/armanisadeghi/code/common-docs/systems/web/persistent-cloud-browser/FEATURE.md) |
 | Live infra dashboard (recommended first stop) | `/administration/sandbox-infra` in matrx-frontend |
 
 **Terminology:** canonical platform vocabulary (Server / Project / Deployment / Sandbox / Template / Image; Manager vs Orchestrator vs Deploy) is [matrx-ship NAMING.md](../matrx-ship/NAMING.md) — where this file differs, NAMING.md wins. "Tier" = where a Sandbox runs (`ec2`/`hosted`); the `matrx-sandbox` *container* on the dev server is a Ship Deployment (version tracking), not a Sandbox.
