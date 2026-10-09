@@ -596,7 +596,16 @@ curl -s https://orchestrator.dev.codematrx.com/ \
 print(f'set ({ap[\"configured_count\"]}): {ap[\"configured_keys\"]}')"
 ```
 
-Should show 25+ keys with `SUPABASE_MATRIX_JWT_SECRET` among them. If it doesn't, `aidream/.env` isn't being read — check the `env_file` block in the compose file.
+Should show 25+ keys with `SUPABASE_MATRIX_JWT_SECRET` among them.
+
+**Box identity lines in `/srv/projects/aidream/.env` (live, not in the repo):**
+`MATRX_PLATFORM_AUTH_JWKS_URL` (public JWKS document) and
+`MATRX_HOSTED_SESSION_AUTHORITY_URL=https://server.app.matrxserver.com/auth/session/status`
+(set 2026-10-09). Without the second, every box refuses every signed-in call with 503
+`session_authority_unavailable` ("Could not verify your session"). The orchestrator boot log
+names a missing one as `DEGRADED CONFIG`; after setting it, `docker compose up -d --force-recreate
+orchestrator`, then recreate boxes born without it (a box's env is fixed at creation). Check one
+box: `GET /sandboxes/{id}/diagnostics` → `container.passthrough_landed`. If it doesn't, `aidream/.env` isn't being read — check the `env_file` block in the compose file.
 
 ---
 

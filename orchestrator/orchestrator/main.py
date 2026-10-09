@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
+from collections.abc import Mapping
 from contextlib import asynccontextmanager
 from pathlib import Path
 
@@ -28,6 +29,42 @@ from orchestrator.storage import validate_bucket
 setup_logging()
 
 _logger = logging.getLogger(__name__)
+
+
+#: The two PUBLIC addresses a credential-free hosted ``aidream`` box needs to
+#: admit anyone: the JWKS document (who is calling) and the central session
+#: authority (is that login still current). Both forward from this host's env.
+HOSTED_BOX_IDENTITY_ENV: tuple[tuple[str, str], ...] = (
+    (
+        "MATRX_PLATFORM_AUTH_JWKS_URL",
+        "every authenticated call into a new hosted box is refused 401",
+    ),
+    (
+        "MATRX_HOSTED_SESSION_AUTHORITY_URL",
+        "every authenticated call into a new hosted box is refused 503 "
+        "session_authority_unavailable, which the person sees as 'Could not verify "
+        "your session' (2026-10-09: own-plan sign-in and every hosted run)",
+    ),
+)
+
+
+def hosted_box_identity_warnings(environ: Mapping[str, str], host_tier: str | None) -> list[str]:
+    """Absent box-identity addresses on the hosted tier, one sentence each.
+
+    Pure over ``environ`` so the guard is testable without a deployed host. A box
+    born while one is missing keeps refusing after the host is fixed: Docker
+    cannot change a running container's env, so it must be recreated
+    (``POST /sandboxes/{id}/migrate``) or stopped.
+    """
+    if host_tier != "hosted":
+        return []
+    return [
+        f"{name} is unset — {effect}. Set it in {settings.aidream_passthrough_env_file} "
+        "(a public https URL, no credential), recreate this orchestrator, then recreate "
+        "boxes born without it."
+        for name, effect in HOSTED_BOX_IDENTITY_ENV
+        if not (environ.get(name) or "").strip()
+    ]
 
 
 def _degraded_config_warnings() -> list[str]:
@@ -66,6 +103,7 @@ def _degraded_config_warnings() -> list[str]:
             f"{settings.aidream_passthrough_env_file}) — sandboxes start with no AI Dream "
             "integration and cloud-files sync is skipped."
         )
+    out.extend(hosted_box_identity_warnings(os.environ, settings.host_tier))
     if not settings.access_token_secret:
         out.append(
             "MATRX_ACCESS_TOKEN_SECRET is unset — /access-tokens, /agent-binding and "
