@@ -20,6 +20,7 @@ import uuid
 from datetime import datetime, timezone
 from typing import Any
 from types import SimpleNamespace
+from urllib.parse import urlsplit
 
 import docker
 from docker.errors import DockerException, NotFound, APIError
@@ -323,7 +324,7 @@ def is_master_credential_name(name: str) -> bool:
 #: The credential-free hosted mode needs public identity/authority addresses:
 #: ``MATRX_PLATFORM_AUTH_JWKS_URL``, the PUBLIC JWKS document every browser
 #: bundle fetches, which is how a box with no secret at all can still know who
-#: is calling it; MATRX_SESSION_AUTHORITY_URL freshly checks that session. Everything else
+#: is calling it; MATRX_HOSTED_SESSION_AUTHORITY_URL freshly checks that session. Everything else
 #: the in-box aidream needs is either baked into the image, set explicitly by
 #: ``create_sandbox`` (identity, storage, the path-shape overrides), minted per
 #: box, or deliberately absent — `configure_packages()` in a box is an allowlist
@@ -335,7 +336,7 @@ def is_master_credential_name(name: str) -> bool:
 PLATFORM_ENV_ALLOWLIST: frozenset[str] = frozenset({
     # The public JWKS document URL — the one thing a credential-free box needs.
     "MATRX_PLATFORM_AUTH_JWKS_URL",
-    "MATRX_SESSION_AUTHORITY_URL",
+    "MATRX_HOSTED_SESSION_AUTHORITY_URL",
     # Non-secret behaviour flags the in-box aidream reads.
     "MATRX_ENV", "LOG_LEVEL", "DEBUG",
     # Region strings (NOT credentials; the keys themselves are orchestrator-
@@ -427,6 +428,24 @@ def _assert_allowlist_is_public_by_design(
             val = (source.get(name) or "").strip()
             if not val:
                 continue  # not set on this host — nothing forwards
+            if name == "MATRX_HOSTED_SESSION_AUTHORITY_URL":
+                try:
+                    parsed = urlsplit(val)
+                    allowed = (
+                        parsed.scheme == "https" and bool(parsed.hostname)
+                        and parsed.username is None and parsed.password is None
+                        and not parsed.query and not parsed.fragment
+                        and "?" not in val and "#" not in val
+                        and "%" not in parsed.hostname
+                        and not any(c.isspace() or ord(c) < 32 or ord(c) == 127 or c == "\\" for c in val)
+                    )
+                    _ = parsed.port
+                except ValueError:
+                    allowed = False
+                if allowed:
+                    continue
+                unvetted.append(f"{name} (requires a bare trusted HTTPS endpoint)")
+                continue
             if val.startswith(("http://", "https://")) and "@" not in val.split("://", 1)[1].split("/", 1)[0]:
                 continue
             unvetted.append(f"{name} (ends in _URL but its value is not a bare http(s) URL)")

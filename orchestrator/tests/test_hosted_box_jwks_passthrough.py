@@ -64,7 +64,7 @@ def test_no_other_template_receives_it() -> None:
         assert denied == []
 
 
-SESSION_ENV = "MATRX_SESSION_AUTHORITY_URL"
+SESSION_ENV = "MATRX_HOSTED_SESSION_AUTHORITY_URL"
 SESSION_URL = "https://server.app.matrxserver.com/auth/session/status"
 
 
@@ -74,16 +74,33 @@ def test_session_authority_explicit_public_url_reaches_only_aidream() -> None:
     for template in ("aidream", "slim", "development", "core"):
         env, denied = platform_passthrough_env(
             template, allow_master_credentials=False,
-            environ={SESSION_ENV: SESSION_URL, "SUPABASE_MATRIX_PASSWORD": "not-in-a-box"},
+            environ={SESSION_ENV: SESSION_URL, JWKS_ENV: JWKS_VALUE, "SUPABASE_MATRIX_PASSWORD": "not-in-a-box"},
         )
-        assert env == ({SESSION_ENV: SESSION_URL} if template == "aidream" else {})
+        assert env == ({SESSION_ENV: SESSION_URL, JWKS_ENV: JWKS_VALUE} if template == "aidream" else {})
         if template == "aidream":
             assert denied == ["SUPABASE_MATRIX_PASSWORD"]
 
 
 def test_session_authority_url_does_not_weaken_public_value_guard() -> None:
     import pytest
-    for value in ("opaque-secret-token-" * 5, "https://user:password@authority.example/status"):
+    for value in ("opaque-secret-token-" * 5, "https://user:password@authority.example/status",
+                  "http://authority.example/status", "https://authority.example/status?secret=synthetic",
+                  "https://authority.example:wrong/status", "https://authority.example/status#fragment"):
         with pytest.raises(RuntimeError):
             platform_passthrough_env("aidream", allow_master_credentials=False,
                                      environ={SESSION_ENV: value})
+
+
+def test_main_remote_authority_setting_is_never_forwarded_to_boxes(monkeypatch) -> None:
+    # Main interprets this name as its own remote-verifier opt-in. Sharing it
+    # with boxes can make a central authority recursively call itself.
+    assert "MATRX_SESSION_AUTHORITY_URL" not in Settings().aidream_passthrough_env.split(",")
+    from orchestrator.config import settings
+    monkeypatch.setattr(settings, "aidream_passthrough_env",
+                        settings.aidream_passthrough_env + ",MATRX_SESSION_AUTHORITY_URL")
+    env, denied = platform_passthrough_env(
+        "aidream", allow_master_credentials=False,
+        environ={"MATRX_SESSION_AUTHORITY_URL": SESSION_URL, SESSION_ENV: SESSION_URL},
+    )
+    assert env == {SESSION_ENV: SESSION_URL}
+    assert denied == ["MATRX_SESSION_AUTHORITY_URL"]

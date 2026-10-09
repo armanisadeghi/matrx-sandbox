@@ -205,7 +205,7 @@ class Settings(BaseSettings):
         # naming it MATRX_* keeps the blanket denial of SUPABASE_* to this
         # template exactly as it is (chair ruling R14, 2026-09-18).
         "MATRX_PLATFORM_AUTH_JWKS_URL,"
-        "MATRX_SESSION_AUTHORITY_URL,"
+        "MATRX_HOSTED_SESSION_AUTHORITY_URL,"
         # AWS — region (boto3) + bucket
         "AWS_REGION,AWS_BUCKET_MODELS,"
         # Supabase — auth + JWT validation

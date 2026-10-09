@@ -21,7 +21,7 @@ initiating `organization_id`; reset, resume, and reconcile preserve that field.
 Postgres never receives an org-less sandbox write. Read the emergency contract:
 [`no-db-assigned-org/PLAN.md`](../../common-docs/systems/architecture/database/projects/no-db-assigned-org/PLAN.md).
 
-The aidream-template allowlist forwards `MATRX_SESSION_AUTHORITY_URL` alongside
+The aidream-template allowlist forwards `MATRX_HOSTED_SESSION_AUTHORITY_URL` alongside
 the public JWKS URL. It is an explicit public endpoint address, never a database
 grant or a shared credential; the existing public-value and master-denial guards
 remain binding. Other templates receive neither platform address. The in-box
