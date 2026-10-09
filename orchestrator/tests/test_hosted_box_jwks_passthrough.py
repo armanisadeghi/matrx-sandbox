@@ -62,3 +62,28 @@ def test_no_other_template_receives_it() -> None:
         )
         assert env == {}
         assert denied == []
+
+
+SESSION_ENV = "MATRX_SESSION_AUTHORITY_URL"
+SESSION_URL = "https://server.app.matrxserver.com/auth/session/status"
+
+
+def test_session_authority_explicit_public_url_reaches_only_aidream() -> None:
+    assert SESSION_ENV in Settings().aidream_passthrough_env.split(",")
+    assert is_master_credential_name(SESSION_ENV) is False
+    for template in ("aidream", "slim", "development", "core"):
+        env, denied = platform_passthrough_env(
+            template, allow_master_credentials=False,
+            environ={SESSION_ENV: SESSION_URL, "SUPABASE_MATRIX_PASSWORD": "not-in-a-box"},
+        )
+        assert env == ({SESSION_ENV: SESSION_URL} if template == "aidream" else {})
+        if template == "aidream":
+            assert denied == ["SUPABASE_MATRIX_PASSWORD"]
+
+
+def test_session_authority_url_does_not_weaken_public_value_guard() -> None:
+    import pytest
+    for value in ("opaque-secret-token-" * 5, "https://user:password@authority.example/status"):
+        with pytest.raises(RuntimeError):
+            platform_passthrough_env("aidream", allow_master_credentials=False,
+                                     environ={SESSION_ENV: value})

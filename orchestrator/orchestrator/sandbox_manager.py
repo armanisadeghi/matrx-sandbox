@@ -320,10 +320,10 @@ def is_master_credential_name(name: str) -> bool:
 #: in the passthrough registry — all 128 names of aidream's `.env` — is dropped,
 #: counted and named in the boot report.
 #:
-#: The credential-free hosted mode (XT-08b) needs exactly ONE platform name:
+#: The credential-free hosted mode needs public identity/authority addresses:
 #: ``MATRX_PLATFORM_AUTH_JWKS_URL``, the PUBLIC JWKS document every browser
 #: bundle fetches, which is how a box with no secret at all can still know who
-#: is calling it (aidream/api/hosted_box_app.py JWKS_URL_ENV). Everything else
+#: is calling it; MATRX_SESSION_AUTHORITY_URL freshly checks that session. Everything else
 #: the in-box aidream needs is either baked into the image, set explicitly by
 #: ``create_sandbox`` (identity, storage, the path-shape overrides), minted per
 #: box, or deliberately absent — `configure_packages()` in a box is an allowlist
@@ -335,6 +335,7 @@ def is_master_credential_name(name: str) -> bool:
 PLATFORM_ENV_ALLOWLIST: frozenset[str] = frozenset({
     # The public JWKS document URL — the one thing a credential-free box needs.
     "MATRX_PLATFORM_AUTH_JWKS_URL",
+    "MATRX_SESSION_AUTHORITY_URL",
     # Non-secret behaviour flags the in-box aidream reads.
     "MATRX_ENV", "LOG_LEVEL", "DEBUG",
     # Region strings (NOT credentials; the keys themselves are orchestrator-

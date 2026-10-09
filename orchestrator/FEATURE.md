@@ -21,6 +21,13 @@ initiating `organization_id`; reset, resume, and reconcile preserve that field.
 Postgres never receives an org-less sandbox write. Read the emergency contract:
 [`no-db-assigned-org/PLAN.md`](../../common-docs/systems/architecture/database/projects/no-db-assigned-org/PLAN.md).
 
+The aidream-template allowlist forwards `MATRX_SESSION_AUTHORITY_URL` alongside
+the public JWKS URL. It is an explicit public endpoint address, never a database
+grant or a shared credential; the existing public-value and master-denial guards
+remain binding. Other templates receive neither platform address. The in-box
+app refuses unavailable current-session authority and reports its own DB-free
+readiness; existing containers need release-owned configuration/image adoption.
+
 ## Change log
 
 - 2026-09-11 — Access-token and agent-binding issuance now perform one
