@@ -371,3 +371,31 @@ async def test_corrupt_journal_is_not_reported_idle_or_leaked(tmp_path):
     status = await migration_status("sbx", "a" * 32, journal=HostedMigrationJournal(tmp_path))
     assert status["outcome"] == "recovery_required"
     assert status["phase"] == "unreadable" and "/srv/private" not in str(status)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("status,stamped", [
+    ("migrated", True), ("already_current", True), ("failed", False), ("busy_deferred", False),
+])
+async def test_a_verified_migration_stamps_the_heartbeat(monkeypatch, status, stamped):
+    """2026-10-09: sbx-5977d07fa376 migrated ready but stayed heartbeat-stale >10 min,
+    so the app neither reused it nor allowed a new one (Connect -> 409). A migration
+    that verified the new box ready is itself the liveness observation."""
+    from orchestrator import migrate
+
+    async def once(*_args, **_kwargs):
+        return {"status": status, "sandbox_id": "sbx"}
+
+    class Store:
+        def __init__(self):
+            self.stamped = []
+
+        async def update_heartbeat(self, sandbox_id, **_kw):
+            self.stamped.append(sandbox_id)
+            return True
+
+    store = Store()
+    monkeypatch.setattr(migrate, "_migrate_sandbox_once", once)
+    result = await migrate.migrate_sandbox("sbx", store=store, operation_id="6" * 32)
+    assert result["status"] == status
+    assert store.stamped == (["sbx"] if stamped else [])

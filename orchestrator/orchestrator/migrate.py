@@ -218,7 +218,7 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
             "reason": "operation_id is not a valid UUID",
         }
     from orchestrator.migration_operations import run_owned_operation
-    return await run_owned_operation(
+    result = await run_owned_operation(
         sandbox_id,
         canonical_operation,
         lambda: _migrate_sandbox_once(
@@ -232,6 +232,26 @@ async def migrate_sandbox(sandbox_id: str, *, store, target_image: str | None = 
             operation_id=canonical_operation,
         ),
     )
+    await _stamp_verified_alive(sandbox_id, result, store=store)
+    return result
+
+
+async def _stamp_verified_alive(sandbox_id: str, result: dict, *, store) -> None:
+    """A migration that verified the new box ready IS a liveness observation.
+
+    The platform's heartbeat comes only from the reaper's liveness sweep, and a
+    migrating box is leased away from that sweep (and a recreate restarts the
+    orchestrator, whose first sweep lands minutes later). Measured 2026-10-09:
+    sbx-5977d07fa376 migrated ready, yet its ``last_heartbeat_at`` stayed >10
+    min stale, so the app would not reuse it while still counting it against
+    the one-box limit — Connect answered 409. Stamp it the moment we know.
+    """
+    if not isinstance(result, dict) or result.get("status") not in {"migrated", "already_current"}:
+        return
+    try:
+        await store.update_heartbeat(sandbox_id)
+    except Exception as exc:  # never turn a good migration into a failure
+        logger.warning("migrate %s: heartbeat stamp failed (non-fatal): %s", sandbox_id, exc)
 
 
 async def _migrate_sandbox_once(

@@ -605,7 +605,7 @@ Should show 25+ keys with `SUPABASE_MATRIX_JWT_SECRET` among them.
 `session_authority_unavailable` ("Could not verify your session"). The orchestrator boot log
 names a missing one as `DEGRADED CONFIG`; after setting it, `docker compose up -d --force-recreate
 orchestrator`, then recreate boxes born without it (a box's env is fixed at creation). Check one
-box: `GET /sandboxes/{id}/diagnostics` → `container.passthrough_landed`. If it doesn't, `aidream/.env` isn't being read — check the `env_file` block in the compose file.
+box: `GET /sandboxes/{id}/diagnostics` → `container.passthrough_landed`. Boxes built from aidream after 2026-10-09 derive the address from `MATRX_AIDREAM_URL` when it is missing (boot log warns), and a migration that verifies ready stamps the row's heartbeat so the app reuses the box at once. If it doesn't, `aidream/.env` isn't being read — check the `env_file` block in the compose file.
 
 ---
 
