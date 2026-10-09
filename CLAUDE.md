@@ -103,3 +103,5 @@ Name collision on the dev server — three things called "sandbox":
 ## Tasks-in-flight docs (repo root)
 
 [ARMAN_TASKS.md](ARMAN_TASKS.md), [LOCAL_AGENT_TASKS.md](LOCAL_AGENT_TASKS.md), [CLAUDE_CODE_AGENT_TASKS.md](CLAUDE_CODE_AGENT_TASKS.md), [MULTI_IMAGE_CONCEPT.md](MULTI_IMAGE_CONCEPT.md), [SANDBOX_API_WISHLIST.md](SANDBOX_API_WISHLIST.md) — planning/TODO docs that may or may not be current; read with skepticism.
+
+Cross-repo system-of-record: /Users/armanisadeghi/code/common-docs/policies/ai-model-and-spend-rules.md — read it before picking a model or running work that spends; system-agent links use `https://manage.aimatrx.com/administration/agents/system-agents/agents/<id>/build`.
