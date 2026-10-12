@@ -9,6 +9,7 @@ on:
 jobs:
   test:
     runs-on: ubuntu-latest
+    timeout-minutes: 30
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
         with:
@@ -37,9 +38,15 @@ jobs:
           .venv/bin/pytest -v --tb=short
       - name: Run sandbox SDK tests
         run: sandbox-image/sdk/.venv/bin/pytest sandbox-image/sdk/tests -v --tb=short
+      # Cost guard (ci-spend, 2026-10-11): .github/ci-cost.json covers every workflow and OS leg, no
+      # macOS/Windows per push, every job time-limited, every dispatch names requested_by.
+      - name: Workflow cost guard (proves it can fail, then checks every workflow)
+        working-directory: ${{ github.workspace }}
+        run: python3 scripts/check_workflow_runner_cost.py --self-test && python3 scripts/check_workflow_runner_cost.py
 
   build-sandbox:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Build sandbox image
@@ -47,6 +54,7 @@ jobs:
 
   build-orchestrator:
     runs-on: ubuntu-latest
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@34e114876b0b11c390a56381ad16ebd13914f8d5 # v4
       - name: Build orchestrator image
