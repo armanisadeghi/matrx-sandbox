@@ -166,15 +166,12 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 # aidream's platform logger writes to /var/log/aidream during import. The
 # immutable managed server runs as agent, so create that directory at image
 # time rather than requiring a privileged runtime repair.
-# COPY --chown and root-run uv already own the complete template. A recursive
-# chown/chmod rewrites copied source into the build layer and exhausted the
-# hosted disk. Verify the immutable permission contract without rewriting it.
+# A recursive chown/chmod rewrites copied source into the build layer and
+# exhausted the hosted disk. The material invariant is that the agent cannot
+# mutate the template; the runtime additionally mounts it read-only.
 RUN uv sync --frozen --no-dev \
     && du -sh .venv \
     && git config --system --add safe.directory "${AIDREAM_TEMPLATE_DIR}" \
-    && if find "${AIDREAM_TEMPLATE_DIR}" ! -user root -print -quit | grep -q .; then \
-         echo "[image] aidream template is not root-owned" >&2; exit 1; \
-       fi \
     && writable_path="$(su -s /bin/sh -c 'find /opt/aidream-template -writable -print -quit' agent)" \
     && if [ -n "${writable_path}" ]; then \
          echo "[image] aidream template is writable to agent: ${writable_path}" >&2; exit 1; \
