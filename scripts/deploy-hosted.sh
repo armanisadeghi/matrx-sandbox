@@ -422,7 +422,9 @@ reclaim_prebuild_space() {
     fi
   done < <(docker image ls --format '{{.Repository}}:{{.Tag}}')
   docker image prune -f >/dev/null 2>&1 || true
-  docker builder prune -a -f --keep-storage=8GB >/dev/null 2>&1 || true
+  # The aidream venv needs several GB of writable build space. Keeping 8 GB
+  # of unused cache left only 2 GB free after repeated failed candidates.
+  docker builder prune -a -f --keep-storage=0 >/dev/null 2>&1 || true
   log "prebuild GC complete; disk free: $(df -h / | awk 'NR==2{print $4}')"
 }
 reclaim_prebuild_space
