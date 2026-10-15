@@ -390,6 +390,10 @@ def test_aidream_autostart_uses_immutable_template_without_resetting_user_work()
     assert 'found existing $WORK_DIR — preserving user state' in entrypoint
     assert "COPY --chown=root:root ./aidream-src/" in dockerfile
     assert "find /opt/aidream-template -writable -print -quit' agent" in dockerfile
+    assert '"${AIDREAM_TEMPLATE_DIR}/run.py"' in dockerfile
+    assert '"${AIDREAM_TEMPLATE_DIR}/config/settings.py"' in dockerfile
+    assert '"${AIDREAM_TEMPLATE_DIR}/aidream/settings/__init__.py"' in dockerfile
+    assert 'RUN chmod go-w' in dockerfile
     assert "test ! -w /opt/aidream-template/pyproject.toml" in dockerfile
     assert 'chown -R root:root "${AIDREAM_TEMPLATE_DIR}"' not in dockerfile
     assert 'chmod -R a-w "${AIDREAM_TEMPLATE_DIR}"' not in dockerfile

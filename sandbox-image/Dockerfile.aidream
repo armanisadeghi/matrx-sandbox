@@ -181,6 +181,14 @@ RUN uv sync --frozen --no-dev \
     && mkdir -p /var/log/aidream \
     && chown agent:agent /var/log/aidream
 
+# git archive extraction on the hosted checkout can preserve group-write bits
+# under its umask. The managed bootstrap requires these fixed entrypoints to
+# be root-owned and have no group/other write bit; chmod only these tiny files.
+RUN chmod go-w \
+    "${AIDREAM_TEMPLATE_DIR}/run.py" \
+    "${AIDREAM_TEMPLATE_DIR}/config/settings.py" \
+    "${AIDREAM_TEMPLATE_DIR}/aidream/settings/__init__.py"
+
 # ─── Helper scripts: mtx aidream {update,reset,serve,version} ──────────────
 # Lives at /opt/sandbox/scripts/aidream-helpers.sh — sourced by the mtx
 # subcommand wrapper installed below.
