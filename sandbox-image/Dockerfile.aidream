@@ -172,8 +172,12 @@ ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python
 RUN uv sync --frozen --no-dev \
     && du -sh .venv \
     && git config --system --add safe.directory "${AIDREAM_TEMPLATE_DIR}" \
-    && if find "${AIDREAM_TEMPLATE_DIR}" \( ! -user root -o -perm /022 \) -print -quit | grep -q .; then \
-         echo "[image] aidream template is not root-owned and read-only to agent" >&2; exit 1; \
+    && if find "${AIDREAM_TEMPLATE_DIR}" ! -user root -print -quit | grep -q .; then \
+         echo "[image] aidream template is not root-owned" >&2; exit 1; \
+       fi \
+    && writable_path="$(su -s /bin/sh -c 'find /opt/aidream-template -writable -print -quit' agent)" \
+    && if [ -n "${writable_path}" ]; then \
+         echo "[image] aidream template is writable to agent: ${writable_path}" >&2; exit 1; \
        fi \
     && su -s /bin/sh -c 'test -r /opt/aidream-template/pyproject.toml && test ! -w /opt/aidream-template/pyproject.toml' agent \
     && su -s /bin/sh -c 'test -x /opt/uv-python && test -x /opt/aidream-template/.venv/bin/python' agent \
