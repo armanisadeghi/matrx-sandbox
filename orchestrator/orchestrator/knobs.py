@@ -26,6 +26,7 @@ from __future__ import annotations
 import time
 from typing import Any
 
+from orchestrator.config_attestation import record_missing, record_read
 from orchestrator.store import KnobSourceUnavailableError  # re-exported
 
 FEATURE = "infrastructure.sandbox"
@@ -76,7 +77,9 @@ async def _raw(feature: str, key: str) -> Any:
         _cache.pop(feature, None)
         values = await _feature_values(feature)
         if key not in values:
+            record_missing(feature, key)
             raise KnobNotRegisteredError(feature, key)
+    record_read(feature, key)
     return values[key]
 
 
@@ -113,7 +116,9 @@ async def security_knob_bool(key: str, feature: str = FEATURE) -> bool:
     else:
         reason = "row not registered"
     if key in values:
+        record_read(feature, key)
         return bool(values[key])
+    record_missing(feature, key)
     import logging
 
     logging.getLogger(__name__).warning(

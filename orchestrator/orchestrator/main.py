@@ -307,7 +307,15 @@ async def lifespan(app: FastAPI):
     pool_task = asyncio.create_task(retire_warm_pool())
 
     try:
+        # Config attestation (common-docs/systems/platform/app-config/attestation/FEATURE.md). Never raises.
+        from orchestrator import config_attestation
+
+        await config_attestation.start(SERVICE_VERSION, SOURCE_SHA)
         yield
+        try:
+            await config_attestation.stop()
+        except Exception as exc:  # noqa: BLE001 — shutdown continues; the last bucket is lost, loudly
+            _logger.error("config attestation final flush failed: %s", exc)
     finally:
         # Shutdown: stop background loops, then close store and Docker client.
         await _cancel_boot_reconciliation(boot_reconcile_task)

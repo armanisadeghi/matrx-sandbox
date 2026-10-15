@@ -38,6 +38,14 @@ def _sandboxes_for_this_host(sandboxes):
     ]
 
 
+@router.get("/health/config-attestation")
+async def config_attestation_health() -> dict:
+    """This orchestrator's config-read recorder: sent/failed/dropped reports, the version floor, or why disabled."""
+    from orchestrator import config_attestation
+
+    return config_attestation.health()
+
+
 @router.get("/health", response_model=HealthResponse)
 async def health_check():
     """Health check for the orchestrator service.

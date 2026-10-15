@@ -416,6 +416,7 @@ class InMemorySandboxStore(SandboxStore):
         # deliberate local-dev boot) seeds them with ``seed_feature_knobs``.
         # A silent default here would be the env var in a new coat.
         self._feature_knobs: dict[str, dict[str, Any]] = {}
+        self.config_read_reports: list[tuple[dict[str, Any], dict[str, Any]]] = []
         self._admission_locks: dict[str, asyncio.Lock] = {}
 
     async def reserve_active(self, sandbox: SandboxResponse, *, replacement_for: str | None = None) -> None:
@@ -505,6 +506,14 @@ class InMemorySandboxStore(SandboxStore):
                     occupants=[_occupant(row) for row in occupied_rows],
                 )
             current.status = SandboxStatus.STARTING
+
+    async def app_config_floor(self, app: str) -> str:
+        raise KnobSourceUnavailableError(f"the in-memory sandbox store has no app_config row for {app!r}")
+
+    async def report_config_reads(self, report: dict[str, Any], instance: dict[str, Any]) -> int:
+        """Config attestation: the in-memory store keeps reports for tests (no database to send to)."""
+        self.config_read_reports.append((report, instance))
+        return 1
 
     def seed_feature_knobs(self, feature: str, values: dict[str, Any]) -> None:
         """The test seam: give this store the settings a database would hold."""
@@ -821,6 +830,30 @@ class PostgresSandboxStore(SandboxStore):
             await self._discard_pool(attempted_pool)
             return await fn(*args, **kwargs)
 
+    async def app_config_floor(self, app: str) -> str:
+        """``public.app_config.min_supported_app_version`` for ``app`` (raises when the row is missing)."""
+        async def _fetch() -> str:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                v = await conn.fetchval("SELECT min_supported_app_version FROM public.app_config WHERE app = $1", app)
+            if v is None:
+                raise LookupError(f"no public.app_config row for {app!r}")
+            return str(v)
+
+        return await self._execute_with_retry(_fetch)
+
+    async def report_config_reads(self, report: dict[str, Any], instance: dict[str, Any]) -> int:
+        """Config attestation: one sealed read bucket through the service-role server door."""
+        async def _send() -> int:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                return int(await conn.fetchval(
+                    "SELECT platform.config_reads_report_server($1::jsonb, $2::jsonb)",
+                    json.dumps(report), json.dumps(instance),
+                ))
+
+        return await self._execute_with_retry(_send)
+
     async def feature_knobs(self, feature: str) -> dict[str, Any]:
         async def _fetch() -> dict[str, Any]:
             pool = await self._get_pool()
@@ -868,6 +901,9 @@ class PostgresSandboxStore(SandboxStore):
                                 or existing["created_at"] != sandbox.created_at):
                             raise RuntimeError("sandbox id replay does not match its immutable creating reservation")
                         return
+                    from orchestrator.config_attestation import record_read
+
+                    record_read("infrastructure.sandbox", "active_sandbox_capacity")
                     knob = await conn.fetchrow(
                         "SELECT value FROM platform.feature_knob WHERE feature = $1 AND key = $2",
                         "infrastructure.sandbox", "active_sandbox_capacity",
@@ -949,6 +985,9 @@ class PostgresSandboxStore(SandboxStore):
                         return
                     if current["status"] not in {"stopped", "expired", "failed"}:
                         raise RuntimeError("resume target is not terminal")
+                    from orchestrator.config_attestation import record_read
+
+                    record_read("infrastructure.sandbox", "active_sandbox_capacity")
                     knob = await conn.fetchrow(
                         "SELECT value FROM platform.feature_knob WHERE feature = $1 AND key = $2",
                         "infrastructure.sandbox", "active_sandbox_capacity",
