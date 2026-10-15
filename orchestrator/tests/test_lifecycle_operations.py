@@ -112,10 +112,12 @@ async def test_force_stop_intent_survives_durable_orphan_recovery_to_destroy(mon
         SID, operation, "stop", recover=True, graceful=False, journal=journal,
     )
     assert status == 202 and recovery["graceful"] is False
-    for _ in range(30):
-        receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=journal)
-        if receipt and receipt["state"] == "succeeded": break
-        await asyncio.sleep(0)
+    async with asyncio.timeout(2):
+        while True:
+            receipt = await lifecycle_operations.lifecycle_status(SID, operation, journal=journal)
+            if receipt and receipt["state"] == "succeeded":
+                break
+            await asyncio.sleep(0.01)
     assert receipt["graceful"] is False and seen == [False]
 
 
