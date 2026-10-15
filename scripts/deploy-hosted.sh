@@ -408,6 +408,25 @@ clear_all_build_markers() {
 # every marker so a dead deploy never looks alive for the 30-minute UI TTL.
 trap 'status=$?; clear_all_build_markers; exit $status' EXIT INT TERM
 
+# A failed build never reaches the post-promotion GC below. Reclaim its unused
+# layers and older immutable candidate tags before the next large image build;
+# otherwise repeated failures can exhaust /srv while the live tags stay safe.
+reclaim_prebuild_space() {
+  local old_candidate
+  while IFS= read -r old_candidate; do
+    if [[ "$old_candidate" =~ ^matrx-orchestrator:sha-[0-9a-f]{40}$ \
+          || "$old_candidate" =~ ^matrx-sandbox:(core|slim|local)-[0-9a-f]{40}$ \
+          || "$old_candidate" =~ ^matrx-sandbox:aidream-[0-9a-f]{40}-[0-9a-f]{12}$ ]]; then
+      [[ "$old_candidate" == *"$NEW_SHA"* ]] \
+        || docker image rm "$old_candidate" >/dev/null 2>&1 || true
+    fi
+  done < <(docker image ls --format '{{.Repository}}:{{.Tag}}')
+  docker image prune -f >/dev/null 2>&1 || true
+  docker builder prune -a -f --keep-storage=8GB >/dev/null 2>&1 || true
+  log "prebuild GC complete; disk free: $(df -h / | awk 'NR==2{print $4}')"
+}
+reclaim_prebuild_space
+
 if [ "$OLD_SHA" != "$NEW_SHA" ] || [ "${FORCE:-0}" = 1 ] \
     || ! image_label_matches "$ORCH_IMAGE" com.aimatrx.source.sha "$NEW_SHA" \
     || { [ "$SELF_HEAL" = 1 ] && [ "$IMAGE_STATE_PRESENT" = 1 ] \
