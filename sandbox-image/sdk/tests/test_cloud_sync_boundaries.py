@@ -229,7 +229,7 @@ def _scan_files():
         for path in root.rglob("*"):
             if not path.is_file() or path.suffix in {".pyc"}:
                 continue
-            if "__pycache__" in path.parts or "tests" in path.parts:
+            if any(part in path.parts for part in (".venv", "venv", "node_modules", "__pycache__", "tests")):
                 continue
             try:
                 yield path, path.read_text(encoding="utf-8")
@@ -251,7 +251,7 @@ def test_no_second_header_builder_exists_anywhere_that_calls_ai_dream() -> None:
         for path in root.rglob("*"):
             if not path.is_file() or path.suffix in {".pyc"}:
                 continue
-            if path in allowed or "tests" in path.parts or "__pycache__" in path.parts:
+            if path in allowed or any(part in path.parts for part in (".venv", "venv", "node_modules", "__pycache__", "tests")):
                 continue
             try:
                 text = path.read_text(encoding="utf-8")
