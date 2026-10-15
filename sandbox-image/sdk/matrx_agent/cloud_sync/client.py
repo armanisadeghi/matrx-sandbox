@@ -163,14 +163,26 @@ class AsyncBridgeClient:
     ``tests/test_bridge_client_wire_golden.py``.
     """
 
-    def __init__(self, cfg: BridgeConfig, *, transport: Optional[httpx.AsyncBaseTransport] = None):
+    def __init__(
+        self,
+        cfg: BridgeConfig,
+        *,
+        transport: Optional[httpx.AsyncBaseTransport] = None,
+        base_url: Optional[str] = None,
+    ):
         self._cfg = cfg
-        self._api = MatrxApi(
-            credentials=ServiceCredential(cfg.token, acting_user_id=cfg.user_id),
-            organization_id=cfg.organization_id,
-            base_urls={"aidream": cfg.url},
-            route_prefix="/api",
-            transport=transport,
+        self._base_url = base_url or cfg.url
+        self._transport = transport
+        # The cloud-files bridge is mounted under /api.
+        self._api = self._make_api(route_prefix="/api")
+
+    def _make_api(self, *, route_prefix: Optional[str]) -> MatrxApi:
+        return MatrxApi(
+            credentials=ServiceCredential(self._cfg.token, acting_user_id=self._cfg.user_id),
+            organization_id=self._cfg.organization_id,
+            base_urls={"aidream": self._base_url},
+            route_prefix=route_prefix,
+            transport=self._transport,
             retry_attempts=1,
         )
 
@@ -321,14 +333,15 @@ AsyncBridgeClient.diff_versions = _remote_unsupported  # type: ignore[attr-defin
 PRESIGNED_THRESHOLD_BYTES = 10 * 1024 * 1024  # 10 MiB
 
 
-class LocalFilesClient:
+class LocalFilesClient(AsyncBridgeClient):
     """Talks to the FULL ``/files/*`` AIDream router exposed by the
     in-sandbox aidream FastAPI on ``127.0.0.1:8001``. Available only on
     ``:aidream`` images.
 
     Auth uses the same service token + ``X-Matrx-User-Id`` header as the
-    bridge — the in-sandbox aidream is configured to accept it. No new
-    credentials are introduced.
+    bridge - the in-sandbox aidream is configured to accept it. No new
+    credentials are introduced. The bridge operations (get/list/changes/delete) are
+    inherited: it is the same ``matrx_api`` client pointed at the local server.
 
     Large uploads (> PRESIGNED_THRESHOLD_BYTES) take the presigned path
     (POST /files/upload/presigned → S3 PUT → POST /files/finalize-upload),
@@ -339,10 +352,14 @@ class LocalFilesClient:
 
     BASE_URL = "http://127.0.0.1:8001"
 
-    def __init__(self, cfg: BridgeConfig):
-        self._cfg = cfg
-        # ONE header builder for every sandbox → AI Dream call.
-        self._client = httpx.AsyncClient(headers=cfg.headers(accept=None))
+    def __init__(self, cfg: BridgeConfig, *, transport: Optional[httpx.AsyncBaseTransport] = None):
+        super().__init__(cfg, transport=transport, base_url=self.BASE_URL)
+        # The richer /files/* router is mounted at the server root (no /api).
+        self._files_root_api = self._make_api(route_prefix=None)
+
+    async def close(self) -> None:
+        await self._files_root_api.aclose()
+        await super().close()
 
     # ── Core ────────────────────────────────────────────────────────────────
 
@@ -352,90 +369,37 @@ class LocalFilesClient:
             return await self._put_presigned(local_path, remote_path, size)
         return await self._put_multipart(local_path, remote_path)
 
-    async def delete_one(self, remote_path: str) -> None:
-        # Resolve path → file_id, then DELETE /files/{id}. The bridge
-        # endpoint exists on the in-sandbox FastAPI too, so reuse it.
-        r = await self._client.delete(
-            f"{self.BASE_URL}/api/cloud-files/delete",
-            params={"path": remote_path},
-            timeout=DELETE_TIMEOUT,
-        )
-        if r.status_code == 404:
-            return
-        r.raise_for_status()
-
-    async def get_one(self, remote_path: str) -> bytes:
-        r = await self._client.get(
-            f"{self.BASE_URL}/api/cloud-files/get",
-            params={"path": remote_path},
-            timeout=PUT_TIMEOUT,
-        )
-        if r.status_code == 404:
-            raise FileNotFoundError(remote_path)
-        r.raise_for_status()
-        return r.content
-
-    async def list_files(self, prefix: str = "") -> list[dict[str, Any]]:
-        params: dict[str, Any] = {}
-        if prefix:
-            params["prefix"] = prefix
-        r = await self._client.get(
-            f"{self.BASE_URL}/api/cloud-files/list",
-            params=params,
-            timeout=DELETE_TIMEOUT,
-        )
-        r.raise_for_status()
-        body = r.json()
-        if isinstance(body, list):
-            return body
-        return list(body.get("files") or [])
-
-    async def list_changes(self, since_iso: str, limit: int = 1000) -> dict[str, Any]:
-        """Polling-mode down-direction. Same endpoint shape the remote
-        bridge serves (Batch A B1) — when matrx-ai is on a :aidream image,
-        we go through the local FastAPI instead of the public bridge so
-        the polling loop doesn't transit aidream's network.
-        """
-        r = await self._client.get(
-            f"{self.BASE_URL}/api/cloud-files/changes",
-            params={"since": since_iso, "limit": limit},
-            timeout=DELETE_TIMEOUT,
-        )
-        r.raise_for_status()
-        body = r.json()
-        return body if isinstance(body, dict) else {"files": [], "next_cursor": since_iso}
-
-    async def close(self) -> None:
-        await self._client.aclose()
-
     # ── Extended ────────────────────────────────────────────────────────────
 
     async def list_versions(self, remote_path: str) -> list[dict[str, Any]]:
         file_id = await self._resolve_file_id(remote_path)
-        r = await self._client.get(
-            f"{self.BASE_URL}/files/{file_id}/versions",
-            timeout=PUT_TIMEOUT,
-        )
-        r.raise_for_status()
-        body = r.json()
+        try:
+            body = await files_api.versions_list_versions(
+                self._files_root_api, path={"file_id": file_id}, options=self._options(PUT_TIMEOUT)
+            )
+        except MatrxApiError as exc:
+            raise _as_status_error(exc) from exc
         if isinstance(body, list):
             return body
         return list(body.get("versions") or [])
 
     async def restore_version(self, remote_path: str, version: int) -> dict[str, Any]:
         file_id = await self._resolve_file_id(remote_path)
-        r = await self._client.post(
-            f"{self.BASE_URL}/files/{file_id}/versions/{version}/restore",
-            timeout=PUT_TIMEOUT,
-        )
-        r.raise_for_status()
-        return r.json() if r.headers.get("content-type", "").startswith("application/json") else {}
+        try:
+            out = await files_api.versions_restore_version(
+                self._files_root_api,
+                path={"file_id": file_id, "version_number": version},
+                options=self._options(PUT_TIMEOUT),
+            )
+        except MatrxApiError as exc:
+            raise _as_status_error(exc) from exc
+        return out if isinstance(out, dict) else {}
 
     async def diff_versions(self, remote_path: str, v1: int, v2: int) -> str:
         """Return a unified diff between two text versions.
 
         We fetch both versions' content via /files/{id}/versions/{n}/download
-        and run difflib locally — there's no server-side diff endpoint that
+        and run difflib locally - there's no server-side diff endpoint that
         returns a unified format consistently across binary/text. The agent
         gets a string ready to drop into a fenced block.
         """
@@ -472,24 +436,28 @@ class LocalFilesClient:
         raise FileNotFoundError(remote_path)
 
     async def _fetch_version_bytes(self, file_id: str, version: int) -> bytes:
-        r = await self._client.get(
-            f"{self.BASE_URL}/files/{file_id}/versions/{version}/download",
-            timeout=PUT_TIMEOUT,
-        )
-        r.raise_for_status()
-        return r.content
+        try:
+            response = await self._files_root_api.raw(
+                files_api._OP_download_version,
+                path={"file_id": file_id, "version_number": version},
+                options=self._options(PUT_TIMEOUT),
+            )
+        except MatrxApiError as exc:
+            raise _as_status_error(exc) from exc
+        return response.content
 
     async def _put_multipart(self, local_path: Path, remote_path: str) -> dict[str, Any]:
-        with local_path.open("rb") as fh:
-            r = await self._client.put(
-                f"{self.BASE_URL}/api/cloud-files/put",
-                files={"file": (local_path.name, fh)},
-                data={"file_path": remote_path},
-                timeout=PUT_TIMEOUT,
-            )
-        r.raise_for_status()
-        if r.headers.get("content-type", "").startswith("application/json"):
-            return r.json()
+        try:
+            with local_path.open("rb") as fh:
+                out = await files_api.put_file(
+                    self._api,
+                    body=Multipart(data={"file_path": remote_path}, files={"file": (local_path.name, fh)}),
+                    options=self._options(PUT_TIMEOUT),
+                )
+        except MatrxApiError as exc:
+            raise _as_status_error(exc) from exc
+        if isinstance(out, dict):
+            return out
         return {"path": remote_path, "bytes": local_path.stat().st_size}
 
     async def _put_presigned(self, local_path: Path, remote_path: str, size: int) -> dict[str, Any]:
@@ -498,21 +466,18 @@ class LocalFilesClient:
         Step 1: POST /files/upload/presigned → {url, headers, upload_id}.
                 AIDream signs the URL with ITS S3 creds; sandbox stays
                 credential-free.
-        Step 2: PUT the file bytes directly to S3.
+        Step 2: PUT the file bytes directly to S3 (not an AI Matrx server: plain httpx, no Matrx identity).
         Step 3: POST /files/finalize-upload → registers the cld_files row.
         """
         content_type = "application/octet-stream"
-        presign = await self._client.post(
-            f"{self.BASE_URL}/files/upload/presigned",
-            json={
-                "file_path": remote_path,
-                "content_type": content_type,
-                "expected_size_bytes": size,
-            },
-            timeout=PUT_TIMEOUT,
-        )
-        presign.raise_for_status()
-        data = presign.json()
+        try:
+            data = await files_api.create_presigned_upload(
+                self._files_root_api,
+                body={"file_path": remote_path, "content_type": content_type, "expected_size_bytes": size},
+                options=self._options(PUT_TIMEOUT),
+            )
+        except MatrxApiError as exc:
+            raise _as_status_error(exc) from exc
         upload_id = data["upload_id"]
         url = data["url"]
         headers = data.get("headers") or {}
@@ -530,13 +495,15 @@ class LocalFilesClient:
 
         # Step 3: tell aidream the upload completed so it writes the
         # cld_files row + bumps the version.
-        finalize = await self._client.post(
-            f"{self.BASE_URL}/files/finalize-upload",
-            json={"upload_id": upload_id, "actual_size_bytes": size},
-            timeout=PUT_TIMEOUT,
-        )
-        finalize.raise_for_status()
-        result: dict[str, Any] = finalize.json() if finalize.headers.get("content-type", "").startswith("application/json") else {}
+        try:
+            finalized = await files_api.finalize_presigned_upload(
+                self._files_root_api,
+                body={"upload_id": upload_id, "actual_size_bytes": size},
+                options=self._options(PUT_TIMEOUT),
+            )
+        except MatrxApiError as exc:
+            raise _as_status_error(exc) from exc
+        result: dict[str, Any] = dict(finalized) if isinstance(finalized, dict) else {}
         result.setdefault("path", remote_path)
         result.setdefault("bytes", size)
         return result
