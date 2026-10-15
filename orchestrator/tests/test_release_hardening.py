@@ -414,6 +414,7 @@ def test_aidream_build_proves_agent_cannot_mutate_certified_runtime():
     assert "sudo /bin/mount --bind /home/agent/aidream /opt/aidream-template" in builder
     assert "AIDREAM_WORK_DIR=/opt/aidream-template" in builder
     assert "aidream-helpers.sh verify-release" in builder
+    assert 'cp -a /opt/aidream-template/. "$runtime_dir/"' not in builder
     assert "touch /var/log/aidream/.agent-log-probe" in builder
     assert "sitecustomize.py" in builder
     assert "fsmonitor = !touch /tmp/gitconfig-ran" in builder

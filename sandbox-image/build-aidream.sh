@@ -226,9 +226,7 @@ docker run --rm --entrypoint /bin/sh "$TAG" -c \
     'test "$(cat /etc/aidream-image-sha)" = "$(git -C /opt/aidream-template rev-parse HEAD)" \
     && command -v bwrap >/dev/null && command -v socat >/dev/null \
     && bwrap --version >/dev/null && socat -V >/dev/null 2>&1 \
-    && runtime_dir=$(mktemp -d) \
-    && cp -a /opt/aidream-template/. "$runtime_dir/" \
-    && AIDREAM_WORK_DIR="$runtime_dir" /opt/sandbox/scripts/aidream-helpers.sh verify-release'
+    && AIDREAM_WORK_DIR=/opt/aidream-template /opt/sandbox/scripts/aidream-helpers.sh verify-release'
 
 echo "[build-aidream] verifying immutable managed source as the runtime user"
 docker run --rm --read-only \
