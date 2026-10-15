@@ -1,0 +1,12 @@
+#!/bin/sh
+# Versioned pre-push for matrx-sandbox (activate once per clone: git config core.hooksPath .githooks).
+# Runs the config-attestation guard tests: a feature_knob read that serves archived rows, a manifest that
+# misses a direct knob read, or a boot that attests the wrong sha refuses the push. The full suite is `make test`.
+root=$(git rev-parse --show-toplevel) || exit 1
+py="$root/orchestrator/.venv/bin/python"
+[ -x "$py" ] || py=python3
+cd "$root/orchestrator" || exit 1
+"$py" -m pytest tests/test_config_attestation_wiring.py -q || {
+    echo "PUSH REFUSED: config-attestation guard tests failed (above). Fix the code, never the guard." >&2
+    exit 1
+}
