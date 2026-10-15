@@ -515,6 +515,12 @@ class InMemorySandboxStore(SandboxStore):
         self.config_read_reports.append((report, instance))
         return 1
 
+    async def attest_config_manifest(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        raise KnobSourceUnavailableError("the in-memory sandbox store has no database to attest a config manifest in")
+
+    async def stored_config_manifest(self, app: str, build_sha: str) -> dict[str, Any] | None:
+        raise KnobSourceUnavailableError("the in-memory sandbox store has no attested config manifests")
+
     def seed_feature_knobs(self, feature: str, values: dict[str, Any]) -> None:
         """The test seam: give this store the settings a database would hold."""
         self._feature_knobs[feature] = dict(values)
@@ -854,12 +860,33 @@ class PostgresSandboxStore(SandboxStore):
 
         return await self._execute_with_retry(_send)
 
+    async def attest_config_manifest(self, manifest: dict[str, Any]) -> dict[str, Any]:
+        """Config attestation, DECLARED half: ``platform.config_manifest_attest`` (service-role door)."""
+        async def _attest() -> dict[str, Any]:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchval("SELECT to_jsonb(platform.config_manifest_attest($1::jsonb, '{}'::jsonb))",
+                                          json.dumps(manifest))
+            return json.loads(row) if isinstance(row, str) else dict(row or {})
+
+        return await self._execute_with_retry(_attest)
+
+    async def stored_config_manifest(self, app: str, build_sha: str) -> dict[str, Any] | None:
+        async def _fetch() -> dict[str, Any] | None:
+            pool = await self._get_pool()
+            async with pool.acquire() as conn:
+                row = await conn.fetchval(
+                    "SELECT manifest FROM platform.config_manifest WHERE app = $1 AND build_sha = $2", app, build_sha)
+            return (json.loads(row) if isinstance(row, str) else row) if row is not None else None
+
+        return await self._execute_with_retry(_fetch)
+
     async def feature_knobs(self, feature: str) -> dict[str, Any]:
         async def _fetch() -> dict[str, Any]:
             pool = await self._get_pool()
             async with pool.acquire() as conn:
                 rows = await conn.fetch(
-                    "SELECT key, value FROM platform.feature_knob WHERE feature = $1",
+                    "SELECT key, value FROM platform.feature_knob WHERE feature = $1 AND archived_at IS NULL",
                     feature,
                 )
             # asyncpg hands jsonb back as text unless a codec is installed.
@@ -905,7 +932,7 @@ class PostgresSandboxStore(SandboxStore):
 
                     record_read("infrastructure.sandbox", "active_sandbox_capacity")
                     knob = await conn.fetchrow(
-                        "SELECT value FROM platform.feature_knob WHERE feature = $1 AND key = $2",
+                        "SELECT value FROM platform.feature_knob WHERE feature = $1 AND key = $2 AND archived_at IS NULL",
                         "infrastructure.sandbox", "active_sandbox_capacity",
                     )
                     if knob is None:
@@ -989,7 +1016,7 @@ class PostgresSandboxStore(SandboxStore):
 
                     record_read("infrastructure.sandbox", "active_sandbox_capacity")
                     knob = await conn.fetchrow(
-                        "SELECT value FROM platform.feature_knob WHERE feature = $1 AND key = $2",
+                        "SELECT value FROM platform.feature_knob WHERE feature = $1 AND key = $2 AND archived_at IS NULL",
                         "infrastructure.sandbox", "active_sandbox_capacity",
                     )
                     if knob is None:

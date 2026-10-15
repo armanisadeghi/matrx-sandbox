@@ -5,6 +5,10 @@ the shared ``matrx_utils.config_attestation`` (one Python implementation for eve
 wires it: app ``matrx-sandbox``, version = the package version, build sha = the deployer-stamped
 ``SOURCE_SHA``, sink = ``platform.config_reads_report_server`` on the store's database connection.
 
+DECLARED half: the image build bakes ``/app/.config-manifest.json`` for its own ``MATRX_SOURCE_SHA``
+(orchestrator/Dockerfile) and :func:`start` attests it at boot through the store's direct connection,
+so the attested sha is the running sha on every deploy path (EC2 and hosted alike).
+
 Nothing fails silently: a process that cannot report (no stamped sha, the shared module not installed, an
 in-memory store) says why at boot and on every ``GET /health/config-attestation``.
 """
@@ -14,11 +18,15 @@ from __future__ import annotations
 import logging
 import re
 import socket
+from pathlib import Path
 from typing import Any
 
 APP = "matrx-sandbox"
 _log = logging.getLogger(__name__)
-_state: dict[str, Any] = {"enabled": False, "disabled_reason": "not started", "version_floor": {}}
+_state: dict[str, Any] = {"enabled": False, "disabled_reason": "not started", "version_floor": {},
+                          "attestation": {"status": "not started"}}
+#: The image root (``/app`` in the orchestrator image), where the build bakes the manifest.
+_APP_ROOT = Path(__file__).resolve().parents[1]
 
 
 def _recorder_module():
@@ -67,8 +75,25 @@ async def start(service_version: str, source_sha: str) -> None:
         return
     ca.install(recorder)
     _state.update(enabled=True, disabled_reason=None)
+    await attest_baked_manifest(ca, store, source_sha)
     recorder.start()
     await _check_version_floor(recorder, store)
+
+
+async def attest_baked_manifest(ca: Any, store: Any, source_sha: str) -> None:
+    """Attest the manifest this image baked for ``source_sha``. Never raises; a failure is loud and on health."""
+    try:
+        manifest = ca.load_baked_manifest(_APP_ROOT / ca.BAKED_MANIFEST, app=APP, build_sha=source_sha)
+        result = await ca.attest_at_boot(manifest, attest=store.attest_config_manifest,
+                                         stored=store.stored_config_manifest)
+    except Exception as exc:  # noqa: BLE001 — an unattested build shows every key red; announced
+        _state["attestation"] = {"status": "failed", "error": f"{type(exc).__name__}: {exc}"[:400]}
+        _log.error("config attestation: build %s NOT attested at boot: %s", source_sha[:12],
+                   _state["attestation"]["error"])
+        return
+    _state["attestation"] = {**result, "knobs": len(manifest["knobs"])}
+    _log.info("config attestation: build %s %s at boot (%d knobs)", source_sha[:12], result["status"],
+              len(manifest["knobs"]))
 
 
 async def _check_version_floor(recorder: Any, store: Any) -> None:
@@ -104,4 +129,5 @@ def health() -> dict[str, Any]:
     if not _state["enabled"]:
         return {"app": APP, "enabled": False, "disabled_reason": _state["disabled_reason"]}
     r = _recorder_module().active()
-    return {"enabled": True, **(r.health() if r else {}), "version_floor": _state["version_floor"]}
+    return {"enabled": True, **(r.health() if r else {}), "version_floor": _state["version_floor"],
+            "attestation": _state["attestation"]}

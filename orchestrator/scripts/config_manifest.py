@@ -24,10 +24,15 @@ APP = "matrx-sandbox"
 FEATURE = "infrastructure.sandbox"
 SPEC = Reader(feature_arg=1, key_arg=0, feature_kw="feature", key_kw="key", default_feature=FEATURE)
 READERS = {n: SPEC for n in ("knob_int", "knob_float", "knob_str", "knob_bool", "security_knob_bool", "record_read")}
-# record_read(feature, key) is the explicit hook beside the store's two raw admission reads.
+# record_read(feature, key) is the explicit hook beside the store's two raw admission reads; knobs._raw(feature, key)
+# is read directly too (migrate.py's auto_update_idle_seconds) — knobs.FEATURE resolves from knobs.py.
 READERS["record_read"] = Reader(feature_arg=0, key_arg=1)
+READERS["_raw"] = Reader(feature_arg=0, key_arg=1)
 EXCLUDE = ("/tests/", "/test_", "conftest.py", "orchestrator/knobs.py", "orchestrator/config_attestation.py")
-RAW_SQL = re.compile(r'"SELECT value FROM platform\.feature_knob WHERE feature = \$1 AND key = \$2",\s*"([^"]+)", "([^"]+)"')
+RAW_SQL = re.compile(
+    r'"SELECT value FROM platform\.feature_knob WHERE feature = \$1 AND key = \$2(?: AND archived_at IS NULL)?",'
+    r'\s*"([^"]+)", "([^"]+)"'
+)
 
 
 def generate(root: Path, build_sha: str):
