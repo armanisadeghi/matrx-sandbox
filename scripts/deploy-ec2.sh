@@ -168,7 +168,9 @@ printf '%s\n' "$TARGET_SHA" > "$CANDIDATE_DIR/.source-sha"
 chown -R ec2-user:ec2-user "$CANDIDATE_DIR"
 sudo -u ec2-user /usr/bin/python3.11 -m pip install --user --quiet "uv==$UV_VERSION"
 sudo -u ec2-user env PATH="/home/ec2-user/.local/bin:$PATH" \
-  uv sync --directory "$CANDIDATE_DIR" --locked --no-dev --python /usr/bin/python3.11
+  uv python install 3.13
+sudo -u ec2-user env PATH="/home/ec2-user/.local/bin:$PATH" \
+  uv sync --directory "$CANDIDATE_DIR" --locked --no-dev --managed-python --python 3.13
 # The venv is built at $CANDIDATE_DIR and then MOVED to $LIVE_DIR, so anything
 # that hardcodes the build path breaks on arrival. Prove the one entry point
 # the unit actually uses survives that move; console scripts do not (their
@@ -625,8 +627,9 @@ DROPIN_CHANGED=1
 # execute .../.venv/bin/uvicorn: No such file or directory" and crashloops,
 # the contract assertion below times out, and the release rolls back. That is
 # what pinned EC2 on f229d4b (a pre-atomic-deploy revision) for weeks.
-# `.venv/bin/python` is a symlink to /usr/bin/python3.11, so it survives the
-# move and resolves the venv from its own pyvenv.cfg. Verified on the box:
+# `.venv/bin/python` is a symlink to uv's Python 3.13 installation in the
+# ec2-user home, so it survives the move and resolves the venv from its own
+# pyvenv.cfg. Verified on the box with the former system-Python venv:
 # after mv, the console script exits 127 while `python -m uvicorn` runs.
 cat > "$RELEASE_DROPIN" <<'EOF'
 [Service]
