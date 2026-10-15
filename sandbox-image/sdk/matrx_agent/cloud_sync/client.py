@@ -48,6 +48,14 @@ from pathlib import Path
 from typing import Any, Optional, Protocol, runtime_checkable
 
 import httpx
+from matrx_api import (
+    CallOptions,
+    MatrxApi,
+    MatrxApiError,
+    Multipart,
+    ServiceCredential,
+)
+from matrx_api.generated import files as files_api
 
 from matrx_agent.bridge_headers import (
     REQUIRED_BRIDGE_ENV,
@@ -132,41 +140,70 @@ PUT_TIMEOUT = httpx.Timeout(connect=10.0, read=60.0, write=60.0, pool=10.0)
 DELETE_TIMEOUT = httpx.Timeout(connect=10.0, read=10.0, write=10.0, pool=10.0)
 
 
-class AsyncBridgeClient:
-    """Async client for the cloud-files bridge — used by the in-process watcher."""
+def _as_status_error(exc: MatrxApiError) -> Exception:
+    """The watcher, the down-direction poller and the refusal classifiers all read an ``httpx.HTTPStatusError``
+    (status, ``Retry-After``, refusal body) off the error - keep that type at this one boundary. A transport
+    failure keeps its own httpx type."""
+    if exc.status == 0 and exc.__cause__ is not None:
+        return exc.__cause__
+    response = exc.response
+    if response is None:  # pragma: no cover - MatrxApi always attaches the response to an HTTP failure
+        return exc
+    return httpx.HTTPStatusError(
+        f"HTTP {exc.status} for {response.request.method} {response.request.url}",
+        request=response.request,
+        response=response,
+    )
 
-    def __init__(self, cfg: BridgeConfig):
+
+class AsyncBridgeClient:
+    """Async client for the cloud-files bridge - used by the in-process watcher.
+
+    Rides ``matrx_api``: the wire (service token, ``X-Matrx-User-Id``, ``X-Organization-Id``) is pinned by
+    ``tests/test_bridge_client_wire_golden.py``.
+    """
+
+    def __init__(self, cfg: BridgeConfig, *, transport: Optional[httpx.AsyncBaseTransport] = None):
         self._cfg = cfg
-        # ONE header builder for every sandbox → AI Dream call.
-        self._client = httpx.AsyncClient(headers=cfg.headers(accept=None))
+        self._api = MatrxApi(
+            credentials=ServiceCredential(cfg.token, acting_user_id=cfg.user_id),
+            organization_id=cfg.organization_id,
+            base_urls={"aidream": cfg.url},
+            route_prefix="/api",
+            transport=transport,
+            retry_attempts=1,
+        )
+
+    @staticmethod
+    def _options(timeout: httpx.Timeout) -> CallOptions:
+        return CallOptions(connect_timeout=timeout.connect, total_timeout=timeout.read)
 
     async def put_one(self, local_path: Path, remote_path: str) -> dict[str, Any]:
         """Multipart PUT a single file. Raises on non-2xx."""
-        with local_path.open("rb") as fh:
-            r = await self._client.put(
-                f"{self._cfg.url}/api/cloud-files/put",
-                files={"file": (local_path.name, fh)},
-                data={"file_path": remote_path},
-                timeout=PUT_TIMEOUT,
-            )
-        r.raise_for_status()
-        if r.headers.get("content-type", "").startswith("application/json"):
-            return r.json()
-        return {}
+        try:
+            with local_path.open("rb") as fh:
+                out = await files_api.put_file(
+                    self._api,
+                    body=Multipart(data={"file_path": remote_path}, files={"file": (local_path.name, fh)}),
+                    options=self._options(PUT_TIMEOUT),
+                )
+        except MatrxApiError as exc:
+            raise _as_status_error(exc) from exc
+        return out if isinstance(out, dict) else {}
 
     async def delete_one(self, remote_path: str) -> None:
         """Soft-delete one file. 404 is treated as already-gone (no-op)."""
-        r = await self._client.delete(
-            f"{self._cfg.url}/api/cloud-files/delete",
-            params={"path": remote_path},
-            timeout=DELETE_TIMEOUT,
-        )
-        if r.status_code == 404:
-            return
-        r.raise_for_status()
+        try:
+            await files_api.cloud_files_bridge_delete_file(
+                self._api, query={"path": remote_path}, options=self._options(DELETE_TIMEOUT)
+            )
+        except MatrxApiError as exc:
+            if exc.status == 404:
+                return
+            raise _as_status_error(exc) from exc
 
     async def close(self) -> None:
-        await self._client.aclose()
+        await self._api.aclose()
 
 
 # ── Public alias — clearer name for new code, kept symmetric with
@@ -216,28 +253,30 @@ class BridgeClient(Protocol):
 # use a richer feature on a :core image.
 
 async def _remote_get_one(self: AsyncBridgeClient, remote_path: str) -> bytes:
-    r = await self._client.get(
-        f"{self._cfg.url}/api/cloud-files/get",
-        params={"path": remote_path},
-        timeout=PUT_TIMEOUT,
-    )
-    if r.status_code == 404:
-        raise FileNotFoundError(remote_path)
-    r.raise_for_status()
-    return r.content
+    try:
+        # Bytes, not JSON: the contract types this op as a plain call, whose parsed body would corrupt them.
+        response = await self._api.raw(
+            files_api._OP_cloud_files_bridge_get_file,
+            query={"path": remote_path},
+            options=self._options(PUT_TIMEOUT),
+        )
+    except MatrxApiError as exc:
+        if exc.status == 404:
+            raise FileNotFoundError(remote_path) from exc
+        raise _as_status_error(exc) from exc
+    return response.content
 
 
 async def _remote_list_files(self: AsyncBridgeClient, prefix: str = "") -> list[dict[str, Any]]:
     params: dict[str, Any] = {}
     if prefix:
         params["prefix"] = prefix
-    r = await self._client.get(
-        f"{self._cfg.url}/api/cloud-files/list",
-        params=params,
-        timeout=DELETE_TIMEOUT,
-    )
-    r.raise_for_status()
-    body = r.json()
+    try:
+        body = await files_api.cloud_files_bridge_list_files(
+            self._api, query=params, options=self._options(DELETE_TIMEOUT)
+        )
+    except MatrxApiError as exc:
+        raise _as_status_error(exc) from exc
     if isinstance(body, list):
         return body
     return list(body.get("files") or [])
@@ -250,13 +289,12 @@ async def _remote_list_changes(
     ``/api/cloud-files/changes`` envelope with ``files`` + ``next_cursor``
     + ``deletions_supported`` keys. Used by ``downstream.PollingSubscriber``.
     """
-    r = await self._client.get(
-        f"{self._cfg.url}/api/cloud-files/changes",
-        params={"since": since_iso, "limit": limit},
-        timeout=DELETE_TIMEOUT,
-    )
-    r.raise_for_status()
-    body = r.json()
+    try:
+        body = await files_api.list_changes(
+            self._api, query={"since": since_iso, "limit": limit}, options=self._options(DELETE_TIMEOUT)
+        )
+    except MatrxApiError as exc:
+        raise _as_status_error(exc) from exc
     return body if isinstance(body, dict) else {"files": [], "next_cursor": since_iso}
 
 

@@ -157,17 +157,13 @@ def test_every_bridge_request_carries_the_organization_on_the_wire() -> None:
         url="https://server.example",
         token="token",
         user_id="user",
-        organization_id="org-1",
+        organization_id="3f2b8c1e-0a4d-4c55-9e0f-1a2b3c4d5e6f",
     )
 
     async def run() -> None:
         from matrx_agent.cloud_sync.client import AsyncBridgeClient
 
-        client = AsyncBridgeClient(cfg)
-        client._client = httpx.AsyncClient(
-            headers=client._client.headers,
-            transport=httpx.MockTransport(handler),
-        )
+        client = AsyncBridgeClient(cfg, transport=httpx.MockTransport(handler))
         import tempfile
 
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
@@ -181,7 +177,7 @@ def test_every_bridge_request_carries_the_organization_on_the_wire() -> None:
 
     assert seen, "no request reached the transport"
     for headers in seen:
-        assert headers["x-organization-id"] == "org-1"
+        assert headers["x-organization-id"] == "3f2b8c1e-0a4d-4c55-9e0f-1a2b3c4d5e6f"
         assert headers["x-matrx-user-id"] == "user"
 
 

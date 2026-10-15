@@ -135,12 +135,25 @@ wheels = [
 ]
 
 [[package]]
+name = "matrx-api"
+version = "0.1.4"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "httpx" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/15/7e/0352759e78dd4f66d86c3dbe0246ee605a35bdad2c1c08baedfc30a96790/matrx_api-0.1.4.tar.gz", hash = "sha256:f748a90d9d7b4d2bb835dfbad416ed9c4a4e4f2f4a68571d656b34d482fd655b", size = 457234, upload-time = "2026-10-15T18:09:25.402Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/36/57/522218f4bd92733af20192b62b22bc9ce460ccbbf5232e3f6ec8db62ca9c/matrx_api-0.1.4-py3-none-any.whl", hash = "sha256:fd7a49bdeedf4f4b13016cba3051f2d32d1fec7014af1d5b089e8b8e46d707ea", size = 460201, upload-time = "2026-10-15T18:09:23.707Z" },
+]
+
+[[package]]
 name = "matrx-sdk"
 version = "0.1.29"
 source = { editable = "." }
 dependencies = [
     { name = "fastapi" },
     { name = "httpx" },
+    { name = "matrx-api" },
     { name = "pydantic" },
     { name = "python-multipart" },
     { name = "uvicorn" },
@@ -158,6 +171,7 @@ dev = [
 requires-dist = [
     { name = "fastapi", specifier = ">=0.100" },
     { name = "httpx", specifier = ">=0.25" },
+    { name = "matrx-api", specifier = ">=0.1.4" },
     { name = "pydantic", specifier = ">=2.0" },
     { name = "pytest", marker = "extra == 'dev'" },
     { name = "pytest-asyncio", marker = "extra == 'dev'" },

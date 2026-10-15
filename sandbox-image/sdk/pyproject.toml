@@ -9,6 +9,8 @@ description = "Matrx SDK — agent utilities + Claude Code-compatible tools for 
 requires-python = ">=3.11"
 dependencies = [
     "httpx>=0.25",
+    # Generated client of every AI Matrx server (cloud-files bridge). Installs on Python >=3.11.
+    "matrx-api>=0.1.4",
     "pydantic>=2.0",
     "fastapi>=0.100",
     "uvicorn>=0.23",
