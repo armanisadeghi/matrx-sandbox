@@ -22,6 +22,12 @@ class SandboxStatus(str, Enum):
 
 
 SandboxTier = Literal["ec2", "hosted"]
+#: Every tier a ``sandbox_instances`` row may carry. ``cloud_computer`` rows
+#: are written and launched by AI Dream (a person's Cloud Computer on Fargate,
+#: aidream/services/cloud_browser/cloud_computer_machine.py); no orchestrator
+#: spawns, reconciles, expires or resumes them — every sweep here filters on its
+#: own ``host_tier``. Reading one must never break ``store.list()``.
+StoredSandboxTier = Literal["ec2", "hosted", "cloud_computer"]
 
 
 class ResourcesSpec(BaseModel):
@@ -177,7 +183,7 @@ class SandboxResponse(BaseModel):
     ssh_port: int | None = Field(default=None, description="Host port mapped to container SSH (port 22)")
     ttl_seconds: int = 7200
     expires_at: datetime | None = Field(default=None, description="When the sandbox auto-expires")
-    tier: SandboxTier | None = Field(default=None, description="Tier this sandbox runs on")
+    tier: StoredSandboxTier | None = Field(default=None, description="Tier this sandbox runs on")
     template: str | None = None
     template_version: str | None = None
     labels: dict[str, str] | None = None
