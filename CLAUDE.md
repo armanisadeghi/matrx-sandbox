@@ -55,7 +55,6 @@ Also binding: the Data Doctrine (`common-docs/systems/architecture/database/DECI
 | Zero-drift migration (version stamping, drift detection, safe image swap, auto-migrate) | [docs/ZERO_DRIFT.md](docs/ZERO_DRIFT.md) |
 | Adding tools/SDKs to the sandbox image | [sandbox-image/ADDING_UTILITIES.md](sandbox-image/ADDING_UTILITIES.md) |
 | Repository layout in detail | [docs/DIRECTORY_STRUCTURE.md](docs/DIRECTORY_STRUCTURE.md) |
-| Local-only sandbox dev on the `/srv` host | [sandbox-local/ROADMAP.md](sandbox-local/ROADMAP.md), [sandbox-local/TESTING.md](sandbox-local/TESTING.md) |
 | AI Work Hub provider runtime (product plan this repo hosts the runtime for) | [ai-work-hub PLAN](/Users/armanisadeghi/code/common-docs/systems/chat/ai-work/projects/ai-work-hub/PLAN.md) |
 | Persistent Cloud Browser (sandbox-sidecar browser plan) | [persistent-cloud-browser PLAN](/Users/armanisadeghi/code/common-docs/systems/web/persistent-cloud-browser/FEATURE.md) |
 | Live infra dashboard (recommended first stop) | `/administration/sandbox-infra` in matrx-frontend |
@@ -68,12 +67,11 @@ Also binding: the Data Doctrine (`common-docs/systems/architecture/database/DECI
 |---|---|---|---|
 | **EC2 tier** (`tier: "ec2"`) | EC2 | Orchestrator (FastAPI) + on-demand sandbox containers. Template-specific retained homes + shared platform Postgres; S3 only where the template supports it. | Push to `main` → GitHub Actions → ECR build → SSM deploy → health-check loop ([.github/workflows/deploy.yml](.github/workflows/deploy.yml)) |
 | **Hosted tier** (`tier: "hosted"`) | `/srv` dev server | Orchestrator at `https://orchestrator.dev.codematrx.com` + spawned sandboxes. Per-(user, organization) Docker volumes (`matrx-user-<uid>-org-<oid>` at `/home/agent`) survive container destroy; pre-2026-09-17 per-user volumes are preserved, never adopted ([OPERATIONS.md](docs/OPERATIONS.md)). Same Postgres `sandbox_instances` table as EC2 — one source of truth. Boot + 60s liveness reconcile from `docker ps` ([docs/ARCHITECTURE.md](docs/ARCHITECTURE.md#status-reconciliation-boot--periodic-liveness)). | Push to `main` — the host **self-deploys** via `matrx-hosted-deploy.timer`, a 2-min poller running [scripts/deploy-hosted.sh](scripts/deploy-hosted.sh). ⚠️ the poller `git reset --hard`s that checkout every tick — commit+push as you go, or `systemctl stop matrx-hosted-deploy.timer` while editing there. |
-| **Static "starter pool"** ⚠️ deprecated | `/srv` dev server | Hard-coded `sandbox-1`…`sandbox-5` from [sandbox-local/docker-compose.yml](sandbox-local/docker-compose.yml), per-slot (not per-user) volumes. Retire once the frontend create-flow is ready. | rebuilt by the same deploy poller |
+| **Static "starter pool"** — retired 2026-10-16 | — | `sandbox-1`…`sandbox-5` and their compose file are gone; only `sandbox-local/`'s Dockerfile + entrypoint scripts remain (the aidream image reuses them). | — |
 
-Name collision on the dev server — three things called "sandbox":
+Name collision on the dev server — two things called "sandbox":
 - `matrx-sandbox` container → Ship instance, **version tracking only**, not the runtime. Pushing here does NOT auto-reach EC2 production either — that's the separate GHA pipeline.
 - `matrx-orchestrator` → hosted-tier orchestrator (spawns/manages sandboxes).
-- `sandbox-1`…`sandbox-5` → deprecated starter-pool containers.
 
 ## The three code surfaces
 
@@ -96,7 +94,7 @@ Name collision on the dev server — three things called "sandbox":
 - **The store has two implementations** — `InMemorySandboxStore` (tests) and `PostgresSandboxStore` (prod, Supabase, RLS per `user_id`). Don't add fields to one without the other.
 - **Package / Implementation Separation — read before touching ANY database or connection config.** One connection, one set of variable names; a different database is a change of VALUES, never a new variable name. ⚠️ This repo's orchestrator predates the rule and reaches the same platform Supabase through its own `MATRX_DATABASE_URL` + `MATRX_SANDBOX_STORE` ([config.py](orchestrator/orchestrator/config.py), [store.py](orchestrator/orchestrator/store.py)) — a known second name for the one connection; don't copy the pattern and don't add a third. Connection strings this repo handles for OTHER services (Coolify/host-managed Postgres, template files) are out of scope. Canonical: [package-vs-implementation.md](/Users/armanisadeghi/code/common-docs/policies/package-vs-implementation.md).
 - **THE HOME OWNERSHIP LAW: nothing under `/home/agent` may be root-owned, and `ensure-layout.sh` is the ONE chokepoint that enforces it.** Boot steps that run as root populate the home (`hot-sync.sh down` restores the whole home from S3 as root; template copies; installs), so every one of them must run BEFORE `ensure-layout.sh`, whose tail repairs every root-owned path and says so. Never add a root write to the home after it, and never "fix" a permission error by chowning one path. Guard: `sandbox-image/scripts/check-home-ownership.sh`, run by `smoke-test.sh`. The class shipped once (2026-09-12 `03bf8ed` deleted the blanket chown; every fresh EC2 box from 2026-09-14 on had a root-owned `~/projects` and `mtx new` died on it).
-- **`mountpoint-s3` is x86_64 only** — a native Apple Silicon build skips cold-mount install; cross-build with `docker buildx build --platform linux/amd64 …`. Sandbox containers need the `SYS_ADMIN` cap and `/dev/fuse` for it ([sandbox-local/docker-compose.yml](sandbox-local/docker-compose.yml); Docker run flags on EC2).
+- **`mountpoint-s3` is x86_64 only** — a native Apple Silicon build skips cold-mount install; cross-build with `docker buildx build --platform linux/amd64 …`. Sandbox containers need the `SYS_ADMIN` cap and `/dev/fuse` for it (Docker run flags on EC2 and in the orchestrator).
 - **Cold writes can be lost on hard crash** — FUSE flushes on graceful shutdown only; treat `/data/cold/` as eventually-consistent.
 - **Images are ~2.9 GB and slow to build** — prefer modifying the SDK or scripts over rebuilding the base; the `/srv` deploy poller rebuilds `matrx-sandbox:core`/`:local` automatically on push (path-diff triggered), manual build is a local-iteration fallback only.
 

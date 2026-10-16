@@ -73,9 +73,9 @@ curl -H "X-API-Key: $KEY" https://orchestrator.dev.codematrx.com/sandboxes
 docker ps --filter label=matrx.sandbox_id --format "table {{.Names}}\t{{.Status}}"
 ```
 
-### Sandbox image rebuild + recreate the starter pool
+### Sandbox image rebuild
 
-**Automatic on push to `main`** — the deploy poller rebuilds every changed image variant, records the exact successful live image IDs beside the deployed SHA, and self-heals missing or unexpectedly retagged aliases before any no-op exit. It recreates the starter pool when its image changes. The commands below are a manual fallback for local iteration only:
+**Automatic on push to `main`** — the deploy poller rebuilds every changed image variant, records the exact successful live image IDs beside the deployed SHA, and self-heals missing or unexpectedly retagged aliases before any no-op exit. The commands below are a manual fallback for local iteration only:
 
 Fleet Health build markers remain active from the start of each candidate build
 through atomic live-tag promotion. A built candidate waiting for another image
@@ -177,9 +177,6 @@ cd /srv/projects/matrx-sandbox/sandbox-image && docker build -t matrx-sandbox:co
 
 # Rebuild the local variant (adds ttyd on top of core)
 cd /srv/projects/matrx-sandbox/sandbox-local && docker build -t matrx-sandbox:local .
-
-# Recreate the starter-pool containers (sandbox-1..5)
-docker compose up -d --force-recreate
 
 # Verify the daemon is listening
 docker exec sandbox-1 netstat -tlnp | grep :8000

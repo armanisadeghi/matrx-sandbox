@@ -164,16 +164,7 @@ image** are all (re)built on a push to main, each version-stamped.
 1. **core / slim / aidream** are already built by `deploy-hosted.sh` (hosted) and
    `core`/`slim` by `deploy.yml` (EC2/ECR). **Confirm aidream actually rebuilds**
    on a content change and on "missing" self-heal (`build-aidream.sh`).
-2. **`local` starter pool** (`sandbox-local/`, images `matrx-sandbox:local` from
-   `:core`, containers `sandbox-1..5`) is **not** currently rebuilt or restarted
-   by the deploy. The product owner explicitly wants it in scope. Either:
-   - **(preferred)** extend `scripts/deploy-hosted.sh` to also
-     `docker build -t matrx-sandbox:local sandbox-local/` and
-     `cd sandbox-local && docker compose up -d` when `sandbox-image/` or
-     `sandbox-local/` changed or the image is missing; **or**
-   - if the starter pool is being retired (it is marked deprecated in
-     `CLAUDE.md`), get explicit confirmation and **remove it** instead — don't
-     leave it half-maintained.
+2. **`local` starter pool** — retired 2026-10-16 (containers `sandbox-1..5` and `sandbox-local/docker-compose.yml` removed); `deploy-hosted.sh` only builds the `matrx-sandbox:local` image alias now.
 3. Make sure every template image is **version-stamped** (the SHA build-arg /
    `/etc/sandbox-image-version`) so `GET /drift` can tell old from new. `core`,
    `slim` already pass `MATRX_IMAGE_VERSION`; confirm `aidream` and `local` do

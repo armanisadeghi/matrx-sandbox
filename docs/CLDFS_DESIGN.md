@@ -213,7 +213,7 @@ this with the three-step fallback when the endpoint is missing, but adding
    pyproject; add when ready to ship cldfs). On Linux installs as
    `libfuse3-3` + `pyfuse3` wheel.
 2. Container needs `--cap-add SYS_ADMIN --device /dev/fuse` (already in
-   `sandbox-local/docker-compose.yml` for cold-mount; same flags work).
+   the orchestrator's container create for cold-mount; same flags work).
 3. `MATRX_CLDFS_MODE=fuse` env var must be passed through by the
    orchestrator.
 4. `SUPABASE_URL` + `SUPABASE_ANON_KEY` must be in the container env

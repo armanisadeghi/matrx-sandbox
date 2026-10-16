@@ -540,14 +540,10 @@ else
   log "aidream present + unchanged (aidream repo SHA current) — skip"
 fi
 
-# ── Local starter pool (sandbox-1..5) ───────────────────────────────────────
-# The static starter pool predates the dynamic orchestrator and is marked
-# deprecated, but it's still serving traffic. Rebuild matrx-sandbox:local +
-# recreate the pool when sandbox-image/ OR sandbox-local/ changes (or the image
-# is missing) so a push-to-main brings it forward too. The rolling auto-migrate
-# loop is orchestrator-driven and does NOT touch these static containers — they
-# refresh via this docker-compose recreate. If/when the pool is retired, remove
-# this block entirely (don't leave it half-maintained).
+# ── matrx-sandbox:local image ───────────────────────────────────────────────
+# Still a required release alias (hosted_release_complete / image state). The
+# static starter pool that ran on it (sandbox-1..5) was retired 2026-10-16;
+# nothing recreates pool containers here any more.
 if need_local_img matrx-sandbox:local; then
   cd "$REPO_DIR/sandbox-local"
   LOCAL_CANDIDATE="matrx-sandbox:local-$NEW_SHA"
@@ -736,9 +732,6 @@ rollback_release() {
       docker image rm "$ORCH_IMAGE" >/dev/null 2>&1 || true
     fi
   fi
-  if [ -n "${LOCAL_CANDIDATE:-}" ] && [ -f "$REPO_DIR/sandbox-local/docker-compose.yml" ]; then
-    ( cd "$REPO_DIR/sandbox-local" && docker compose up -d ) || true
-  fi
   # Final mutation on rollback: start the exact previous source.  Nothing
   # below may signal, retag, recreate, reload configuration, or mutate images.
   if [ "${ORCH_STOPPED:-0}" = 1 ]; then
@@ -865,12 +858,6 @@ fi
 if [ "$ORCH_STOPPED" = 1 ]; then
   ( cd "$ORCH_COMPOSE_DIR" && docker compose up -d --force-recreate ) \
     || fail_release "orchestrator recreate failed"
-fi
-
-if [ -n "${LOCAL_CANDIDATE:-}" ] && [ -f "$REPO_DIR/sandbox-local/docker-compose.yml" ]; then
-  log "recreating local starter pool (sandbox-1..5) on the promoted image"
-  ( cd "$REPO_DIR/sandbox-local" && docker compose up -d ) \
-    || fail_release "starter pool recreate failed"
 fi
 
 # A measured 229-row fleet startup took 157s. Budget elapsed time, not attempts
