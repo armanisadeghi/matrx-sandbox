@@ -124,11 +124,10 @@ CLONE_BOOT_IGNORED = {
 # 2026-10-16. Anything not matched here is content. Guards:
 # tests/test_unused_home_sweep.py.
 
-#: Files boot (re)writes wholesale every start, so nothing a person put in them
-#: survives a boot anyway.
+#: REGULAR files boot (re)writes wholesale every start, so nothing a person put
+#: in them survives a boot anyway. Exact paths only.
 BOOT_SKELETON_EXACT = frozenset({
     ".sandbox_env",                           # entrypoint*.sh: cat > every boot
-    ".ssh/authorized_keys",                   # prepare-agent-home.sh: admin PUBLIC keys
     ".matrx/instructions/SANDBOX_LAYOUT.md",  # ensure-layout.sh: cat > every boot
     ".matrx/session.json",                    # matrx_agent.persistence, every 5 min
     ".matrx/session.prev.json",               # matrx_agent.persistence, rotated at boot
@@ -136,19 +135,26 @@ BOOT_SKELETON_EXACT = frozenset({
     ".matrx/runtime/cloud-files-down-complete",  # cloud_sync watcher marker (empty)
 })
 
-#: Directory trees that hold only regenerable machine state.
-BOOT_SKELETON_PREFIXES = (
-    ".cache/",                                # pip/uv caches (still weighed)
-    ".codex/tmp/",                            # codex arg0 dispatch links, per process
-    ".matrx/runtime/session-reports/",        # persistence startup reports
-    ".matrx/runtime/tool-calls/_runtime/",    # service actions, never an agent call
-)
+#: The one boot-created TREE, matched exactly: the Codex CLI's per-process
+#: arg0 dispatch dir (seen on the live untouched aidream home 2026-10-16) — an
+#: empty ``.lock`` and four symlinks, each to exactly :data:`CODEX_ARG0_TARGET`.
+#: Anything else under ``.codex`` (or any other tree) is content.
+CODEX_ARG0_DIR_RE = r"^\.codex/tmp/arg0/codex-arg0[A-Za-z0-9]+/"
+CODEX_ARG0_LINKS = frozenset({"apply_patch", "applypatch", "codex-execve-wrapper",
+                              "codex-linux-sandbox"})
+CODEX_ARG0_TARGET = ("/opt/matrx-codex/lib/node_modules/@openai/codex/node_modules/"
+                     "@openai/codex-linux-x64/vendor/x86_64-unknown-linux-musl/bin/codex")
 
 #: Ubuntu 22.04 /etc/skel copies, byte for byte (measured from the live
 #: matrx-sandbox:core image 2026-10-16). An edited copy is content.
 SKEL_SHA256 = {
     ".profile": "28b4a453b68dde64f814e94bab14ee651f4f162e15dd9920490aa1d49f05d2a4",
     ".bash_logout": "26882b79471c25f945c970f8233d8ce29d54e9d5eedcd2884f88affa84a18f56",
+    # Baked at image build (Dockerfile*: cp admin_authorized_keys), identical in
+    # core/slim/aidream and both untouched homes; = sandbox-image/config/
+    # admin_authorized_keys. prepare-agent-home.sh only appends keys from that
+    # same file, so any other line is somebody's key.
+    ".ssh/authorized_keys": "c041196992f03beea13b1cff1815e3d47f48548cf02842ef3b29bbea453688bd",
 }
 SKEL_BASHRC_SHA256 = "342099da4dd28c394d3f8782d90d7465cb2eaa611193f8f378d6918261cb9bb8"
 
@@ -164,12 +170,19 @@ BASHRC_BOOT_LINES = frozenset({
     "alias la='ls -A --color=auto'",
 })
 
-#: configure-git-credentials.sh writes credential.helper (these two) and the
-#: github.com username; any other .gitconfig key is the person's.
-GITCONFIG_BOOT_HELPERS = (
-    "cache --socket=/home/agent/.matrx/runtime/git-credential-cache.sock",
+#: configure-git-credentials.sh writes credential.helper (exactly these two,
+#: its defaults) and the github.com username (rewritten every boot); any other
+#: .gitconfig key or helper value is the person's.
+GITCONFIG_BOOT_HELPERS = frozenset({
+    "cache --socket=/home/agent/.matrx/runtime/git-credential-cache.sock --timeout=1800",
     "/opt/sandbox/scripts/matrx-git-credential-env",
-)
+})
+
+#: The boot copy (``cp -a`` + ``chown -R`` + editable retarget) stamps every
+#: ``.venv`` entry's ctime within one window; ``cp -a`` cannot carry ctime, so
+#: an entry changed AFTER the copy (a pip install, an edit) has a later ctime.
+#: Measured from ``.venv/pyvenv.cfg``. Byte-code caches are exempt.
+VENV_COPY_WINDOW_SECONDS = 3600
 
 #: Every git call in the helper is capped; a timeout means "cannot prove
 #: pristine", i.e. KEEP.
@@ -178,8 +191,9 @@ GIT_CALL_TIMEOUT_SECONDS = 60
 #: The constants :func:`_classify_home` reads, shipped into the helper.
 _SHIPPED_CONSTANTS = (
     "TEMPLATE_SEEDED_CLONES", "CLONE_BOOT_IGNORED", "BOOT_SKELETON_EXACT",
-    "BOOT_SKELETON_PREFIXES", "SKEL_SHA256", "SKEL_BASHRC_SHA256",
-    "BASHRC_BOOT_LINES", "GITCONFIG_BOOT_HELPERS", "GIT_CALL_TIMEOUT_SECONDS",
+    "CODEX_ARG0_DIR_RE", "CODEX_ARG0_LINKS", "CODEX_ARG0_TARGET",
+    "SKEL_SHA256", "SKEL_BASHRC_SHA256", "BASHRC_BOOT_LINES",
+    "GITCONFIG_BOOT_HELPERS", "GIT_CALL_TIMEOUT_SECONDS", "VENV_COPY_WINDOW_SECONDS",
 )
 
 _last_sweep_at: float | None = None
@@ -188,11 +202,11 @@ _last_sweep_at: float | None = None
 _known_used: set[tuple[str, str]] = set()
 
 
-def _classify_home(root, max_bytes):
+def _classify_home(root, max_bytes, release_shas=()):
     """Decide whether a mounted home holds user content. ALLOW-LIST: every
     file or symlink anywhere in the home is content unless the image's own
     never-used boot is known to create it (:data:`BOOT_SKELETON_EXACT`,
-    :data:`BOOT_SKELETON_PREFIXES`, the verified dotfiles below). Unknown is
+    the exact Codex arg0 links, the verified dotfiles below). Unknown is
     content. Empty directories are never content. ``cloud-files/`` (a mirror)
     is skipped; a template-seeded clone is judged by git.
 
@@ -201,6 +215,7 @@ def _classify_home(root, max_bytes):
     import hashlib
     import json
     import os
+    import re
     import stat as statmod
     import subprocess
 
@@ -234,14 +249,21 @@ def _classify_home(root, max_bytes):
                 h.update(chunk)
         return h.hexdigest()
 
-    def boot_file_ok(rel, full):
-        """True only when a known boot-written file holds only what boot wrote."""
+    def boot_file_ok(rel, full, st):
+        """True only when a known boot-written file holds only what boot wrote.
+        A symlink is content unless it is one of the exact Codex arg0 links."""
+        codex = re.match(CODEX_ARG0_DIR_RE, rel)
+        if codex:
+            leaf = rel[codex.end():]
+            if statmod.S_ISLNK(st.st_mode):
+                return leaf in CODEX_ARG0_LINKS and os.readlink(full) == CODEX_ARG0_TARGET
+            return leaf == ".lock" and statmod.S_ISREG(st.st_mode) and st.st_size == 0
+        if statmod.S_ISLNK(st.st_mode):
+            return False
         if rel in BOOT_SKELETON_EXACT:
             return True
-        if rel.startswith(BOOT_SKELETON_PREFIXES):
-            return True
         if rel in SKEL_SHA256:
-            return sha(full) == SKEL_SHA256[rel]
+            return rel == ".ssh/authorized_keys" or sha(full) == SKEL_SHA256[rel]
         if rel == ".bashrc":
             with open(full, "rb") as fh:
                 lines = fh.read().decode("utf-8", "replace").splitlines(keepends=True)
@@ -255,7 +277,7 @@ def _classify_home(root, max_bytes):
                 key, _, value = entry.partition("=")
                 if key == "credential.https://github.com.username":
                     continue
-                if key == "credential.helper" and value.startswith(GITCONFIG_BOOT_HELPERS):
+                if key == "credential.helper" and value in GITCONFIG_BOOT_HELPERS:
                     continue
                 return False
             return True
@@ -276,6 +298,26 @@ def _classify_home(root, max_bytes):
             return not pending
         return False
 
+    def venv_changed_after_copy(venv):
+        """None when every .venv entry was stamped by the boot copy."""
+        try:
+            anchor = os.lstat(os.path.join(venv, "pyvenv.cfg")).st_ctime
+        except OSError:
+            return ".venv has no pyvenv.cfg"
+        limit = anchor + VENV_COPY_WINDOW_SECONDS
+        for dirpath, dirnames, filenames in os.walk(venv, followlinks=False):
+            if os.path.basename(dirpath) == "__pycache__":
+                dirnames[:] = []
+                continue
+            # Files and symlinks only: a directory's ctime moves whenever an
+            # entry (a byte-code cache) is added inside it.
+            for name in filenames + [d for d in dirnames
+                                     if os.path.islink(os.path.join(dirpath, d))]:
+                full = os.path.join(dirpath, name)
+                if os.lstat(full).st_ctime > limit:
+                    return ".venv changed after its boot copy: " + os.path.relpath(full, venv)[:120]
+        return None
+
     def clone_shows_work(name):
         """None when the clone is pristine; else a short reason."""
         repo = os.path.join(root, name)
@@ -291,22 +333,25 @@ def _classify_home(root, max_bytes):
                 return "changed: " + line[:120]
             if git(repo, "rev-parse", "-q", "--verify", "refs/stash").returncode == 0:
                 return "stash"
-            # The baseline is what the clone itself knows came from upstream:
-            # every remote-tracking ref, plus FETCH_HEAD (the template seed is
-            # a shallow fetch of the release commit and has no remote refs).
-            baseline = []
-            try:
-                with open(os.path.join(repo, ".git", "FETCH_HEAD")) as fh:
-                    for line in fh:
-                        h = line[:40]
-                        if len(h) == 40 and all(c in "0123456789abcdef" for c in h):
-                            baseline.append(h)
-            except OSError:
-                pass
+            # Hidden from `git status` on purpose: assume-unchanged (lowercase
+            # tag) or skip-worktree (S) entries can carry edits status won't show.
+            flagged = git(repo, "ls-files", "-v")
+            if flagged.returncode != 0:
+                return "git ls-files failed"
+            for line in flagged.stdout.splitlines():
+                if line[:1].islower() or line[:1] == "S":
+                    return "hidden from status: " + line[:120]
+            # The baseline is upstream as the clone records it (refs/remotes/*)
+            # plus the release commits of the aidream images on this host (the
+            # seed is a shallow fetch of exactly that commit). FETCH_HEAD is
+            # NOT a baseline: any local fetch rewrites it.
             remotes = git(repo, "for-each-ref", "--format=%(objectname)", "refs/remotes")
             if remotes.returncode != 0:
                 return "git for-each-ref failed"
-            baseline += [s for s in remotes.stdout.split() if s]
+            baseline = [s for s in remotes.stdout.split() if s]
+            for sha_ in release_shas:
+                if git(repo, "cat-file", "-e", sha_ + "^{commit}").returncode == 0:
+                    baseline.append(sha_)
             if not baseline:
                 return "no upstream baseline to compare commits against"
             local = git(repo, "rev-list", "--max-count=1", "HEAD", "--branches", "--tags",
@@ -315,6 +360,10 @@ def _classify_home(root, max_bytes):
                 return "git rev-list failed: " + local.stderr.strip()[:120]
             if local.stdout.strip():
                 return "local commit " + local.stdout.strip()[:12]
+            if ".venv/" in allowed_ignored and os.path.isdir(os.path.join(repo, ".venv")):
+                why = venv_changed_after_copy(os.path.join(repo, ".venv"))
+                if why:
+                    return why
             return None
         except Exception as exc:  # git missing, timeout, … = cannot prove pristine
             return "git unavailable: " + str(exc)[:120]
@@ -369,7 +418,7 @@ def _classify_home(root, max_bytes):
             files += 1
             total += st.st_size
             try:
-                ok = boot_file_ok(rel, full)
+                ok = boot_file_ok(rel, full, st)
             except Exception as exc:  # unreadable or malformed = content
                 errored(exc)
                 ok = False
@@ -395,18 +444,32 @@ def helper_program() -> str:
         prelude
         + source
         + "\nimport json, sys\n"
-        + f"print({_RESULT_PREFIX!r} + json.dumps(_classify_home(sys.argv[1], sys.argv[2])))\n"
+        + "_release = json.loads(sys.argv[3]) if len(sys.argv) > 3 else []\n"
+        + f"print({_RESULT_PREFIX!r} + json.dumps(_classify_home(sys.argv[1], sys.argv[2], _release)))\n"
     )
 
 
+def aidream_release_shas(client: Any) -> list[str]:
+    """Release commits of every sandbox image on this host (the label
+    ``com.aimatrx.aidream.sha`` Dockerfile.aidream stamps). A seeded clone's
+    HEAD is one of these; nothing else about the clone is trusted as upstream."""
+    shas: set[str] = set()
+    for image in client.images.list():
+        sha_ = ((getattr(image, "labels", None) or {}).get("com.aimatrx.aidream.sha") or "")
+        if len(sha_) == 40 and all(c in "0123456789abcdef" for c in sha_):
+            shas.add(sha_)
+    return sorted(shas)
+
+
 def _run_helper_bounded(client: Any, image: str, volume: str, max_bytes: int,
-                        timeout: float) -> str:
+                        timeout: float, release_shas: list[str] | None = None) -> str:
     """Run the helper detached, wait at most ``timeout`` seconds, and ALWAYS
     remove it. Runs whole in one worker thread, so a cancelled caller can never
     skip the kill/remove. A timeout raises: the caller keeps the home."""
     container = client.containers.run(
         image,
-        command=["-c", helper_program(), "/home/agent", str(int(max_bytes))],
+        command=["-c", helper_program(), "/home/agent", str(int(max_bytes)),
+                 json.dumps(list(release_shas or []))],
         entrypoint=["python3"],
         user="0:0",
         volumes={volume: {"bind": "/home/agent", "mode": "ro"}},
@@ -445,8 +508,9 @@ async def inspect_home(client: Any, volume: str, max_bytes: int) -> dict:
     image = await _helper_image(client)
     if not image:
         raise RuntimeError("no helper image identity")
+    shas = await asyncio.to_thread(aidream_release_shas, client)
     text = await asyncio.to_thread(_run_helper_bounded, client, image, volume, max_bytes,
-                                   HELPER_TIMEOUT_SECONDS)
+                                   HELPER_TIMEOUT_SECONDS, shas)
     lines = [ln for ln in text.splitlines() if ln.startswith(_RESULT_PREFIX)]
     if len(lines) != 1:
         raise RuntimeError("home inspector did not emit exactly one verdict")

@@ -49,6 +49,9 @@ KNOBS = {
 # ── The home skeleton the image writes, and the content that makes it "used" ──
 
 SKEL = Path(__file__).resolve().parent / "fixtures" / "ubuntu-skel"
+ADMIN_KEYS = Path(__file__).resolve().parents[2] / "sandbox-image" / "config" / "admin_authorized_keys"
+#: Release commit of each fixture clone, as the host's image label would carry it.
+RELEASE_SHAS: list[str] = []
 
 GITCONFIG_BOOT = (
     '[credential "https://github.com"]\n\tusername = x-access-token\n'
@@ -79,7 +82,7 @@ def _skeleton(home: Path, *, aidream: bool = False) -> Path:
     (home / ".bash_logout").write_text((SKEL / "bash_logout").read_text())
     (home / ".gitconfig").write_text(GITCONFIG_BOOT)
     (home / ".sandbox_env").write_text("export SANDBOX_ID=sbx\n")
-    (home / ".ssh/authorized_keys").write_text("ssh-ed25519 AAAA admin\n")
+    (home / ".ssh/authorized_keys").write_bytes(ADMIN_KEYS.read_bytes())
     (home / ".matrx/instructions/SANDBOX_LAYOUT.md").write_text("# layout\n" * 200)
     (home / ".matrx/session.json").write_text("{}")
     (home / ".matrx/session.prev.json").write_text("{}")
@@ -88,12 +91,11 @@ def _skeleton(home: Path, *, aidream: bool = False) -> Path:
     (home / ".matrx/runtime/cloud-sync-queue.jsonl").write_text(
         '{"event_id": "e1", "kind": "upsert", "rel_path": "a.pdf", "queued_at": 1}\n'
         '{"event_id": "e1", "done": true, "completed_at": 2}\n')
-    (home / ".matrx/runtime/session-reports/boot.md").write_text("booted\n")
-    (home / ".matrx/runtime/tool-calls/_runtime/1-cloud-sync.md").write_text("synced\n")
-    (home / ".cache/uv/wheels").mkdir(parents=True)
-    (home / ".cache/uv/wheels/x.whl").write_bytes(b"x" * 1000)
-    (home / ".codex/tmp/arg0/codex-arg0X").mkdir(parents=True)
-    (home / ".codex/tmp/arg0/codex-arg0X/apply_patch").symlink_to("/usr/bin/codex")
+    arg0 = home / ".codex/tmp/arg0/codex-arg0413WyQ"
+    arg0.mkdir(parents=True)
+    (arg0 / ".lock").write_bytes(b"")
+    for link in ("apply_patch", "applypatch", "codex-execve-wrapper", "codex-linux-sandbox"):
+        (arg0 / link).symlink_to(empty_home.CODEX_ARG0_TARGET)
     # The person's AI Matrx files, mirrored down at boot: big, and NOT use.
     (home / "cloud-files/report.pdf").write_bytes(b"x" * 5_000_000)
     return home
@@ -131,13 +133,31 @@ CONTENT = {
         h / ".matrx/runtime/cloud-sync-queue.jsonl",
         '{"event_id": "e2", "kind": "upsert", "rel_path": "new.pdf", "queued_at": 3}\n'),
     "dotfile_unknown": lambda h: _append(h / ".npmrc", "//registry/:_authToken=x\n"),
+    # Second review: allow-listed trees accepted anything under them.
+    "cache_notes": lambda h: _append(h / ".cache/work/notes.txt", "n"),
+    "codex_tmp_file": lambda h: _append(h / ".codex/tmp/mywork.py", "x"),
+    "codex_arg0_extra": lambda h: _append(h / ".codex/tmp/arg0/codex-arg0413WyQ/mine.py", "x"),
+    "codex_arg0_retargeted_link": lambda h: (
+        (h / ".codex/tmp/arg0/codex-arg0413WyQ/apply_patch").unlink(),
+        (h / ".codex/tmp/arg0/codex-arg0413WyQ/apply_patch").symlink_to("/home/agent/x")),
+    "session_report_extra": lambda h: _append(h / ".matrx/runtime/session-reports/mine.md", "m"),
+    "runtime_tool_call_extra": lambda h: _append(h / ".matrx/runtime/tool-calls/_runtime/mine.md", "m"),
+    "symlink_in_cache": lambda h: ((h / ".cache").mkdir(exist_ok=True),
+                                   (h / ".cache/link").symlink_to("/etc/passwd")),
+    "symlink_replacing_layout_file": lambda h: (
+        (h / ".matrx/session.json").unlink(),
+        (h / ".matrx/session.json").symlink_to("/home/agent/projects/x")),
+    "extra_authorized_key": lambda h: _append(h / ".ssh/authorized_keys", "ssh-ed25519 AAAAmine me\n"),
+    "gitconfig_helper_suffix": lambda h: (h / ".gitconfig").write_text(GITCONFIG_BOOT.replace(
+        "matrx-git-credential-env", "matrx-git-credential-env --also-mine")),
 }
 
 
 def _run_helper_program(home: Path, max_bytes: int) -> dict:
     """Run the EXACT program the helper container runs, against ``home``."""
     out = subprocess.run(
-        [sys.executable, "-c", empty_home.helper_program(), str(home), str(max_bytes)],
+        [sys.executable, "-c", empty_home.helper_program(), str(home), str(max_bytes),
+         json.dumps(RELEASE_SHAS)],
         check=True, capture_output=True, text=True,
     ).stdout
     line = [ln for ln in out.splitlines() if ln.startswith("EMPTY_HOME_RESULT=")]
@@ -190,8 +210,10 @@ def _template_clone(home: Path, tmp_path: Path) -> Path:
     _git(clone, "reset", "-q", "--mixed", "FETCH_HEAD")
     _git(clone, "checkout", "-q", "--", ".")  # the git-archive'd tracked files
     _git(clone, "branch", "-M", "main")
-    (clone / ".venv/lib").mkdir(parents=True)
+    (clone / ".venv/lib/site-packages/pkg-1.0.dist-info").mkdir(parents=True)
+    (clone / ".venv/pyvenv.cfg").write_text("home = /opt/uv-python\n")
     (clone / ".venv/lib/wheels.bin").write_bytes(b"x" * 3_000_000)  # > max_bytes
+    RELEASE_SHAS.append(sha)
     return clone
 
 
@@ -205,6 +227,14 @@ CLONE_WORK = {
     # Ignored by the clone's .gitignore, so plain `git status` never shows them.
     "ignored_env_file": lambda c: (c / ".env").write_text("SECRET=1\n"),
     "ignored_data_dump": lambda c: ((c / "data").mkdir(), (c / "data/big.csv").write_text("a,b\n")),
+    "assume_unchanged_edit": lambda c: ((c / "app.py").write_text("print('hidden')\n"),
+                                        _git(c, "update-index", "--assume-unchanged", "app.py")),
+    "skip_worktree_edit": lambda c: ((c / "app.py").write_text("print('hidden')\n"),
+                                     _git(c, "update-index", "--skip-worktree", "app.py")),
+    "commit_hidden_behind_fetch_head": lambda c: (
+        (c / "app.py").write_text("print('v2')\n"), _git(c, "commit", "-q", "-am", "mine"),
+        (c / ".git/FETCH_HEAD").write_text(subprocess.run(
+            ["git", "rev-parse", "HEAD"], cwd=c, capture_output=True, text=True).stdout)),
 }
 
 
@@ -216,6 +246,13 @@ def test_a_pristine_template_clone_is_empty(tmp_path) -> None:
     verdict = _run_helper_program(home, 1_000_000)
     assert verdict["empty"] is True, verdict
     assert verdict["bytes"] < 1_000_000  # the clone is never weighed
+
+
+@pytest.fixture(autouse=True)
+def _fresh_release_shas():
+    RELEASE_SHAS.clear()
+    yield
+    RELEASE_SHAS.clear()
 
 
 @pytest.mark.parametrize("kind", sorted(CLONE_WORK))
@@ -319,8 +356,13 @@ class _FakeDocker:
                 docker.inspected.append(volume)
                 return _FakeHelper(docker, volume, command)
 
+        class _Images:
+            def list(self):
+                return [SimpleNamespace(labels={"com.aimatrx.aidream.sha": s}) for s in RELEASE_SHAS]
+
         self.volumes = _Volumes()
         self.containers = _Containers()
+        self.images = _Images()
 
 
 def _row(sandbox_id, user, *, age_days, status=SandboxStatus.EXPIRED, labels=None):
@@ -576,3 +618,43 @@ def test_the_skel_fixture_is_what_the_allow_list_pins() -> None:
 
 def test_an_aidream_boot_skeleton_is_empty(tmp_path) -> None:
     assert _run_helper_program(_skeleton(tmp_path / "home", aidream=True), 1_000_000)["empty"] is True
+
+
+def test_a_clone_from_an_unknown_release_is_used(tmp_path) -> None:
+    """No image on the host carries its release commit and it has no remote
+    refs: nothing proves its commits are upstream's, so it is kept."""
+    home = _skeleton(tmp_path / "home")
+    _template_clone(home, tmp_path)
+    RELEASE_SHAS.clear()
+    assert _run_helper_program(home, 1_000_000)["empty"] is False
+
+
+def test_a_venv_changed_after_its_boot_copy_is_used(tmp_path, monkeypatch) -> None:
+    import time
+    monkeypatch.setattr(empty_home, "VENV_COPY_WINDOW_SECONDS", 1)
+    home = _skeleton(tmp_path / "home")
+    clone = _template_clone(home, tmp_path)
+    assert _run_helper_program(home, 1_000_000)["empty"] is True
+    time.sleep(2.2)
+    (clone / ".venv/lib/site-packages/mine-0.1.dist-info").mkdir()  # a pip install
+    (clone / ".venv/lib/site-packages/mine-0.1.dist-info/RECORD").write_text("x")
+    verdict = _run_helper_program(home, 1_000_000)
+    assert verdict["empty"] is False and "venv" in str(verdict["evidence"]), verdict
+
+
+def test_venv_bytecode_after_the_copy_is_not_use(tmp_path, monkeypatch) -> None:
+    import time
+    monkeypatch.setattr(empty_home, "VENV_COPY_WINDOW_SECONDS", 1)
+    home = _skeleton(tmp_path / "home")
+    clone = _template_clone(home, tmp_path)
+    time.sleep(2.2)
+    pyc = clone / ".venv/lib/site-packages/__pycache__"
+    pyc.mkdir()
+    (pyc / "x.cpython-313.pyc").write_bytes(b"x")
+    assert _run_helper_program(home, 1_000_000)["empty"] is True
+
+
+def test_the_pinned_authorized_keys_is_the_image_admin_file() -> None:
+    import hashlib
+    assert (hashlib.sha256(ADMIN_KEYS.read_bytes()).hexdigest()
+            == empty_home.SKEL_SHA256[".ssh/authorized_keys"])
