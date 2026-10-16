@@ -113,6 +113,26 @@ RUN npm install --global --prefix "${MATRX_CODEX_PREFIX}" \
            exit 1; \
        fi
 
+# ─── Codex may not read a person's own-plan sign-in ─────────────────────────
+# A person can sign Claude Code and Codex in to their OWN plans inside this box
+# (aidream `own_plan.py`), stored under /home/agent/.matrx/own-plan. Codex's
+# `read-only` / `workspace-write` sandbox limits writes and network, NOT reads,
+# so without this a model-run shell could `cat` those sign-ins. Codex's
+# managed requirements (`[permissions.filesystem] deny_read`, codex-cli
+# >= 0.122) mask the paths in the bubblewrap view its spawned commands run in;
+# Codex itself still reads its own CODEX_HOME in-process. Root-owned and
+# read-only so the agent cannot remove it, and `--ignore-user-config` does not
+# skip it (it only skips $CODEX_HOME/config.toml).
+RUN install -d -o root -g root -m 0755 /etc/codex \
+    && printf '%s\n' \
+        '# Written by Dockerfile.aidream. Managed requirement: Codex shells never read own-plan sign-ins.' \
+        '[permissions.filesystem]' \
+        'deny_read = ["/home/agent/.matrx/own-plan"]' \
+        > /etc/codex/requirements.toml \
+    && chown root:root /etc/codex/requirements.toml \
+    && chmod 0444 /etc/codex/requirements.toml \
+    && grep -q '"/home/agent/.matrx/own-plan"' /etc/codex/requirements.toml
+
 # ─── uv installer + uv-managed Python 3.13 ─────────────────────────────────
 # uv installs its own Python — avoids the deadsnakes-PPA + python3-apt
 # breakage on Ubuntu 22.04. The :core image's system Python 3.11 stays
