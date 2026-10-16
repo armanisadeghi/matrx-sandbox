@@ -219,6 +219,8 @@ docker run --rm --entrypoint /bin/sh "$TAG" -c \
     && case "$stamped" in codex-cli\ *) : ;; *) echo "bad codex stamp: $stamped" >&2; exit 1 ;; esac \
     && test ! -w /opt/matrx-codex/bin/codex \
     && ! touch /opt/matrx-codex/bin/.probe 2>/dev/null \
+    && grep -q "/home/agent/.matrx/own-plan" /etc/codex/requirements.toml \
+    && test ! -w /etc/codex/requirements.toml \
     && echo "[build-aidream] codex ok as $(id -un): $stamped"'
 
 echo "[build-aidream] verifying Claude Linux sandbox prerequisites in $TAG"
