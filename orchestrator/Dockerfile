@@ -4,12 +4,15 @@ WORKDIR /app
 
 # Hosted-volume snapshot helpers execute inside this controlled orchestrator
 # image, not inside whichever sandbox image happens to be old or incomplete.
-# These are the verification/copy tools the helper invokes directly.
+# These are the verification/copy tools the helper invokes directly. git is for
+# the unused-home inspector (orchestrator/empty_home.py), which judges a
+# template-seeded clone in a home by its own git state.
 RUN apt-get update \
     && apt-get install -y --no-install-recommends \
         acl \
         coreutils \
         findutils \
+        git \
         tar \
     && rm -rf /var/lib/apt/lists/*
 

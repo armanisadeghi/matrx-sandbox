@@ -26,8 +26,10 @@ WHAT "NEVER USED" MEANS — every condition must hold:
    the retention purge stamps it when it soft-deletes, which is housekeeping,
    not use.)
 5. **The home holds no user content** — :func:`_classify_home`, run read-only
-   inside a networkless helper container. Content is ANY of:
-     * any entry under ``projects/``, ``repos/``, ``scratch/``,
+   inside a networkless helper container. Only FILES are evidence; an empty
+   directory never is (an untouched aidream home carries empty ``workspace/``
+   and ``temp/``). Content is ANY of:
+     * a file under ``projects/``, ``repos/``, ``scratch/``,
        ``.matrx/plans/``, ``.matrx/skills/``, ``.matrx/memory/`` or
        ``.matrx/runtime/shell-logs/``;
      * any agent tool-call record under ``.matrx/runtime/tool-calls/`` (the
@@ -35,9 +37,15 @@ WHAT "NEVER USED" MEANS — every condition must hold:
        python call an agent makes writes one, so this is the durable
        "an agent worked here" signal that survives an orchestrator restart;
      * a shell/REPL history file at the top level (a human used a terminal);
-     * any non-hidden top-level entry that the image's layout does not create;
-     * more than ``empty_home_max_bytes`` in total, ``cloud-files/`` excluded;
-     * anything the helper could not read.
+     * a file under any non-hidden top-level entry the layout does not create;
+     * in a TEMPLATE-SEEDED CLONE (:data:`TEMPLATE_SEEDED_CLONES`, e.g. the
+       aidream template's ``aidream/``): uncommitted or untracked changes, a
+       stash, or a commit not reachable from the clone's own upstream refs
+       (``refs/remotes/*`` plus ``FETCH_HEAD`` — the helper has no network).
+       A pristine seed is not use, and the clone is never weighed;
+     * more than ``empty_home_max_bytes`` in total, ``cloud-files/`` and the
+       template clones excluded;
+     * anything the helper (or git) could not read.
    ``cloud-files/`` is a MIRROR of the person's AI Matrx files (pulled down at
    every boot; anything written in the box is pushed up within seconds), so its
    contents alone do not make a home "used"; writing there takes a tool call
@@ -93,6 +101,16 @@ TERMINAL_STATUSES = frozenset({"stopped", "expired", "failed"})
 _RESULT_PREFIX = "EMPTY_HOME_RESULT="
 _HELPER_LABELS = {"matrx.kind": "empty-home-inspector", "matrx.owner": "orchestrator"}
 
+#: Top-level home directories a TEMPLATE seeds as a git clone (template name →
+#: directory). Judged by git — uncommitted or untracked changes, a stash, or a
+#: commit not reachable from the clone's own upstream refs is use; a pristine
+#: seed is not — and never weighed against ``empty_home_max_bytes`` (the aidream
+#: clone is ~1.7 GB). Kept in step with sandbox-image by a guard test that reads
+#: every entrypoint's seed target.
+TEMPLATE_SEEDED_CLONES = frozenset({
+    "aidream",  # entrypoint-aidream.sh: cp -a /opt/aidream-template → /home/agent/aidream
+})
+
 _last_sweep_at: float | None = None
 #: Homes already proven to hold content, keyed by (volume, newest sandbox_id).
 #: Content does not un-happen without a new row, so never re-inspect them.
@@ -102,77 +120,145 @@ _known_used: set[tuple[str, str]] = set()
 def _classify_home(root, max_bytes):
     """Decide whether a mounted home holds user content. SELF-CONTAINED: this
     exact source is shipped into the helper container, so it may only use the
-    standard library, imported here."""
+    standard library (and the ``git`` binary), imported here.
+
+    Only FILES (and symlinks) are evidence: an empty directory never is, which
+    is what the image and the aidream app leave behind (``workspace/``,
+    ``temp/``, the layout dirs). A template-seeded clone
+    (:data:`TEMPLATE_SEEDED_CLONES`) is judged by git, not by its files."""
     import os
+    import subprocess
 
     content_dirs = (
-        "projects", "repos", "scratch",
-        ".matrx/plans", ".matrx/skills", ".matrx/memory",
-        ".matrx/runtime/shell-logs",
+        "projects/", "repos/", "scratch/",
+        ".matrx/plans/", ".matrx/skills/", ".matrx/memory/",
+        ".matrx/runtime/shell-logs/",
     )
-    tool_calls = ".matrx/runtime/tool-calls"
-    tool_calls_service = ".matrx/runtime/tool-calls/_runtime"
+    tool_calls = ".matrx/runtime/tool-calls/"
+    tool_calls_service = ".matrx/runtime/tool-calls/_runtime/"
     histories = {".bash_history", ".python_history", ".zsh_history",
                  ".node_repl_history", ".sh_history"}
     layout_top = {"cloud-files", "repos", "projects", "scratch"}
     mirror = "cloud-files"
+    template_clones = TEMPLATE_SEEDED_CLONES
 
     evidence = []
     unreadable = []
     total = 0
     files = 0
 
-    def under(rel, prefix):
-        return rel == prefix or rel.startswith(prefix + "/")
-
     def errored(exc):
         unreadable.append(str(getattr(exc, "filename", "") or exc))
+
+    def git(repo, *args):
+        # Read-only and inert: no optional index writes, no hooks, no
+        # fsmonitor, no system/global config — the repo is the user's, the
+        # helper is root, so nothing in it may run.
+        env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "GIT_OPTIONAL_LOCKS": "0",
+               "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
+               "HOME": "/nonexistent", "GIT_TERMINAL_PROMPT": "0"}
+        return subprocess.run(
+            ["git", "-c", "safe.directory=*", "-c", "core.fsmonitor=",
+             "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false",
+             "-C", repo, *args],
+            capture_output=True, text=True, env=env, timeout=600,
+        )
+
+    def clone_shows_work(name):
+        """None when the clone is pristine; else a short reason."""
+        repo = os.path.join(root, name)
+        try:
+            status = git(repo, "status", "--porcelain", "--untracked-files=normal")
+            if status.returncode != 0:
+                return "git status failed: " + status.stderr.strip()[:120]
+            if status.stdout.strip():
+                return "uncommitted: " + status.stdout.strip().splitlines()[0][:120]
+            if git(repo, "rev-parse", "-q", "--verify", "refs/stash").returncode == 0:
+                return "stash"
+            # The baseline is what the clone itself knows came from upstream:
+            # every remote-tracking ref, plus FETCH_HEAD (the template seed is
+            # a shallow fetch of the release commit and has no remote refs).
+            baseline = []
+            try:
+                with open(os.path.join(repo, ".git", "FETCH_HEAD")) as fh:
+                    for line in fh:
+                        sha = line[:40]
+                        if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):
+                            baseline.append(sha)
+            except OSError:
+                pass
+            remotes = git(repo, "for-each-ref", "--format=%(objectname)", "refs/remotes")
+            if remotes.returncode != 0:
+                return "git for-each-ref failed"
+            baseline += [s for s in remotes.stdout.split() if s]
+            if not baseline:
+                return "no upstream baseline to compare commits against"
+            local = git(repo, "rev-list", "--max-count=1", "HEAD", "--branches", "--tags",
+                        "--not", *baseline)
+            if local.returncode != 0:
+                return "git rev-list failed: " + local.stderr.strip()[:120]
+            if local.stdout.strip():
+                return "local commit " + local.stdout.strip()[:12]
+            return None
+        except Exception as exc:  # git missing, timeout, … = cannot prove pristine
+            return "git unavailable: " + str(exc)[:120]
 
     try:
         top = os.listdir(root)
     except OSError as exc:
         return {"empty": False, "evidence": [], "unreadable": [str(exc)],
-                "bytes": 0, "files": 0}
+                "bytes": 0, "files": 0, "over_size": False}
+
+    judged_clones = set()
     for name in top:
-        if name in histories:
-            evidence.append(name)
-        elif not name.startswith(".") and name not in layout_top:
-            evidence.append(name)
+        if name in template_clones and os.path.isdir(os.path.join(root, name, ".git")) \
+                and not os.path.islink(os.path.join(root, name)):
+            judged_clones.add(name)
+            why = clone_shows_work(name)
+            if why:
+                evidence.append(name + ": " + why)
 
     root_dev = os.lstat(root).st_dev
     for dirpath, dirnames, filenames in os.walk(root, onerror=errored, followlinks=False):
         rel_dir = os.path.relpath(dirpath, root)
         rel_dir = "" if rel_dir == "." else rel_dir
+        leaves = list(filenames)
         kept = []
         for d in dirnames:
             full = os.path.join(dirpath, d)
+            rel = d if not rel_dir else rel_dir + "/" + d
+            if not rel_dir and (d == mirror or d in judged_clones):
+                continue  # mirror and git-judged clones: not walked, not weighed
             try:
-                if os.lstat(full).st_dev != root_dev:
-                    continue
+                st = os.lstat(full)
             except OSError as exc:
                 errored(exc)
                 continue
-            kept.append(d)
+            if os.path.islink(full):
+                leaves.append(d)  # a symlink is an entry, never descended
+            elif st.st_dev == root_dev:
+                kept.append(d)
         dirnames[:] = kept
-        for name in list(kept) + list(filenames):
+        for name in leaves:
             rel = name if not rel_dir else rel_dir + "/" + name
-            if under(rel, mirror):
+            first = rel.split("/", 1)[0]
+            if first == mirror or first in judged_clones:
                 continue
-            if any(rel.startswith(p + "/") for p in content_dirs):
-                evidence.append(rel)
-            elif rel.startswith(tool_calls + "/") and not under(rel, tool_calls_service):
-                evidence.append(rel)
-        for name in filenames:
-            rel = name if not rel_dir else rel_dir + "/" + name
             try:
                 st = os.lstat(os.path.join(dirpath, name))
             except OSError as exc:
                 errored(exc)
                 continue
-            if under(rel, mirror):
-                continue
             files += 1
             total += st.st_size
+            if rel in histories:
+                evidence.append(rel)
+            elif rel.startswith(content_dirs):
+                evidence.append(rel)
+            elif rel.startswith(tool_calls) and not rel.startswith(tool_calls_service):
+                evidence.append(rel)
+            elif not first.startswith(".") and first not in layout_top:
+                evidence.append(rel)
     over = total > int(max_bytes)
     return {
         "empty": not evidence and not unreadable and not over,
@@ -188,7 +274,8 @@ def helper_program() -> str:
     """The python program the helper runs: :func:`_classify_home`, verbatim."""
     source = textwrap.dedent(inspect.getsource(_classify_home))
     return (
-        source
+        f"TEMPLATE_SEEDED_CLONES = frozenset({sorted(TEMPLATE_SEEDED_CLONES)!r})\n"
+        + source
         + "\nimport json, sys\n"
         + f"print({_RESULT_PREFIX!r} + json.dumps(_classify_home(sys.argv[1], sys.argv[2])))\n"
     )

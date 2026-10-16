@@ -69,8 +69,7 @@ def _skeleton(home: Path) -> Path:
 
 CONTENT = {
     "project_file": lambda h: (h / "projects/app").mkdir() or (h / "projects/app/main.py").write_text("print(1)"),
-    "empty_project_dir": lambda h: (h / "projects/new-thing").mkdir(),
-    "cloned_repo": lambda h: (h / "repos/acme").mkdir(),
+    "cloned_repo": lambda h: (h / "repos/acme").mkdir() or (h / "repos/acme/README").write_text("r"),
     "scratch_file": lambda h: (h / "scratch/notes.txt").write_text("hi"),
     "agent_tool_call": lambda h: (h / ".matrx/runtime/tool-calls/1-shell-ab.md").write_text("ls"),
     "agent_plan": lambda h: (h / ".matrx/plans/plan.md").write_text("plan"),
@@ -79,7 +78,7 @@ CONTENT = {
     "shell_log": lambda h: (h / ".matrx/runtime/shell-logs/x.log").write_text("x"),
     "terminal_history": lambda h: (h / ".bash_history").write_text("ls\n"),
     "file_at_home_root": lambda h: (h / "todo.txt").write_text("x"),
-    "dir_at_home_root": lambda h: (h / "work").mkdir(),
+    "file_in_new_top_dir": lambda h: (h / "work").mkdir() or (h / "work/a.txt").write_text("x"),
     "large_hidden_install": lambda h: (h / ".local").mkdir() or (h / ".local/blob").write_bytes(b"x" * 2_000_000),
 }
 
@@ -98,6 +97,101 @@ def _run_helper_program(home: Path, max_bytes: int) -> dict:
 def test_a_skeleton_home_is_empty(tmp_path) -> None:
     verdict = _run_helper_program(_skeleton(tmp_path / "home"), 1_000_000)
     assert verdict["empty"] is True, verdict
+
+
+def test_empty_directories_never_count(tmp_path) -> None:
+    """Measured live 2026-10-16: an untouched aidream-template home carries
+    empty ``workspace/`` and ``temp/`` at the top level."""
+    home = _skeleton(tmp_path / "home")
+    for d in ("workspace", "temp", "projects/new-thing", "repos/acme", ".cache/uv"):
+        (home / d).mkdir(parents=True)
+    verdict = _run_helper_program(home, 1_000_000)
+    assert verdict["empty"] is True, verdict
+
+
+# ── A template-seeded clone (aidream/) is judged by git, not by its files ──────
+
+def _git(cwd, *args):
+    subprocess.run(["git", "-c", "user.name=t", "-c", "user.email=t@t", "-c",
+                    "init.defaultBranch=main", *args], cwd=cwd, check=True,
+                   capture_output=True)
+
+
+def _template_clone(home: Path, tmp_path: Path) -> Path:
+    """Seed ``home/aidream`` the way build-aidream.sh + entrypoint-aidream.sh
+    do: git init, remote origin, shallow fetch of the release commit, reset to
+    FETCH_HEAD, branch main — then ``cp -a`` into the home, with a big ignored
+    .venv beside the tracked files."""
+    upstream = tmp_path / "upstream"
+    upstream.mkdir()
+    _git(upstream, "init", "-q")
+    (upstream / ".gitignore").write_text(".venv/\n__pycache__/\n")
+    (upstream / "app.py").write_text("print('aidream')\n")
+    _git(upstream, "add", "-A")
+    _git(upstream, "commit", "-q", "-m", "release")
+    sha = subprocess.run(["git", "rev-parse", "HEAD"], cwd=upstream, check=True,
+                         capture_output=True, text=True).stdout.strip()
+    clone = home / "aidream"
+    clone.mkdir()
+    _git(clone, "init", "-q")
+    _git(clone, "remote", "add", "origin", "https://github.com/example/aidream.git")
+    _git(clone, "fetch", "-q", "--depth=1", f"file://{upstream}", sha)
+    _git(clone, "reset", "-q", "--mixed", "FETCH_HEAD")
+    _git(clone, "checkout", "-q", "--", ".")  # the git-archive'd tracked files
+    _git(clone, "branch", "-M", "main")
+    (clone / ".venv/lib").mkdir(parents=True)
+    (clone / ".venv/lib/wheels.bin").write_bytes(b"x" * 3_000_000)  # > max_bytes
+    return clone
+
+
+CLONE_WORK = {
+    "untracked_file": lambda c: (c / "notes.md").write_text("mine"),
+    "dirty_edit": lambda c: (c / "app.py").write_text("print('edited')\n"),
+    "unpushed_commit": lambda c: ((c / "app.py").write_text("print('v2')\n"),
+                                  _git(c, "commit", "-q", "-am", "mine")),
+    "stash": lambda c: ((c / "app.py").write_text("print('wip')\n"),
+                        _git(c, "stash", "-q")),
+}
+
+
+def test_a_pristine_template_clone_is_empty(tmp_path) -> None:
+    home = _skeleton(tmp_path / "home")
+    _template_clone(home, tmp_path)
+    for d in ("workspace", "temp"):
+        (home / d).mkdir()
+    verdict = _run_helper_program(home, 1_000_000)
+    assert verdict["empty"] is True, verdict
+    assert verdict["bytes"] < 1_000_000  # the clone is never weighed
+
+
+@pytest.mark.parametrize("kind", sorted(CLONE_WORK))
+def test_work_in_a_template_clone_makes_a_home_used(tmp_path, kind) -> None:
+    home = _skeleton(tmp_path / "home")
+    CLONE_WORK[kind](_template_clone(home, tmp_path))
+    verdict = _run_helper_program(home, 1_000_000)
+    assert verdict["empty"] is False, (kind, verdict)
+    assert any(e.startswith("aidream: ") for e in verdict["evidence"]), verdict
+
+
+def test_a_clone_git_cannot_read_counts_as_used(tmp_path) -> None:
+    home = _skeleton(tmp_path / "home")
+    clone = _template_clone(home, tmp_path)
+    (clone / ".git/HEAD").write_text("garbage\n")
+    assert _run_helper_program(home, 1_000_000)["empty"] is False
+
+
+def test_every_template_seeded_home_dir_is_judged_as_a_clone() -> None:
+    """A template that seeds a new top-level clone into the home must be named
+    in TEMPLATE_SEEDED_CLONES, or every home of that template reads as used
+    (and is never weighed correctly). Reads each entrypoint's seed target."""
+    import re
+    scripts = Path(__file__).resolve().parents[2] / "sandbox-image" / "scripts"
+    seeded = set()
+    for path in scripts.glob("entrypoint*.sh"):
+        for m in re.finditer(r'WORK_DIR="/home/agent/([A-Za-z0-9_.-]+)"', path.read_text()):
+            seeded.add(m.group(1))
+    assert "aidream" in seeded, "the census found nothing; its pattern is stale"
+    assert seeded <= set(empty_home.TEMPLATE_SEEDED_CLONES), seeded
 
 
 @pytest.mark.parametrize("kind", sorted(CONTENT))
@@ -296,3 +390,23 @@ async def test_the_sweep_never_runs_on_the_ec2_tier(wired, monkeypatch) -> None:
     monkeypatch.setattr("orchestrator.config.settings.host_tier", "ec2")
     summary = await empty_home.sweep_unused_homes(wired.store, force=True)
     assert summary["ran"] is False and wired.docker.removed == []
+
+
+@pytest.mark.asyncio
+async def test_an_untouched_aidream_template_home_is_deleted(wired, tmp_path) -> None:
+    volume = await wired.add("sbx-aidream", USERS[0], age_days=30)
+    home = wired.docker.homes[volume]
+    _template_clone(home, tmp_path)
+    for d in ("workspace", "temp"):
+        (home / d).mkdir()
+    summary = await empty_home.sweep_unused_homes(wired.store, force=True)
+    assert summary["deleted"] == ["sbx-aidream"] and wired.docker.removed == [volume]
+
+
+@pytest.mark.asyncio
+async def test_an_aidream_home_with_an_edit_is_kept(wired, tmp_path) -> None:
+    volume = await wired.add("sbx-aidream", USERS[0], age_days=30)
+    CLONE_WORK["dirty_edit"](_template_clone(wired.docker.homes[volume], tmp_path))
+    summary = await empty_home.sweep_unused_homes(wired.store, force=True)
+    assert summary["deleted"] == [] and summary["kept_used"] == 1
+    assert wired.docker.removed == []
