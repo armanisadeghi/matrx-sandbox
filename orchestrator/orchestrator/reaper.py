@@ -284,6 +284,17 @@ async def _reap_once() -> dict:
     except Exception as exc:
         logger.warning("Reaper: always-on revive failed this tick: %s", exc)
 
+    # Unused-home sweep (Arman, 2026-10-16): a hosted home nobody ever used is
+    # deleted after `empty_home_delete_after_days`. Hourly inside this tick,
+    # knob-gated (unreadable knob = off), never a home with user content and
+    # never an always-on one; see orchestrator/empty_home.py for every rule.
+    try:
+        from orchestrator import empty_home
+        unused = await empty_home.sweep_unused_homes(store)
+        summary["unused_homes_deleted"] = len(unused["deleted"])
+    except Exception as exc:
+        logger.warning("Reaper: unused-home sweep failed this tick: %s", exc)
+
     # Version-drift alarm (zero-drift system, Phase 1). Its configurable,
     # process-coalesced cadence is independent of the 60-second lifecycle
     # sweep above. Each eligible pass resolves the newest image then; it never

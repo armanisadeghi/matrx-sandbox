@@ -119,6 +119,8 @@ by `always_on_revive_min_interval_seconds` so a box that cannot boot is not
 resurrected every minute forever. Every revive logs at WARNING. Guards:
 `tests/test_always_on_workspace.py`.
 
+**Unused hosted homes are deleted (Arman, 2026-10-16).** Hourly inside the same reaper tick, a per-(user, organization) home whose rows are all terminal, never always-on, untouched for `empty_home_delete_after_days`, and whose volume holds no user content (nothing in projects/repos/scratch/.matrx plans·skills·memory, no agent tool-call record, no shell history, no unknown top-level entry, ≤ `empty_home_max_bytes` outside the cloud-files mirror) is removed through `delete_user_volume` under the lifecycle lease, its rows soft-deleted with `config['home_deleted']`; at most `empty_home_delete_max_per_pass` per pass, one WARNING line each, and an unreadable knob turns it off. `orchestrator/empty_home.py`; guards `tests/test_unused_home_sweep.py`.
+
 **`stop_reason` has five legal values.** `sandbox_instances_stop_reason_check`
 admits only `user_requested | expired | error | graceful_shutdown | admin`;
 anything else RAISES and the row keeps its stale status. Two live instances

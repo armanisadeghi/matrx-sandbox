@@ -218,6 +218,13 @@ class SandboxStore(ABC):
         purging one is permanent data loss (orchestrator/always_on.py)."""
         return []
 
+    async def mark_home_deleted(self, sandbox_ids: list[str], detail: dict) -> int:
+        """Record that the home behind these TERMINAL rows was deleted: set
+        ``config['home_deleted'] = detail`` and soft-delete each row, so none
+        can be resumed onto a home that no longer exists. Live rows are never
+        touched. Returns how many rows were marked (orchestrator/empty_home.py)."""
+        raise NotImplementedError
+
     @abstractmethod
     async def feature_knobs(self, feature: str) -> dict[str, Any]:
         """Every ``platform.feature_knob`` row for one feature, as ``{key: value}``.
@@ -583,6 +590,17 @@ class InMemorySandboxStore(SandboxStore):
                 self._deleted[sid] = datetime.now(timezone.utc)
                 purged.append(sid)
         return purged
+
+    async def mark_home_deleted(self, sandbox_ids: list[str], detail: dict) -> int:
+        marked = 0
+        for sid in sandbox_ids:
+            sb = self._sandboxes.get(sid)
+            if sb is None or getattr(sb.status, "value", sb.status) not in ("stopped", "expired", "failed"):
+                continue
+            sb.config = {**(sb.config or {}), "home_deleted": dict(detail)}
+            self._deleted.setdefault(sid, datetime.now(timezone.utc))
+            marked += 1
+        return marked
 
     async def get_lifecycle(self, sandbox_id: str) -> dict | None:
         sb = self._sandboxes.get(sandbox_id)
@@ -1234,6 +1252,27 @@ class PostgresSandboxStore(SandboxStore):
                 days,
             )
             return [r["sandbox_id"] for r in rows]
+
+    async def mark_home_deleted(self, sandbox_ids: list[str], detail: dict) -> int:
+        if not sandbox_ids:
+            return 0
+        pool = await self._get_pool()
+        async with pool.acquire() as conn:
+            result = await conn.execute(
+                """UPDATE sandbox_instances
+                   SET config = COALESCE(config, '{}'::jsonb)
+                                || jsonb_build_object('home_deleted', $2::jsonb),
+                       deleted_at = COALESCE(deleted_at, NOW()),
+                       updated_at = NOW()
+                   WHERE sandbox_id = ANY($1::text[])
+                     AND status IN ('stopped', 'expired', 'failed')""",
+                list(sandbox_ids),
+                json.dumps(detail),
+            )
+            try:
+                return int(result.split()[-1])
+            except (ValueError, IndexError):
+                return 0
 
     async def update_status(self, sandbox_id: str, status: SandboxStatus) -> bool:
         pool = await self._get_pool()
