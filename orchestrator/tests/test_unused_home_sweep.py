@@ -48,23 +48,61 @@ KNOBS = {
 
 # ── The home skeleton the image writes, and the content that makes it "used" ──
 
-def _skeleton(home: Path) -> Path:
-    """What ensure-layout.sh, prepare-agent-home.sh, the entrypoint and a
-    cloud-files down-sync leave in a home nobody ever touched."""
+SKEL = Path(__file__).resolve().parent / "fixtures" / "ubuntu-skel"
+
+GITCONFIG_BOOT = (
+    '[credential "https://github.com"]\n\tusername = x-access-token\n'
+    "[credential]\n"
+    "\thelper = cache --socket=/home/agent/.matrx/runtime/git-credential-cache.sock --timeout=1800\n"
+    "\thelper = /opt/sandbox/scripts/matrx-git-credential-env\n"
+)
+
+
+def _skeleton(home: Path, *, aidream: bool = False) -> Path:
+    """Exactly what the two live homes judged untouched on 2026-10-16 held
+    (outside cloud-files), plus the layout's empty dirs and a big mirror."""
     for d in ("cloud-files", "repos", "projects", "scratch", ".matrx/plans",
               ".matrx/skills", ".matrx/memory", ".matrx/runtime/tool-calls/_runtime",
               ".matrx/runtime/shell-logs", ".matrx/runtime/session-reports",
               ".matrx/instructions", ".ssh"):
         (home / d).mkdir(parents=True, exist_ok=True)
-    (home / ".matrx/instructions/SANDBOX_LAYOUT.md").write_text("# layout\n" * 200)
+    bashrc = (SKEL / "bashrc").read_text()
+    if aidream:
+        bashrc += ". /etc/profile.d/aidream.sh\n"
+    bashrc += "[ -f ~/.sandbox_env ] && source ~/.sandbox_env\n"
+    if aidream:
+        bashrc += ('# SANDBOX_PROMPT\nexport PS1="\\[\\033[1;36m\\]sandbox:${SANDBOX_ID:-?}'
+                   '\\[\\033[0m\\] \\[\\033[1;34m\\]\\w\\[\\033[0m\\] \\$ "\n'
+                   "alias ll='ls -alh --color=auto'\nalias la='ls -A --color=auto'\n")
+    (home / ".bashrc").write_text(bashrc)
+    (home / ".profile").write_text((SKEL / "profile").read_text())
+    (home / ".bash_logout").write_text((SKEL / "bash_logout").read_text())
+    (home / ".gitconfig").write_text(GITCONFIG_BOOT)
+    (home / ".sandbox_env").write_text("export SANDBOX_ID=sbx\n")
     (home / ".ssh/authorized_keys").write_text("ssh-ed25519 AAAA admin\n")
-    (home / ".bashrc").write_text("[ -f ~/.sandbox_env ] && source ~/.sandbox_env\n")
-    (home / ".sandbox_env").write_text("export X=1\n")
+    (home / ".matrx/instructions/SANDBOX_LAYOUT.md").write_text("# layout\n" * 200)
+    (home / ".matrx/session.json").write_text("{}")
+    (home / ".matrx/session.prev.json").write_text("{}")
+    (home / ".matrx/session-report.md").write_text("report")
+    (home / ".matrx/runtime/cloud-files-down-complete").write_text("")
+    (home / ".matrx/runtime/cloud-sync-queue.jsonl").write_text(
+        '{"event_id": "e1", "kind": "upsert", "rel_path": "a.pdf", "queued_at": 1}\n'
+        '{"event_id": "e1", "done": true, "completed_at": 2}\n')
     (home / ".matrx/runtime/session-reports/boot.md").write_text("booted\n")
     (home / ".matrx/runtime/tool-calls/_runtime/1-cloud-sync.md").write_text("synced\n")
+    (home / ".cache/uv/wheels").mkdir(parents=True)
+    (home / ".cache/uv/wheels/x.whl").write_bytes(b"x" * 1000)
+    (home / ".codex/tmp/arg0/codex-arg0X").mkdir(parents=True)
+    (home / ".codex/tmp/arg0/codex-arg0X/apply_patch").symlink_to("/usr/bin/codex")
     # The person's AI Matrx files, mirrored down at boot: big, and NOT use.
     (home / "cloud-files/report.pdf").write_bytes(b"x" * 5_000_000)
     return home
+
+
+def _append(path: Path, text: str) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("a") as fh:
+        fh.write(text)
 
 
 CONTENT = {
@@ -80,6 +118,19 @@ CONTENT = {
     "file_at_home_root": lambda h: (h / "todo.txt").write_text("x"),
     "file_in_new_top_dir": lambda h: (h / "work").mkdir() or (h / "work/a.txt").write_text("x"),
     "large_hidden_install": lambda h: (h / ".local").mkdir() or (h / ".local/blob").write_bytes(b"x" * 2_000_000),
+    # The review's holes: hidden entries are content unless boot made them.
+    "claude_credentials": lambda h: _append(h / ".claude/.credentials.json", "{}"),
+    "claude_transcript": lambda h: _append(h / ".claude/projects/x/1.jsonl", "{}"),
+    "ssh_private_key": lambda h: _append(h / ".ssh/id_ed25519", "KEY"),
+    "gitconfig_identity": lambda h: _append(h / ".gitconfig", "[user]\n\tname = Ada\n"),
+    "bashrc_alias": lambda h: _append(h / ".bashrc", "alias gs='git status'\n"),
+    "profile_edit": lambda h: _append(h / ".profile", "export EDITOR=vim\n"),
+    "matrx_other": lambda h: _append(h / ".matrx/notes.md", "n"),
+    "own_plan_sign_in": lambda h: _append(h / ".matrx/own-plan/claude/.claude/.claude.json", "{}"),
+    "pending_cloud_upload": lambda h: _append(
+        h / ".matrx/runtime/cloud-sync-queue.jsonl",
+        '{"event_id": "e2", "kind": "upsert", "rel_path": "new.pdf", "queued_at": 3}\n'),
+    "dotfile_unknown": lambda h: _append(h / ".npmrc", "//registry/:_authToken=x\n"),
 }
 
 
@@ -103,7 +154,7 @@ def test_empty_directories_never_count(tmp_path) -> None:
     """Measured live 2026-10-16: an untouched aidream-template home carries
     empty ``workspace/`` and ``temp/`` at the top level."""
     home = _skeleton(tmp_path / "home")
-    for d in ("workspace", "temp", "projects/new-thing", "repos/acme", ".cache/uv"):
+    for d in ("workspace", "temp", "projects/new-thing", "repos/acme", ".config/empty"):
         (home / d).mkdir(parents=True)
     verdict = _run_helper_program(home, 1_000_000)
     assert verdict["empty"] is True, verdict
@@ -125,7 +176,7 @@ def _template_clone(home: Path, tmp_path: Path) -> Path:
     upstream = tmp_path / "upstream"
     upstream.mkdir()
     _git(upstream, "init", "-q")
-    (upstream / ".gitignore").write_text(".venv/\n__pycache__/\n")
+    (upstream / ".gitignore").write_text(".venv/\n__pycache__/\n.env\ndata/\n")
     (upstream / "app.py").write_text("print('aidream')\n")
     _git(upstream, "add", "-A")
     _git(upstream, "commit", "-q", "-m", "release")
@@ -151,6 +202,9 @@ CLONE_WORK = {
                                   _git(c, "commit", "-q", "-am", "mine")),
     "stash": lambda c: ((c / "app.py").write_text("print('wip')\n"),
                         _git(c, "stash", "-q")),
+    # Ignored by the clone's .gitignore, so plain `git status` never shows them.
+    "ignored_env_file": lambda c: (c / ".env").write_text("SECRET=1\n"),
+    "ignored_data_dump": lambda c: ((c / "data").mkdir(), (c / "data/big.csv").write_text("a,b\n")),
 }
 
 
@@ -204,6 +258,35 @@ def test_every_kind_of_user_content_makes_a_home_used(tmp_path, kind) -> None:
 
 # ── The sweep, end to end on the in-memory store and a fake Docker ─────────────
 
+class _FakeHelper:
+    """A detached helper container: runs the program on wait(); a home listed
+    in ``docker.hang`` never finishes, as a wedged inspection would."""
+
+    def __init__(self, docker, volume, command):
+        self.docker, self.volume, self.command = docker, volume, command
+        self.out = b""
+        self.killed = self.removed = False
+
+    def wait(self, timeout=None):
+        if self.volume in self.docker.hang:
+            raise TimeoutError("read timed out")  # what requests raises, in kind
+        args = [str(self.docker.homes[self.volume]) if a == "/home/agent" else a
+                for a in self.command]
+        done = subprocess.run([sys.executable, *args], capture_output=True)
+        self.out = done.stdout
+        return {"StatusCode": done.returncode}
+
+    def logs(self, stdout=True, stderr=False):
+        return self.out
+
+    def kill(self):
+        self.killed = True
+
+    def remove(self, force=False):
+        self.removed = True
+        self.docker.helpers_removed += 1
+
+
 class _FakeDocker:
     """Volumes are directories; ``containers.run`` runs the helper program
     against the directory bound at /home/agent, exactly as the helper would."""
@@ -213,6 +296,8 @@ class _FakeDocker:
         self.removed: list[str] = []
         self.inspected: list[str] = []
         self.attached: set[str] = set()
+        self.hang: set[str] = set()
+        self.helpers_removed = 0
         docker = self
 
         class _Volumes:
@@ -228,13 +313,11 @@ class _FakeDocker:
 
             def run(self, image, command, entrypoint, volumes, **kwargs):
                 assert entrypoint == ["python3"]
-                assert kwargs["network_disabled"] is True
+                assert kwargs["network_disabled"] is True and kwargs["detach"] is True
                 (volume, bind), = volumes.items()
                 assert bind == {"bind": "/home/agent", "mode": "ro"}
                 docker.inspected.append(volume)
-                args = [str(docker.homes[volume]) if a == "/home/agent" else a for a in command]
-                return subprocess.run([sys.executable, *args], check=True,
-                                      capture_output=True).stdout
+                return _FakeHelper(docker, volume, command)
 
         self.volumes = _Volumes()
         self.containers = _Containers()
@@ -410,3 +493,86 @@ async def test_an_aidream_home_with_an_edit_is_kept(wired, tmp_path) -> None:
     summary = await empty_home.sweep_unused_homes(wired.store, force=True)
     assert summary["deleted"] == [] and summary["kept_used"] == 1
     assert wired.docker.removed == []
+
+
+@pytest.mark.asyncio
+async def test_a_hung_inspection_is_killed_removed_and_keeps_the_home(wired, monkeypatch) -> None:
+    volume = await wired.add("sbx-hang", USERS[0], age_days=60)
+    wired.docker.hang.add(volume)
+    summary = await empty_home.sweep_unused_homes(wired.store, force=True)
+    assert summary["deleted"] == [] and summary["failed"] == 1
+    assert wired.docker.removed == [] and wired.docker.helpers_removed == 1
+    assert (await wired.store.get_lifecycle("sbx-hang"))["deleted"] is False
+
+
+@pytest.mark.asyncio
+async def test_the_reaper_tick_never_waits_on_the_sweep(monkeypatch) -> None:
+    """A wedged pass must not stall expiry/liveness/revive: launch returns at
+    once, and a second launch while one runs is refused (single flight)."""
+    import asyncio
+    gate = asyncio.Event()
+
+    async def wedged(store, *, force=False):
+        await gate.wait()
+        return {"deleted": []}
+
+    monkeypatch.setattr(empty_home, "sweep_unused_homes", wedged)
+    monkeypatch.setattr(empty_home, "_running", None)
+    monkeypatch.setattr(empty_home, "_last_sweep_at", None)
+    assert await asyncio.wait_for(asyncio.to_thread(lambda: None), 1) is None
+    assert empty_home.launch_sweep(object()) is True
+    monkeypatch.setattr(empty_home, "_last_sweep_at", None)  # due again
+    assert empty_home.launch_sweep(object()) is False  # still running
+    gate.set()
+    await asyncio.sleep(0)
+    await empty_home._running
+
+
+@pytest.mark.asyncio
+async def test_the_reaper_starts_the_sweep_without_awaiting_it(monkeypatch) -> None:
+    from contextlib import ExitStack
+    from orchestrator import reaper
+    calls = []
+    monkeypatch.setattr(empty_home, "launch_sweep", lambda store: calls.append(store) or True)
+
+    async def _empty(*a, **k):
+        return []
+
+    async def _healthy(*a, **k):
+        return {"stopped": [], "refreshed": 0}
+
+    async def _revive(*a, **k):
+        return {"revived": [], "failed": 0, "left_for_next_tick": 0}
+
+    store = InMemorySandboxStore()
+    monkeypatch.setattr("orchestrator.sandbox_manager._get_store", lambda: store)
+    monkeypatch.setattr("orchestrator.config.settings.host_tier", "hosted")
+    monkeypatch.setattr(reaper, "_lease_reaper_fleet", lambda _t: (ExitStack(), set()))
+    monkeypatch.setattr("orchestrator.reconcile.reap_zombie_containers", _empty)
+    monkeypatch.setattr("orchestrator.reconcile.reconcile_liveness", _healthy)
+    monkeypatch.setattr("orchestrator.always_on.revive_always_on", _revive)
+    summary = await reaper._reap_once()
+    assert calls == [store] and summary["unused_home_sweep_started"] is True
+
+
+def test_every_bashrc_boot_line_is_written_by_the_image() -> None:
+    """The allow-list may only name lines sandbox-image really appends."""
+    root = Path(__file__).resolve().parents[2]
+    corpus = "".join(p.read_text() for p in [
+        *(root / "sandbox-image" / "scripts").glob("entrypoint*.sh"),
+        root / "sandbox-local" / "scripts" / "entrypoint-local.sh",
+        root / "sandbox-image" / "Dockerfile.aidream",
+    ])
+    for line in empty_home.BASHRC_BOOT_LINES:
+        assert line in corpus, line
+
+
+def test_the_skel_fixture_is_what_the_allow_list_pins() -> None:
+    import hashlib
+    for name, rel in (("profile", ".profile"), ("bash_logout", ".bash_logout")):
+        assert hashlib.sha256((SKEL / name).read_bytes()).hexdigest() == empty_home.SKEL_SHA256[rel]
+    assert hashlib.sha256((SKEL / "bashrc").read_bytes()).hexdigest() == empty_home.SKEL_BASHRC_SHA256
+
+
+def test_an_aidream_boot_skeleton_is_empty(tmp_path) -> None:
+    assert _run_helper_program(_skeleton(tmp_path / "home", aidream=True), 1_000_000)["empty"] is True

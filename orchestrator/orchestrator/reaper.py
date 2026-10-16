@@ -288,10 +288,10 @@ async def _reap_once() -> dict:
     # deleted after `empty_home_delete_after_days`. Hourly inside this tick,
     # knob-gated (unreadable knob = off), never a home with user content and
     # never an always-on one; see orchestrator/empty_home.py for every rule.
+    # It runs as a single-flight background task: this tick never waits on it.
     try:
         from orchestrator import empty_home
-        unused = await empty_home.sweep_unused_homes(store)
-        summary["unused_homes_deleted"] = len(unused["deleted"])
+        summary["unused_home_sweep_started"] = empty_home.launch_sweep(store)
     except Exception as exc:
         logger.warning("Reaper: unused-home sweep failed this tick: %s", exc)
 

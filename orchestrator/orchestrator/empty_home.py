@@ -26,30 +26,21 @@ WHAT "NEVER USED" MEANS — every condition must hold:
    the retention purge stamps it when it soft-deletes, which is housekeeping,
    not use.)
 5. **The home holds no user content** — :func:`_classify_home`, run read-only
-   inside a networkless helper container. Only FILES are evidence; an empty
-   directory never is (an untouched aidream home carries empty ``workspace/``
-   and ``temp/``). Content is ANY of:
-     * a file under ``projects/``, ``repos/``, ``scratch/``,
-       ``.matrx/plans/``, ``.matrx/skills/``, ``.matrx/memory/`` or
-       ``.matrx/runtime/shell-logs/``;
-     * any agent tool-call record under ``.matrx/runtime/tool-calls/`` (the
-       ``_runtime/`` service-action subdirectory excepted) — every shell or
-       python call an agent makes writes one, so this is the durable
-       "an agent worked here" signal that survives an orchestrator restart;
-     * a shell/REPL history file at the top level (a human used a terminal);
-     * a file under any non-hidden top-level entry the layout does not create;
-     * in a TEMPLATE-SEEDED CLONE (:data:`TEMPLATE_SEEDED_CLONES`, e.g. the
-       aidream template's ``aidream/``): uncommitted or untracked changes, a
-       stash, or a commit not reachable from the clone's own upstream refs
-       (``refs/remotes/*`` plus ``FETCH_HEAD`` — the helper has no network).
-       A pristine seed is not use, and the clone is never weighed;
-     * more than ``empty_home_max_bytes`` in total, ``cloud-files/`` and the
-       template clones excluded;
-     * anything the helper (or git) could not read.
-   ``cloud-files/`` is a MIRROR of the person's AI Matrx files (pulled down at
-   every boot; anything written in the box is pushed up within seconds), so its
-   contents alone do not make a home "used"; writing there takes a tool call
-   or a terminal, both of which leave evidence above.
+   inside a networkless helper container (killed and removed after
+   ``HELPER_TIMEOUT_SECONDS``; a timeout KEEPS the home). It is an ALLOW-LIST:
+   every file or symlink anywhere in the home is content UNLESS the image's own
+   never-used boot creates it — ``BOOT_SKELETON_EXACT`` / ``_PREFIXES``, the
+   skel ``.profile``/``.bash_logout`` byte for byte, a ``.bashrc`` that is the
+   skel plus only ``BASHRC_BOOT_LINES``, a ``.gitconfig`` holding only the
+   credential keys boot writes, and a cloud-sync queue with nothing pending.
+   Unknown is content (``~/.claude``, ``~/.ssh`` private keys, own-plan
+   sign-ins, any other ``.matrx`` file). Empty directories never are.
+   ``cloud-files/`` (a mirror of server-held files) is skipped. A
+   TEMPLATE-SEEDED CLONE (``aidream/``) is judged by git: any changed,
+   untracked or ignored path other than ``CLONE_BOOT_IGNORED`` (its baked
+   ``.venv/``), a stash, or a commit not reachable from its own upstream refs
+   is use. Over ``empty_home_max_bytes`` (mirror and clones excluded), or
+   anything unreadable, is use.
 
 A home with ANY user content is never deleted by this pass — it only ever
 stops on the existing idle rules.
@@ -96,6 +87,14 @@ HOME_DELETED_REASON = "unused_empty_home"
 #: often inside the 60-second tick (process-local; a restart runs it at once).
 SWEEP_INTERVAL_SECONDS = 3600
 
+#: One home inspection may take at most this long (a 1.7 GB template clone's
+#: git status included). On expiry the helper is killed and removed and the
+#: home is KEPT. Mechanism bounds, not opinions, so constants.
+HELPER_TIMEOUT_SECONDS = 300
+#: A whole pass runs in the background, never inside the 60 s reaper tick, and
+#: is cancelled after this long (the lease is released on the way out).
+SWEEP_PASS_BUDGET_SECONDS = 1800
+
 TERMINAL_STATUSES = frozenset({"stopped", "expired", "failed"})
 
 _RESULT_PREFIX = "EMPTY_HOME_RESULT="
@@ -111,6 +110,78 @@ TEMPLATE_SEEDED_CLONES = frozenset({
     "aidream",  # entrypoint-aidream.sh: cp -a /opt/aidream-template → /home/agent/aidream
 })
 
+#: Ignored paths a template's own boot creates inside its clone (``git status
+#: --ignored=matching`` spelling). Any OTHER ignored path — a ``.env``, a data
+#: dump — is the person's and makes the home used.
+CLONE_BOOT_IGNORED = {
+    "aidream": (".venv/",),  # cp -a of /opt/aidream-template carries the baked venv
+}
+
+# ── The never-used boot skeleton: the ONLY files that are not content ─────────
+# Derived from sandbox-image (ensure-layout.sh, prepare-agent-home.sh, the
+# entrypoints, configure-git-credentials.sh, the SDK's persistence + cloud_sync)
+# and checked against the two homes the live host judged untouched on
+# 2026-10-16. Anything not matched here is content. Guards:
+# tests/test_unused_home_sweep.py.
+
+#: Files boot (re)writes wholesale every start, so nothing a person put in them
+#: survives a boot anyway.
+BOOT_SKELETON_EXACT = frozenset({
+    ".sandbox_env",                           # entrypoint*.sh: cat > every boot
+    ".ssh/authorized_keys",                   # prepare-agent-home.sh: admin PUBLIC keys
+    ".matrx/instructions/SANDBOX_LAYOUT.md",  # ensure-layout.sh: cat > every boot
+    ".matrx/session.json",                    # matrx_agent.persistence, every 5 min
+    ".matrx/session.prev.json",               # matrx_agent.persistence, rotated at boot
+    ".matrx/session-report.md",               # matrx_agent.persistence, rendered at boot
+    ".matrx/runtime/cloud-files-down-complete",  # cloud_sync watcher marker (empty)
+})
+
+#: Directory trees that hold only regenerable machine state.
+BOOT_SKELETON_PREFIXES = (
+    ".cache/",                                # pip/uv caches (still weighed)
+    ".codex/tmp/",                            # codex arg0 dispatch links, per process
+    ".matrx/runtime/session-reports/",        # persistence startup reports
+    ".matrx/runtime/tool-calls/_runtime/",    # service actions, never an agent call
+)
+
+#: Ubuntu 22.04 /etc/skel copies, byte for byte (measured from the live
+#: matrx-sandbox:core image 2026-10-16). An edited copy is content.
+SKEL_SHA256 = {
+    ".profile": "28b4a453b68dde64f814e94bab14ee651f4f162e15dd9920490aa1d49f05d2a4",
+    ".bash_logout": "26882b79471c25f945c970f8233d8ce29d54e9d5eedcd2884f88affa84a18f56",
+}
+SKEL_BASHRC_SHA256 = "342099da4dd28c394d3f8782d90d7465cb2eaa611193f8f378d6918261cb9bb8"
+
+#: Lines boot appends to the skel .bashrc. With these removed the file must be
+#: the skel byte for byte; any other line is the person's.
+BASHRC_BOOT_LINES = frozenset({
+    "[ -f ~/.sandbox_env ] && source ~/.sandbox_env",  # entrypoint*.sh
+    ". /etc/profile.d/aidream.sh",                       # Dockerfile.aidream
+    "# SANDBOX_PROMPT",                                  # entrypoint-local.sh block
+    'export PS1="\\[\\033[1;36m\\]sandbox:${SANDBOX_ID:-?}\\[\\033[0m\\] '
+    '\\[\\033[1;34m\\]\\w\\[\\033[0m\\] \\$ "',
+    "alias ll='ls -alh --color=auto'",
+    "alias la='ls -A --color=auto'",
+})
+
+#: configure-git-credentials.sh writes credential.helper (these two) and the
+#: github.com username; any other .gitconfig key is the person's.
+GITCONFIG_BOOT_HELPERS = (
+    "cache --socket=/home/agent/.matrx/runtime/git-credential-cache.sock",
+    "/opt/sandbox/scripts/matrx-git-credential-env",
+)
+
+#: Every git call in the helper is capped; a timeout means "cannot prove
+#: pristine", i.e. KEEP.
+GIT_CALL_TIMEOUT_SECONDS = 60
+
+#: The constants :func:`_classify_home` reads, shipped into the helper.
+_SHIPPED_CONSTANTS = (
+    "TEMPLATE_SEEDED_CLONES", "CLONE_BOOT_IGNORED", "BOOT_SKELETON_EXACT",
+    "BOOT_SKELETON_PREFIXES", "SKEL_SHA256", "SKEL_BASHRC_SHA256",
+    "BASHRC_BOOT_LINES", "GITCONFIG_BOOT_HELPERS", "GIT_CALL_TIMEOUT_SECONDS",
+)
+
 _last_sweep_at: float | None = None
 #: Homes already proven to hold content, keyed by (volume, newest sandbox_id).
 #: Content does not un-happen without a new row, so never re-inspect them.
@@ -118,30 +189,22 @@ _known_used: set[tuple[str, str]] = set()
 
 
 def _classify_home(root, max_bytes):
-    """Decide whether a mounted home holds user content. SELF-CONTAINED: this
-    exact source is shipped into the helper container, so it may only use the
-    standard library (and the ``git`` binary), imported here.
+    """Decide whether a mounted home holds user content. ALLOW-LIST: every
+    file or symlink anywhere in the home is content unless the image's own
+    never-used boot is known to create it (:data:`BOOT_SKELETON_EXACT`,
+    :data:`BOOT_SKELETON_PREFIXES`, the verified dotfiles below). Unknown is
+    content. Empty directories are never content. ``cloud-files/`` (a mirror)
+    is skipped; a template-seeded clone is judged by git.
 
-    Only FILES (and symlinks) are evidence: an empty directory never is, which
-    is what the image and the aidream app leave behind (``workspace/``,
-    ``temp/``, the layout dirs). A template-seeded clone
-    (:data:`TEMPLATE_SEEDED_CLONES`) is judged by git, not by its files."""
+    SELF-CONTAINED: this exact source, plus the module constants it names,
+    is shipped into the helper container; standard library + ``git`` only."""
+    import hashlib
+    import json
     import os
+    import stat as statmod
     import subprocess
 
-    content_dirs = (
-        "projects/", "repos/", "scratch/",
-        ".matrx/plans/", ".matrx/skills/", ".matrx/memory/",
-        ".matrx/runtime/shell-logs/",
-    )
-    tool_calls = ".matrx/runtime/tool-calls/"
-    tool_calls_service = ".matrx/runtime/tool-calls/_runtime/"
-    histories = {".bash_history", ".python_history", ".zsh_history",
-                 ".node_repl_history", ".sh_history"}
-    layout_top = {"cloud-files", "repos", "projects", "scratch"}
     mirror = "cloud-files"
-    template_clones = TEMPLATE_SEEDED_CLONES
-
     evidence = []
     unreadable = []
     total = 0
@@ -153,26 +216,79 @@ def _classify_home(root, max_bytes):
     def git(repo, *args):
         # Read-only and inert: no optional index writes, no hooks, no
         # fsmonitor, no system/global config — the repo is the user's, the
-        # helper is root, so nothing in it may run.
+        # helper is root, so nothing in it may run. Bounded per call.
         env = {"PATH": "/usr/local/bin:/usr/bin:/bin", "GIT_OPTIONAL_LOCKS": "0",
                "GIT_CONFIG_NOSYSTEM": "1", "GIT_CONFIG_GLOBAL": "/dev/null",
                "HOME": "/nonexistent", "GIT_TERMINAL_PROMPT": "0"}
         return subprocess.run(
             ["git", "-c", "safe.directory=*", "-c", "core.fsmonitor=",
              "-c", "core.hooksPath=/dev/null", "-c", "core.untrackedCache=false",
-             "-C", repo, *args],
-            capture_output=True, text=True, env=env, timeout=600,
+             *(["-C", repo] if repo else []), *args],
+            capture_output=True, text=True, env=env, timeout=GIT_CALL_TIMEOUT_SECONDS,
         )
+
+    def sha(path):
+        h = hashlib.sha256()
+        with open(path, "rb") as fh:
+            for chunk in iter(lambda: fh.read(65536), b""):
+                h.update(chunk)
+        return h.hexdigest()
+
+    def boot_file_ok(rel, full):
+        """True only when a known boot-written file holds only what boot wrote."""
+        if rel in BOOT_SKELETON_EXACT:
+            return True
+        if rel.startswith(BOOT_SKELETON_PREFIXES):
+            return True
+        if rel in SKEL_SHA256:
+            return sha(full) == SKEL_SHA256[rel]
+        if rel == ".bashrc":
+            with open(full, "rb") as fh:
+                lines = fh.read().decode("utf-8", "replace").splitlines(keepends=True)
+            kept = "".join(ln for ln in lines if ln.rstrip("\n") not in BASHRC_BOOT_LINES)
+            return hashlib.sha256(kept.encode()).hexdigest() == SKEL_BASHRC_SHA256
+        if rel == ".gitconfig":
+            listed = git(None, "config", "--file", full, "--list")
+            if listed.returncode != 0:
+                return False
+            for entry in listed.stdout.splitlines():
+                key, _, value = entry.partition("=")
+                if key == "credential.https://github.com.username":
+                    continue
+                if key == "credential.helper" and value.startswith(GITCONFIG_BOOT_HELPERS):
+                    continue
+                return False
+            return True
+        if rel == ".matrx/runtime/cloud-sync-queue.jsonl":
+            # Allowed only when every queued upload is DONE — a pending one is a
+            # file that has not reached the person's AI Matrx files yet.
+            pending = set()
+            with open(full, encoding="utf-8") as fh:
+                for line in fh:
+                    if not line.strip():
+                        continue
+                    obj = json.loads(line)
+                    eid = obj.get("event_id")
+                    if obj.get("done"):
+                        pending.discard(eid)
+                    else:
+                        pending.add(eid)
+            return not pending
+        return False
 
     def clone_shows_work(name):
         """None when the clone is pristine; else a short reason."""
         repo = os.path.join(root, name)
         try:
-            status = git(repo, "status", "--porcelain", "--untracked-files=normal")
+            status = git(repo, "status", "--porcelain", "--untracked-files=normal",
+                         "--ignored=matching")
             if status.returncode != 0:
                 return "git status failed: " + status.stderr.strip()[:120]
-            if status.stdout.strip():
-                return "uncommitted: " + status.stdout.strip().splitlines()[0][:120]
+            allowed_ignored = set(CLONE_BOOT_IGNORED.get(name, ()))
+            for line in status.stdout.splitlines():
+                if line.startswith("!! ") and line[3:] in allowed_ignored:
+                    continue
+                return "changed: " + line[:120]
             if git(repo, "rev-parse", "-q", "--verify", "refs/stash").returncode == 0:
                 return "stash"
             # The baseline is what the clone itself knows came from upstream:
@@ -182,9 +298,9 @@ def _classify_home(root, max_bytes):
             try:
                 with open(os.path.join(repo, ".git", "FETCH_HEAD")) as fh:
                     for line in fh:
-                        sha = line[:40]
-                        if len(sha) == 40 and all(c in "0123456789abcdef" for c in sha):
-                            baseline.append(sha)
+                        h = line[:40]
+                        if len(h) == 40 and all(c in "0123456789abcdef" for c in h):
+                            baseline.append(h)
             except OSError:
                 pass
             remotes = git(repo, "for-each-ref", "--format=%(objectname)", "refs/remotes")
@@ -211,7 +327,7 @@ def _classify_home(root, max_bytes):
 
     judged_clones = set()
     for name in top:
-        if name in template_clones and os.path.isdir(os.path.join(root, name, ".git")) \
+        if name in TEMPLATE_SEEDED_CLONES and os.path.isdir(os.path.join(root, name, ".git")) \
                 and not os.path.islink(os.path.join(root, name)):
             judged_clones.add(name)
             why = clone_shows_work(name)
@@ -226,7 +342,6 @@ def _classify_home(root, max_bytes):
         kept = []
         for d in dirnames:
             full = os.path.join(dirpath, d)
-            rel = d if not rel_dir else rel_dir + "/" + d
             if not rel_dir and (d == mirror or d in judged_clones):
                 continue  # mirror and git-judged clones: not walked, not weighed
             try:
@@ -238,26 +353,27 @@ def _classify_home(root, max_bytes):
                 leaves.append(d)  # a symlink is an entry, never descended
             elif st.st_dev == root_dev:
                 kept.append(d)
+            else:
+                evidence.append((d if not rel_dir else rel_dir + "/" + d) + " (other filesystem)")
         dirnames[:] = kept
         for name in leaves:
             rel = name if not rel_dir else rel_dir + "/" + name
-            first = rel.split("/", 1)[0]
-            if first == mirror or first in judged_clones:
-                continue
+            full = os.path.join(dirpath, name)
             try:
-                st = os.lstat(os.path.join(dirpath, name))
+                st = os.lstat(full)
             except OSError as exc:
                 errored(exc)
                 continue
+            if not (statmod.S_ISREG(st.st_mode) or statmod.S_ISLNK(st.st_mode)):
+                continue  # sockets, fifos: runtime plumbing, never data
             files += 1
             total += st.st_size
-            if rel in histories:
-                evidence.append(rel)
-            elif rel.startswith(content_dirs):
-                evidence.append(rel)
-            elif rel.startswith(tool_calls) and not rel.startswith(tool_calls_service):
-                evidence.append(rel)
-            elif not first.startswith(".") and first not in layout_top:
+            try:
+                ok = boot_file_ok(rel, full)
+            except Exception as exc:  # unreadable or malformed = content
+                errored(exc)
+                ok = False
+            if not ok:
                 evidence.append(rel)
     over = total > int(max_bytes)
     return {
@@ -271,26 +387,24 @@ def _classify_home(root, max_bytes):
 
 
 def helper_program() -> str:
-    """The python program the helper runs: :func:`_classify_home`, verbatim."""
+    """The python program the helper runs: :func:`_classify_home`, verbatim,
+    preceded by the exact values of the constants it reads."""
+    prelude = "".join(f"{name} = {globals()[name]!r}\n" for name in _SHIPPED_CONSTANTS)
     source = textwrap.dedent(inspect.getsource(_classify_home))
     return (
-        f"TEMPLATE_SEEDED_CLONES = frozenset({sorted(TEMPLATE_SEEDED_CLONES)!r})\n"
+        prelude
         + source
         + "\nimport json, sys\n"
         + f"print({_RESULT_PREFIX!r} + json.dumps(_classify_home(sys.argv[1], sys.argv[2])))\n"
     )
 
 
-async def inspect_home(client: Any, volume: str, max_bytes: int) -> dict:
-    """Run :func:`_classify_home` against ``volume`` mounted READ-ONLY in a
-    networkless helper. Raises on any failure (the caller keeps the home)."""
-    from orchestrator.hosted_runtime import _helper_image
-
-    image = await _helper_image(client)
-    if not image:
-        raise RuntimeError("no helper image identity")
-    output = await asyncio.to_thread(
-        client.containers.run,
+def _run_helper_bounded(client: Any, image: str, volume: str, max_bytes: int,
+                        timeout: float) -> str:
+    """Run the helper detached, wait at most ``timeout`` seconds, and ALWAYS
+    remove it. Runs whole in one worker thread, so a cancelled caller can never
+    skip the kill/remove. A timeout raises: the caller keeps the home."""
+    container = client.containers.run(
         image,
         command=["-c", helper_program(), "/home/agent", str(int(max_bytes))],
         entrypoint=["python3"],
@@ -299,10 +413,40 @@ async def inspect_home(client: Any, volume: str, max_bytes: int) -> dict:
         network_disabled=True,
         environment={},
         labels=_HELPER_LABELS,
-        remove=True,
-        detach=False,
+        detach=True,
     )
-    text = output.decode("utf-8", "replace") if isinstance(output, bytes) else str(output)
+    try:
+        try:
+            result = container.wait(timeout=timeout)
+        except Exception as exc:  # requests ReadTimeout / ConnectionError
+            try:
+                container.kill()
+            except Exception:  # noqa: BLE001 — already gone is fine
+                pass
+            raise TimeoutError(f"home inspector exceeded {timeout:.0f}s ({exc!r})") from exc
+        output = container.logs(stdout=True, stderr=False)
+        code = (result or {}).get("StatusCode")
+        if code != 0:
+            raise RuntimeError(f"home inspector exited {code}")
+        return output.decode("utf-8", "replace") if isinstance(output, bytes) else str(output)
+    finally:
+        try:
+            container.remove(force=True)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unused-home sweep: could not remove inspector container: %r", exc)
+
+
+async def inspect_home(client: Any, volume: str, max_bytes: int) -> dict:
+    """Run :func:`_classify_home` against ``volume`` mounted READ-ONLY in a
+    networkless helper, bounded by :data:`HELPER_TIMEOUT_SECONDS`. Raises on
+    any failure or timeout (the caller keeps the home)."""
+    from orchestrator.hosted_runtime import _helper_image
+
+    image = await _helper_image(client)
+    if not image:
+        raise RuntimeError("no helper image identity")
+    text = await asyncio.to_thread(_run_helper_bounded, client, image, volume, max_bytes,
+                                   HELPER_TIMEOUT_SECONDS)
     lines = [ln for ln in text.splitlines() if ln.startswith(_RESULT_PREFIX)]
     if len(lines) != 1:
         raise RuntimeError("home inspector did not emit exactly one verdict")
@@ -441,6 +585,33 @@ async def sweep_unused_homes(store, *, force: bool = False) -> dict:
         elif outcome == "used":
             summary["kept_used"] += 1
     return summary
+
+
+_running: "asyncio.Task | None" = None
+
+
+def launch_sweep(store) -> bool:
+    """Start one pass in the background unless one is still running. The
+    reaper tick calls this and never waits: an inspection that hangs can never
+    stall expiry, liveness or always-on revive. Returns True when started."""
+    global _running
+    if _running is not None and not _running.done():
+        return False
+    if not _sweep_due():
+        return False
+
+    async def _bounded() -> None:
+        try:
+            await asyncio.wait_for(sweep_unused_homes(store, force=True),
+                                   timeout=SWEEP_PASS_BUDGET_SECONDS)
+        except asyncio.TimeoutError:
+            logger.warning("Unused-home sweep: pass exceeded %ds and was cancelled; "
+                           "nothing further deleted this pass.", SWEEP_PASS_BUDGET_SECONDS)
+        except Exception as exc:  # noqa: BLE001
+            logger.warning("Unused-home sweep: pass failed: %r", exc)
+
+    _running = asyncio.get_running_loop().create_task(_bounded(), name="unused-home-sweep")
+    return True
 
 
 async def _delete_if_unused(store, key: tuple[str, str], newest_id: str, *,
