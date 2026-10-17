@@ -83,7 +83,15 @@ def _clean_caches():
     sdk_refresh.clear_caches()
 
 
-def _wire(monkeypatch, container, *, exec_results, current_available=True, scripts_stamped=True):
+def _wire(
+    monkeypatch,
+    container,
+    *,
+    exec_results,
+    current_available=True,
+    scripts_stamped=True,
+    failure_stamp: dict | None = None,
+):
     client = MagicMock()
     client.containers.get.return_value = container
     holder = MagicMock()
@@ -108,8 +116,16 @@ def _wire(monkeypatch, container, *, exec_results, current_available=True, scrip
     # guards in tests/test_github_credential_and_vault_env.py, and a positional
     # list would make every SDK test break whenever that half grows a step.
     sdk_script = list(exec_results)
+    written_failures: list[dict] = []
 
     async def _dispatch(*, sandbox_id, command, **_kwargs):
+        if sdk_refresh.FAILURE_STAMP in command:
+            if command.startswith("cat >"):
+                body = command.split("<<'MATRXSTAMP'\n", 1)[1].rsplit("\nMATRXSTAMP", 1)[0]
+                written_failures.append(json.loads(body))
+                return (0, "", "", "/opt/sandbox")
+            stamp = written_failures[-1] if written_failures else failure_stamp
+            return (0, json.dumps(stamp) if stamp else "", "", "/opt/sandbox")
         if ".matrx-scripts-refresh" in command:
             if command.startswith("cat >"):
                 return (0, "", "", "/opt/sandbox")
@@ -135,6 +151,7 @@ def _wire(monkeypatch, container, *, exec_results, current_available=True, scrip
         return sdk_script.pop(0)
 
     execute = AsyncMock(side_effect=_dispatch)
+    execute.written_failures = written_failures
     monkeypatch.setattr(sdk_refresh.sandbox_manager, "exec_in_sandbox", execute)
     return client, execute
 
@@ -324,3 +341,176 @@ async def test_a_migrating_box_is_left_to_its_migration(monkeypatch):
     monkeypatch.setattr(activity, "is_migrating", lambda _sid: True)
     result = await sdk_refresh.refresh_sdk_if_stale(_sandbox())
     assert result["status"] == "skipped"
+
+
+# ── 2026-10-17 incident guards ───────────────────────────────────────────────
+# The admin development box repeated a 65 s failing install on EVERY binding
+# (13 times in 48 h), and each one ran inside the token mint, which then blew
+# the browser's 6.75 s budget: no sandbox tools in chat.
+
+
+def _installer_runs(execute) -> int:
+    return sum(
+        1
+        for call in execute.await_args_list
+        if "matrx_agent/selfupdate.py" in call.kwargs.get("command", "")
+    )
+
+
+@pytest.mark.asyncio
+async def test_a_rolled_back_refresh_is_not_retried_within_the_backoff(monkeypatch):
+    rolled_back = json.dumps(
+        {
+            "status": "rolled_back",
+            "daemon_restart": {"status": "failed"},
+            "rollback": {"status": "restored"},
+            "deps_checked": {"added": ["matrx-api"], "removed": []},
+        }
+    )
+    container = _container(OLD_IMAGE_ID)
+    _client, execute = _wire(
+        monkeypatch,
+        container,
+        exec_results=[
+            (0, "", "", "/opt/sandbox"),  # sdk stamp: never refreshed
+            (1, rolled_back, "", "/opt/sandbox"),
+        ],
+    )
+
+    first = await sdk_refresh.refresh_sdk_if_stale(_sandbox())
+    assert first["status"] == "rolled_back"
+    assert _installer_runs(execute) == 1
+    assert execute.written_failures, "a rolled-back refresh must be stamped inside the box"
+    assert execute.written_failures[-1]["failed_image_id"] == CURRENT_IMAGE_ID
+
+    second = await sdk_refresh.refresh_sdk_if_stale(_sandbox())
+    assert second["status"] == "backoff", second
+    assert _installer_runs(execute) == 1, "the failing install ran again on the next binding"
+
+    # An orchestrator restart loses the process cache; the stamp in the box
+    # must still hold the backoff.
+    sdk_refresh._failed.clear()
+    sdk_refresh._recent.clear()
+    third_execs_before = _installer_runs(execute)
+    # the sdk stamp read for the third binding
+    _client2, execute2 = _wire(
+        monkeypatch,
+        container,
+        exec_results=[(0, "", "", "/opt/sandbox")],
+        failure_stamp=execute.written_failures[-1],
+    )
+    third = await sdk_refresh.refresh_sdk_if_stale(_sandbox())
+    assert third["status"] == "backoff", third
+    assert _installer_runs(execute2) == 0
+    assert third_execs_before == 1
+
+
+@pytest.mark.asyncio
+async def test_a_failed_refresh_retries_when_the_backoff_expires_or_the_image_changes(monkeypatch):
+    container = _container(OLD_IMAGE_ID)
+    old_failure = {
+        "failed_image_id": CURRENT_IMAGE_ID,
+        "status": "rolled_back",
+        "at": 0.0,  # long ago
+    }
+    refreshed = json.dumps({"status": "refreshed", "daemon_restart": {"status": "restarted"}})
+    _client, execute = _wire(
+        monkeypatch,
+        container,
+        exec_results=[(0, "", "", "/opt/sandbox"), (0, refreshed, "", "/opt/sandbox")],
+        failure_stamp=old_failure,
+    )
+    result = await sdk_refresh.refresh_sdk_if_stale(_sandbox())
+    assert result["status"] == "refreshed"
+    assert _installer_runs(execute) == 1
+
+    sdk_refresh.clear_caches()
+    other_image = dict(old_failure, failed_image_id="sha256:some-older-target", at=__import__("time").time())
+    _client, execute = _wire(
+        monkeypatch,
+        container,
+        exec_results=[(0, "", "", "/opt/sandbox"), (0, refreshed, "", "/opt/sandbox")],
+        failure_stamp=other_image,
+    )
+    result = await sdk_refresh.refresh_sdk_if_stale(_sandbox())
+    assert result["status"] == "refreshed", "a failure for a DIFFERENT target image must not block"
+
+
+@pytest.mark.asyncio
+async def test_a_deps_missing_abort_is_reported_and_backed_off(monkeypatch):
+    aborted = json.dumps(
+        {
+            "status": "deps_missing",
+            "reason": "pip could not install matrx-api",
+            "deps_checked": {"added": ["matrx-api"], "removed": []},
+            "deps_install": {"status": "failed", "packages": ["matrx-api"]},
+        }
+    )
+    container = _container(OLD_IMAGE_ID)
+    _client, execute = _wire(
+        monkeypatch,
+        container,
+        exec_results=[(0, "", "", "/opt/sandbox"), (1, aborted, "", "/opt/sandbox")],
+    )
+    first = await sdk_refresh.refresh_sdk_if_stale(_sandbox())
+    assert first["status"] == "deps_missing"
+    assert "matrx-api" in first["reason"]
+    second = await sdk_refresh.refresh_sdk_if_stale(_sandbox())
+    assert second["status"] == "backoff"
+    assert _installer_runs(execute) == 1
+
+
+@pytest.mark.asyncio
+async def test_the_mint_returns_fast_while_a_refresh_hangs(monkeypatch):
+    """The token mint must never wait on a slow hook: the hooks keep running in
+    the background and the mint answers with ``in_progress``."""
+    import asyncio
+    import time as _time
+
+    from orchestrator import hook_budget
+
+    release = asyncio.Event()
+    calls = {"sdk": 0}
+
+    async def hanging_refresh(_sandbox):
+        calls["sdk"] += 1
+        await release.wait()
+        return {"hook": "session_start.sdk_refresh", "status": "refreshed"}
+
+    async def vault(_sandbox):
+        return {"hook": "session_start.vault_env_refresh", "status": "refreshed"}
+
+    monkeypatch.setattr(sdk_refresh, "refresh_sdk_if_stale", hanging_refresh)
+    from orchestrator import vault_env_refresh
+
+    monkeypatch.setattr(vault_env_refresh, "refresh_vault_env", vault)
+    from orchestrator import connection_hooks
+
+    async def repo_sync(_sandbox):
+        return {"hook": "session_start.repo_sync", "status": "ok", "exit_code": 0, "summary": ""}
+
+    monkeypatch.setattr(connection_hooks, "prepare_development_connection", repo_sync)
+    monkeypatch.setattr(hook_budget, "HOOK_WAIT_SECONDS", 0.2)
+    try:
+        started = _time.monotonic()
+        first = await sandboxes._prepare_connection(_sandbox(template="development"))
+        elapsed = _time.monotonic() - started
+        assert elapsed < 1.0, f"the mint waited {elapsed:.2f}s on a hanging refresh"
+        assert first["sdk_refresh"]["status"] == "in_progress"
+        assert first["status"] == "in_progress"
+        assert hook_budget.is_running("sbx-old"), "the refresh must keep running in the background"
+
+        # A second binding joins the SAME task instead of starting another.
+        second = await sandboxes._prepare_connection(_sandbox(template="development"))
+        assert second["sdk_refresh"]["status"] == "in_progress"
+        assert calls["sdk"] == 1, "a second binding started a second refresh"
+
+        release.set()
+        for _ in range(50):
+            if not hook_budget.is_running("sbx-old"):
+                break
+            await asyncio.sleep(0.02)
+        assert not hook_budget.is_running("sbx-old"), "the background refresh never finished"
+    finally:
+        release.set()
+        await hook_budget.drain()

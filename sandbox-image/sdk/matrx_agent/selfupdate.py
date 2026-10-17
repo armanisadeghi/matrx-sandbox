@@ -21,10 +21,18 @@ THE RULES.
   imports. The previous tree is kept for one refresh as ``sdk.prev`` and is the
   rollback.
 * The pip editable install baked by the Dockerfile points at the PATH
-  ``/opt/sandbox/sdk``, so a rename into that path is the whole install. No pip,
-  no network. A release that adds a third-party DEPENDENCY still needs a real
-  image migration — this reports ``deps_checked`` so that case is visible
-  instead of mysterious.
+  ``/opt/sandbox/sdk``, so a rename into that path is the code install.
+* DEPENDENCIES are installed BEFORE the swap (incident 2026-10-17: a tree that
+  added ``matrx-api`` was swapped in anyway, the daemon died on
+  ``ModuleNotFoundError``, the box rolled back after ~65 s, and the next binding
+  did it all again). Any direct dependency of the staged tree that the DAEMON's
+  interpreter does not have is installed exactly the way the image installs
+  them — ``pip install --require-hashes`` from the staged tree's own
+  ``requirements.lock`` — limited to the missing names and their pinned
+  transitive closure. If that cannot be done the install ABORTS with status
+  ``deps_missing`` before anything is touched: the daemon keeps running the
+  working SDK and the answer comes back in seconds, not after a crash and a
+  rollback.
 * The daemon (uvicorn ``matrx_agent.api.main``) holds every PTY session in
   process: pty.fork()'s child shell dies with it. So the daemon is restarted
   ONLY when the daemon's own code actually changed AND the caller passes
@@ -41,7 +49,9 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
+import tempfile
 import signal
 import subprocess
 import sys
@@ -60,6 +70,10 @@ MTX_SHIM = "/usr/local/bin/mtx"
 MTX_SHIM_BODY = '#!/bin/sh\nexec /usr/bin/python3 -m matrx_agent.cli "$@"\n'
 BROWSE_SHIM = "/usr/local/bin/browse"
 BROWSE_SHIM_BODY = '#!/bin/sh\nexec /usr/bin/python3 -m matrx_agent.cli browse "$@"\n'
+LOCK_NAME = "requirements.lock"
+#: A pip install of a handful of pinned wheels takes seconds; the ceiling is for
+#: a slow index, and it is still far below the swap -> crash -> rollback path.
+DEPS_INSTALL_TIMEOUT = 180
 DAEMON_MARKER = "matrx_agent.api.main"
 DAEMON_HEALTH = "http://127.0.0.1:8000/health"
 
@@ -269,6 +283,166 @@ def _requirements(root: str) -> set[str]:
     return names
 
 
+# ── dependencies ─────────────────────────────────────────────────────────────
+
+
+def _norm(name: str) -> str:
+    """PEP 503 normalised distribution name."""
+    return re.sub(r"[-_.]+", "-", name).lower().strip()
+
+
+def parse_lock(path: str) -> dict[str, dict]:
+    """``requirements.lock`` (uv/pip-compile ``--generate-hashes`` format) as
+    ``{normalised name: {"lines": [requirement + hash lines], "via": {names}}}``.
+    ``via`` is who pulled the package in — the edges of the closure."""
+    entries: dict[str, dict] = {}
+    current: dict | None = None
+    in_via_block = False
+    with open(path, "r", encoding="utf-8") as fh:
+        for raw in fh:
+            line = raw.rstrip("\n")
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if not line[0].isspace() and not stripped.startswith(("#", "-")):
+                name = re.split(r"[=<>!~;\[\s]", stripped, maxsplit=1)[0]
+                current = {"lines": [line], "via": set()}
+                entries[_norm(name)] = current
+                in_via_block = False
+                continue
+            if current is None:
+                continue
+            if stripped.startswith("--hash"):
+                current["lines"].append(line)
+            elif stripped.startswith("# via"):
+                rest = stripped[len("# via"):].strip()
+                if rest:
+                    current["via"].add(_norm(rest))
+                    in_via_block = False
+                else:
+                    in_via_block = True
+            elif stripped.startswith("#") and in_via_block:
+                parent = stripped.lstrip("#").strip()
+                if parent and not parent.startswith("-r"):
+                    current["via"].add(_norm(parent.split()[0]))
+    return entries
+
+
+def _daemon_python() -> str:
+    """The interpreter the daemon actually runs — the one that has to import
+    the new dependencies. Falls back to this installer's own interpreter: the
+    orchestrator runs it as ``python3``, the same name the entrypoint launches
+    uvicorn with."""
+    for pid in _daemon_pids():
+        try:
+            exe = os.readlink(f"/proc/{pid}/exe")
+        except OSError:
+            continue
+        if os.path.basename(exe).startswith("python") and os.path.exists(exe):
+            return exe
+    return sys.executable or shutil.which("python3") or "python3"
+
+
+def _installed_dists(python: str) -> set[str] | None:
+    """Normalised names of every distribution ``python`` can import, or None
+    when it cannot be asked."""
+    probe = (
+        "import importlib.metadata as m, json; "
+        "print(json.dumps(sorted({(d.metadata['Name'] or '') for d in m.distributions()})))"
+    )
+    try:
+        out = subprocess.run(
+            [python, "-c", probe], capture_output=True, text=True, timeout=60, check=True
+        ).stdout
+        return {_norm(n) for n in json.loads(out.strip().splitlines()[-1]) if n}
+    except (subprocess.SubprocessError, OSError, ValueError, IndexError):
+        return None
+
+
+def ensure_deps(source: str, required: set[str], *, python: str | None = None) -> dict:
+    """Install every dependency of ``source`` that ``python`` is missing, from
+    the staged tree's own hash-pinned lock. Never raises.
+
+    Returns ``{"status": "not_needed" | "installed" | "failed", ...}``.
+    """
+    python = python or _daemon_python()
+    report: dict = {"status": "not_needed", "python": python, "packages": []}
+    installed = _installed_dists(python)
+    if installed is None:
+        report.update(status="failed", reason=f"could not list the packages {python} has installed")
+        return report
+    missing = sorted(n for n in (_norm(r) for r in required) if n not in installed)
+    if not missing:
+        return report
+    lock_path = os.path.join(source, LOCK_NAME)
+    if not os.path.isfile(lock_path):
+        report.update(
+            status="failed",
+            packages=missing,
+            reason=f"the staged SDK needs {missing} but carries no {LOCK_NAME} to install them from",
+        )
+        return report
+    try:
+        lock = parse_lock(lock_path)
+    except (OSError, ValueError) as exc:
+        report.update(status="failed", packages=missing, reason=f"unreadable {LOCK_NAME}: {exc}")
+        return report
+    unpinned = [n for n in missing if n not in lock]
+    if unpinned:
+        report.update(
+            status="failed",
+            packages=missing,
+            reason=f"{unpinned} are required by the staged SDK but not pinned in its {LOCK_NAME}",
+        )
+        return report
+    # The pinned transitive closure of what is missing, minus what the
+    # interpreter already has: nothing already installed is re-versioned.
+    needed = set(missing)
+    grew = True
+    while grew:
+        grew = False
+        for name, entry in lock.items():
+            if name not in needed and entry["via"] & needed:
+                needed.add(name)
+                grew = True
+    to_install = sorted(n for n in needed if n not in installed)
+    report["packages"] = to_install
+    fd, req_path = tempfile.mkstemp(prefix="matrx-sdk-deps-", suffix=".txt")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as fh:
+            for name in to_install:
+                fh.write("\n".join(lock[name]["lines"]) + "\n")
+        proc = subprocess.run(
+            [
+                python, "-m", "pip", "install", "--no-cache-dir", "--disable-pip-version-check",
+                "--require-hashes", "--no-deps", "-r", req_path,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=DEPS_INSTALL_TIMEOUT,
+        )
+    except (subprocess.SubprocessError, OSError) as exc:
+        report.update(status="failed", reason=f"pip install failed: {exc}")
+        return report
+    finally:
+        try:
+            os.unlink(req_path)
+        except OSError:
+            pass
+    if proc.returncode != 0:
+        report.update(
+            status="failed",
+            reason=f"pip install exited {proc.returncode}: {(proc.stderr or proc.stdout or '').strip()[-500:]}",
+        )
+        return report
+    still = _installed_dists(python)
+    if still is None or any(n not in still for n in missing):
+        report.update(status="failed", reason="pip reported success but the packages are still missing")
+        return report
+    report["status"] = "installed"
+    return report
+
+
 def apply(
     source: str = DEFAULT_SOURCE,
     target: str = DEFAULT_TARGET,
@@ -317,6 +491,22 @@ def apply(
         "added": sorted(new_reqs - old_reqs),
         "removed": sorted(old_reqs - new_reqs),
     }
+
+    # Dependencies BEFORE the swap — and a refusal to swap when they cannot be
+    # had. Swapping anyway is the 2026-10-17 crash -> rollback loop.
+    deps = ensure_deps(source, new_reqs)
+    result["deps_install"] = deps
+    if deps["status"] == "failed":
+        result.update(
+            status="deps_missing",
+            reason=(
+                f"the current SDK needs {deps.get('packages') or result['deps_checked']['added']} "
+                f"and they could not be installed ({deps.get('reason')}); nothing was swapped and "
+                "the daemon was not touched"
+            ),
+        )
+        result["elapsed_seconds"] = round(time.time() - started, 3)
+        return result
 
     if old_all and old_all == new_all:
         result.update(status="already_current", reason="the staged SDK is byte-identical to the installed one")

@@ -1956,6 +1956,42 @@ async def settle_agent_presence(sandbox_id: str, execution_nonce: str, request: 
 
 
 async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
+    """Start the SessionStart hooks and wait for them only briefly.
+
+    A token mint NEVER waits on a slow hook (incident 2026-10-17: a 65 s SDK
+    install inside the mint made the browser's 6.75 s mint fail, so the admin
+    development box had no tools in chat). The hooks run as ONE single-flight
+    background task per box (``orchestrator/hook_budget.py``); after
+    ``HOOK_WAIT_SECONDS`` the mint answers with what has finished, every hook
+    still running reports ``status: "in_progress"``, and the task finishes on
+    its own. A binding that arrives meanwhile joins the same task.
+    """
+    from orchestrator import hook_budget
+
+    finished, report, partial = await hook_budget.run_bounded(
+        sandbox.sandbox_id, lambda progress: _run_connection_hooks(sandbox, progress)
+    )
+    if finished:
+        return report
+    out = {
+        "sdk_refresh": partial.get("sdk_refresh")
+        or hook_budget.in_progress("session_start.sdk_refresh"),
+        "vault_env_refresh": partial.get("vault_env_refresh")
+        or hook_budget.in_progress("session_start.vault_env_refresh"),
+    }
+    if sandbox.template == "development":
+        out.update(
+            hook="session_start.repo_sync",
+            status="in_progress",
+            exit_code=None,
+            summary="Connection preparation is still running in the background; the token was issued without waiting.",
+            image_refresh=None,
+            cached=False,
+        )
+    return out
+
+
+async def _run_connection_hooks(sandbox: SandboxResponse, progress: dict) -> dict | None:
     """Run the SessionStart hooks before the agent gets its hands on the box.
 
     Two hooks, different reach:
@@ -1979,7 +2015,9 @@ async def _prepare_connection(sandbox: SandboxResponse) -> dict | None:
     from orchestrator.vault_env_refresh import refresh_vault_env
 
     sdk_refresh = await refresh_sdk_if_stale(sandbox)
+    progress["sdk_refresh"] = sdk_refresh
     vault_env = await refresh_vault_env(sandbox)
+    progress["vault_env_refresh"] = vault_env
     if sandbox.template != "development":
         return {"sdk_refresh": sdk_refresh, "vault_env_refresh": vault_env}
     from orchestrator.connection_hooks import prepare_development_connection

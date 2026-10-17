@@ -282,3 +282,140 @@ def test_the_installer_runs_standalone_from_a_staged_tree(boxes):
     )
     assert proc.returncode == 0, proc.stderr
     assert json.loads(proc.stdout)["status"] == "refreshed"
+
+
+# ── 2026-10-17: dependencies are installed BEFORE the swap, or nothing swaps ──
+# A staged tree that added ``matrx-api`` was swapped in, the daemon died on
+# ModuleNotFoundError, the box rolled back after ~65 s — on every binding.
+
+_LOCK = """\
+httpx==0.28.1 \\
+    --hash=sha256:aaaa
+    # via
+    #   matrx-api
+    #   matrx-sdk
+matrx-api==0.1.4 \\
+    --hash=sha256:bbbb \\
+    --hash=sha256:cccc
+    # via matrx-sdk
+attrs==25.1.0 \\
+    --hash=sha256:dddd
+    # via matrx-api
+unrelated==1.0 \\
+    --hash=sha256:eeee
+    # via matrx-sdk
+"""
+
+
+def _add_matrx_api(boxes, *, with_lock=True):
+    _write(
+        os.path.join(boxes["source"], "pyproject.toml"),
+        'dependencies = [\n  "httpx>=0.25",\n  "matrx-api>=0.1.4",\n]\n',
+    )
+    if with_lock:
+        _write(os.path.join(boxes["source"], "requirements.lock"), _LOCK)
+
+
+class _FakePython:
+    """Stands in for the daemon's interpreter: what it has installed, and what
+    a pip install does to that. Records the pip call and the target tree's state
+    at that moment, so the test can prove the install came BEFORE the swap."""
+
+    def __init__(self, boxes, *, pip_rc=0):
+        self.boxes = boxes
+        self.installed = {"httpx", "pydantic"}
+        self.pip_rc = pip_rc
+        self.pip_calls = []
+        self.real_run = subprocess.run
+
+    def dists(self, _python):
+        return set(self.installed)
+
+    def run(self, cmd, *args, **kwargs):
+        if len(cmd) > 2 and cmd[1:4] == ["-m", "pip", "install"]:
+            req = cmd[cmd.index("-r") + 1]
+            with open(req, encoding="utf-8") as fh:
+                body = fh.read()
+            with open(os.path.join(self.boxes["target"], "matrx_agent", "cli", "__main__.py")) as fh:
+                live_cli = fh.read()
+            self.pip_calls.append({"cmd": cmd, "requirements": body, "live_cli": live_cli})
+            if self.pip_rc == 0:
+                for line in body.splitlines():
+                    if line and not line[0].isspace():
+                        self.installed.add(line.split("==")[0])
+            return subprocess.CompletedProcess(cmd, self.pip_rc, "", "ERROR: no matching distribution")
+        return self.real_run(cmd, *args, **kwargs)
+
+
+def test_an_added_dependency_is_installed_from_the_lock_before_the_swap(boxes, monkeypatch):
+    _add_matrx_api(boxes)
+    fake = _FakePython(boxes)
+    monkeypatch.setattr(selfupdate, "_installed_dists", fake.dists)
+    monkeypatch.setattr(selfupdate.subprocess, "run", fake.run)
+
+    result = selfupdate.apply(boxes["source"], boxes["target"], image_version="sep14")
+
+    assert result["status"] == "refreshed", result
+    assert result["deps_install"]["status"] == "installed"
+    assert len(fake.pip_calls) == 1
+    call = fake.pip_calls[0]
+    assert "--require-hashes" in call["cmd"] and "--no-deps" in call["cmd"]
+    # Only what is missing, with its pinned closure and its hashes — never a
+    # re-version of what the daemon already has, never unrelated pins.
+    assert "matrx-api==0.1.4" in call["requirements"]
+    assert "--hash=sha256:bbbb" in call["requirements"]
+    assert "attrs==25.1.0" in call["requirements"]
+    assert "httpx" not in call["requirements"]
+    assert "unrelated" not in call["requirements"]
+    assert "august CLI" in call["live_cli"], "pip ran AFTER the swap — the crash window is back"
+
+
+def test_an_uninstallable_dependency_aborts_before_anything_is_swapped(boxes, monkeypatch):
+    _add_matrx_api(boxes)
+    fake = _FakePython(boxes, pip_rc=1)
+    monkeypatch.setattr(selfupdate, "_installed_dists", fake.dists)
+    monkeypatch.setattr(selfupdate.subprocess, "run", fake.run)
+    restarts = []
+    monkeypatch.setattr(selfupdate, "restart_daemon", lambda *a, **k: restarts.append(1) or {})
+    before = _digest_dir(boxes["target"])
+
+    result = selfupdate.apply(
+        boxes["source"], boxes["target"], image_version="sep14", allow_daemon_restart=True
+    )
+
+    assert result["status"] == "deps_missing", result
+    assert "matrx-api" in result["reason"]
+    assert _digest_dir(boxes["target"]) == before, "the live SDK changed on an aborted install"
+    assert not os.path.exists(boxes["target"] + ".prev")
+    assert restarts == [], "the daemon was touched on an aborted install"
+
+
+def test_a_dependency_with_no_pin_aborts_instead_of_swapping(boxes, monkeypatch):
+    _add_matrx_api(boxes, with_lock=False)
+    fake = _FakePython(boxes)
+    monkeypatch.setattr(selfupdate, "_installed_dists", fake.dists)
+    monkeypatch.setattr(selfupdate.subprocess, "run", fake.run)
+    before = _digest_dir(boxes["target"])
+
+    result = selfupdate.apply(boxes["source"], boxes["target"], image_version="sep14")
+
+    assert result["status"] == "deps_missing"
+    assert fake.pip_calls == []
+    assert _digest_dir(boxes["target"]) == before
+
+
+def test_the_cli_exits_nonzero_on_deps_missing(boxes, monkeypatch, capsys):
+    _add_matrx_api(boxes)
+    fake = _FakePython(boxes, pip_rc=1)
+    monkeypatch.setattr(selfupdate, "_installed_dists", fake.dists)
+    monkeypatch.setattr(selfupdate.subprocess, "run", fake.run)
+    rc = selfupdate.main(["--source", boxes["source"], "--target", boxes["target"]])
+    assert rc == 1
+    assert json.loads(capsys.readouterr().out)["status"] == "deps_missing"
+
+
+def test_the_real_lock_parses_and_pins_matrx_api():
+    lock = selfupdate.parse_lock(os.path.join(os.path.dirname(__file__), "..", "requirements.lock"))
+    assert "matrx-api" in lock
+    assert any("--hash=sha256:" in line for line in lock["matrx-api"]["lines"])
+    assert "matrx-sdk" in lock["matrx-api"]["via"]

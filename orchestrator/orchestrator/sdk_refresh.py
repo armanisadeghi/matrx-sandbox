@@ -109,6 +109,20 @@ _locks: dict[str, asyncio.Lock] = {}
 _recent: dict[str, tuple[str, float]] = {}
 _RECENT_TTL = 900.0
 
+#: A refresh to an image that FAILED (installer error, rollback, missing deps,
+#: crash) is not retried on every binding — the 2026-10-17 admin box repeated a
+#: 65 s failing install 13 times in 48 h. It is retried after this backoff, or at
+#: once when the target image changes. A constant, not a knob: it bounds a
+#: repair loop, it is not an organization's preference.
+FAILURE_BACKOFF_SECONDS = 6 * 3600
+#: Outside the SDK tree on purpose: a rollback swaps that tree back, which
+#: would take a stamp written inside it with it.
+FAILURE_STAMP = f"{OPT_SANDBOX}/.matrx-sdk-refresh-failed"
+#: Statuses from the installer that mean "this image did not take on this box".
+_FAILED_STATUSES = {"failed", "rolled_back", "deps_missing", "refused"}
+#: (sandbox_id -> (failed image_id, wall-clock time of the failure, status))
+_failed: dict[str, tuple[str, float, str]] = {}
+
 
 @contextlib.contextmanager
 def _preserved_cwd(sandbox_id: str):
@@ -184,6 +198,10 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
     if cached and cached[0] == current.image_id and time.monotonic() - cached[1] < _RECENT_TTL:
         return _result("already_refreshed", **{"from": box_version, "to": to_version, "cached": True})
 
+    failed = _failed.get(sandbox_id)
+    if failed and failed[0] == current.image_id and time.time() - failed[1] < FAILURE_BACKOFF_SECONDS:
+        return _backoff_result(failed, box_version, to_version)
+
     with _preserved_cwd(sandbox_id):
         async with activity.track(sandbox_id):
             # The scripts half runs FIRST and on its own stamp. A box whose SDK
@@ -208,33 +226,68 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
                 )
             from_version = stamp.get("to_version") or box_version
 
-            payload = await asyncio.to_thread(
-                _stage_payload, client, current.tag, SDK_PATH, STAGE_DIR
-            )
-            await asyncio.to_thread(_put_payload, container, payload)
+            # A failure recorded INSIDE the box survives an orchestrator restart
+            # (the process cache does not), so a redeploy cannot restart the loop.
+            box_failure = await _read_failure_stamp(sandbox_id)
+            if (
+                box_failure.get("failed_image_id") == current.image_id
+                and isinstance(box_failure.get("at"), (int, float))
+                and time.time() - float(box_failure["at"]) < FAILURE_BACKOFF_SECONDS
+            ):
+                failed = (
+                    current.image_id,
+                    float(box_failure["at"]),
+                    str(box_failure.get("status") or "failed"),
+                )
+                _failed[sandbox_id] = failed
+                logger.warning(
+                    "SDK REFRESH BACKOFF on %s: the refresh to %s failed (%s) at %s; not "
+                    "retrying for %ds or until the current image changes.",
+                    sandbox_id, to_version, failed[2], box_failure.get("at"),
+                    FAILURE_BACKOFF_SECONDS,
+                )
+                return _backoff_result(failed, from_version, to_version, scripts=scripts)
 
-            allow_restart = activity.open_session_count(sandbox_id) == 0
-            command = (
-                f"python3 {STAGE_PATH}/matrx_agent/selfupdate.py "
-                f"--source {STAGE_PATH} --target {SDK_PATH} "
-                f"--image-id {current.image_id} --image-version {to_version}"
-            )
-            if allow_restart:
-                command += " --allow-daemon-restart"
-            command += f"; rc=$?; rm -rf {STAGE_PATH}; exit $rc"
-            exit_code, stdout, stderr, _ = await sandbox_manager.exec_in_sandbox(
-                sandbox_id=sandbox_id,
-                command=command,
-                timeout=INSTALL_TIMEOUT,
-                user="root",
-                cwd=OPT_SANDBOX,
-            )
+            try:
+                payload = await asyncio.to_thread(
+                    _stage_payload, client, current.tag, SDK_PATH, STAGE_DIR
+                )
+                await asyncio.to_thread(_put_payload, container, payload)
+
+                allow_restart = activity.open_session_count(sandbox_id) == 0
+                command = (
+                    f"python3 {STAGE_PATH}/matrx_agent/selfupdate.py "
+                    f"--source {STAGE_PATH} --target {SDK_PATH} "
+                    f"--image-id {current.image_id} --image-version {to_version}"
+                )
+                if allow_restart:
+                    command += " --allow-daemon-restart"
+                command += f"; rc=$?; rm -rf {STAGE_PATH}; exit $rc"
+                exit_code, stdout, stderr, _ = await sandbox_manager.exec_in_sandbox(
+                    sandbox_id=sandbox_id,
+                    command=command,
+                    timeout=INSTALL_TIMEOUT,
+                    user="root",
+                    cwd=OPT_SANDBOX,
+                )
+            except Exception as exc:
+                await _remember_failure(
+                    sandbox_id, current.image_id, to_version, "failed", f"{type(exc).__name__}: {exc}"
+                )
+                raise
 
     installed = _parse_json(stdout)
-    if exit_code != 0 or not installed:
+    if not installed:
         logger.error(
             "SDK REFRESH FAILED for %s (exit=%s): %s %s",
             sandbox_id, exit_code, (stdout or "")[-2000:], (stderr or "")[-2000:],
+        )
+        await _remember_failure(
+            sandbox_id,
+            current.image_id,
+            to_version,
+            str(installed.get("status") or "failed"),
+            str(installed.get("reason") or (stderr or stdout or "installer produced no report"))[-600:],
         )
         return _result(
             "failed",
@@ -247,10 +300,12 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
             },
         )
 
-    _recent[sandbox_id] = (current.image_id, time.monotonic())
     daemon = installed.get("daemon_restart") or {}
+    status = str(installed.get("status") or "failed")
+    if exit_code != 0 and status not in _FAILED_STATUSES:
+        status = "failed"
     result = _result(
-        installed.get("status") or "failed",
+        status,
         scripts=scripts,
         **{
             "from": from_version,
@@ -265,25 +320,112 @@ async def _refresh(sandbox: SandboxResponse) -> dict:
                 if installed.get("rollback")
                 else None
             ),
+            "exit_code": exit_code,
+            **(
+                {"reason": str(installed.get("reason"))[-600:]}
+                if installed.get("reason") and status in _FAILED_STATUSES
+                else {}
+            ),
         },
     )
+    if result["status"] in _FAILED_STATUSES:
+        await _remember_failure(
+            sandbox_id,
+            current.image_id,
+            to_version,
+            result["status"],
+            str(installed.get("reason") or result.get("rollback") or "")[-600:],
+        )
+    else:
+        _recent[sandbox_id] = (current.image_id, time.monotonic())
+        _failed.pop(sandbox_id, None)
     if result["status"] == "rolled_back":
         logger.error(
             "SDK REFRESH ROLLED BACK on %s: the current SDK's daemon would not start, so the "
             "box was restored to %s (rollback=%s). This box needs a real image migration.",
             sandbox_id, from_version, result["rollback"],
         )
-    if result["deps_added"]:
-        logger.warning(
-            "SDK REFRESH on %s installed a tree that declares NEW dependencies %s — the file "
-            "copy cannot install them; this box needs a real image migration for those.",
+    if result["status"] == "deps_missing":
+        logger.error(
+            "SDK REFRESH ABORTED on %s before the swap: the current SDK needs %s and they "
+            "could not be installed (%s). The box keeps its working SDK.",
+            sandbox_id, installed.get("deps_install", {}).get("packages") or result["deps_added"],
+            str(installed.get("reason") or "")[-300:],
+        )
+    elif result["deps_added"]:
+        logger.info(
+            "SDK REFRESH on %s installed the new dependencies %s before the swap (%s).",
             sandbox_id, result["deps_added"],
+            (installed.get("deps_install") or {}).get("status"),
         )
     logger.info(
         "SDK refresh on %s: %s (%s -> %s, daemon=%s)",
         sandbox_id, result["status"], from_version, to_version, result["daemon_restart"],
     )
     return result
+
+
+def _backoff_result(failed: tuple[str, float, str], from_version: str, to_version: str, **extra) -> dict:
+    retry_in = max(0, int(FAILURE_BACKOFF_SECONDS - (time.time() - failed[1])))
+    return _result(
+        "backoff",
+        reason=(
+            f"the refresh to this image {failed[2]} on this box; retrying in {retry_in}s "
+            "or as soon as the current image changes"
+        ),
+        last_failure_status=failed[2],
+        retry_in_seconds=retry_in,
+        **{"from": from_version, "to": to_version},
+        **extra,
+    )
+
+
+async def _remember_failure(
+    sandbox_id: str, image_id: str, to_version: str, status: str, reason: str
+) -> None:
+    """Record a failed refresh in the process AND inside the box. Never raises."""
+    at = time.time()
+    _failed[sandbox_id] = (image_id, at, status)
+    _recent.pop(sandbox_id, None)
+    logger.error(
+        "SDK REFRESH to %s on %s ended %s; not retrying for %ds or until the image changes: %s",
+        to_version, sandbox_id, status, FAILURE_BACKOFF_SECONDS, (reason or "")[-300:],
+    )
+    try:
+        await sandbox_manager.exec_in_sandbox(
+            sandbox_id=sandbox_id,
+            command=(
+                f"cat > {FAILURE_STAMP} <<'MATRXSTAMP'\n"
+                + json.dumps(
+                    {
+                        "failed_image_id": image_id,
+                        "to_version": to_version,
+                        "status": status,
+                        "at": at,
+                        "reason": (reason or "")[-300:],
+                    }
+                )
+                + "\nMATRXSTAMP"
+            ),
+            timeout=20,
+            user="root",
+            cwd=OPT_SANDBOX,
+        )
+    except Exception:  # noqa: BLE001 — the process cache still holds the backoff
+        logger.warning("could not write the SDK refresh failure stamp into %s", sandbox_id)
+
+
+async def _read_failure_stamp(sandbox_id: str) -> dict:
+    exit_code, stdout, _stderr, _ = await sandbox_manager.exec_in_sandbox(
+        sandbox_id=sandbox_id,
+        command=f"cat {FAILURE_STAMP} 2>/dev/null || true",
+        timeout=20,
+        user="root",
+        cwd=OPT_SANDBOX,
+    )
+    if exit_code != 0:
+        return {}
+    return _parse_json(stdout)
 
 
 SCRIPTS_STAMP = f"{SCRIPTS_PATH}/.matrx-scripts-refresh"
@@ -499,4 +641,5 @@ def _put_payload(container, payload: bytes) -> None:
 def clear_caches() -> None:
     """Tests, and anything that just changed the knob."""
     _recent.clear()
+    _failed.clear()
     _locks.clear()
