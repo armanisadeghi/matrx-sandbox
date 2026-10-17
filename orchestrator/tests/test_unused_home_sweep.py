@@ -658,3 +658,25 @@ def test_the_pinned_authorized_keys_is_the_image_admin_file() -> None:
     import hashlib
     assert (hashlib.sha256(ADMIN_KEYS.read_bytes()).hexdigest()
             == empty_home.SKEL_SHA256[".ssh/authorized_keys"])
+
+
+@pytest.mark.parametrize("planted", ["mydata.csv", "deep/x.txt", "fake.pyc/"])
+def test_non_bytecode_under_a_venv_pycache_is_use(tmp_path, monkeypatch, planted) -> None:
+    """Only a regular *.pyc directly inside __pycache__ is exempt."""
+    import time
+    monkeypatch.setattr(empty_home, "VENV_COPY_WINDOW_SECONDS", 1)
+    home = _skeleton(tmp_path / "home")
+    clone = _template_clone(home, tmp_path)
+    time.sleep(2.2)
+    pyc = clone / ".venv/lib/site-packages/__pycache__"
+    pyc.mkdir()
+    (pyc / "ok.cpython-313.pyc").write_bytes(b"x")
+    target = pyc / planted.rstrip("/")
+    if planted.endswith("/"):  # a directory named like byte-code, with data in it
+        target.mkdir()
+        (target / "data.txt").write_text("x")
+    else:
+        target.parent.mkdir(parents=True, exist_ok=True)
+        target.write_text("x")
+    verdict = _run_helper_program(home, 1_000_000)
+    assert verdict["empty"] is False and "__pycache__" in str(verdict["evidence"]), verdict

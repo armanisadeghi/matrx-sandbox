@@ -306,15 +306,18 @@ def _classify_home(root, max_bytes, release_shas=()):
             return ".venv has no pyvenv.cfg"
         limit = anchor + VENV_COPY_WINDOW_SECONDS
         for dirpath, dirnames, filenames in os.walk(venv, followlinks=False):
-            if os.path.basename(dirpath) == "__pycache__":
-                dirnames[:] = []
-                continue
+            in_pycache = os.path.basename(dirpath) == "__pycache__"
             # Files and symlinks only: a directory's ctime moves whenever an
-            # entry (a byte-code cache) is added inside it.
+            # entry (a byte-code cache) is added inside it. The walk is never
+            # pruned; the ONLY exemption is a regular *.pyc directly inside a
+            # __pycache__ dir — anything else there is checked like any file.
             for name in filenames + [d for d in dirnames
                                      if os.path.islink(os.path.join(dirpath, d))]:
                 full = os.path.join(dirpath, name)
-                if os.lstat(full).st_ctime > limit:
+                st_ = os.lstat(full)
+                if in_pycache and name.endswith(".pyc") and statmod.S_ISREG(st_.st_mode):
+                    continue
+                if st_.st_ctime > limit:
                     return ".venv changed after its boot copy: " + os.path.relpath(full, venv)[:120]
         return None
 
