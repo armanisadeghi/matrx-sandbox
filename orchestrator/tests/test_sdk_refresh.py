@@ -493,7 +493,12 @@ async def test_the_mint_returns_fast_while_a_refresh_hangs(monkeypatch):
     monkeypatch.setattr(hook_budget, "HOOK_WAIT_SECONDS", 0.2)
     try:
         started = _time.monotonic()
-        first = await sandboxes._prepare_connection(_sandbox(template="development"))
+        try:
+            first = await asyncio.wait_for(
+                sandboxes._prepare_connection(_sandbox(template="development")), timeout=5
+            )
+        except asyncio.TimeoutError:
+            pytest.fail("the mint blocked on a hanging SDK refresh (waited 5 s and gave up)")
         elapsed = _time.monotonic() - started
         assert elapsed < 1.0, f"the mint waited {elapsed:.2f}s on a hanging refresh"
         assert first["sdk_refresh"]["status"] == "in_progress"
