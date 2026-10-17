@@ -263,7 +263,7 @@ def _classify_home(root, max_bytes, release_shas=()):
         if rel in BOOT_SKELETON_EXACT:
             return True
         if rel in SKEL_SHA256:
-            return rel == ".ssh/authorized_keys" or sha(full) == SKEL_SHA256[rel]
+            return sha(full) == SKEL_SHA256[rel]
         if rel == ".bashrc":
             with open(full, "rb") as fh:
                 lines = fh.read().decode("utf-8", "replace").splitlines(keepends=True)
