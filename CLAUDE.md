@@ -3,7 +3,7 @@
 <!-- nine-laws:start -->
 ## The laws (synced from `common-docs/policies/the-nine-laws.md` — edit there, never here)
 
-1. **Done means verified, then handoff.** Build it, check types and regressions, use it in localhost as a user would, get an independent check, commit and push. Deploy agents own releases. `common-docs/policies/reality-is-the-referee.md`
+1. **Done means verified, then handoff.** Build it, check types and regressions, use it on the live site as a user would (localhost only for a quick fix-and-look loop), get an independent check, commit and push. Deploy agents own releases. `common-docs/policies/reality-is-the-referee.md`
 2. **Attack before you trust.** Plans are attacked before commitment; "done" is re-verified by someone outside the builder's frame.
 3. **Fix the class, never the instance.** Root cause, find the siblings, add a guard proven to fail then pass. A bug you hit yourself is fixed now.
 4. **Nothing fails silently.** A stand-in announces itself; a screen is honest or absent; never hide a feature to dodge a defect — fix it. In-app text is layout, not prose. `common-docs/policies/interface-text-is-layout.md`
