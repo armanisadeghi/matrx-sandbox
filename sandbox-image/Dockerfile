@@ -75,6 +75,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && python3 --version \
     && python3 -c "import sys; v=sys.version_info; assert v[:2] >= (3, 12) and v.releaselevel == 'final', f'sandbox python3 must be a release >= 3.12, got {sys.version}'"
 
+# Noble marks its system interpreter externally managed (PEP 668). This image
+# deliberately owns the interpreter's tool layers, so make that existing build
+# contract explicit for every following Python package install.
+ENV PIP_BREAK_SYSTEM_PACKAGES=1
 # pip comes from get-pip, not apt: the `python3-pip` package is wired to the
 # distro interpreter we just replaced.
 RUN curl -fsSL https://bootstrap.pypa.io/get-pip.py -o /tmp/get-pip.py \
