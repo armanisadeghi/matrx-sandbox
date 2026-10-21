@@ -139,6 +139,10 @@ async def _get_volume(client: Any, name: str) -> tuple[Any, dict[str, Any]]:
     return volume, identity
 
 
+#: One unrotated log file for the helper's output (its manifests). See _run_helper.
+HELPER_LOG_CONFIG = {"type": "json-file", "config": {"max-size": "4g", "max-file": "1"}}
+
+
 async def _run_helper(client: Any, *, image: str, volumes: dict[str, dict[str, str]], command: str) -> str:
     try:
         output = await asyncio.to_thread(
@@ -152,6 +156,14 @@ async def _run_helper(client: Any, *, image: str, volumes: dict[str, dict[str, s
             network_disabled=True,
             environment={},
             labels=_HELPER_LABELS,
+            # The helper's manifests come back as its LOG. Under the host's
+            # default json-file rotation (10m x 3 on the hosted box) a home of
+            # ~95k files produced more than 30 MB of manifest, the head was
+            # rotated away, and every migration of that box rolled back with
+            # "helper did not emit complete source and backup manifests"
+            # (sbx-358104000663, 2026-10-21). The helper is removed on exit,
+            # so one large, unrotated log file costs nothing afterwards.
+            log_config=HELPER_LOG_CONFIG,
             remove=True,
             detach=False,
         )
