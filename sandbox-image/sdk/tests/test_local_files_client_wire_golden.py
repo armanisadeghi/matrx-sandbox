@@ -73,7 +73,7 @@ def test_bridge_ops_go_to_the_local_aidream_with_identity():
         with tempfile.TemporaryDirectory() as d:
             local = Path(d) / "b.md"
             local.write_text("hello")
-            put = await c.put_one(local, "a/b.md")
+            put = await c.put_one(local, "a/b.md", expected_checksum="absent")
         await c.delete_one("a/b.md")
         return put, await c.get_one("a/b.md"), await c.list_files("a/"), await c.list_changes("2026-01-01T00:00:00Z", 5)
 
@@ -129,14 +129,14 @@ def test_presigned_upload_hops_and_s3_carries_no_matrx_identity(monkeypatch):
         with tempfile.TemporaryDirectory() as d:
             local = Path(d) / "big.bin"
             local.write_bytes(b"0123456789")
-            return await c.put_one(local, "big.bin")
+            return await c.put_one(local, "big.bin", expected_checksum="absent")
 
     result, seen = _run(respond, action)
     assert result["file_id"] == FILE_ID and result["path"] == "big.bin" and result["bytes"] == 10
     presign, s3, finalize = seen
     assert (presign.method, presign.url.path) == ("POST", "/files/upload/presigned")
     assert json.loads(presign.content) == {
-        "file_path": "big.bin", "content_type": "application/octet-stream", "expected_size_bytes": 10,
+        "file_path": "big.bin", "content_type": "application/octet-stream", "expected_size_bytes": 10, "expected_checksum": "absent",
     }
     assert (s3.method, s3.url.host, s3.content, s3.headers["x-amz"]) == ("PUT", "s3.example", b"0123456789", "1")
     assert _identity(s3) == {}

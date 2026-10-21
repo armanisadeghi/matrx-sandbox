@@ -28,6 +28,20 @@ call without the organization (`400 organization_required`) because a write
 is never filed in an organization nobody chose. Law:
 `common-docs/policies/context-is-carried-never-rebuilt.md` rule 1.
 
+**The replica never writes a cloud-removed file back by path.** Every PUT
+carries `expected_checksum`: the sha256 this box last saw on the server at that
+path (a PUT it made, a change it applied, the startup listing), or `absent`.
+That server base is persisted beside the queue (`<queue>.base.json`). A 412 that
+names no current file, or the bridge's 409 `resurrects_deleted_file`, means the
+cloud trashed or moved the file since: the write is retired (counted as
+`downstream.cloud_removed_kept_local`), the local bytes are kept, nothing is
+re-created. The feed's row `id` makes a remote rename/move a local `os.replace`
+of the unedited copy instead of a download that leaves the old path behind; a
+deletion also clears the copy at the row's earlier path. Startup reconcile never
+queues a file this box saw on the server that is gone now. Guard:
+`tests/test_replica_never_resurrects.py`. Incident: aidream Lane E defect b
+(2026-10-21), duplicate rows after rename + delete.
+
 **Permanent rejections are attempted once — and then HELD, never dropped.** The
 watcher retries timeouts, rate limits and 5xx on the hot ladder. Other 4xx
 responses are caller/policy conflicts; retrying the identical request

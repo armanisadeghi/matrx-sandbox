@@ -23,7 +23,9 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import json
 import logging
+import os
 import random
 import time
 from collections import OrderedDict, deque
@@ -317,6 +319,85 @@ class CloudFilesWatcher:
         self._backpressure_events = 0
         self._backpressure_unindexed = 0
         self._readmit_handle: Optional[asyncio.TimerHandle] = None
+        # rel_path -> the sha256 this replica last SAW ON THE SERVER at that
+        # path (a PUT it made, a remote change it applied, the startup
+        # listing). It is the precondition every write carries, so a file the
+        # cloud trashed or moved away is refused with 412 instead of coming
+        # back as a brand-new row (Lane E defect b, 2026-10-21). Persisted
+        # beside the queue: a restarted box still knows what the cloud removed.
+        self._remote_base: dict[str, str] = {}
+        # file id -> rel_path, so a remote rename/move is applied as a local
+        # move instead of leaving the old path behind as a stale copy.
+        self._path_by_id: dict[str, str] = {}
+        self._cloud_removed_kept_local = 0
+        self._base_path: Optional[Path] = (
+            queue_path.with_name(queue_path.name + ".base.json") if queue_path else None
+        )
+        self._load_base()
+
+    # ─── Server base (the precondition every write carries) ─────────────────
+
+    def _load_base(self) -> None:
+        if self._base_path is None or not self._base_path.exists():
+            return
+        try:
+            raw = json.loads(self._base_path.read_text(encoding="utf-8"))
+            self._remote_base = {str(k): str(v) for k, v in (raw.get("base") or {}).items()}
+            self._path_by_id = {str(k): str(v) for k, v in (raw.get("ids") or {}).items()}
+        except (OSError, ValueError) as e:
+            _logger.warning(
+                "cloud-files: server-base file %s unreadable (%s); a path this box has "
+                "not seen on the server is written as expected_checksum=absent",
+                self._base_path,
+                e,
+            )
+
+    def _save_base(self) -> None:
+        if self._base_path is None:
+            return
+        try:
+            tmp = self._base_path.with_suffix(self._base_path.suffix + ".tmp")
+            tmp.write_text(
+                json.dumps({"base": self._remote_base, "ids": self._path_by_id}), encoding="utf-8"
+            )
+            tmp.replace(self._base_path)
+        except OSError as e:
+            _logger.warning("cloud-files: could not persist server base: %s", e)
+
+    def _note_server_state(self, rel: str, checksum: Optional[str], file_id: Optional[str]) -> None:
+        if checksum:
+            self._remote_base[rel] = checksum
+        if file_id:
+            self._path_by_id[file_id] = rel
+        self._save_base()
+
+    def _forget_server_state(self, rel: str) -> None:
+        self._remote_base.pop(rel, None)
+        for fid in [k for k, v in self._path_by_id.items() if v == rel]:
+            self._path_by_id.pop(fid, None)
+        self._save_base()
+
+    @staticmethod
+    def _cloud_removed(error: BaseException, expected: str) -> bool:
+        """True when the bridge refused because the file is no longer at the path.
+
+        A 412 whose conflict names no current file (the row was trashed or moved
+        away), or the bridge's 409 ``resurrects_deleted_file``. Only for a write
+        that expected bytes there: an ``absent`` write that 412s met a NEW file,
+        which is a real conflict and is held.
+        """
+        if expected == "absent" or not isinstance(error, httpx.HTTPStatusError):
+            return False
+        try:
+            body = error.response.json()
+        except ValueError:
+            return False
+        detail = body.get("detail", body) if isinstance(body, dict) else {}
+        if not isinstance(detail, dict):
+            return False
+        if error.response.status_code == 409:
+            return detail.get("error") == "resurrects_deleted_file"
+        return error.response.status_code == 412 and not detail.get("current_checksum")
 
     @property
     def mode(self) -> str:
@@ -641,12 +722,28 @@ class CloudFilesWatcher:
             ck = row.get("checksum") or row.get("sha256")
             if rp:
                 remote_index[str(rp)] = str(ck) if ck else ""
+                if ck:
+                    self._remote_base[str(rp)] = str(ck)
+                if row.get("id"):
+                    self._path_by_id[str(row["id"])] = str(rp)
 
         queued = 0
         for rel, local_hash in list(self._last_hash.items()):
             remote_hash = remote_index.get(rel)
             if remote_hash and remote_hash == local_hash:
                 # In sync — leave alone.
+                continue
+            if rel not in remote_index and rel in self._remote_base:
+                # This box saw the file on the server and it is gone now: the
+                # cloud trashed or moved it while the box was away. Never put
+                # it back; the local copy is kept.
+                self._cloud_removed_kept_local += 1
+                _logger.warning(
+                    "cloud-files: NOT re-uploading %s at startup — the cloud removed it "
+                    "since this box last saw it; the local copy is kept.",
+                    rel,
+                )
+                self._remote_base.pop(rel, None)
                 continue
             # Either missing from remote or checksum mismatch — schedule an upload.
             # Use the existing debounce machinery so we don't thunder on boot;
@@ -656,6 +753,7 @@ class CloudFilesWatcher:
                 ("upsert", str(self.cloud_root / rel), time.monotonic())
             )
             queued += 1
+        self._save_base()
         return queued
 
     # ─── Path helpers ────────────────────────────────────────────────────────
@@ -1033,12 +1131,15 @@ class CloudFilesWatcher:
                     return
 
                 t0 = self._event_arrivals.get(rel, time.monotonic())
+                expected = self._remote_base.get(rel, "absent")
                 last_err: Optional[Exception] = None
                 for delay in (0.0, *RETRY_DELAYS):
                     if delay > 0:
                         await asyncio.sleep(delay)
                     try:
-                        result = await self._client.put_one(local, rel)
+                        result = await self._client.put_one(
+                            local, rel, expected_checksum=expected
+                        )
                         latency_ms = (time.monotonic() - t0) * 1000
                         is_new = isinstance(result, dict) and result.get("version") == 1
                         _logger.info(
@@ -1049,6 +1150,11 @@ class CloudFilesWatcher:
                             int(latency_ms),
                         )
                         self._last_hash[rel] = new_hash
+                        self._note_server_state(
+                            rel,
+                            new_hash,
+                            str(result["id"]) if isinstance(result, dict) and result.get("id") else None,
+                        )
                         self._metrics.record_put(size, latency_ms)
                         self._event_arrivals.pop(rel, None)
                         self._safe_mark_done(event_id, rel)
@@ -1057,6 +1163,20 @@ class CloudFilesWatcher:
                         last_err = e
                         if not _is_retryable_bridge_error(e):
                             break
+                if last_err is not None and self._cloud_removed(last_err, expected):
+                    # The cloud trashed or moved this file after this box last
+                    # saw it. Writing it back would resurrect it as a new row;
+                    # the local copy stays untouched and the feed reconciles it.
+                    self._cloud_removed_kept_local += 1
+                    _logger.warning(
+                        "cloud-files: NOT re-uploading %s — the cloud removed or moved it "
+                        "since this box last saw it; the local copy is kept, not written back.",
+                        rel,
+                    )
+                    self._forget_server_state(rel)
+                    self._event_arrivals.pop(rel, None)
+                    self._safe_mark_done(event_id, rel)
+                    return
                 self._hold("upsert", rel, event_id, last_err or RuntimeError("unknown"))
             except Exception as e:  # noqa: BLE001
                 _logger.exception("cloud-files: flush_upsert error for %s: %s", rel, e)
@@ -1186,15 +1306,27 @@ class CloudFilesWatcher:
             return
 
         if change.kind == "deleted":
-            try:
-                if local.exists() and not local.is_symlink():
-                    local.unlink()
-                    self._last_hash.pop(rel, None)
-                    self._remote_applied += 1
-                    _logger.info("cloud-files: applied remote DELETE %s", rel)
-            except OSError as e:
-                _logger.warning("cloud-files: remote DELETE failed for %s: %s", rel, e)
+            # A row moved and then trashed between two polls arrives once, at
+            # its LAST path; the copy this box holds may sit at the earlier one.
+            earlier = self._path_by_id.get(change.file_id) if change.file_id else None
+            for path in {rel, earlier} - {None}:
+                target = self.cloud_root / path
+                try:
+                    if target.exists() and not target.is_symlink():
+                        target.unlink()
+                        self._last_hash.pop(path, None)
+                        self._remote_applied += 1
+                        _logger.info("cloud-files: applied remote DELETE %s", path)
+                except OSError as e:
+                    _logger.warning("cloud-files: remote DELETE failed for %s: %s", path, e)
+                self._forget_server_state(path)
             return
+
+        # A remote rename/move keeps the row's id. Move the local copy rather
+        # than downloading the new path and leaving the old one behind.
+        earlier = self._path_by_id.get(change.file_id) if change.file_id else None
+        if earlier and earlier != rel:
+            await self._apply_remote_move(earlier, rel)
 
         # change.kind == "modified" → fetch + write
         if self._client is None:
@@ -1204,6 +1336,7 @@ class CloudFilesWatcher:
         # are identical (e.g. the change came from this same sandbox writing,
         # round-tripping through cld_files, and back).
         if change.checksum and self._last_hash.get(rel) == change.checksum:
+            self._note_server_state(rel, change.checksum, change.file_id)
             return
 
         try:
@@ -1231,6 +1364,7 @@ class CloudFilesWatcher:
             ):
                 self._last_hash[rel] = new_hash
                 self._remember_apply(rel, new_hash)
+                self._note_server_state(rel, new_hash, change.file_id)
                 return
         except OSError:
             pass
@@ -1247,6 +1381,7 @@ class CloudFilesWatcher:
 
         self._last_hash[rel] = new_hash
         self._remember_apply(rel, new_hash)
+        self._note_server_state(rel, new_hash, change.file_id)
         self._remote_applied += 1
         _logger.info(
             "cloud-files: applied remote MODIFY %s (%d bytes, version=%s)",
@@ -1254,6 +1389,33 @@ class CloudFilesWatcher:
             len(data),
             change.current_version,
         )
+
+    async def _apply_remote_move(self, old: str, new: str) -> None:
+        """Move the local copy of a file the cloud renamed/moved (same row id).
+
+        Only an UNEDITED copy moves (its bytes are the server base); a copy the
+        agent changed stays where it is, and its next write carries the old base,
+        which the bridge refuses with 412 — never a resurrected row.
+        """
+        src, dst = self.cloud_root / old, self.cloud_root / new
+        base = self._remote_base.get(old)
+        try:
+            if (
+                base
+                and src.exists()
+                and not src.is_symlink()
+                and not dst.exists()
+                and await asyncio.to_thread(self._sha256, src) == base
+            ):
+                dst.parent.mkdir(parents=True, exist_ok=True)
+                os.replace(src, dst)
+                self._last_hash[new] = self._last_hash.pop(old, base)
+                self._remember_apply(new, base)
+                self._remote_applied += 1
+                _logger.info("cloud-files: applied remote MOVE %s -> %s", old, new)
+        except OSError as e:
+            _logger.warning("cloud-files: remote MOVE %s -> %s failed: %s", old, new, e)
+        self._forget_server_state(old)
 
     # ─── Status / Stats (A3 + A4) ────────────────────────────────────────────
 
@@ -1315,6 +1477,7 @@ class CloudFilesWatcher:
                 "received": self._remote_received,
                 "applied": self._remote_applied,
                 "echo_suppressed": self._remote_echo_suppressed,
+                "cloud_removed_kept_local": self._cloud_removed_kept_local,
                 "recently_applied_size": len(self._recently_applied),
                 # A 4xx on the DOWN direction (the box is refused the change
                 # feed) means this sandbox stopped receiving the user's cloud

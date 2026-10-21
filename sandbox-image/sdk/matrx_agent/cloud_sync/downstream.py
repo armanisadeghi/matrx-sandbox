@@ -94,6 +94,10 @@ class RemoteChange:
     checksum: Optional[str] = None
     current_version: Optional[int] = None
     updated_at: Optional[str] = None
+    # The row's identity. A remote rename/move keeps the id and changes
+    # ``rel_path``; without it a path-keyed replica cannot tell a move from a
+    # new file and keeps the old path as a stale copy.
+    file_id: Optional[str] = None
 
 
 OnChange = Callable[[RemoteChange], Awaitable[None]]
@@ -176,8 +180,9 @@ class PollingSubscriber:
                     rel = rec.get("file_path")
                     if not rel:
                         continue
+                    row_id = str(rec["id"]) if rec.get("id") else None
                     if _row_is_deleted(rec):
-                        change = RemoteChange(kind="deleted", rel_path=rel)
+                        change = RemoteChange(kind="deleted", rel_path=rel, file_id=row_id)
                     else:
                         change = RemoteChange(
                             kind="modified",
@@ -186,6 +191,7 @@ class PollingSubscriber:
                             checksum=rec.get("checksum"),
                             current_version=rec.get("current_version"),
                             updated_at=rec.get("updated_at"),
+                            file_id=row_id,
                         )
                     try:
                         await on_change(change)

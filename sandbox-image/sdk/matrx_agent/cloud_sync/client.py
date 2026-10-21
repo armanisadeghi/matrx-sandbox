@@ -190,13 +190,24 @@ class AsyncBridgeClient:
     def _options(timeout: httpx.Timeout) -> CallOptions:
         return CallOptions(connect_timeout=timeout.connect, total_timeout=timeout.read)
 
-    async def put_one(self, local_path: Path, remote_path: str) -> dict[str, Any]:
-        """Multipart PUT a single file. Raises on non-2xx."""
+    async def put_one(
+        self, local_path: Path, remote_path: str, *, expected_checksum: str
+    ) -> dict[str, Any]:
+        """Multipart PUT a single file. Raises on non-2xx.
+
+        ``expected_checksum`` is REQUIRED: the sha256 this replica last saw on the
+        server at ``remote_path``, or ``"absent"`` when it believes nothing is
+        there. A replica never writes by path blind -- a file the cloud removed or
+        moved is refused with 412 instead of coming back as a new row.
+        """
         try:
             with local_path.open("rb") as fh:
                 out = await files_api.put_file(
                     self._api,
-                    body=Multipart(data={"file_path": remote_path}, files={"file": (local_path.name, fh)}),
+                    body=Multipart(
+                        data={"file_path": remote_path, "expected_checksum": expected_checksum},
+                        files={"file": (local_path.name, fh)},
+                    ),
                     options=self._options(PUT_TIMEOUT),
                 )
         except MatrxApiError as exc:
@@ -244,7 +255,9 @@ class BridgeClient(Protocol):
     """
 
     # Core (both implementations)
-    async def put_one(self, local_path: Path, remote_path: str) -> dict[str, Any]: ...
+    async def put_one(
+        self, local_path: Path, remote_path: str, *, expected_checksum: str
+    ) -> dict[str, Any]: ...
     async def delete_one(self, remote_path: str) -> None: ...
     async def close(self) -> None: ...
     # Polling fallback for the down-direction (Batch A B1). Both the bridge
@@ -363,11 +376,13 @@ class LocalFilesClient(AsyncBridgeClient):
 
     # ── Core ────────────────────────────────────────────────────────────────
 
-    async def put_one(self, local_path: Path, remote_path: str) -> dict[str, Any]:
+    async def put_one(
+        self, local_path: Path, remote_path: str, *, expected_checksum: str
+    ) -> dict[str, Any]:
         size = local_path.stat().st_size
         if size > PRESIGNED_THRESHOLD_BYTES:
-            return await self._put_presigned(local_path, remote_path, size)
-        return await self._put_multipart(local_path, remote_path)
+            return await self._put_presigned(local_path, remote_path, size, expected_checksum)
+        return await self._put_multipart(local_path, remote_path, expected_checksum)
 
     # ── Extended ────────────────────────────────────────────────────────────
 
@@ -446,12 +461,17 @@ class LocalFilesClient(AsyncBridgeClient):
             raise _as_status_error(exc) from exc
         return response.content
 
-    async def _put_multipart(self, local_path: Path, remote_path: str) -> dict[str, Any]:
+    async def _put_multipart(
+        self, local_path: Path, remote_path: str, expected_checksum: str
+    ) -> dict[str, Any]:
         try:
             with local_path.open("rb") as fh:
                 out = await files_api.put_file(
                     self._api,
-                    body=Multipart(data={"file_path": remote_path}, files={"file": (local_path.name, fh)}),
+                    body=Multipart(
+                        data={"file_path": remote_path, "expected_checksum": expected_checksum},
+                        files={"file": (local_path.name, fh)},
+                    ),
                     options=self._options(PUT_TIMEOUT),
                 )
         except MatrxApiError as exc:
@@ -460,7 +480,9 @@ class LocalFilesClient(AsyncBridgeClient):
             return out
         return {"path": remote_path, "bytes": local_path.stat().st_size}
 
-    async def _put_presigned(self, local_path: Path, remote_path: str, size: int) -> dict[str, Any]:
+    async def _put_presigned(
+        self, local_path: Path, remote_path: str, size: int, expected_checksum: str
+    ) -> dict[str, Any]:
         """Two-step large-file upload via presigned S3 URL.
 
         Step 1: POST /files/upload/presigned → {url, headers, upload_id}.
@@ -473,7 +495,12 @@ class LocalFilesClient(AsyncBridgeClient):
         try:
             data = await files_api.create_presigned_upload(
                 self._files_root_api,
-                body={"file_path": remote_path, "content_type": content_type, "expected_size_bytes": size},
+                body={
+                    "file_path": remote_path,
+                    "content_type": content_type,
+                    "expected_size_bytes": size,
+                    "expected_checksum": expected_checksum,
+                },
                 options=self._options(PUT_TIMEOUT),
             )
         except MatrxApiError as exc:

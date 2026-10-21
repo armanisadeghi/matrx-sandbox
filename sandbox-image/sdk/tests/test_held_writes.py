@@ -49,7 +49,7 @@ class _RefusingBridge:
         self.put_calls: list[str] = []
         self.delete_calls: list[str] = []
 
-    async def put_one(self, local_path: Path, remote_path: str):
+    async def put_one(self, local_path: Path, remote_path: str, *, expected_checksum: str):
         self.put_calls.append(remote_path)
         raise _refusal(self.status)
 
@@ -167,7 +167,7 @@ def test_a_success_after_a_hold_clears_it(tmp_path: Path) -> None:
     local.write_text("v1", encoding="utf-8")
 
     class _Accepting(_RefusingBridge):
-        async def put_one(self, local_path: Path, remote_path: str):
+        async def put_one(self, local_path: Path, remote_path: str, *, expected_checksum: str):
             self.put_calls.append(remote_path)
             return {"version": 1}
 

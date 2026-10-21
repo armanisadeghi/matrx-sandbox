@@ -61,12 +61,14 @@ def test_put_is_multipart_with_identity():
     with tempfile.TemporaryDirectory() as d:
         local = Path(d) / "notes.md"
         local.write_text("hello")
-        out, seen = _run(lambda r: httpx.Response(200, json={"ok": 1}), lambda c: c.put_one(local, "dir/notes.md"))
+        out, seen = _run(lambda r: httpx.Response(200, json={"ok": 1}), lambda c: c.put_one(local, "dir/notes.md", expected_checksum="absent"))
     req = seen[0]
     assert out == {"ok": 1}
     assert (req.method, req.url.host, req.url.path) == ("PUT", "server.example", "/api/cloud-files/put")
     assert req.headers["content-type"].startswith("multipart/form-data")
     assert b'name="file_path"' in req.content and b"dir/notes.md" in req.content
+    # Every replica write carries its precondition (never a blind by-path write).
+    assert b'name="expected_checksum"' in req.content and b"absent" in req.content
     assert b'filename="notes.md"' in req.content and b"hello" in req.content
     assert _identity(req) == {"authorization": "Bearer svc-token", "x-organization-id": ORG, "x-matrx-user-id": USER}
 

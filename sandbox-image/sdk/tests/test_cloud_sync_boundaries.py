@@ -169,7 +169,7 @@ def test_every_bridge_request_carries_the_organization_on_the_wire() -> None:
         with tempfile.NamedTemporaryFile("w", suffix=".md", delete=False) as fh:
             fh.write("body")
             local = Path(fh.name)
-        await client.put_one(local, "notes.md")
+        await client.put_one(local, "notes.md", expected_checksum="absent")
         await client.delete_one("notes.md")
         await client.close()
 
