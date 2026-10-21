@@ -45,6 +45,15 @@ from pathlib import Path
 Path(os.environ["MATRX_TEMP_DIR"], "logs").mkdir(parents=True, exist_ok=True)
 Path(os.environ["IMPORT_TRACE"]).open("a", encoding="utf-8").write("settings\n")
 PY
+cat > "$template/aidream/asgi.py" <<'PY'
+import os
+from pathlib import Path
+
+if os.getenv("ASGI_CRASH"):
+    raise RuntimeError("the served app crashed at import")
+if os.getenv("IMPORT_TRACE"):
+    Path(os.environ["IMPORT_TRACE"]).open("a", encoding="utf-8").write("asgi\n")
+PY
 printf 'raise RuntimeError("hostile sitecustomize ran")
 ' > "$scratch/home/sitecustomize.py"
 printf 'raise RuntimeError("hostile cwd module ran")
@@ -92,7 +101,17 @@ IMPORT_TRACE="$scratch/trace" MATRX_TEMP_DIR="$scratch/temp" LOG_DIR="$scratch/l
 test -d "$scratch/temp/logs"
 test -d "$scratch/temp/reports"
 test -d "$scratch/log"
-test "$(cat "$scratch/trace")" = $'config\nsettings'
+test "$(cat "$scratch/trace")" = $'config\nsettings\nasgi'
+
+# The served app crashing at import (2026-10-21: box-mode import chain hit the
+# refused platform db) must fail the build verify, not pass it.
+if ASGI_CRASH=1 IMPORT_TRACE="$scratch/crash-trace" MATRX_TEMP_DIR="$scratch/crash-temp" LOG_DIR="$scratch/crash-log" \
+    HOME="$scratch/home" PYTHONPATH="$scratch/cwd" PROBE_OUT="$scratch/crash-positive" \
+    "$PYTHON" -I -B "$bootstrap_copy" --verify-imports >"$scratch/crash.out" 2>&1; then
+    echo "expected an app that crashes at import to fail --verify-imports" >&2
+    exit 1
+fi
+grep -q "the served app crashed at import" "$scratch/crash.out"
 
 # Omit one canonical writer in a scratch copy: the trace forces the guard red.
 omit_bootstrap="$scratch/omit-bootstrap.py"
@@ -100,7 +119,7 @@ sed 's/for import_file in VERIFY_IMPORT_FILES:/for import_file in ():/g' "$boots
 IMPORT_TRACE="$scratch/omit-trace" MATRX_TEMP_DIR="$scratch/omit-temp" LOG_DIR="$scratch/omit-log" HOME="$scratch/home" \
     PYTHONPATH="$scratch/cwd" PROBE_OUT="$scratch/omit-positive" \
     "$PYTHON" -I -B "$omit_bootstrap" --verify-imports
-if [ "$(cat "$scratch/omit-trace" 2>/dev/null || true)" = $'config\nsettings' ]; then
+if [ "$(cat "$scratch/omit-trace" 2>/dev/null || true)" = $'config\nsettings\nasgi' ]; then
     echo "expected omitted startup writers to fail trace guard" >&2
     exit 1
 fi
