@@ -59,8 +59,15 @@ def run() -> int:
         }
     except Exception as exc:  # never let diagnostics break `mtx whoami`
         sdk = {"version": "unknown", "error": str(exc)}
+    try:  # is the IMAGE (OS, Python, packages) current? The SDK refresh can't fix that.
+        from matrx_agent.image_drift import image_drift
+
+        image = image_drift()
+    except Exception as exc:  # noqa: BLE001
+        image = {"status": "unknown", "error": str(exc)}
     info = {
         "sandbox_id": os.environ.get("SANDBOX_ID", "unknown"),
+        "image": image,
         "sdk": sdk,
         "user_id": os.environ.get("USER_ID", "unknown"),
         # Both halves of the request context every AI Dream call carries. A

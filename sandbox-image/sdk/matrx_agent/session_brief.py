@@ -503,6 +503,15 @@ def box_warnings(image: dict[str, Any], tools: dict[str, Any]) -> list[str]:
     behind = image.get("image_commits_behind_main")
     if isinstance(behind, int) and behind > DRIFT_WARN_COMMITS:
         warns.append(f"image is {behind} commits behind matrx-sandbox main (SDK may be refreshed; system packages are not)")
+    elif not isinstance(behind, int):  # no checkout to count with: ask the SDK refresh stamp
+        try:
+            from matrx_agent.image_drift import warning as image_warning
+
+            stale = image_warning()
+            if stale:
+                warns.append(stale)
+        except Exception:  # noqa: BLE001 — the brief never fails on diagnostics
+            pass
     age = image.get("image_age_days")
     if isinstance(age, int) and age > AGE_WARN_DAYS:
         warns.append(f"image is {age} days old")

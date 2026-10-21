@@ -584,6 +584,44 @@ def apply(
     return result
 
 
+FAILED_TREES_KEPT = 3
+
+
+def _image_drift() -> dict:
+    """Image freshness for ``--status`` (never breaks the status call)."""
+    try:
+        from matrx_agent import image_drift
+
+        return image_drift.image_drift()
+    except Exception as exc:  # noqa: BLE001
+        return {"status": "unknown", "error": str(exc)}
+
+
+def prune_failed_trees(target: str, keep: int = FAILED_TREES_KEPT) -> list[str]:
+    """Remove all but the newest ``keep`` ``<target>.failed-<ts>`` trees.
+
+    Every rollback keeps the failed tree for diagnosis; nothing ever removed
+    them, so a box with flaky refreshes piled up one SDK copy per failure
+    (sbx-7ddc2eb0c364 had 13). Returns the removed paths."""
+    parent, base = os.path.split(target.rstrip("/"))
+    prefix = base + ".failed-"
+    try:
+        names = [n for n in os.listdir(parent or ".") if n.startswith(prefix)
+                 and n[len(prefix):].isdigit()]
+    except OSError:
+        return []
+    names.sort(key=lambda n: int(n[len(prefix):]), reverse=True)
+    removed = []
+    for name in names[max(keep, 0):]:
+        path = os.path.join(parent, name)
+        try:
+            shutil.rmtree(path)
+            removed.append(path)
+        except OSError:
+            pass
+    return removed
+
+
 def _rollback(target: str, prev: str) -> dict:
     """Put the previous SDK back and restart on it. Returns what happened."""
     failed = f"{target}.failed-{int(time.time())}"
@@ -601,7 +639,9 @@ def _rollback(target: str, prev: str) -> dict:
     except OSError as exc:
         return {"status": "failed", "reason": f"rollback rename failed: {exc}"}
     restarted = restart_daemon()
+    pruned = prune_failed_trees(target)
     return {
+        "pruned_failed_trees": pruned,
         "status": "restored" if restarted.get("status") == "restarted" else "restored_daemon_down",
         "restored_from": prev,
         "failed_tree_kept_at": failed,
@@ -696,6 +736,7 @@ def main(argv: list[str] | None = None) -> int:
                 "installed_version": installed_version(args.target),
                 "stamp": read_stamp(args.target),
                 "daemon_running": bool(_daemon_pids()),
+                "image": _image_drift(),
             },
             indent=2,
         ))
