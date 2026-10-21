@@ -564,8 +564,13 @@ async def version_drift():
     from orchestrator.sandbox_manager import _get_docker_client
     from orchestrator.versioning import drift_summary
 
+    from orchestrator.auto_update_policy import status_block
+
     client = _get_docker_client()
-    return await asyncio.to_thread(drift_summary, client)
+    summary = await asyncio.to_thread(drift_summary, client)
+    # Automatic-update stage, halted targets and held boxes (read-only).
+    summary["auto_update"] = await status_block()
+    return summary
 
 
 @app.post("/migrate-all", tags=["meta"])

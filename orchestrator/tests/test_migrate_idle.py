@@ -557,21 +557,33 @@ async def test_auto_migrate_captures_policy_once_and_forwards_to_each_box(monkey
     """The reaper's real batch entrypoint owns one immutable quiet interval."""
     from orchestrator import migrate, knobs
 
-    drifted = [SimpleNamespace(sandbox_id="auto-quiet", drifted=True)]
-    client = object()
+    from orchestrator import auto_update_policy as aup
+
+    drifted = [SimpleNamespace(sandbox_id="auto-quiet", drifted=True,
+                               current_version="v2", current_image_id="sha256:v2")]
+    client = SimpleNamespace(containers=SimpleNamespace(get=lambda sid: object()))
     store = _IdleStore()
     migrate_one = AsyncMock(return_value={"status": "busy_deferred"})
     monkeypatch.setattr(knobs, "_raw", AsyncMock(return_value=1800))
+    # Stage gates are covered in test_auto_update_policy.py; admit here.
+    monkeypatch.setattr(aup, "resolve_policy", AsyncMock(return_value=aup.Policy(stage="fleet")))
+    monkeypatch.setattr(aup, "admit", AsyncMock(
+        return_value=aup.Decision("auto-quiet", True, "admitted", {"target": "v2"})))
+    monkeypatch.setattr(aup, "preservation_manifest", AsyncMock(return_value={"files": {}, "repos": {}}))
+    monkeypatch.setattr(aup, "Ledger", lambda: SimpleNamespace(
+        load=lambda: {"version": 1, "targets": {}, "boxes": {}}, save=lambda data: None))
     monkeypatch.setattr("orchestrator.sandbox_manager._get_docker_client", lambda: client)
     monkeypatch.setattr("orchestrator.versioning.compute_drift", lambda received: drifted)
     monkeypatch.setattr(migrate, "migrate_sandbox", migrate_one)
 
     result = await migrate.migrate_all_drifted(store=store)
 
+    report = result.pop("auto_update")
     assert result == {
         "migrated": [], "deferred": ["auto-quiet"], "failed": [],
         "skipped": [], "unsupported": [],
     }
+    assert report["stage"] == "fleet"
     migrate_one.assert_awaited_once_with(
         "auto-quiet", store=store,
         require_idle=True, quiet_interval=1800,

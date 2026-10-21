@@ -681,7 +681,7 @@ async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
     from orchestrator.sandbox_manager import _get_docker_client
     from orchestrator.versioning import compute_drift
 
-    results: dict[str, list[str]] = {"migrated": [], "deferred": [], "failed": [], "skipped": [], "unsupported": []}
+    results: dict = {"migrated": [], "deferred": [], "failed": [], "skipped": [], "unsupported": []}
     # Capture and validate the automatic policy before Docker discovery. This
     # exact value is carried through both admission fences for the entire pass.
     try:
@@ -692,6 +692,22 @@ async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
         reason = f"automatic migration quiet policy unavailable or invalid: {exc}"
         logger.warning("migrate_all: %s", reason)
         return {"error": reason, **results}
+    # SBX-013 policy gates (stage/canary, storage, opt-out, detached work,
+    # coalescing, bounded attempts, preservation check). Stage defaults to
+    # off, so the master switch alone never moves a box.
+    from orchestrator import auto_update_policy as aup
+
+    policy = await aup.resolve_policy()
+    results["auto_update"] = aup.fleet_report({}, policy)
+    if policy.stage == "off":
+        return results
+    try:
+        ledger_store = aup.Ledger()
+        ledger = await asyncio.to_thread(ledger_store.load)
+    except Exception as exc:
+        reason = f"automatic update ledger unavailable: {exc}"
+        logger.error("migrate_all: %s", reason)
+        return {"error": reason, **results}
     try:
         client = _get_docker_client()
         drifted = await asyncio.to_thread(
@@ -701,10 +717,34 @@ async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
         logger.warning("migrate_all: drift scan failed: %s", exc)
         return {"error": str(exc), **results}
 
+    decisions: list[dict] = []
     done = 0
     for box in drifted:
         if max_per_pass and done >= max_per_pass:
             results["skipped"].append(box.sandbox_id)
+            continue
+        try:
+            container = await asyncio.to_thread(client.containers.get, box.sandbox_id)
+        except Exception:
+            results["skipped"].append(box.sandbox_id)
+            continue
+        decision = await aup.admit(container, box, policy, ledger)
+        if not decision.admit:
+            decisions.append(decision.as_dict())
+            bucket = "unsupported" if decision.reason == "manual_only" else "deferred"
+            results[bucket].append(box.sandbox_id)
+            if decision.reason in {"manual_only", "box_held", "target_halted", "probe_failed"}:
+                logger.warning("auto-update: %s not updated (%s) %s",
+                               box.sandbox_id, decision.reason, decision.detail)
+            continue
+        try:
+            before = await aup.preservation_manifest(container)
+        except Exception as exc:
+            decisions.append({**decision.as_dict(), "admit": False, "reason": "probe_failed",
+                              "detail": {**decision.detail, "probe": "preservation",
+                                         "error": str(exc)[:200]}})
+            results["deferred"].append(box.sandbox_id)
+            logger.warning("auto-update: %s pre-update manifest failed: %s", box.sandbox_id, exc)
             continue
         try:
             res = await migrate_sandbox(
@@ -713,9 +753,42 @@ async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
             )
         except Exception as exc:  # defensive — migrate_sandbox already guards, but never let one box abort the pass
             logger.error("migrate_all: %s raised: %s", box.sandbox_id, exc)
-            results["failed"].append(box.sandbox_id)
-            continue
+            res = {"status": "failed", "reason": str(exc)}
         st = res.get("status")
+        problems: list[str] = []
+        notes: list[str] = []
+        if st == "migrated":
+            try:
+                new = await asyncio.to_thread(client.containers.get, box.sandbox_id)
+                after = await aup.preservation_manifest(new)
+                problems, notes = aup.compare_manifests(before, after)
+            except Exception as exc:
+                problems = [f"post-update manifest failed: {str(exc)[:200]}"]
+        severity = aup.record_outcome(ledger, decision, st or "failed", now=time.time(),
+                                      problems=problems, notes=notes,
+                                      max_failures=policy.max_failures_per_box)
+        try:
+            await asyncio.to_thread(ledger_store.save, ledger)
+        except Exception as exc:
+            # Without a durable record the attempt bound is unenforceable:
+            # stop this pass rather than keep swapping blind.
+            logger.error("auto-update: ledger write failed after %s: %s; stopping pass",
+                         box.sandbox_id, exc)
+            results["failed"].append(box.sandbox_id)
+            results["error"] = f"ledger write failed: {exc}"
+            break
+        decisions.append({**decision.as_dict(), "status": st, "problems": problems,
+                          "notes": notes})
+        if severity == "error":
+            logger.error("auto-update: %s -> %s FAILED status=%s problems=%s",
+                         box.sandbox_id, decision.detail.get("target"), st, problems)
+            if problems:
+                results["failed"].append(box.sandbox_id)
+                done += 1
+                continue
+        else:
+            logger.warning("auto-update: %s -> %s status=%s notes=%s",
+                           box.sandbox_id, decision.detail.get("target"), st, notes)
         if st in ("migrated", "already_current"):
             results["migrated"].append(box.sandbox_id)
             done += 1
@@ -729,6 +802,16 @@ async def migrate_all_drifted(*, store, max_per_pass: int = 0) -> dict:
         else:
             results["failed"].append(box.sandbox_id)
             done += 1
+    try:  # persists target first-seen times (the settle clock)
+        await asyncio.to_thread(ledger_store.save, ledger)
+    except Exception as exc:
+        logger.error("auto-update: ledger write failed: %s", exc)
+    results["auto_update"] = aup.fleet_report(ledger, policy, decisions)
+    if results["auto_update"]["halted_targets"] or results["auto_update"]["held_boxes"]:
+        logger.error("auto-update: halted targets=%s held boxes=%s (operator action needed; "
+                     "see docs/SANDBOX_FRESHNESS.md)",
+                     sorted(results["auto_update"]["halted_targets"]),
+                     sorted(results["auto_update"]["held_boxes"]))
     if results["migrated"] or results["failed"]:
         logger.info(
             "migrate_all pass: migrated=%d deferred=%d failed=%d skipped=%d unsupported=%d",
