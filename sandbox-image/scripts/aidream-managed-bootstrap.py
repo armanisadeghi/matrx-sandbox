@@ -9,6 +9,7 @@ before putting the one allowed project root on ``sys.path``.
 
 from __future__ import annotations
 
+import importlib
 import os
 import runpy
 import stat
@@ -82,6 +83,11 @@ def main() -> None:
         runpy.run_path(os.fspath(RUN_FILE))
         for import_file in VERIFY_IMPORT_FILES:
             runpy.run_path(os.fspath(import_file))
+        # The app uvicorn will serve. run.py only names it; uvicorn imports it
+        # lazily, so without this an import-time crash in box mode (2026-10-21:
+        # token_broker -> feature_knobs -> db, refused in a box) passed the build
+        # and every box came up with nothing on :8001.
+        importlib.import_module("aidream.asgi")
         return
     if len(sys.argv) != 1:
         _refuse("unsupported arguments")
