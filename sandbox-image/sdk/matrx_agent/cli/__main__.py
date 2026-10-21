@@ -120,6 +120,12 @@ def main(argv: list[str] | None = None) -> int:
     )
     su_p.add_argument("--status", action="store_true", help="print what SDK this box carries and exit")
 
+    # `mtx brief` / `mtx repos tidy` / `mtx session start` — the start-of-session
+    # repo tidy + session brief (~/.matrx/session-brief.{md,json}).
+    from matrx_agent.cli.brief import add_subparsers as _brief_subparsers
+
+    _brief_subparsers(sub)
+
     # `mtx browse <subcommand>` / the `browse` shim — the sandbox browser from a
     # shell. Registered by the browse module itself so the standalone `browse`
     # entry point and this one can never drift apart.
@@ -170,6 +176,10 @@ def main(argv: list[str] | None = None) -> int:
         if args.status:
             sub_argv.append("--status")
         return selfupdate.main(sub_argv)
+
+    if args.cmd in ("brief", "repos", "session"):
+        from matrx_agent.cli.brief import run as brief_run
+        return brief_run(args)
 
     if args.cmd == "browse":
         from matrx_agent.cli.browse import run as browse_run

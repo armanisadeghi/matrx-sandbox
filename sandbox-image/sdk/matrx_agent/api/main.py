@@ -119,6 +119,15 @@ async def _activate_background_capabilities(*, strict: bool) -> None:
             raise RuntimeError("; ".join(failures))
         _background_ready = True
         _logger.info("matrx_agent: persistence module active (prior=%s)", "yes" if prior else "no")
+        # Boot trigger for the repo tidy + session brief. The daemon runs as the
+        # agent user after ensure-layout, and this point is past the migration
+        # commit, so writing into the home is safe. Detached: never blocks boot.
+        try:
+            from matrx_agent import session_brief
+
+            session_brief.spawn_detached("boot")
+        except Exception as exc:  # noqa: BLE001
+            _logger.warning("matrx_agent: session brief not started: %s", exc)
 
 
 async def _wait_for_migration_commit() -> None:
