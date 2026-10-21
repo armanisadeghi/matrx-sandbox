@@ -42,6 +42,7 @@ def _isolated_git_identity(tmp_path, monkeypatch):
     monkeypatch.delenv("MATRX_GIT_USER_NAME", raising=False)
     monkeypatch.delenv("MATRX_GIT_USER_EMAIL", raising=False)
     monkeypatch.setattr(sb, "IDENTITY_FILE", tmp_path / "identity.json")
+    monkeypatch.setattr(sb, "VAULT_ENV_FILE", tmp_path / "no-vault-env.sh")
     return gc
 
 
@@ -306,3 +307,11 @@ def test_repo_local_placeholder_and_placeholder_commits_are_reported(world):
     assert facts["placeholder_commits"].get("app") == 1
     md = sb.render_markdown(sb.build_brief(fetch=False, apply=False, trigger="t", repos=[app]))
     assert "Git identity" in md and "placeholder" in md
+
+
+def test_platform_identity_read_from_vault_env_file(tmp_path, monkeypatch):
+    vault = tmp_path / "vault-env.sh"
+    vault.write_text("export MATRX_GIT_USER_NAME='Ada Lovelace'\nexport MATRX_GIT_USER_EMAIL=ada@example.org\n")
+    monkeypatch.setattr(sb, "VAULT_ENV_FILE", vault)
+    name, email, source = sb.platform_identity()
+    assert (name, email) == ("Ada Lovelace", "ada@example.org") and "vault-env" in source

@@ -565,12 +565,44 @@ def _git_config(*args: str, cwd: Path | None = None) -> str | None:
     return proc.stdout.strip() if proc.returncode == 0 else None
 
 
+VAULT_ENV_FILE = Path("/etc/matrx/vault-env.sh")
+
+
+def _vault_env_values(path: Path, names: tuple[str, ...]) -> dict[str, str]:
+    import shlex
+
+    out: dict[str, str] = {}
+    try:
+        text = path.read_text(encoding="utf-8")
+    except (OSError, UnicodeDecodeError):
+        return out
+    for line in text.splitlines():
+        line = line.strip()
+        if line.startswith("export "):
+            line = line[len("export "):]
+        key, sep, raw = line.partition("=")
+        if sep and key in names:
+            try:
+                parts = shlex.split(raw)
+            except ValueError:
+                continue
+            if parts:
+                out[key] = parts[0]
+    return out
+
+
 def platform_identity() -> tuple[str | None, str | None, str | None]:
     """(name, email, source) the platform published for this box's person."""
     name = os.environ.get("MATRX_GIT_USER_NAME")
     email = os.environ.get("MATRX_GIT_USER_EMAIL")
     if name and email:
         return name.strip(), email.strip(), "env MATRX_GIT_USER_NAME/EMAIL"
+    # The vault env file the orchestrator publishes on binding: a detached boot
+    # run may not have sourced it, so read the two names straight from it.
+    vault = _vault_env_values(VAULT_ENV_FILE, ("MATRX_GIT_USER_NAME", "MATRX_GIT_USER_EMAIL"))
+    if vault.get("MATRX_GIT_USER_NAME") and vault.get("MATRX_GIT_USER_EMAIL"):
+        return (vault["MATRX_GIT_USER_NAME"].strip(), vault["MATRX_GIT_USER_EMAIL"].strip(),
+                f"{VAULT_ENV_FILE} MATRX_GIT_USER_NAME/EMAIL")
     try:
         data = json.loads(IDENTITY_FILE.read_text(encoding="utf-8"))
         if isinstance(data, dict) and data.get("name") and data.get("email"):
