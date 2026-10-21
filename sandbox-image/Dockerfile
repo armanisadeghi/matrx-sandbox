@@ -228,10 +228,16 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     libasound2t64 \
     && rm -rf /var/lib/apt/lists/*
 
-# Install playwright for Python with Chromium browser binary
+# Install playwright for Python with Chromium browser binary.
+# The browsers go to a shared path every user can read (2026-10-21): installed as root into the
+# default ~/.cache, they landed in /root, so every Playwright launch by the `agent` user failed with
+# "Executable doesn't exist" (BrowserNavigate and the real-test cloud browser both hit it). The launch
+# check after the agent user is created below fails the build if that ever regresses.
+ENV PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright
 RUN python3 -m pip install --no-cache-dir playwright \
     && playwright install-deps \
-    && playwright install chromium
+    && playwright install chromium \
+    && chmod -R a+rX /opt/ms-playwright
 
 # ─── Common Python packages for agent use ─────────────────────────────────────
 RUN python3 -m pip install --no-cache-dir \
@@ -263,6 +269,10 @@ RUN echo "agent ALL=(ALL) NOPASSWD:ALL" > /etc/sudoers.d/agent \
 
 # Allow agent to use FUSE
 RUN echo "user_allow_other" >> /etc/fuse.conf
+
+# The agent user can launch Playwright's Chromium (guard for the shared browser path above).
+RUN runuser -u agent -- env PLAYWRIGHT_BROWSERS_PATH=/opt/ms-playwright python3 -c \
+    "from playwright.sync_api import sync_playwright as s; p = s().start(); p.chromium.launch().close(); p.stop()"
 
 # ─── Copy sandbox scripts ────────────────────────────────────────────────────
 COPY scripts/ /opt/sandbox/scripts/
