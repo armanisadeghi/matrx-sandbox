@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import logging
 import ipaddress
 import json
 import re
@@ -81,6 +82,9 @@ finally:
     os.close(directory_fd)
 """
 
+
+
+logger = logging.getLogger(__name__)
 
 def migration_state_volume_name(sandbox_id: str) -> str:
     """Return the exact orchestrator-owned restart gate volume for one sandbox."""
@@ -988,6 +992,15 @@ async def _activate_promoted_target(record, *, target, store, client, journal):
 def _record_error(record, journal, exc):
     # Preserve the phase, including commit_intent after an ambiguous DB call.
     record["last_error"] = type(exc).__name__ + ": " + str(exc)
+    # The FIRST failure is the cause; a later recovery error must not replace
+    # the step that started the rollback.
+    record.setdefault("failed_phase", record["phase"])
+    record.setdefault("failure_class", type(exc).__name__)
+    record.setdefault("failure_reason", record["last_error"])
+    logger.error(
+        "hosted migration %s for %s FAILED at phase %s: %s",
+        record.get("operation_label"), record.get("sandbox_id"), record["phase"], record["last_error"],
+    )
     journal.write(record)
     return {"status": "recovery_required", "sandbox_id": record["sandbox_id"],
             "phase": record["phase"], "reason": record["last_error"]}
@@ -1088,13 +1101,25 @@ async def _cleanup(record, client, journal, *, committed):
     record["cleanup_complete"] = True
     record.pop("last_error", None)
     journal.write(record)
-    journal.write_operation_receipt({
+    receipt = {
         "schema_version": 1,
         "sandbox_id": record["sandbox_id"],
         "operation_id": record["operation_label"],
         "outcome": "migrated" if committed else "rolled_back",
         "phase": record["phase"],
-    })
+    }
+    if not committed:
+        # A rollback always says why. Cleaning up used to drop last_error, so
+        # a 14-minute rollback (sbx-358104000663, 2026-10-21) left no reason
+        # anywhere: not on the record, not on the receipt, not in a log line.
+        for key in ("failed_phase", "failure_class", "failure_reason"):
+            receipt[key] = record.get(key) or "unrecorded"
+        logger.error(
+            "hosted migration %s for %s ROLLED BACK: failed at phase %s: %s",
+            record["operation_label"], record["sandbox_id"],
+            receipt["failed_phase"], receipt["failure_reason"],
+        )
+    journal.write_operation_receipt(receipt)
 
 
 async def recover_hosted_migration(record, *, store, client, journal, locked=False, copy_locked=False):

@@ -57,6 +57,19 @@ def _status_reason(outcome: str) -> str | None:
     return None
 
 
+def _project_failure(response: dict[str, Any], source: dict[str, Any] | None) -> None:
+    """Say WHICH step failed and what kind of failure, never the raw text.
+
+    The raw error stays host-side (journal record, receipt, log line): it can
+    carry host paths. The step and the exception class are safe and are what
+    an operator needs to know where to look.
+    """
+    if response.get("outcome") != "rolled_back" or not isinstance(source, dict):
+        return
+    response["failed_phase"] = source.get("failed_phase") or "unrecorded"
+    response["failure_class"] = source.get("failure_class") or "unrecorded"
+
+
 async def migration_status(
     sandbox_id: str,
     operation_id: str | None = None,
@@ -125,6 +138,7 @@ async def migration_status(
         reason = _status_reason(outcome)
         if reason:
             response["reason"] = reason
+        _project_failure(response, receipt)
         return response
 
     if record is None:
@@ -170,6 +184,8 @@ async def migration_status(
     reason = _status_reason(outcome)
     if reason:
         response["reason"] = reason
+    if outcome == "rolled_back":
+        _project_failure(response, record)
     receipt = record.get("rollback_readiness_receipt")
     if outcome == "rolled_back" and isinstance(receipt, dict):
         if receipt.get("template_service_ready") is False:

@@ -68,6 +68,11 @@ def test_cleanup_removes_exact_operation_tag_for_commit_and_rollback(committed):
         "operation_id": OPERATION,
         "outcome": "migrated" if committed else "rolled_back",
         "phase": "recovered",
+        # A rollback always states its cause; with none recorded it says so
+        # (test_rollback_always_says_why.py).
+        **({} if committed else {
+            "failed_phase": "unrecorded", "failure_class": "unrecorded", "failure_reason": "unrecorded",
+        }),
     }]
 
 
