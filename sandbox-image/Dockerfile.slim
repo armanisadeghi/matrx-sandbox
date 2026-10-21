@@ -224,8 +224,10 @@ RUN python3 -m pip install --no-cache-dir \
     Pillow
 
 # ─── Create agent user (non-root) ────────────────────────────────────────────
-RUN groupadd -g 1000 agent \
-    && useradd -m -u 1000 -g agent -s /bin/bash agent \
+RUN existing_group="$(getent group 1000 | cut -d: -f1)" \
+    && if [ -n "$existing_group" ]; then groupmod --new-name agent "$existing_group"; else groupadd -g 1000 agent; fi \
+    && existing_user="$(getent passwd 1000 | cut -d: -f1)" \
+    && if [ -n "$existing_user" ]; then usermod --login agent --home /home/agent --move-home "$existing_user"; else useradd -m -u 1000 -g agent -s /bin/bash agent; fi \
     && mkdir -p /home/agent /var/log/sandbox \
     && chown -R agent:agent /home/agent /var/log/sandbox
 
