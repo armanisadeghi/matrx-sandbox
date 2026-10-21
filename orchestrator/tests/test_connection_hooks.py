@@ -7,7 +7,7 @@ from unittest.mock import AsyncMock
 
 import pytest
 
-from orchestrator import connection_hooks, sdk_refresh, vault_env_refresh
+from orchestrator import connection_hooks, sdk_refresh, session_brief_hook, vault_env_refresh
 from orchestrator.models import SandboxResponse, SandboxStatus
 from orchestrator.routes import sandboxes
 
@@ -29,6 +29,11 @@ def _stub_sdk_refresh(monkeypatch):
         vault_env_refresh,
         "refresh_vault_env",
         AsyncMock(return_value=VAULT_STUB),
+    )
+    monkeypatch.setattr(
+        session_brief_hook,
+        "kick_session_brief",
+        AsyncMock(return_value={"hook": "session_start.session_brief", "status": "started"}),
     )
 
 

@@ -2014,6 +2014,10 @@ async def _run_connection_hooks(sandbox: SandboxResponse, progress: dict) -> dic
       the person's CURRENT vault values into the box and names what was added
       and removed, so the sandbox briefing's vault section is true rather than
       aspirational. See ``orchestrator/vault_env_refresh.py``.
+    * ``session_brief`` runs on EVERY binding, every template, after
+      ``sdk_refresh``: it kicks the in-box repo tidy + session brief DETACHED
+      (``mtx session start --detach``), so it never delays the mint. See
+      ``orchestrator/session_brief_hook.py``.
     * the repository sync runs only for the internal ``development`` worker.
 
     Failures stay visible in the report and logs, but never overwrite work or
@@ -2026,6 +2030,9 @@ async def _run_connection_hooks(sandbox: SandboxResponse, progress: dict) -> dic
     progress["sdk_refresh"] = sdk_refresh
     vault_env = await refresh_vault_env(sandbox)
     progress["vault_env_refresh"] = vault_env
+    from orchestrator.session_brief_hook import kick_session_brief
+
+    progress["session_brief"] = await kick_session_brief(sandbox)
     if sandbox.template != "development":
         return {"sdk_refresh": sdk_refresh, "vault_env_refresh": vault_env}
     from orchestrator.connection_hooks import prepare_development_connection
