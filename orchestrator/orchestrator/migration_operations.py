@@ -57,6 +57,42 @@ def _status_reason(outcome: str) -> str | None:
     return None
 
 
+# (sandbox_id, operation_id) -> the deferral the caller was given. A refused
+# request is never "idle": polling the operation it named must say it was
+# deferred and why (2026-10-21: a migrate request was refused 409
+# busy_deferred, the caller polled GET /migration?operation_id=... and saw
+# "idle" for 18 minutes). Process-local on purpose: a deferral admits nothing
+# and an orchestrator restart forgets it the same way it forgets activity.
+_DEFERRED: dict[tuple[str, str], dict[str, Any]] = {}
+
+
+def record_deferral(sandbox_id: str, operation_id: str, refusal: dict[str, Any]) -> dict[str, Any]:
+    """Remember a busy_deferred refusal for this operation and return what the caller sees."""
+    import re as _re
+    import time as _time
+
+    retry_after = None
+    match = _re.search(r"(\d+)s ago \(< (\d+)s\)", str(refusal.get("reason") or ""))
+    if match:
+        retry_after = max(1, int(match.group(2)) - int(match.group(1)))
+    seen = {
+        **refusal,
+        "sandbox_id": sandbox_id,
+        "operation_id": operation_id,
+        "outcome": "deferred",
+        "execution_state": "not_started",
+        "phase": "deferred",
+        "retry_after_seconds": retry_after,
+        "remedy": "Nothing was started. Send the same request again"
+        + (f" after {retry_after}s." if retry_after else " once the box is idle."),
+        "deferred_at": _time.time(),
+    }
+    if len(_DEFERRED) > 1024:
+        _DEFERRED.pop(next(iter(_DEFERRED)))
+    _DEFERRED[(sandbox_id, operation_id)] = seen
+    return seen
+
+
 def _project_failure(response: dict[str, Any], source: dict[str, Any] | None) -> None:
     """Say WHICH step failed and what kind of failure, never the raw text.
 
@@ -142,6 +178,9 @@ async def migration_status(
         return response
 
     if record is None:
+        deferred = _DEFERRED.get((sandbox_id, operation_id)) if operation_id else None
+        if deferred is not None:
+            return {k: v for k, v in deferred.items() if k != "deferred_at"}
         return {
             "sandbox_id": sandbox_id,
             "operation_id": operation_id,
@@ -285,6 +324,7 @@ def reset_operation_registry_for_tests() -> None:
     if any(not entry.task.done() for entry in _operations.values()):
         raise RuntimeError("cannot reset a registry with live migration tasks")
     _operations.clear()
+    _DEFERRED.clear()
     _registry_lock = None
     _registry_loop = None
 

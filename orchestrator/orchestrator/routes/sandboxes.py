@@ -835,7 +835,15 @@ async def migrate_sandbox_route(
             ),
         }
     if result["status"] == "busy_deferred":
-        raise HTTPException(status_code=409, detail=result)
+        from orchestrator.migration_operations import record_deferral
+
+        detail = record_deferral(sandbox_id, canonical_operation, result)
+        detail = {k: v for k, v in detail.items() if k != "deferred_at"}
+        headers = (
+            {"Retry-After": str(detail["retry_after_seconds"])}
+            if detail.get("retry_after_seconds") else None
+        )
+        raise HTTPException(status_code=409, detail=detail, headers=headers)
     if result["status"] == "not_found":
         raise HTTPException(status_code=404, detail=f"Sandbox {sandbox_id} not found")
     terminal = await migration_status(sandbox_id, canonical_operation)

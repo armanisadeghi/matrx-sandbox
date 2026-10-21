@@ -137,10 +137,16 @@ async def test_migrate_route_returns_structured_conflict_without_touching_busy_s
     detail = response.json()["detail"]
     operation_id = detail.pop("operation_id")
     assert len(operation_id) == 32
+    assert detail.pop("remedy").startswith("Nothing was started.")
+    # A deferral names itself (test_deferred_migration_is_never_idle.py).
     assert detail == {
         "status": "busy_deferred",
         "sandbox_id": sandbox_id,
         "reason": reason,
+        "outcome": "deferred",
+        "execution_state": "not_started",
+        "phase": "deferred",
+        "retry_after_seconds": None,
     }
 
 
