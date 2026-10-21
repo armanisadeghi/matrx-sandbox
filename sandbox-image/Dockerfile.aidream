@@ -41,9 +41,8 @@ RUN echo "aidream" > /etc/sandbox-image-tag \
     && chmod 0444 /etc/aidream-image-sha
 
 # ─── System deps for aidream (mirroring aidream/Dockerfile) ────────────────
-# Skipping software-properties-common / deadsnakes PPA — it's brittle on
-# Ubuntu 22.04 (broken python3-apt + dbus dependency cascades). Instead we
-# let uv install its own Python 3.13 below.
+# The Ubuntu 24.04 core image already supplies its system Python from the
+# signed base archive. Aidream installs its separate Python 3.13 with uv below.
 USER root
 RUN apt-get update \
     && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
@@ -52,8 +51,8 @@ RUN apt-get update \
     libasound2-dev \
     libpulse-dev \
     ffmpeg \
-    chromium-driver \
-    libmagic1 \
+    chromium-chromedriver \
+    libmagic1t64 \
     libpq-dev \
     tesseract-ocr \
     tzdata \
@@ -134,8 +133,7 @@ RUN install -d -o root -g root -m 0755 /etc/codex \
     && grep -q '"/home/agent/.matrx/own-plan"' /etc/codex/requirements.toml
 
 # ─── uv installer + uv-managed Python 3.13 ─────────────────────────────────
-# uv installs its own Python — avoids the deadsnakes-PPA + python3-apt
-# breakage on Ubuntu 22.04. The :core image's system Python 3.11 stays
+# uv installs its own Python 3.13. The :core image's system Python 3.12 stays
 # untouched (matrx_agent daemon + mtx CLI still use it).
 ENV UV_INSTALL_DIR=/usr/local/bin
 ENV UV_PYTHON_INSTALL_DIR=/opt/uv-python

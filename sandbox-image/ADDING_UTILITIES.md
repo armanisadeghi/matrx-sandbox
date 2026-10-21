@@ -51,7 +51,7 @@ floor. They are now **one contract**, identical in `Dockerfile`,
 | **Node ≥ 22 LTS**, corepack enabled, pinned `pnpm` first on PATH | Stagehand v4 and its generation need Node 22 (`ReferenceError: WebSocket is not defined` on 20) | P1-1 |
 | **`npm i -g` works as the agent**, prefix `/opt/npm-global` (agent-owned, on PATH) | the prefix was `/usr`, whose `lib/node_modules` is root-owned → `EACCES` | P1-2 |
 | **Install scripts run** — `dangerously-allow-all-scripts=true` in `/opt/npm-global/etc/npmrc` | npm 11 ships an `allow-scripts` allowlist; without a policy a dependency's postinstall is SKIPPED with only a warning | P1-3 |
-| **`python3` is a FINAL release ≥ 3.12** (deadsnakes 3.12 on jammy; `python3.11` is GONE) | Ubuntu 22.04's `python3.11` package is **3.11.0rc1**, a 2022 release candidate | P2-1 |
+| **`python3` is a FINAL release ≥ 3.12** (Ubuntu 24.04's signed Python 3.12; `python3.11` is GONE) | Ubuntu 22.04's `python3.11` package is **3.11.0rc1**, a 2022 release candidate; deadsnakes package-index 503s made the former Jammy source unreliable | P2-1 |
 | **`browse` is preinstalled** | agents typed `browse` and got `command not found` | P2-2 |
 | **Platform-launched binaries live OUTSIDE `/opt/npm-global`** — root-owned prefix, resolved on `/usr/local/bin:/usr/bin:/bin` | the agent-writable prefix means agent-replaceable; a privileged launch carrying a brokered credential must not exec a binary the model can swap | XT-09 |
 
