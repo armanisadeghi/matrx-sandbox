@@ -229,6 +229,36 @@ def test_overlapping_runs_never_tidy_twice(monkeypatch, tmp_path):
         held.release()
 
 
+def test_a_fetch_run_writes_a_quick_local_snapshot_first(monkeypatch, tmp_path):
+    """The first agent turn after a binding waits for a brief newer than the binding; a
+    snapshot written before the (slow) fetch means it never waits on the network."""
+    monkeypatch.setattr(sb, "LOCK_PATH", tmp_path / "lock")
+    events: list[tuple] = []
+    monkeypatch.setattr(sb, "build_brief", lambda **kw: events.append(("build", kw["fetch"], kw["apply"], kw["trigger"])) or kw)
+    monkeypatch.setattr(sb, "write_brief", lambda brief: events.append(("write", brief["trigger"])) or "md")
+    assert sb.run(fetch=True, apply=True, trigger="binding") == (0, "md")
+    assert events == [
+        ("build", False, False, "binding, snapshot"), ("write", "binding, snapshot"),
+        ("build", True, True, "binding"), ("write", "binding"),
+    ]
+    events.clear()
+    sb.run(fetch=False, apply=False, trigger="mtx brief")  # status runs are already quick
+    assert events == [("build", False, False, "mtx brief"), ("write", "mtx brief")]
+
+
+def test_a_failed_snapshot_never_blocks_the_tidy(monkeypatch, tmp_path):
+    monkeypatch.setattr(sb, "LOCK_PATH", tmp_path / "lock")
+
+    def build(**kw):
+        if not kw["fetch"]:
+            raise RuntimeError("boom")
+        return kw
+
+    monkeypatch.setattr(sb, "build_brief", build)
+    monkeypatch.setattr(sb, "write_brief", lambda brief: "md")
+    assert sb.run(fetch=True, apply=True, trigger="binding") == (0, "md")
+
+
 def test_discover_finds_repos_one_level_deep(world, tmp_path):
     (world["repos"] / "not-a-repo").mkdir()
     found = sb.discover_repos([world["repos"], tmp_path / "missing"])

@@ -864,6 +864,15 @@ def run(*, fetch: bool, apply: bool, trigger: str) -> tuple[int, str | None]:
     if not lock.acquire():
         return 75, None  # EX_TEMPFAIL: another run holds the lock
     try:
+        if fetch:
+            # A fetch can take tens of seconds while the lock is held, and the agent's first
+            # turn after a binding reads the brief then (aidream sandbox_briefing waits for one
+            # newer than the binding). Write a quick local snapshot first so it never waits on
+            # the network; the full fetch + tidy brief replaces it moments later.
+            try:
+                write_brief(build_brief(fetch=False, apply=False, trigger=f"{trigger}, snapshot"))
+            except Exception:  # noqa: BLE001 — the snapshot is a courtesy, never a blocker
+                pass
         brief = build_brief(fetch=fetch, apply=apply, trigger=trigger)
         return 0, write_brief(brief)
     finally:
