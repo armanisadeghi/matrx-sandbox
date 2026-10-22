@@ -19,6 +19,9 @@ set -uo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 cd "$ROOT"
+# THE RELEASE PATH IS NEVER BLOCKED (Arman 2026-10-02): the git hooks this run's pushes trigger REPORT
+# their failures (banner + agent mail) instead of refusing the push.
+export MATRX_RELEASE_PATH=1
 export RELEASE_STAGE_CALLER_PWD="$PWD"
 
 NOTE="sync and release"
