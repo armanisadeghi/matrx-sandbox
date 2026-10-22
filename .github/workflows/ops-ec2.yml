@@ -1,0 +1,106 @@
+# armanisadeghi/matrx-sandbox/.github/workflows/ops-ec2.yml (harness wellness 642f4280)
+# Uses the EXISTING repo secrets AWS_ACCESS_KEY_ID/SECRET + EC2_INSTANCE_ID and
+# ssm:SendCommand (already exercised by deploy.yml) to (a) tail orchestrator logs
+# and (b) reset a sandbox through the orchestrator's own localhost API with the
+# host's MATRX_API_KEY (never leaves the host). NOTE: deploy.yml runs on every
+# push to main with no paths filter — commit this with "[skip ci]" in the message.
+name: Ops EC2
+run-name: "Ops EC2 ${{ inputs.op }} ${{ inputs.sandbox_id }} (by ${{ inputs.requested_by }})"
+on:
+  workflow_dispatch:
+    inputs:
+      op:
+        type: choice
+        options: [orchestrator-logs, sandbox-status, sandbox-reset]
+        default: orchestrator-logs
+      sandbox_id:
+        type: string
+        default: ""
+      since:
+        description: "journalctl --since (e.g. '60 min ago')"
+        type: string
+        default: "60 min ago"
+      requested_by:
+        type: string
+        required: true
+permissions:
+  contents: read
+jobs:
+  ops_readonly:
+    if: ${{ inputs.op != 'sandbox-reset' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    env:
+      AWS_REGION: us-east-1
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Build + send SSM command
+        env:
+          OP: ${{ inputs.op }}
+          SID: ${{ inputs.sandbox_id }}
+          SINCE: ${{ inputs.since }}
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          [[ -z "$SID" || "$SID" =~ ^sbx-[a-f0-9]{8,32}$ ]] || { echo "bad sandbox_id"; exit 2; }
+          [[ "$SINCE" =~ ^[0-9]+\ (min|hour|day)s?\ ago$ ]] || { echo "bad since"; exit 2; }
+          KEYCMD='KEY=$(systemctl show matrx-orchestrator -p Environment --value | tr " " "\n" | sed -n "s/^MATRX_API_KEY=//p"); [ -n "$KEY" ] || KEY=$(sed -n "s/^MATRX_API_KEY=//p" /home/ec2-user/orchestrator/.env | head -1)'
+          case "$OP" in
+            orchestrator-logs) CMD="journalctl -u matrx-orchestrator --since '$SINCE' --no-pager | tail -n 2000" ;;
+            sandbox-status) CMD="$KEYCMD; curl -fsS -H \"X-API-Key: \$KEY\" http://localhost:8000/sandboxes/$SID" ;;
+            sandbox-reset) CMD="$KEYCMD; curl -fsS -X POST -H \"X-API-Key: \$KEY\" 'http://localhost:8000/sandboxes/$SID/reset?wipe_volume=false'" ;;
+          esac
+          PARAMS=$(jq -cn --arg c "$CMD" '{commands: [$c]}')
+          ID=$(aws ssm send-command --instance-ids "$EC2_INSTANCE_ID" --document-name AWS-RunShellScript \
+               --parameters "$PARAMS" --timeout-seconds 900 --query Command.CommandId --output text)
+          for i in $(seq 1 180); do
+            S=$(aws ssm get-command-invocation --command-id "$ID" --instance-id "$EC2_INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$S" in Success|Failed|Cancelled|TimedOut) break ;; esac; sleep 5
+          done
+          aws ssm get-command-invocation --command-id "$ID" --instance-id "$EC2_INSTANCE_ID" \
+            --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
+          [ "$S" = Success ]
+
+  ops_reset:
+    if: ${{ inputs.op == 'sandbox-reset' }}
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    environment: ec2-ops
+    env:
+      AWS_REGION: us-east-1
+    steps:
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: us-east-1
+      - name: Build + send SSM command
+        env:
+          OP: ${{ inputs.op }}
+          SID: ${{ inputs.sandbox_id }}
+          SINCE: ${{ inputs.since }}
+          EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
+        run: |
+          set -euo pipefail
+          [[ -z "$SID" || "$SID" =~ ^sbx-[a-f0-9]{8,32}$ ]] || { echo "bad sandbox_id"; exit 2; }
+          [[ "$SINCE" =~ ^[0-9]+\ (min|hour|day)s?\ ago$ ]] || { echo "bad since"; exit 2; }
+          KEYCMD='KEY=$(systemctl show matrx-orchestrator -p Environment --value | tr " " "\n" | sed -n "s/^MATRX_API_KEY=//p"); [ -n "$KEY" ] || KEY=$(sed -n "s/^MATRX_API_KEY=//p" /home/ec2-user/orchestrator/.env | head -1)'
+          case "$OP" in
+            orchestrator-logs) CMD="journalctl -u matrx-orchestrator --since '$SINCE' --no-pager | tail -n 2000" ;;
+            sandbox-status) CMD="$KEYCMD; curl -fsS -H \"X-API-Key: \$KEY\" http://localhost:8000/sandboxes/$SID" ;;
+            sandbox-reset) CMD="$KEYCMD; curl -fsS -X POST -H \"X-API-Key: \$KEY\" 'http://localhost:8000/sandboxes/$SID/reset?wipe_volume=false'" ;;
+          esac
+          PARAMS=$(jq -cn --arg c "$CMD" '{commands: [$c]}')
+          ID=$(aws ssm send-command --instance-ids "$EC2_INSTANCE_ID" --document-name AWS-RunShellScript \
+               --parameters "$PARAMS" --timeout-seconds 900 --query Command.CommandId --output text)
+          for i in $(seq 1 180); do
+            S=$(aws ssm get-command-invocation --command-id "$ID" --instance-id "$EC2_INSTANCE_ID" --query Status --output text 2>/dev/null || echo Pending)
+            case "$S" in Success|Failed|Cancelled|TimedOut) break ;; esac; sleep 5
+          done
+          aws ssm get-command-invocation --command-id "$ID" --instance-id "$EC2_INSTANCE_ID" \
+            --query '[Status,StandardOutputContent,StandardErrorContent]' --output text
+          [ "$S" = Success ]
