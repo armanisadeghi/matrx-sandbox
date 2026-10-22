@@ -2012,6 +2012,7 @@ async def exec_in_sandbox(
             # docker-py exec_run with stdin requires socket attach; we use create+start.
             return await _exec_with_stdin(
                 container, wrapped, user, env or {}, stdin, sandbox_id, effective_cwd,
+                timeout=timeout,
             )
 
         # The actual command run — can be arbitrarily long (e.g. a build or a
@@ -2042,12 +2043,24 @@ async def _exec_with_stdin(
     stdin_data: str,
     sandbox_id: str,
     effective_cwd: str,
+    *,
+    timeout: int | None = None,
 ) -> tuple[int, str, str, str]:
     """Run an exec where stdin is fed to the command.
 
     docker-py's ``exec_run`` doesn't accept a stdin payload directly. We use
     the lower-level ``exec_create`` + ``exec_start`` pair with ``socket=True``
     to write the input, then collect output.
+
+    🚨 THE CALLER'S TIMEOUT IS THE WAIT (2026-10-22). ``exec_start(socket=True)``
+    hands back a socket still carrying the Docker client's own 60 s read
+    timeout (docker-py only lifts it on its non-socket paths). A script that
+    printed nothing for a minute raised ``socket.timeout`` here, the route had
+    no handler for it, and the agent read "Sandbox call failed (500)" while the
+    script carried on inside the box (conversation 9b224bf5). The wait is now
+    exactly the ``timeout`` the caller asked for; when it runs out the answer is
+    an honest exit 124 that says the command is STILL RUNNING and was not
+    stopped, with every byte of output collected so far.
     """
     # The whole exec_create + socket send/recv + exec_inspect dance is blocking
     # docker/socket IO. Run it in a thread so a slow stdin-fed command can't
@@ -2077,7 +2090,22 @@ async def _exec_with_stdin(
             except OSError:
                 pass
 
-            chunks_out, chunks_err = _demux_docker_exec_socket(raw)
+            deadline = (time.monotonic() + timeout) if timeout else None
+            try:
+                chunks_out, chunks_err = _demux_docker_exec_socket(raw, deadline=deadline)
+            except ExecStillRunning as running:
+                note = (
+                    f"\n[sandbox] still running after {timeout}s; it was NOT stopped and keeps "
+                    "running inside the sandbox. The output above is everything so far. For "
+                    "work longer than the timeout, start it in the background (nohup <cmd> > "
+                    "~/job.log 2>&1 &) and read ~/job.log, or call again with a longer "
+                    "timeout_seconds.\n"
+                )
+                return (
+                    EXEC_STILL_RUNNING_EXIT_CODE,
+                    running.stdout.decode("utf-8", errors="replace"),
+                    running.stderr.decode("utf-8", errors="replace") + note,
+                )
         finally:
             try:
                 raw.close()
@@ -2101,7 +2129,22 @@ async def _exec_with_stdin(
     return exit_code, stdout, stderr, new_cwd
 
 
-def _demux_docker_exec_socket(raw: Any) -> tuple[bytearray, bytearray]:
+#: The ``timeout`` convention (coreutils ``timeout`` exits 124): the wait ran out.
+EXEC_STILL_RUNNING_EXIT_CODE = 124
+
+
+class ExecStillRunning(Exception):
+    """The caller's wait ran out while the command kept running; carries the output so far."""
+
+    def __init__(self, stdout: bytearray, stderr: bytearray) -> None:
+        super().__init__("exec still running")
+        self.stdout = stdout
+        self.stderr = stderr
+
+
+def _demux_docker_exec_socket(
+    raw: Any, *, deadline: float | None = None
+) -> tuple[bytearray, bytearray]:
     """Read Docker's non-TTY exec stream, separating stdout and stderr frames.
 
     Docker sends every frame as an 8-byte header (stream id plus big-endian
@@ -2115,7 +2158,15 @@ def _demux_docker_exec_socket(raw: Any) -> tuple[bytearray, bytearray]:
     pending = bytearray()
 
     while True:
-        data = raw.recv(65536)
+        if deadline is not None and hasattr(raw, "settimeout"):
+            # The caller's wait, never the Docker client's inherited 60 s.
+            raw.settimeout(max(0.05, deadline - time.monotonic()))
+        try:
+            data = raw.recv(65536)
+        except TimeoutError:
+            if deadline is None:
+                raise
+            raise ExecStillRunning(stdout, stderr) from None
         if not data:
             break
         pending.extend(data)
