@@ -2,11 +2,26 @@
 # Versioned pre-push for matrx-sandbox (activate once per clone: git config core.hooksPath .githooks).
 # Runs the config-attestation guard tests: a feature_knob read that serves archived rows, a manifest that
 # misses a direct knob read, or a boot that attests the wrong sha refuses the push. The full suite is `make test`.
+#
+# THE RELEASE PATH IS NEVER BLOCKED (Arman 2026-09-24 / 10-02 / 10-21: "report warnings and errors and release").
+# ship.sh and scripts/release.sh export MATRX_RELEASE_PATH=1: there a failure prints a banner, mails the ship-all
+# lanes (matrx-ship/scripts/release-scream.py) and the push goes through. An ordinary push is still refused.
+# Guard: matrx-ship/scripts/test_release_path_never_blocked.py.
 root=$(git rev-parse --show-toplevel) || exit 1
 py="$root/orchestrator/.venv/bin/python"
 [ -x "$py" ] || py=python3
 cd "$root/orchestrator" || exit 1
-"$py" -m pytest tests/test_config_attestation_wiring.py -q || {
+if ! "$py" -m pytest tests/test_config_attestation_wiring.py -q; then
+    if [ "${MATRX_RELEASE_PATH:-0}" = "1" ]; then
+        scream="$HOME/code/matrx-ship/scripts/release-scream.py"
+        if [ -f "$scream" ]; then
+            python3 "$scream" --repo matrx-sandbox --where "pre-push (release path)" --check "config-attestation guard tests" \
+                --detail "tests/test_config_attestation_wiring.py failed (above). Fix the code, never the guard." || true
+        else
+            echo "RELEASE WARNING — PUSHED ANYWAY (release path never blocks): config-attestation guard tests failed (above)." >&2
+        fi
+        exit 0
+    fi
     echo "PUSH REFUSED: config-attestation guard tests failed (above). Fix the code, never the guard." >&2
     exit 1
-}
+fi
