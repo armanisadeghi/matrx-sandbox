@@ -38,6 +38,13 @@ AFTER_PUSH=""                 # a command run after the push; a failure is an ER
 set -uo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT" || exit 1
+# NESTED in the aidream monorepo (infra/matrx-sandbox, 2026-10-23): a release from here would bump
+# aidream's root version file and tag v* in aidream. The sandbox ships through the Sandbox Deploy
+# workflow there; nothing to release.
+if [[ -n "$(git -C "$ROOT" rev-parse --show-prefix 2>/dev/null)" ]]; then
+    echo "release.sh: matrx-sandbox is a folder of $(git -C "$ROOT" rev-parse --show-toplevel): no release of its own (Sandbox Deploy ships it)."
+    exit 0
+fi
 REMOTE="origin"
 BRANCH="main"
 START=$SECONDS

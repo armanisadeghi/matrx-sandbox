@@ -37,6 +37,13 @@ RELEASE=""
 for candidate in "$ROOT/scripts/release.sh" "$ROOT/release.sh"; do
     [[ -x "$candidate" || -f "$candidate" ]] && { RELEASE="$candidate"; break; }
 done
+# NESTED in the aidream monorepo (infra/matrx-sandbox, 2026-10-23): the sync below runs aidream's own
+# sync (scripts/sync-main.py delegates) and the sandbox has no release of its own there (its v* tags
+# moved to sandbox/v*; the deploy is the Sandbox Deploy workflow on aidream main), so nothing is released.
+if [[ -n "$(git -C "$ROOT" rev-parse --show-prefix 2>/dev/null)" ]]; then
+    echo "ship.sh: matrx-sandbox is a folder of $(git -C "$ROOT" rev-parse --show-toplevel): synced with that checkout's sync; no release of its own."
+    RELEASE=""
+fi
 
 # ── 1. sync ──────────────────────────────────────────────────────────────────
 if $DRY_RUN; then

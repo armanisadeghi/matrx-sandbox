@@ -179,10 +179,6 @@ untracked files, persistent-venv command shims cannot replace launch binaries,
 and the separate runtime log directory remains writable. Aidream warm pooling
 is prohibited because a pre-owner box cannot preserve this policy and volume.
 
-Both CI and Deploy test checkouts fetch full Git history because the release
-hardening suite archives the exact legacy EC2 source SHAs. A shallow checkout
-cannot validate that recovery path and will fail before the sandbox SDK suite.
-
 ```bash
 # Rebuild the core image
 cd /srv/projects/matrx-sandbox/sandbox-image && docker build -t matrx-sandbox:core .

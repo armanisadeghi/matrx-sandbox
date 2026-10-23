@@ -15,9 +15,6 @@ UV_VERSION=0.10.8
 DROPIN_DIR=/etc/systemd/system/matrx-orchestrator.service.d
 RELEASE_DROPIN="$DROPIN_DIR/release.conf"
 DROPIN_BACKUP="/tmp/matrx-orchestrator-release-conf-$TARGET_SHA"
-# Exact production revisions served by the copy-in-place workflow before
-# atomic, revision-stamped deployments. Bootstrap accepts no other tree.
-LEGACY_EC2_SOURCE_SHAS="30ed118b431b72e8f73f1b199fd9398d78361ed5 f229d4b9347a66b3e8e8d8235f122d31dc336436"
 
 log() { echo "[deploy-ec2] $*"; }
 fail() { echo "[deploy-ec2] ERROR: $*" >&2; exit 1; }
@@ -38,11 +35,9 @@ flock -n 9 || fail "another EC2 release is already running"
 validate_release_authority() {
   release_guard_fetch_approved_release "$RELEASE_ROOT" "$TARGET_SHA"
   if [ -d "$LIVE_DIR" ]; then
-    if [ ! -e "$LIVE_DIR/.source-sha" ] && [ ! -L "$LIVE_DIR/.source-sha" ]; then
-      log "verifying one-time legacy live-source bootstrap"
-      release_guard_bootstrap_legacy_source \
-        "$RELEASE_ROOT" "$LIVE_DIR" "$LEGACY_EC2_SOURCE_SHAS" orchestrator
-    fi
+    # Every live orchestrator carries .source-sha (the one-time legacy bootstrap of the
+    # pre-marker copy-in-place host ran out in 2026-07 and was retired 2026-10-23): a live
+    # directory without it is refused, never inferred.
     [ -f "$LIVE_DIR/.source-sha" ] && [ ! -L "$LIVE_DIR/.source-sha" ] \
       && [ -r "$LIVE_DIR/.source-sha" ] \
       || fail "live orchestrator source revision is unreadable"

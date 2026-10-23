@@ -37,10 +37,6 @@ HOSTED_DEPLOY_SERVICE = (
 )
 HOSTED_RUNNER = REPO_ROOT / "scripts" / "systemd" / "pull-deploy-runner.sh"
 NESTED_PREFIX = "infra/matrx-sandbox"
-LEGACY_EC2_SOURCE_SHAS = (
-    "30ed118b431b72e8f73f1b199fd9398d78361ed5",
-    "f229d4b9347a66b3e8e8d8235f122d31dc336436",
-)
 
 
 def _git(cwd: Path, *args: str) -> str:
@@ -115,50 +111,6 @@ release_guard_assert_descendant "$2" "$3" "$4" "deployed revision"
     )
 
 
-def _run_legacy_bootstrap(
-    checkout: Path,
-    live_dir: Path,
-    legacy_shas: tuple[str, ...] = LEGACY_EC2_SOURCE_SHAS,
-) -> subprocess.CompletedProcess[str]:
-    script = """
-set -u
-fail() { echo "$*" >&2; exit 1; }
-source "$1"
-release_guard_bootstrap_legacy_source "$2" "$3" "$4" orchestrator
-"""
-    return subprocess.run(
-        [
-            "bash",
-            "-c",
-            script,
-            "legacy-test",
-            str(RELEASE_GUARD),
-            str(checkout),
-            str(live_dir),
-            " ".join(legacy_shas),
-        ],
-        text=True,
-        capture_output=True,
-    )
-
-
-def _extract_legacy_orchestrator(
-    checkout: Path, destination: Path, legacy_sha: str = LEGACY_EC2_SOURCE_SHAS[0]
-) -> None:
-    destination.mkdir()
-    archive = subprocess.run(
-        ["git", "archive", legacy_sha, "orchestrator"],
-        cwd=checkout,
-        check=True,
-        capture_output=True,
-    )
-    subprocess.run(
-        ["tar", "-x", "--strip-components=1", "-C", str(destination)],
-        input=archive.stdout,
-        check=True,
-    )
-
-
 def test_release_guard_accepts_only_current_forward_release(tmp_path: Path):
     checkout, author, first, second = _release_history(tmp_path)
 
@@ -220,50 +172,6 @@ def test_workflow_approves_only_current_main_then_revalidates_immutable_ref():
     assert "origin/main" not in revalidation
 
 
-def test_ec2_legacy_source_bootstraps_each_exact_known_layout(tmp_path: Path):
-    checkout = tmp_path / "checkout"
-    _git(tmp_path, "clone", str(REPO_ROOT), str(checkout))
-    for index, legacy_sha in enumerate(LEGACY_EC2_SOURCE_SHAS):
-        live_dir = tmp_path / f"live-{index}"
-        _extract_legacy_orchestrator(checkout, live_dir, legacy_sha)
-        (live_dir / ".env").write_text("MATRX_API_KEY=test\n", encoding="utf-8")
-        (live_dir / ".venv").mkdir()
-        cache = live_dir / "orchestrator" / "__pycache__"
-        cache.mkdir()
-        (cache / "main.cpython-311.pyc").write_bytes(b"runtime cache")
-
-        result = _run_legacy_bootstrap(checkout, live_dir)
-
-        assert result.returncode == 0, result.stderr
-        assert (live_dir / ".source-sha").read_text(encoding="utf-8") == (
-            f"{legacy_sha}\n"
-        )
-
-
-def test_ec2_legacy_source_rejects_missing_tampered_and_ambiguous_layouts(
-    tmp_path: Path,
-):
-    checkout = tmp_path / "checkout"
-    _git(tmp_path, "clone", str(REPO_ROOT), str(checkout))
-
-    missing = tmp_path / "missing"
-    missing.mkdir()
-    tampered = tmp_path / "tampered"
-    _extract_legacy_orchestrator(checkout, tampered)
-    (tampered / "orchestrator" / "main.py").write_text("# tampered\n", encoding="utf-8")
-    ambiguous = tmp_path / "ambiguous"
-    _extract_legacy_orchestrator(checkout, ambiguous)
-    (ambiguous / "unexpected.py").write_text("pass\n", encoding="utf-8")
-    symlinked_marker = tmp_path / "symlinked-marker"
-    _extract_legacy_orchestrator(checkout, symlinked_marker)
-    (symlinked_marker / ".source-sha").symlink_to(tmp_path / "absent-marker")
-
-    for live_dir in (missing, tampered, ambiguous, symlinked_marker):
-        result = _run_legacy_bootstrap(checkout, live_dir)
-        assert result.returncode != 0
-        assert not (live_dir / ".source-sha").is_file()
-
-
 def test_workflow_uses_sha_as_single_ecr_release_pointer():
     workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
 
@@ -273,13 +181,6 @@ def test_workflow_uses_sha_as_single_ecr_release_pointer():
     assert 'docker push $ECR_REPO:slim-${{ github.sha }}' in workflow
     assert not re.search(r"docker push .*:(?:latest|slim)[\"']?\s*$", workflow, re.MULTILINE)
     assert "Promote verified ECR aliases" not in workflow
-
-
-def test_ci_test_checkout_includes_legacy_release_history():
-    workflow = CI_WORKFLOW.read_text(encoding="utf-8")
-    test_job = workflow[workflow.index("  test:") : workflow.index("\n  build-sandbox:")]
-
-    assert "fetch-depth: 0" in test_job
 
 
 def test_hosted_fast_path_allows_one_serialized_recovery_ahead_of_it():

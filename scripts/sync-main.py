@@ -1261,7 +1261,32 @@ def nothing_left_after_wait():
     return rc == 0 and head.strip() == remote.strip()
 
 
+def delegate_when_nested():
+    """NESTED in the aidream monorepo (infra/matrx-sandbox, 2026-10-23): ONE sync owns the shared
+    checkout, the host repository's scripts/sync-main.py (it commits and pushes the sandbox with the
+    rest). A plain sync here runs that one; every other mode refuses loudly. Standalone: unchanged.
+    (Same rule as common-docs/scripts/sync-main.py.)"""
+    here = os.path.dirname(os.path.dirname(os.path.realpath(__file__)))
+    r = subprocess.run(["git", "-C", here, "rev-parse", "--show-prefix", "--show-toplevel"],
+                       capture_output=True, text=True)
+    lines = r.stdout.splitlines()
+    if r.returncode != 0 or len(lines) < 2 or not lines[0].strip():
+        return
+    prefix, top = lines[0].strip(), lines[1].strip()
+    host = os.path.join(top, "scripts", "sync-main.py")
+    args = sys.argv[1:]
+    if set(args) - {"--no-push"} or not os.path.isfile(host):
+        die("matrx-sandbox is the folder %s of the %s checkout: its sync is that repository's own "
+            "(`cd %s && python3 scripts/sync-main.py`); this copy's other modes (%s) only run "
+            "standalone." % (prefix, os.path.basename(top), top, " ".join(args) or "none"))
+    say("sync-main: matrx-sandbox is %s inside %s; running that checkout's sync (it owns the whole "
+        "checkout)." % (prefix, top))
+    os.chdir(top)
+    os.execv(sys.executable, [sys.executable, host, *args])
+
+
 def main():
+    delegate_when_nested()
     if sys.argv[1:2] == ["--replay"]:
         _, top, _ = git("rev-parse", "--show-toplevel")
         os.chdir(top.strip())
