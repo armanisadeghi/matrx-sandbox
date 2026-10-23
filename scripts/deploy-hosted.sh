@@ -176,12 +176,15 @@ prepare_hosted_journal() {
 }
 
 cd "$REPO_DIR" || fail "repo dir $REPO_DIR not found"
+# Root checkout today, infra/matrx-sandbox inside the aidream monorepo later:
+# the ref names follow the layout (scripts/lib/release-guard.sh).
+release_source_init "$REPO_DIR"
 
 HEAD_SHA="$(git rev-parse HEAD 2>/dev/null)" || fail "cannot resolve checkout HEAD"
 TARGET_SHA="${DEPLOY_TARGET_SHA:-}"
 if [ -z "$TARGET_SHA" ]; then
-  git fetch origin refs/heads/deploy/hosted --quiet \
-    || fail "cannot resolve CI-approved deploy/hosted ref"
+  git fetch origin "$MATRX_SANDBOX_DEPLOY_REF" --quiet \
+    || fail "cannot resolve CI-approved $MATRX_SANDBOX_DEPLOY_REF ref"
   TARGET_SHA="$(git rev-parse FETCH_HEAD)"
 fi
 release_guard_validate_sha "$TARGET_SHA" "approved target"
@@ -195,6 +198,8 @@ git diff --quiet && git diff --cached --quiet \
 STATE_FILE="${DEPLOY_STATE_FILE:-/srv/apps/deploy-state/matrx-sandbox.last-deployed-sha}"
 IMAGE_STATE_FILE="${DEPLOY_IMAGE_STATE_FILE:-${STATE_FILE}.images}"
 OLD_SHA="$(cat "$STATE_FILE" 2>/dev/null || echo none)"
+# A state written before a history-rewriting monorepo import names the old SHA.
+[ "$OLD_SHA" = "none" ] || OLD_SHA=$(release_guard_resolve_lineage "$REPO_DIR" "$OLD_SHA")
 validate_release_authority() {
   release_guard_fetch_approved_release "$REPO_DIR" "$TARGET_SHA"
   if [ "$OLD_SHA" != "none" ]; then
@@ -370,7 +375,9 @@ elif [ "$OLD_SHA" = "$NEW_SHA" ]; then
     exit 0
   fi
 else
-  CHANGED="$(git diff --name-only "$OLD_SHA" "$NEW_SHA")" \
+  # --relative: paths below $REPO_DIR only, without the monorepo prefix, so the
+  # anchored changed '^orchestrator/' tests mean the same thing in both layouts.
+  CHANGED="$(git diff --name-only --relative "$OLD_SHA" "$NEW_SHA")" \
     || fail "cannot compute the validated release change set"
 fi
 changed() { [ "$CHANGED" = "ALL" ] || grep -q "$1" <<<"$CHANGED"; }

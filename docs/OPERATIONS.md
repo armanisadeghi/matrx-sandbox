@@ -33,6 +33,18 @@ a three-hour budget, covering both lock wait and a cold core/slim/aidream build.
 Successful releases refresh the runner and both systemd units, so the live
 timeout policy cannot silently remain pinned to an obsolete checkout.
 
+**Release source (standalone repo today, aidream `infra/matrx-sandbox` later).**
+Ref names follow the checkout layout (`scripts/lib/release-guard.sh`
+`release_source_init`): `deploy/hosted` + `deploy-approved/<sha>` at a repo
+root, `deploy/sandbox-hosted` + `sandbox/deploy-approved/<sha>` when nested.
+The EC2 host fetches with the deploy job's own `github.token` (blobless, sparse
+when nested; never stored). The hosted poller and the GitHub fast path both run
+`/usr/local/bin/matrx-hosted-deploy-runner`, which reads the optional
+`/etc/matrx/sandbox-release.env` (`MATRX_SANDBOX_CHECKOUT`, `MATRX_SANDBOX_SUBDIR`,
+`MATRX_SANDBOX_DEPLOY_REF`); the checkout's own git config carries its
+credential. Pre-move SHAs survive a history-rewriting import through
+`scripts/release-lineage.tsv` (`old<TAB>new`).
+
 ---
 
 ## Hosted-tier ops (this server)
