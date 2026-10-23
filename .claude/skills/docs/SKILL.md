@@ -113,7 +113,7 @@ Done when: the doc reads as one voice and every claim in it is currently true.
 5. **Prove it.** For every deleted path, grep all repos plus common-docs: it comes back empty.
 
 Never touch: generated files, a `.md` that code reads (grep `.py`/`.ts` for its name first),
-a published package README, `inbox/`, a repo's `.arman/`. A spotted duplicate that is not
+a published package README, `inbox/`. A spotted duplicate that is not
 blocking you is still yours: run this section or dispatch it, never just report it.
 
 ## 4. Clean up as you go
