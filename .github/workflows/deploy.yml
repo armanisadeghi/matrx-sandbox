@@ -72,21 +72,42 @@ jobs:
           fetch-depth: 0
       - name: Promote tested commit to hosted approval ref
         run: |
+          set -euo pipefail
+          # Ref names follow the checkout layout (scripts/lib/release-guard.sh):
+          # deploy/hosted + deploy-approved/<sha> in this repository,
+          # deploy/sandbox-hosted + sandbox/deploy-approved/<sha> in a monorepo.
+          fail() { echo "$*" >&2; exit 1; }
+          . scripts/lib/release-guard.sh
+          release_source_init "$PWD"
+          DEPLOY_REF="$MATRX_SANDBOX_DEPLOY_REF"
           git fetch origin refs/heads/main:refs/remotes/origin/main --quiet
-          test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA" || {
-            echo "Refusing to approve a historical workflow run; main has moved." >&2
-            exit 1
-          }
-          if APPROVED=$(git ls-remote origin refs/heads/deploy/hosted | cut -f1) \
+          if [ -z "$MATRX_SANDBOX_SUBDIR" ]; then
+            test "$(git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA" || {
+              echo "Refusing to approve a historical workflow run; main has moved." >&2
+              exit 1
+            }
+          else
+            # Monorepo: main moves all day for unrelated paths. Refuse only when
+            # the sandbox tree itself moved past the tested commit; that newer
+            # commit has its own queued run (concurrency group above).
+            git merge-base --is-ancestor "$GITHUB_SHA" refs/remotes/origin/main \
+              || fail "Refusing: $GITHUB_SHA is not on main."
+            test "$(git rev-parse "refs/remotes/origin/main:./")" = "$(git rev-parse "$GITHUB_SHA:./")" || {
+              echo "Refusing to approve a historical workflow run; $MATRX_SANDBOX_SUBDIR moved on main." >&2
+              exit 1
+            }
+          fi
+          APPROVED=""
+          if APPROVED=$(git ls-remote origin "$DEPLOY_REF" | cut -f1) \
               && test -n "$APPROVED"; then
             git cat-file -e "${APPROVED}^{commit}" 2>/dev/null \
               || git fetch origin "$APPROVED" --quiet
             git merge-base --is-ancestor "$APPROVED" "$GITHUB_SHA" || {
-              echo "Refusing to move deploy/hosted backwards or across history." >&2
+              echo "Refusing to move $DEPLOY_REF backwards or across history." >&2
               exit 1
             }
           fi
-          APPROVAL_REF="refs/tags/deploy-approved/$GITHUB_SHA"
+          APPROVAL_REF="${MATRX_SANDBOX_APPROVAL_PREFIX}$GITHUB_SHA"
           if EXISTING=$(git ls-remote origin "$APPROVAL_REF" | cut -f1) \
               && test -n "$EXISTING"; then
             test "$EXISTING" = "$GITHUB_SHA" || {
@@ -94,14 +115,24 @@ jobs:
               exit 1
             }
           fi
-          # Include main as a leased no-op update in the same atomic
-          # transaction. If main changes after the check above in either
-          # direction, the exact lease prevents every approval ref update.
-          git push --atomic \
-            --force-with-lease=refs/heads/main:$GITHUB_SHA origin \
-            "${GITHUB_SHA}:refs/heads/main" \
-            "${GITHUB_SHA}:${APPROVAL_REF}" \
-            "${GITHUB_SHA}:refs/heads/deploy/hosted"
+          if [ -z "$MATRX_SANDBOX_SUBDIR" ]; then
+            # Include main as a leased no-op update in the same atomic
+            # transaction. If main changes after the check above in either
+            # direction, the exact lease prevents every approval ref update.
+            git push --atomic \
+              --force-with-lease=refs/heads/main:$GITHUB_SHA origin \
+              "${GITHUB_SHA}:refs/heads/main" \
+              "${GITHUB_SHA}:${APPROVAL_REF}" \
+              "${GITHUB_SHA}:${DEPLOY_REF}"
+          else
+            # Monorepo: never lease the shared main. Lease the deploy ref on the
+            # value checked above (empty = must not exist yet), so it only moves
+            # forward from exactly what this run proved it descends from.
+            git push --atomic \
+              "--force-with-lease=${DEPLOY_REF}:${APPROVED}" origin \
+              "${GITHUB_SHA}:${APPROVAL_REF}" \
+              "${GITHUB_SHA}:${DEPLOY_REF}"
+          fi
 
   deploy:
     needs: [test, approve-hosted]
@@ -118,13 +149,17 @@ jobs:
 
       - name: Revalidate immutable approved release
         run: |
-          APPROVAL_REF="refs/tags/deploy-approved/$GITHUB_SHA"
+          set -euo pipefail
+          fail() { echo "$*" >&2; exit 1; }
+          . scripts/lib/release-guard.sh
+          release_source_init "$PWD"
+          APPROVAL_REF="${MATRX_SANDBOX_APPROVAL_PREFIX}$GITHUB_SHA"
           git fetch origin \
             "${APPROVAL_REF}:${APPROVAL_REF}" \
-            refs/heads/deploy/hosted:refs/remotes/origin/deploy/hosted \
+            "${MATRX_SANDBOX_DEPLOY_REF}:refs/remotes/origin/sandbox-deploy-ref" \
             --quiet
           test "$(git rev-parse "$APPROVAL_REF")" = "$GITHUB_SHA"
-          test "$(git rev-parse refs/remotes/origin/deploy/hosted)" = "$GITHUB_SHA"
+          test "$(git rev-parse refs/remotes/origin/sandbox-deploy-ref)" = "$GITHUB_SHA"
 
       - name: Configure AWS credentials
         uses: aws-actions/configure-aws-credentials@7474bc4690e29a8392af63c5b98e7449536d5c3a # v4
@@ -212,13 +247,36 @@ jobs:
           EC2_INSTANCE_ID: ${{ secrets.EC2_INSTANCE_ID }}
           ECR_REPO: ${{ secrets.ECR_REPO_URI }}
           GITHUB_SHA: ${{ github.sha }}
+          # This job's own token (contents: read, dies when the job ends) is the
+          # EC2 host's ONLY GitHub credential: no stored key, nothing to rotate,
+          # and it reads this repository whether it is public, private, or the
+          # aidream monorepo. git gets it via GIT_CONFIG_* env (git >= 2.31),
+          # scoped to this one repository URL, never written to disk.
+          GIT_AUTH_TOKEN: ${{ github.token }}
         run: |
-          # Clone and execute only the tested commit. deploy-ec2.sh stages its
+          set -euo pipefail
+          # Fetch and execute only the tested commit. deploy-ec2.sh stages its
           # locked venv and immutable image tags, migrates, swaps, verifies the
           # exact release contract, and rolls the whole release back on error.
-          PARAMS=$(jq -n --arg ecr "$ECR_REPO" --arg sha "$GITHUB_SHA" '{
+          fail() { echo "$*" >&2; exit 1; }
+          . scripts/lib/release-guard.sh
+          release_source_init "$PWD"
+          REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"
+          APPROVAL_REF="${MATRX_SANDBOX_APPROVAL_PREFIX}${GITHUB_SHA}"
+          AUTH_B64=$(printf 'x-access-token:%s' "$GIT_AUTH_TOKEN" | base64 -w0)
+          echo "::add-mask::$AUTH_B64"
+          # Blobless + (in a monorepo) sparse: the host downloads the commit
+          # graph and only the sandbox's own files, never the whole monorepo.
+          PARAMS=$(jq -n --arg ecr "$ECR_REPO" --arg sha "$GITHUB_SHA" \
+            --arg url "$REPO_URL" --arg auth "$AUTH_B64" --arg ref "$APPROVAL_REF" \
+            --arg sub "$MATRX_SANDBOX_SUBDIR" '
+            ("/tmp/matrx-sandbox-deploy-" + $sha) as $d
+            | ($d + (if $sub == "" then "" else "/" + $sub end)) as $root
+            | "sudo --preserve-env=GIT_CONFIG_COUNT,GIT_CONFIG_KEY_0,GIT_CONFIG_VALUE_0,GIT_TERMINAL_PROMPT" as $su
+            | {
             "commands": [
               "set -euo pipefail",
+              ("export GIT_CONFIG_COUNT=1 GIT_CONFIG_KEY_0=http." + $url + ".extraheader GIT_CONFIG_VALUE_0=\"AUTHORIZATION: basic " + $auth + "\" GIT_TERMINAL_PROMPT=0"),
               "set -x",
               "df -h /",
               # `-a` removes only images unused by containers. It is required
@@ -226,19 +284,22 @@ jobs:
               # retained Docker volumes must never be pruned as deployment GC.
               "sudo docker image prune -a -f || true",
               ("aws ecr get-login-password --region us-east-1 | sudo docker login --username AWS --password-stdin " + $ecr),
-              ("sudo rm -rf /tmp/matrx-sandbox-deploy-" + $sha),
-              ("sudo git init -q /tmp/matrx-sandbox-deploy-" + $sha),
-              ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " remote add origin https://github.com/armanisadeghi/matrx-sandbox.git"),
-              ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " fetch origin refs/tags/deploy-approved/" + $sha),
-              ("test $(sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " rev-parse FETCH_HEAD) = " + $sha),
-              ("sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " checkout --detach " + $sha),
-              ("test $(sudo git -C /tmp/matrx-sandbox-deploy-" + $sha + " rev-parse HEAD) = " + $sha),
-              ("sudo bash /tmp/matrx-sandbox-deploy-" + $sha + "/scripts/deploy-ec2.sh " + $sha + " " + $ecr + " /tmp/matrx-sandbox-deploy-" + $sha),
-              ("sudo rm -rf /tmp/matrx-sandbox-deploy-" + $sha)
+              ("sudo rm -rf " + $d),
+              ("sudo git init -q " + $d),
+              ("sudo git -C " + $d + " remote add origin " + $url),
+              ("sudo git -C " + $d + " config remote.origin.promisor true"),
+              ("sudo git -C " + $d + " config remote.origin.partialclonefilter blob:none"),
+              (if $sub == "" then empty else ("sudo git -C " + $d + " sparse-checkout set --cone " + $sub) end),
+              ($su + " git -C " + $d + " fetch --filter=blob:none origin " + $ref),
+              ("test $(sudo git -C " + $d + " rev-parse FETCH_HEAD) = " + $sha),
+              ($su + " git -C " + $d + " checkout --detach " + $sha),
+              ("test $(sudo git -C " + $d + " rev-parse HEAD) = " + $sha),
+              ($su + " bash " + $root + "/scripts/deploy-ec2.sh " + $sha + " " + $ecr + " " + $root),
+              ("sudo rm -rf " + $d)
             ]
           }')
 
-          echo "SSM Parameters: $PARAMS"
+          echo "SSM Parameters: ${PARAMS//$AUTH_B64/***}"
 
           COMMAND_ID=$(aws ssm send-command \
             --instance-ids "$EC2_INSTANCE_ID" \
@@ -333,15 +394,9 @@ jobs:
             # inner deploy-hosted.sh is pointed at a separate lock file
             # (flock isn't reentrant across processes, and holding the main
             # lock is exactly the point).
-            mkdir -p /srv/apps/deploy-state
-            flock /srv/apps/deploy-state/.deploy-hosted.lock bash -c '
-              set -e
-              cd /srv/projects/matrx-sandbox
-              git fetch origin refs/heads/deploy/hosted --quiet
-              TARGET=$(git rev-parse FETCH_HEAD)
-              test "$TARGET" = "${{ github.sha }}"
-              git checkout --detach "$TARGET" --quiet
-              chmod +x scripts/deploy-hosted.sh
-              DEPLOY_LOCK_FILE=/srv/apps/deploy-state/.deploy-hosted.inner.lock \
-                DEPLOY_TARGET_SHA="$TARGET" bash scripts/deploy-hosted.sh
-            '
+            # The installed poller runner IS the sync path: it reads the host's
+            # source config (/etc/matrx/sandbox-release.env: checkout, subdir,
+            # ref), takes the main lock, and refuses unless the approved ref is
+            # exactly this run's commit. One path, so the two can never drift.
+            MATRX_SANDBOX_EXPECT_SHA='${{ github.sha }}' \
+              /usr/local/bin/matrx-hosted-deploy-runner

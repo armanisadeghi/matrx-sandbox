@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
 import subprocess
+import textwrap
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -33,6 +35,8 @@ SLIM_DOCKERFILE = REPO_ROOT / "sandbox-image" / "Dockerfile.slim"
 HOSTED_DEPLOY_SERVICE = (
     REPO_ROOT / "scripts" / "systemd" / "matrx-hosted-deploy.service"
 )
+HOSTED_RUNNER = REPO_ROOT / "scripts" / "systemd" / "pull-deploy-runner.sh"
+NESTED_PREFIX = "infra/matrx-sandbox"
 LEGACY_EC2_SOURCE_SHAS = (
     "30ed118b431b72e8f73f1b199fd9398d78361ed5",
     "f229d4b9347a66b3e8e8d8235f122d31dc336436",
@@ -205,12 +209,14 @@ def test_workflow_approves_only_current_main_then_revalidates_immutable_ref():
     ]
 
     assert 'git rev-parse refs/remotes/origin/main)" = "$GITHUB_SHA"' in approval
-    assert 'refs/tags/deploy-approved/$GITHUB_SHA' in approval
+    assert 'APPROVAL_REF="${MATRX_SANDBOX_APPROVAL_PREFIX}$GITHUB_SHA"' in approval
+    assert 'release_source_init "$PWD"' in approval
     assert "git push --atomic" in approval
     assert "--force-with-lease=refs/heads/main:$GITHUB_SHA origin" in approval
     assert '"${GITHUB_SHA}:refs/heads/main"' in approval
     assert '"${GITHUB_SHA}:${APPROVAL_REF}"' in approval
-    assert 'refs/tags/deploy-approved/$GITHUB_SHA' in revalidation
+    assert 'APPROVAL_REF="${MATRX_SANDBOX_APPROVAL_PREFIX}$GITHUB_SHA"' in revalidation
+    assert 'release_source_init "$PWD"' in revalidation
     assert "origin/main" not in revalidation
 
 
@@ -730,3 +736,261 @@ def test_hosted_promotion_holds_exclusive_peer_of_migration_lock():
         encoding="utf-8"
     )
     assert runtime.count('journal.lock("deployment", shared=True)') == 2
+
+
+
+# ── Release source layout: standalone repository today, aidream monorepo later ──
+# Every deploy path derives its ref names from the checkout layout, the EC2 host
+# fetches with the deploy job's own token, and a history-rewriting import keeps
+# the live hosts' recorded SHAs meaningful through scripts/release-lineage.tsv.
+
+
+def _monorepo_history(tmp_path: Path) -> tuple[Path, Path, Path, str, str]:
+    """A bare origin holding a monorepo with the sandbox at NESTED_PREFIX."""
+    origin = tmp_path / "mono.git"
+    author = tmp_path / "mono-author"
+    checkout = tmp_path / "mono-checkout"
+    _git(tmp_path, "init", "--bare", str(origin))
+    _git(tmp_path, "init", "-b", "main", str(author))
+    _git(author, "config", "user.email", "release-test@example.com")
+    _git(author, "config", "user.name", "Release Test")
+    sandbox = author / NESTED_PREFIX / "scripts" / "lib"
+    sandbox.mkdir(parents=True)
+    shutil.copy(RELEASE_GUARD, sandbox / "release-guard.sh")
+    (author / "apps").mkdir()
+    (author / "apps" / "other.txt").write_text("one\n", encoding="utf-8")
+    _git(author, "add", "-A")
+    _git(author, "commit", "-m", "first")
+    first = _git(author, "rev-parse", "HEAD")
+    (author / NESTED_PREFIX / "release.txt").write_text("two\n", encoding="utf-8")
+    _git(author, "add", "-A")
+    _git(author, "commit", "-m", "second")
+    second = _git(author, "rev-parse", "HEAD")
+    _git(author, "remote", "add", "origin", str(origin))
+    _git(author, "push", "-u", "origin", "main")
+    _git(tmp_path, "clone", "--branch", "main", str(origin), str(checkout))
+    return checkout, author, origin, first, second
+
+
+def _layout(root: Path, **env: str) -> subprocess.CompletedProcess[str]:
+    script = """
+set -u
+fail() { echo "$*" >&2; exit 1; }
+source "$1"
+release_source_init "$2"
+printf '%s\\n' "$MATRX_SANDBOX_SUBDIR" "$MATRX_SANDBOX_DEPLOY_REF" "$MATRX_SANDBOX_APPROVAL_PREFIX"
+"""
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("MATRX_SANDBOX_")}
+    return subprocess.run(
+        ["bash", "-c", script, "layout-test", str(RELEASE_GUARD), str(root)],
+        text=True,
+        capture_output=True,
+        env={**clean, **env},
+    )
+
+
+def test_release_ref_names_follow_the_checkout_layout(tmp_path: Path):
+    (tmp_path / "root").mkdir()
+    root_checkout, _, _, _ = _release_history(tmp_path / "root")
+    mono_checkout, _, _, _, _ = _monorepo_history(tmp_path)
+
+    root = _layout(root_checkout)
+    nested = _layout(mono_checkout / NESTED_PREFIX)
+    mismatch = _layout(mono_checkout / NESTED_PREFIX, MATRX_SANDBOX_SUBDIR="infra/other")
+    bad_ref = _layout(root_checkout, MATRX_SANDBOX_DEPLOY_REF="refs/tags/x")
+
+    assert root.returncode == 0, root.stderr
+    assert root.stdout.splitlines() == [
+        "",
+        "refs/heads/deploy/hosted",
+        "refs/tags/deploy-approved/",
+    ]
+    assert nested.returncode == 0, nested.stderr
+    assert nested.stdout.splitlines() == [
+        NESTED_PREFIX,
+        "refs/heads/deploy/sandbox-hosted",
+        "refs/tags/sandbox/deploy-approved/",
+    ]
+    assert mismatch.returncode != 0 and "MATRX_SANDBOX_SUBDIR" in mismatch.stderr
+    assert bad_ref.returncode != 0 and "refs/heads/" in bad_ref.stderr
+
+
+def test_host_runner_defaults_match_the_guard_layout_rule():
+    runner = HOSTED_RUNNER.read_text(encoding="utf-8")
+    guard = RELEASE_GUARD.read_text(encoding="utf-8")
+
+    for ref in ("refs/heads/deploy/hosted", "refs/heads/deploy/sandbox-hosted"):
+        assert f"MATRX_SANDBOX_DEPLOY_REF:-{ref}" in runner
+        assert f"MATRX_SANDBOX_DEPLOY_REF:={ref}" in guard
+    assert "/etc/matrx/sandbox-release.env" in runner
+    assert 'MATRX_SANDBOX_DIR="$RUNNER_SANDBOX_ROOT"' in runner
+
+
+def _approval_step_script() -> str:
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    start = workflow.index("- name: Promote tested commit to hosted approval ref")
+    body = workflow[workflow.index("run: |\n", start) + len("run: |\n") : workflow.index("\n  deploy:")]
+    return textwrap.dedent(body)
+
+
+def _run_approval(cwd: Path, sha: str) -> subprocess.CompletedProcess[str]:
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("MATRX_SANDBOX_")}
+    return subprocess.run(
+        ["bash", "-e", "-c", _approval_step_script()],
+        cwd=cwd,
+        text=True,
+        capture_output=True,
+        env={**clean, "GITHUB_SHA": sha},
+    )
+
+
+def test_monorepo_approval_ignores_unrelated_main_moves_only(tmp_path: Path):
+    checkout, author, origin, _, second = _monorepo_history(tmp_path)
+    sandbox = checkout / NESTED_PREFIX
+
+    # Unrelated monorepo work lands after the tested commit: still approvable.
+    (author / "apps" / "other.txt").write_text("moved\n", encoding="utf-8")
+    _git(author, "commit", "-am", "unrelated")
+    _git(author, "push", "origin", "main")
+    approved = _run_approval(sandbox, second)
+    refs = _git(origin, "for-each-ref", "--format=%(refname) %(objectname)")
+
+    assert approved.returncode == 0, approved.stderr
+    assert f"refs/heads/deploy/sandbox-hosted {second}" in refs
+    assert f"refs/tags/sandbox/deploy-approved/{second} {second}" in refs
+    assert "refs/heads/deploy/hosted" not in refs
+
+    # The sandbox tree itself moves past the tested commit: refuse.
+    (author / NESTED_PREFIX / "release.txt").write_text("three\n", encoding="utf-8")
+    _git(author, "commit", "-am", "sandbox change")
+    _git(author, "push", "origin", "main")
+    third = _git(author, "rev-parse", "HEAD")
+    _git(checkout, "fetch", "origin", "main")
+    stale = _run_approval(sandbox, second)
+    assert stale.returncode != 0
+    assert f"{NESTED_PREFIX} moved on main" in stale.stderr
+
+    # The newer sandbox commit then approves forward from the leased deploy ref.
+    _git(checkout, "checkout", "-q", "--detach", third)
+    forward = _run_approval(sandbox, third)
+    assert forward.returncode == 0, forward.stderr
+    assert _git(origin, "rev-parse", "refs/heads/deploy/sandbox-hosted") == third
+
+
+def test_standalone_approval_still_requires_current_main(tmp_path: Path):
+    checkout, author, first, second = _release_history(tmp_path)
+    (checkout / "scripts" / "lib").mkdir(parents=True)
+    shutil.copy(RELEASE_GUARD, checkout / "scripts" / "lib" / "release-guard.sh")
+
+    historical = _run_approval(checkout, first)
+    current = _run_approval(checkout, second)
+
+    assert historical.returncode != 0
+    assert "main has moved" in historical.stderr
+    assert current.returncode == 0, current.stderr
+    assert _git(author, "ls-remote", "origin", "refs/heads/deploy/hosted").startswith(second)
+
+
+def test_nested_guard_uses_monorepo_approval_ref_and_lineage(tmp_path: Path):
+    checkout, author, _, first, second = _monorepo_history(tmp_path)
+    sandbox = checkout / NESTED_PREFIX
+    _git(author, "push", "origin", f"{second}:refs/tags/sandbox/deploy-approved/{second}")
+    pre_move = "e" * 40  # a SHA the live host recorded before a rewriting import
+
+    approved = _run_approved_guard(sandbox, first, second)
+    unmapped = _run_approved_guard(sandbox, pre_move, second)
+    lineage = sandbox / "scripts" / "release-lineage.tsv"
+    lineage.write_text(f"{pre_move}\t{first}\n", encoding="utf-8")
+    mapped = _run_approved_guard(sandbox, pre_move, second)
+    lineage.write_text(f"{pre_move}\t{second}\n{pre_move}\t{first}\n", encoding="utf-8")
+    ambiguous = _run_approved_guard(sandbox, pre_move, second)
+
+    assert approved.returncode == 0, approved.stderr
+    assert unmapped.returncode != 0
+    assert "unavailable in release history" in unmapped.stderr
+    assert mapped.returncode == 0, mapped.stderr
+    assert "lineage maps it to" in mapped.stderr
+    assert ambiguous.returncode != 0
+
+
+def test_hosted_change_set_is_relative_to_the_sandbox_root():
+    deploy = HOSTED_DEPLOY.read_text(encoding="utf-8")
+    assert 'git diff --name-only --relative "$OLD_SHA" "$NEW_SHA"' in deploy
+    assert 'release_source_init "$REPO_DIR"' in deploy
+    assert "refs/heads/deploy/hosted" not in deploy
+    # Image labels written before a rewriting import stay "compatible" through lineage.
+    assert 'actual=$(release_guard_resolve_lineage "$REPO_DIR" "$actual" 2>/dev/null)' in deploy
+
+
+def test_ec2_deploy_fetches_with_the_job_token_never_anonymously():
+    workflows = sorted(DEPLOY_WORKFLOW.parent.glob("*.yml"))
+    for path in workflows:
+        text = path.read_text(encoding="utf-8")
+        assert "github.com/armanisadeghi/" not in text, path.name
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    ssm = workflow[workflow.index("- name: Deploy to EC2 via SSM") : workflow.index("COMMAND_ID=")]
+
+    assert "GIT_AUTH_TOKEN: ${{ github.token }}" in ssm
+    assert 'REPO_URL="https://github.com/${GITHUB_REPOSITORY}.git"' in ssm
+    assert 'echo "::add-mask::$AUTH_B64"' in ssm
+    assert 'echo "SSM Parameters: ${PARAMS//$AUTH_B64/***}"' in ssm
+    assert 'echo "SSM Parameters: $PARAMS"' not in ssm
+    assert "fetch --filter=blob:none origin" in ssm
+    # The credential line runs before xtrace so the SSM transcript never echoes it.
+    assert ssm.index("GIT_CONFIG_VALUE_0=") < ssm.index('"set -x"')
+
+
+def test_hosted_fast_path_runs_the_installed_poller_runner():
+    workflow = DEPLOY_WORKFLOW.read_text(encoding="utf-8")
+    hosted_job = workflow[workflow.index("  deploy-hosted:") :]
+    assert "/usr/local/bin/matrx-hosted-deploy-runner" in hosted_job
+    assert "MATRX_SANDBOX_EXPECT_SHA='${{ github.sha }}'" in hosted_job
+    assert "/srv/projects/matrx-sandbox" not in hosted_job
+
+
+def test_host_runner_syncs_the_nested_checkout_end_to_end(tmp_path: Path):
+    if shutil.which("flock") is None:
+        # CI (ubuntu) has util-linux flock; a bare macOS shell does not.
+        import pytest
+
+        pytest.skip("flock is not installed on this machine; CI runs this test")
+    checkout, author, _, _, second = _monorepo_history(tmp_path)
+    stub = author / NESTED_PREFIX / "scripts" / "deploy-hosted.sh"
+    stub.write_text(
+        '#!/usr/bin/env bash\nprintf "%s|%s|%s\\n" "$MATRX_SANDBOX_DIR" '
+        '"$DEPLOY_TARGET_SHA" "$MATRX_SANDBOX_DEPLOY_REF" > "$RUNNER_PROOF"\n',
+        encoding="utf-8",
+    )
+    _git(author, "add", "-A")
+    _git(author, "commit", "-m", "stub deploy")
+    target = _git(author, "rev-parse", "HEAD")
+    _git(author, "push", "origin", f"{target}:refs/heads/deploy/sandbox-hosted")
+    env_file = tmp_path / "sandbox-release.env"
+    env_file.write_text(
+        f"MATRX_SANDBOX_CHECKOUT={checkout}\nMATRX_SANDBOX_SUBDIR={NESTED_PREFIX}\n",
+        encoding="utf-8",
+    )
+    proof = tmp_path / "proof.txt"
+    clean = {k: v for k, v in os.environ.items() if not k.startswith("MATRX_SANDBOX_")}
+    env = {
+        **clean,
+        "MATRX_SANDBOX_RELEASE_ENV": str(env_file),
+        "MATRX_SANDBOX_LOCK_DIR": str(tmp_path / "locks"),
+        "RUNNER_PROOF": str(proof),
+    }
+
+    run = subprocess.run(["bash", str(HOSTED_RUNNER)], env=env, text=True, capture_output=True)
+    wrong = subprocess.run(
+        ["bash", str(HOSTED_RUNNER)],
+        env={**env, "MATRX_SANDBOX_EXPECT_SHA": second},
+        text=True,
+        capture_output=True,
+    )
+
+    assert run.returncode == 0, run.stderr
+    assert proof.read_text(encoding="utf-8").strip() == (
+        f"{checkout / NESTED_PREFIX}|{target}|refs/heads/deploy/sandbox-hosted"
+    )
+    assert _git(checkout, "rev-parse", "HEAD") == target
+    assert wrong.returncode != 0
+    assert "caller expected" in wrong.stderr
