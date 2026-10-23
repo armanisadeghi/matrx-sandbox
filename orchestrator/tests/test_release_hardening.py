@@ -918,6 +918,8 @@ def test_hosted_change_set_is_relative_to_the_sandbox_root():
     assert 'git diff --name-only --relative "$OLD_SHA" "$NEW_SHA"' in deploy
     assert 'release_source_init "$REPO_DIR"' in deploy
     assert "refs/heads/deploy/hosted" not in deploy
+    # Image labels written before a rewriting import stay "compatible" through lineage.
+    assert 'actual=$(release_guard_resolve_lineage "$REPO_DIR" "$actual" 2>/dev/null)' in deploy
 
 
 def test_ec2_deploy_fetches_with_the_job_token_never_anonymously():

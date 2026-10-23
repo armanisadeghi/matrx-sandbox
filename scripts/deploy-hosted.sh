@@ -310,6 +310,7 @@ image_version_compatible() {
     --format '{{index .Config.Labels "com.aimatrx.sandbox.version"}}' 2>/dev/null) \
     || return 1
   [[ "$actual" =~ ^[0-9a-f]{40}$ ]] || return 1
+  actual=$(release_guard_resolve_lineage "$REPO_DIR" "$actual" 2>/dev/null)
   git merge-base --is-ancestor "$actual" "$NEW_SHA" 2>/dev/null
 }
 
